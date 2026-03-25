@@ -1,0 +1,15 @@
+ramp
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+dist/
+build/
+.pytest_cache/
+.env
+.env.*
+*.pem
+*.key
+credentials.*
+secrets.*
+CLAUDE.local.md

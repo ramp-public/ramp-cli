@@ -1,0 +1,109 @@
+name: Build Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: darwin
+            arch: arm64
+            runner: macos-14
+          - os: darwin
+            arch: amd64
+            runner: macos-14
+          - os: linux
+            arch: amd64
+            runner: ubuntu-22.04
+          - os: linux
+            arch: arm64
+            runner: ubuntu-22.04-arm
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Build with Nuitka
+        run: |
+          uv run python -m nuitka \
+            --standalone \
+            --output-filename="ramp-${{ matrix.os }}-${{ matrix.arch }}" \
+            --output-dir=build \
+            --include-package=ramp_cli \
+            --include-package-data=ramp_cli \
+            --include-data-files=src/ramp_cli/specs/*.json=ramp_cli/specs/ \
+            --python-flag=no_site \
+            --assume-yes-for-downloads \
+            src/ramp_cli/main.py
+
+      - name: Package standalone directory
+        run: |
+          cd build
+          tar -czf "ramp-${{ matrix.os }}-${{ matrix.arch }}.tar.gz" main.dist/
+
+      - name: Generate checksum
+        run: |
+          cd build
+          if [ "${{ matrix.os }}" = "darwin" ]; then
+            shasum -a 256 "ramp-${{ matrix.os }}-${{ matrix.arch }}.tar.gz" > "ramp-${{ matrix.os }}-${{ matrix.arch }}.tar.gz.sha256"
+          else
+            sha256sum "ramp-${{ matrix.os }}-${{ matrix.arch }}.tar.gz" > "ramp-${{ matrix.os }}-${{ matrix.arch }}.tar.gz.sha256"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ramp-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            build/ramp-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
+            build/ramp-${{ matrix.os }}-${{ matrix.arch }}.tar.gz.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Verify expected artifacts
+        run: |
+          for platform in darwin-arm64 darwin-amd64 linux-amd64 linux-arm64; do
+            test -f "ramp-${platform}.tar.gz" || { echo "Missing ramp-${platform}.tar.gz"; exit 1; }
+            test -f "ramp-${platform}.tar.gz.sha256" || { echo "Missing ramp-${platform}.tar.gz.sha256"; exit 1; }
+          done
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --generate-notes \
+            ramp-darwin-arm64.tar.gz \
+            ramp-darwin-arm64.tar.gz.sha256 \
+            ramp-darwin-amd64.tar.gz \
+            ramp-darwin-amd64.tar.gz.sha256 \
+            ramp-linux-amd64.tar.gz \
+            ramp-linux-amd64.tar.gz.sha256 \
+            ramp-linux-arm64.tar.gz \
+            ramp-linux-arm64.tar.gz.sha256
