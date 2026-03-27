@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import traceback
 
 import click
 
@@ -14,16 +15,20 @@ from ramp_cli.commands.config import config_group
 from ramp_cli.commands.env import env_cmd
 from ramp_cli.commands.feedback import feedback_cmd
 from ramp_cli.commands.skills import skills_group
+from ramp_cli.config.settings import load, resolve_environment
 from ramp_cli.easter_eggs.flip import card_cmd
 from ramp_cli.easter_eggs.invoice import invoice_cmd
 from ramp_cli.easter_eggs.nyc import nyc_cmd
 from ramp_cli.easter_eggs.rampy import rampy_cmd
 from ramp_cli.errors import EXIT_RUNTIME, ApiError, AuthRequiredError, RampCLIError
+from ramp_cli.output.formatter import print_error_json, set_quiet
 from ramp_cli.output.help import (
     BoxHelpFormatter,
     make_box_formatter,
     suppress_help_text,
 )
+from ramp_cli.tools.commands import build_tool_command
+from ramp_cli.tools.registry import get_tool, list_categories
 
 # ── Display constants ────────────────────────────────────────────────────────
 
@@ -85,7 +90,6 @@ class ToolGroup(click.Group):
     @staticmethod
     def build(name: str, tools: list, help_text: str) -> ToolGroup:
         """Build a ToolGroup from a list of ToolDefs."""
-        from ramp_cli.tools.commands import build_tool_command
 
         @click.group(
             name=name,
@@ -177,9 +181,6 @@ class RampGroup(click.Group):
             return ToolGroup.build(cmd_name, tools, help_text)
 
         # Flat tool access (e.g. "ramp get-funds") for agents
-        from ramp_cli.tools.commands import build_tool_command
-        from ramp_cli.tools.registry import get_tool
-
         tool_def = get_tool(cmd_name, env=self._resolve_env(ctx))
         if tool_def is not None:
             return build_tool_command(tool_def)
@@ -215,8 +216,6 @@ class RampGroup(click.Group):
                 formatter.write_dl(resource_rows)
 
     def _resolve_env(self, ctx: click.Context | None) -> str:
-        from ramp_cli.config.settings import resolve_environment
-
         flag_env = (ctx.params.get("flag_env") or "") if ctx else ""
         return resolve_environment(flag_env)
 
@@ -226,8 +225,6 @@ class RampGroup(click.Group):
         Applies _CATEGORY_REMAP to merge related categories (e.g. cards → funds),
         then splits multi-tool groups from singletons.
         """
-        from ramp_cli.tools.registry import list_categories
-
         cats = list_categories(self._resolve_env(ctx))
 
         # Remap and merge categories
@@ -328,9 +325,6 @@ def cli(
             param_hint="'-o'",
         )
 
-    from ramp_cli.config.settings import load, resolve_environment
-    from ramp_cli.output.formatter import set_quiet
-
     cfg = load()
     env = resolve_environment(flag_env)
 
@@ -385,8 +379,6 @@ def _handle_error(code: int, message: str, *, exit_code: int | None = None) -> N
     code: the error code shown in agent JSON (e.g., HTTP 401 for auth errors).
     exit_code: the POSIX exit status (0-255). Defaults to code if not provided.
     """
-    from ramp_cli.output.formatter import print_error_json
-
     if _is_agent_mode():
         print_error_json(code, message)
     else:
@@ -407,8 +399,6 @@ def main() -> None:
         _handle_error(e.code, str(e))
     except click.UsageError as e:
         if _is_agent_mode():
-            from ramp_cli.output.formatter import print_error_json
-
             print_error_json(e.exit_code, e.format_message())
         else:
             BoxHelpFormatter._suppress_wave = True
@@ -419,16 +409,12 @@ def main() -> None:
         sys.exit(e.exit_code)
     except click.ClickException as e:
         if _is_agent_mode():
-            from ramp_cli.output.formatter import print_error_json
-
             print_error_json(e.exit_code, e.format_message())
         else:
             e.show()
         sys.exit(e.exit_code)
     except Exception as e:
         if os.environ.get("RAMP_DEBUG"):
-            import traceback
-
             traceback.print_exc()
         _handle_error(EXIT_RUNTIME, f"{type(e).__name__}: internal error")
 

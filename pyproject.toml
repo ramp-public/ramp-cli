@@ -23,7 +23,7 @@ path = "src/ramp_cli/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ramp_cli"]
-artifacts = ["src/ramp_cli/specs/*.json"]
+artifacts = ["src/ramp_cli/specs/*.json", "src/ramp_cli/skills/*/SKILL.md"]
 
 [dependency-groups]
 dev = [
@@ -38,4 +38,4 @@ dev = [
 testpaths = ["tests"]
 
 [tool.ruff.lint]
-extend-select = ["I"]
+extend-select = ["I", "PLC0415"]

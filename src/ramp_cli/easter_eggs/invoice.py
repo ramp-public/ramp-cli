@@ -4,7 +4,9 @@ import json
 
 import click
 
+from ramp_cli.client.api import RampClient
 from ramp_cli.output.formatter import print_agent_json
+from ramp_cli.views.invoice import render_bill_invoice
 
 
 @click.command(
@@ -13,9 +15,6 @@ from ramp_cli.output.formatter import print_agent_json
 @click.argument("bill_id")
 @click.pass_context
 def invoice_cmd(ctx: click.Context, bill_id: str) -> None:
-    from ramp_cli.client.api import RampClient
-    from ramp_cli.views.invoice import render_bill_invoice
-
     client = RampClient(ctx.obj["env"])
     body = client.get(f"/developer/v1/bills/{bill_id}")
 

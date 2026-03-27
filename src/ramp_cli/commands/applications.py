@@ -7,6 +7,8 @@ import sys
 from typing import Any
 
 import click
+import httpx
+import jsonref
 
 from ramp_cli.client.api import RampClient
 from ramp_cli.config.constants import application_signup_token, base_url
@@ -250,9 +252,6 @@ def _merge_all_of(schema: dict[str, Any]) -> dict[str, Any]:
 
 def _fetch_application_schema() -> dict[str, Any]:
     """Fetch the Developer API spec and extract the resolved applications create schema."""
-    import httpx
-    import jsonref
-
     resp = httpx.get(_DEVELOPER_API_SPEC_URL, timeout=30, follow_redirects=True)
     resp.raise_for_status()
     spec = resp.json()

@@ -24,6 +24,7 @@ from ramp_cli.output.formatter import (
     print_table,
     resolve_format,
 )
+from ramp_cli.output.paginator import ToolPaginator
 from ramp_cli.output.style import show_detail_card, show_table_card
 from ramp_cli.specs.sync import maybe_sync
 from ramp_cli.tools.parser import ParamType, ToolDef, ToolParam
@@ -335,8 +336,6 @@ def _try_interactive_table(
         return _format_rows(items, headers, wide=wide), page_data.get(
             "next_page_cursor"
         )
-
-    from ramp_cli.output.paginator import ToolPaginator
 
     selected = ToolPaginator(
         title=tool.display_name,

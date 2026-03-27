@@ -9,24 +9,12 @@ import click
 from ramp_cli.output.formatter import print_agent_json, resolve_format
 from ramp_cli.output.help import BoxHelpFormatter
 from ramp_cli.skills import (
-    SKILLS_DIR,
     detect_agent_dir,
     get_skill_content,
     install_skill,
     list_skills,
     skill_names,
 )
-
-
-def _ensure_skills_dir() -> None:
-    """Raise SystemExit if the skills directory is not available."""
-    if not SKILLS_DIR.is_dir():
-        click.echo(
-            "Skills directory not found. Skills are available in dev/editable installs "
-            "or via: npx skills add ramp-developers/agent-skills",
-            err=True,
-        )
-        raise SystemExit(1)
 
 
 @click.group("skills", help="Browse and install agent skill instructions")
@@ -37,8 +25,6 @@ def skills_group() -> None:
 @skills_group.command("list", help="List all available skills")
 @click.pass_context
 def skills_list(ctx: click.Context) -> None:
-    _ensure_skills_dir()
-
     skills = list_skills()
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
 
@@ -106,8 +92,6 @@ def skills_install(
         raise click.UsageError(
             "Provide a skill name or use --all to install all skills."
         )
-
-    _ensure_skills_dir()
 
     # Resolve target directory
     if target is None:

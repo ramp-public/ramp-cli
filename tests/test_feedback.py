@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock, patch
 
+import httpx
 from click.testing import CliRunner
 
 from ramp_cli.main import cli
@@ -153,8 +154,6 @@ class TestFeedbackErrors:
     @patch("ramp_cli.commands.feedback.httpx.Client")
     @patch("ramp_cli.commands.feedback.store")
     def test_timeout_error(self, mock_store, mock_client_cls, isolated_config):
-        import httpx
-
         mock_store.has_tokens.return_value = False
         mock_http = MagicMock()
         mock_http.__enter__ = MagicMock(return_value=mock_http)
@@ -169,8 +168,6 @@ class TestFeedbackErrors:
     @patch("ramp_cli.commands.feedback.httpx.Client")
     @patch("ramp_cli.commands.feedback.store")
     def test_http_error(self, mock_store, mock_client_cls, isolated_config):
-        import httpx
-
         mock_store.has_tokens.return_value = False
         mock_resp = MagicMock()
         mock_resp.status_code = 400
@@ -190,8 +187,6 @@ class TestFeedbackErrors:
     @patch("ramp_cli.commands.feedback.httpx.Client")
     @patch("ramp_cli.commands.feedback.store")
     def test_network_error(self, mock_store, mock_client_cls, isolated_config):
-        import httpx
-
         mock_store.has_tokens.return_value = False
         mock_http = MagicMock()
         mock_http.__enter__ = MagicMock(return_value=mock_http)

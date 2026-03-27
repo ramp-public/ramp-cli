@@ -9,8 +9,10 @@ from pathlib import Path
 from ramp_cli.config.settings import config_dir
 
 _PKG_DIR = Path(__file__).parent
+_PKG_ROOT = _PKG_DIR.parent  # ramp_cli/
 
 AGENT_TOOL_SPEC = _PKG_DIR / "agent-tool.json"
+SKILLS_DIR = _PKG_ROOT / "skills"
 
 
 def local_agent_tool_spec(env: str) -> Path:

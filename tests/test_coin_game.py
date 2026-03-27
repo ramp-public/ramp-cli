@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import os
+
 from click.testing import CliRunner
 
 from ramp_cli.animations.rampy import _render_eye
 from ramp_cli.easter_eggs.rampy import rampy_cmd
+from ramp_cli.output.lifecycle import Lifecycle
 from ramp_cli.output.rampy_coin_game import (
     G_EYE_L,
     _render_coin_sprite,
@@ -116,8 +119,6 @@ def test_render_eye_outside():
 # ---------------------------------------------------------------------------
 def test_coin_game_terminal_too_short(monkeypatch):
     """Coin game should error if terminal is too short."""
-    import os
-
     monkeypatch.setitem(os.environ, "COLUMNS", "80")
     monkeypatch.setitem(os.environ, "LINES", "15")
     runner = CliRunner()
@@ -128,8 +129,6 @@ def test_coin_game_terminal_too_short(monkeypatch):
 
 def test_lifecycle_emits_alt_screen_sequences(monkeypatch):
     """Lifecycle should emit alt-screen-on at start and alt-screen-off at cleanup."""
-    from ramp_cli.output.lifecycle import Lifecycle
-
     written: list[str] = []
     frame_count = 0
 
@@ -170,8 +169,6 @@ def test_lifecycle_emits_alt_screen_sequences(monkeypatch):
 
 def test_lifecycle_quit_on_esc():
     """Lifecycle should quit when ESC is received."""
-    from ramp_cli.output.lifecycle import Lifecycle
-
     lc = Lifecycle(lambda t: None, lambda t: None, fps=20)
     # Verify the quit flag is initially false
     assert lc._quitting is False
@@ -179,8 +176,6 @@ def test_lifecycle_quit_on_esc():
 
 def test_lifecycle_on_input_forwarding():
     """Lifecycle should forward non-quit keys to on_input callback."""
-    from ramp_cli.output.lifecycle import Lifecycle
-
     received: list[bytes] = []
     lc = Lifecycle(
         lambda t: None, lambda t: None, on_input=lambda d: received.append(d), fps=20

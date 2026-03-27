@@ -1,4 +1,9 @@
-"""Skill discovery — locate and parse SKILL.md files from the skills/ directory."""
+"""Skill discovery — locate and parse bundled SKILL.md files.
+
+Skills are bundled inside this package directory.  Each subdirectory that
+contains a SKILL.md is a skill.  The path is resolved via __file__ so it
+works in both editable and installed (wheel) builds.
+"""
 
 from __future__ import annotations
 
@@ -6,10 +11,7 @@ import re
 import shutil
 from pathlib import Path
 
-from ramp_cli.specs import _PKG_DIR
-
-# _PKG_DIR is src/ramp_cli/specs/; skills/ is at repo root
-SKILLS_DIR = (_PKG_DIR / "../../../skills").resolve()
+from ramp_cli.specs import SKILLS_DIR
 
 AGENT_SKILL_DIRS = [".claude/skills", ".cursor/skills", ".windsurf/skills"]
 

@@ -6,6 +6,7 @@ import json
 import sys
 from contextlib import nullcontext
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -20,7 +21,7 @@ from ramp_cli.auth.oauth import (
     _generate_verifier,
 )
 from ramp_cli.errors import RefreshFailedError
-from ramp_cli.main import cli, main
+from ramp_cli.main import BoxHelpFormatter, cli, main
 
 
 def test_pkce_verifier_length():
@@ -304,18 +305,14 @@ class TestUsageErrorDisplay:
         self, isolated_config, monkeypatch
     ):
         """main() sets _suppress_wave=True while e.show() runs, then resets it."""
-        import click as _click
-
-        from ramp_cli.main import BoxHelpFormatter
-
         flag_during_show: list[bool] = []
-        original_show = _click.UsageError.show
+        original_show = click.UsageError.show
 
         def spy_show(self, file=None):
             flag_during_show.append(BoxHelpFormatter._suppress_wave)
             original_show(self, file)
 
-        monkeypatch.setattr(_click.UsageError, "show", spy_show)
+        monkeypatch.setattr(click.UsageError, "show", spy_show)
         # --human forces the non-agent path so e.show() is called
         # (without it, _is_agent_mode() returns True in CI/pytest
         # because stdout is not a TTY)
@@ -331,8 +328,6 @@ class TestUsageErrorDisplay:
 
     def test_suppress_wave_flag_prevents_wave(self, isolated_config):
         """BoxHelpFormatter._suppress_wave=True prevents the wave in getvalue()."""
-        from ramp_cli.main import BoxHelpFormatter
-
         BoxHelpFormatter._suppress_wave = True
         try:
             fmt = BoxHelpFormatter()

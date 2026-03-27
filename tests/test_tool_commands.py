@@ -5,10 +5,10 @@ import json
 import click
 from click.testing import CliRunner
 
-from ramp_cli.main import cli
+from ramp_cli.main import ToolGroup, cli
 from ramp_cli.tools.commands import build_tool_command
 from ramp_cli.tools.parser import ParamType, ToolDef, ToolParam
-from ramp_cli.tools.registry import get_tool, list_tools
+from ramp_cli.tools.registry import _registry, get_tool, list_tools
 
 
 class TestRegistry:
@@ -28,7 +28,6 @@ class TestRegistry:
 
     def test_env_switch_reloads_spec(self, tmp_path, monkeypatch):
         """Registry auto-reloads when a different env is requested."""
-        from ramp_cli.tools.registry import _registry
 
         # Create two minimal specs with different tool sets.
         # The parser requires a $ref to components/schemas.
@@ -324,8 +323,6 @@ class TestPositionalIdParams:
 
     def test_real_tool_bill_id_positional(self):
         """get-bill-details from the bundled spec should have bill_id as positional."""
-        from ramp_cli.tools.registry import get_tool
-
         tool = get_tool("get-bill-details")
         assert tool is not None
         cmd = build_tool_command(tool)
@@ -335,8 +332,6 @@ class TestPositionalIdParams:
 
     def test_real_tool_lock_card_id_positional(self):
         """lock-or-unlock-card should have id as positional."""
-        from ramp_cli.tools.registry import get_tool
-
         tool = get_tool("lock-or-unlock-card")
         assert tool is not None
         cmd = build_tool_command(tool)
@@ -449,8 +444,6 @@ class TestErrorExampleFormat:
 class TestAliasInCategoryGroup:
     def test_category_uses_alias(self):
         """Category subcommands use alias when present."""
-        from ramp_cli.main import ToolGroup
-
         tool_with_alias = ToolDef(
             name="get-funds",
             path="/developer/v1/agent-tools/get-funds",

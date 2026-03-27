@@ -22,6 +22,15 @@ from typing import Any, Callable, TextIO
 
 import click
 
+try:
+    import select
+    import termios
+    import tty
+except ImportError:  # pragma: no cover - Windows fallback
+    select = None  # type: ignore[assignment]
+    termios = None  # type: ignore[assignment]
+    tty = None  # type: ignore[assignment]
+
 # === Width Limits ===
 _WIDTH_MIN = 80
 _WIDTH_MAX = 120
@@ -179,10 +188,6 @@ def _read_key() -> str:
     Returns 'left', 'right', 'up', 'down', 'enter', 'esc', 'q', or the char.
     Shared primitive used by interactive views (paginator, etc.).
     """
-    import select
-    import termios
-    import tty
-
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:

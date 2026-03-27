@@ -6,7 +6,10 @@ import sys
 
 import click
 
+from ramp_cli.animations.nyc import show_nyc
 from ramp_cli.auth import store
+from ramp_cli.auth.oauth import LoginOptions
+from ramp_cli.auth.oauth import login as do_login
 from ramp_cli.config.constants import ENV_PRODUCTION, ENV_SANDBOX, base_url
 from ramp_cli.output.formatter import print_agent_json, resolve_format
 from ramp_cli.output.style import env_label, show_status_box
@@ -38,9 +41,6 @@ def _show_default_env_hint(env: str) -> None:
 @click.pass_context
 def login(ctx: click.Context, token_stdin: bool, no_browser: bool) -> None:
     """Authenticate with Ramp via browser."""
-    from ramp_cli.auth.oauth import LoginOptions
-    from ramp_cli.auth.oauth import login as do_login
-
     env = ctx.obj["env"]
     label = env_label(env)
 
@@ -72,8 +72,6 @@ def login(ctx: click.Context, token_stdin: bool, no_browser: bool) -> None:
         access_token_expires_in=token_resp.expires_in,
         refresh_token_expires_in=token_resp.refresh_token_expires_in,
     )
-
-    from ramp_cli.animations.nyc import show_nyc
 
     show_nyc(duration=5.0)
 

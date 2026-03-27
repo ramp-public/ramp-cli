@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+import json
 
 from click.testing import CliRunner
 
 from ramp_cli.main import cli
-from ramp_cli.skills import detect_agent_dir, install_skill, skill_names
+from ramp_cli.skills import SKILLS_DIR, detect_agent_dir, install_skill, skill_names
 
 
 class TestSkillDiscovery:
@@ -22,12 +22,10 @@ class TestSkillDiscovery:
         assert "transaction-cleanup" in names
         assert "apply-to-ramp" in names
 
-    def test_skill_names_missing_dir(self, monkeypatch):
-        """Returns empty list when skills dir does not exist."""
-        monkeypatch.setattr("ramp_cli.skills.SKILLS_DIR", Path("/nonexistent/path"))
-
-        # Re-import won't help since SKILLS_DIR is module-level, use the monkeypatched value
-        assert skill_names() == []  # noqa: this still uses the original import but SKILLS_DIR is patched
+    def test_skill_names_empty_dir(self, tmp_path, monkeypatch):
+        """Returns empty list when skills dir has no skill subdirectories."""
+        monkeypatch.setattr("ramp_cli.skills.SKILLS_DIR", tmp_path)
+        assert skill_names() == []
 
 
 class TestSkillsList:
@@ -35,7 +33,6 @@ class TestSkillsList:
         runner = CliRunner()
         result = runner.invoke(cli, ["--agent", "skills", "list"])
         assert result.exit_code == 0
-        import json
 
         data = json.loads(result.output)
         assert len(data["data"]) == 6
@@ -106,14 +103,12 @@ class TestSkillsInstall:
         content = (tmp_path / "browser-automation" / "SKILL.md").read_text()
         assert "user-invocable" not in content
 
-    def test_install_no_skills_dir(self, monkeypatch):
-        """Error when skills directory is missing."""
-        fake = Path("/nonexistent/path")
-        monkeypatch.setattr("ramp_cli.skills.SKILLS_DIR", fake)
-        monkeypatch.setattr("ramp_cli.commands.skills.SKILLS_DIR", fake)
+    def test_install_empty_skills_dir(self, tmp_path, monkeypatch):
+        """No skills available when SKILLS_DIR is empty."""
+        monkeypatch.setattr("ramp_cli.skills.SKILLS_DIR", tmp_path)
         runner = CliRunner()
         result = runner.invoke(
-            cli, ["skills", "install", "--all", "--target", "/tmp/test"]
+            cli, ["skills", "install", "browser-automation", "--target", str(tmp_path)]
         )
         assert result.exit_code != 0
 
@@ -139,3 +134,18 @@ class TestDetectAgentDir:
         monkeypatch.chdir(tmp_path)
         result = detect_agent_dir()
         assert result is None
+
+
+class TestSkillsBundled:
+    """Verify SKILLS_DIR resolves to a directory containing all skills."""
+
+    def test_skills_dir_has_skill_content(self):
+        """SKILLS_DIR should contain subdirectories with SKILL.md files."""
+        assert SKILLS_DIR.is_dir()
+        assert any(SKILLS_DIR.glob("*/SKILL.md"))
+
+    def test_all_skills_have_skill_md(self):
+        """Every discovered skill should have a SKILL.md file."""
+        for name in skill_names():
+            skill_file = SKILLS_DIR / name / "SKILL.md"
+            assert skill_file.is_file(), f"{name}/SKILL.md missing from {SKILLS_DIR}"

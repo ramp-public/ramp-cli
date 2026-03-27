@@ -10,6 +10,9 @@ from __future__ import annotations
 import math
 import random
 import shutil
+import sys
+
+import click
 
 from ramp_cli.animations.rampy import (
     _SYMBOL_BITMAP,
@@ -287,10 +290,6 @@ MIN_GAME_LINES = 20  # Minimum terminal height for the coin game
 
 def show_coin_game(file=None) -> None:
     """Run the Rampy Coin Chase game."""
-    import sys
-
-    import click
-
     file = file or sys.stdout
     use_color = _color_supported(file)
 

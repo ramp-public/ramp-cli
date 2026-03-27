@@ -2,6 +2,11 @@
 
 import click
 
+from ramp_cli.animations.rampy import show_rampy
+from ramp_cli.animations.rampy_idle import show_rampy_idle
+from ramp_cli.animations.rampy_surf import show_rampy_surf
+from ramp_cli.output.rampy_coin_game import show_coin_game
+
 
 @click.command("rampy", hidden=False, help="Meet Rampy (--skate, --surf, --coin-game)")
 @click.option("--skate", is_flag=True, default=False, help="Skateboard animation")
@@ -18,19 +23,11 @@ def rampy_cmd(skate: bool, surf: bool, coin_game: bool, duration: float) -> None
         )
 
     if skate:
-        from ramp_cli.animations.rampy import show_rampy
-
         show_rampy(duration=duration)
     elif surf:
-        from ramp_cli.animations.rampy_surf import show_rampy_surf
-
         show_rampy_surf(duration=duration)
     elif coin_game:
-        from ramp_cli.output.rampy_coin_game import show_coin_game
-
         show_coin_game()
     else:
         # Default — idle standing Rampy
-        from ramp_cli.animations.rampy_idle import show_rampy_idle
-
         show_rampy_idle(duration=duration)

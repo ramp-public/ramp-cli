@@ -10,6 +10,18 @@ from typing import Iterator
 
 import click
 
+from ramp_cli.output.formatter import is_quiet
+from ramp_cli.output.style import (
+    _WIDTH_MAX,
+    _WIDTH_MIN,
+    BOX_V,
+    _build_strip_wave_str,
+    _fg,
+    _frame_bottom,
+    _frame_top,
+    _reset,
+)
+
 
 def _wrap_text(text: str, width: int) -> list[str]:
     """Word-wrap text to the given width."""
@@ -78,15 +90,6 @@ class BoxHelpFormatter(click.HelpFormatter):
     def _flush_section(self) -> None:
         if not self._section_title:
             return
-        from ramp_cli.output.style import (
-            _WIDTH_MAX,
-            _WIDTH_MIN,
-            BOX_V,
-            _fg,
-            _frame_bottom,
-            _frame_top,
-            _reset,
-        )
 
         use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
         width = max(
@@ -146,14 +149,6 @@ class BoxHelpFormatter(click.HelpFormatter):
         self._section_rows = []
 
     def write_usage(self, prog: str, args: str = "", prefix: str | None = None) -> None:
-        from ramp_cli.output.style import (
-            _WIDTH_MAX,
-            _WIDTH_MIN,
-            BOX_V,
-            _frame_bottom,
-            _frame_top,
-        )
-
         use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
         width = max(
             _WIDTH_MIN, min(shutil.get_terminal_size((80, 24)).columns, _WIDTH_MAX)
@@ -172,7 +167,6 @@ class BoxHelpFormatter(click.HelpFormatter):
     def getvalue(self) -> str:
         self._flush_section()
         result = super().getvalue()
-        from ramp_cli.output.formatter import is_quiet
 
         if (
             not BoxHelpFormatter._suppress_wave
@@ -180,12 +174,6 @@ class BoxHelpFormatter(click.HelpFormatter):
             and sys.stdout.isatty()
             and not os.environ.get("NO_COLOR")
         ):
-            from ramp_cli.output.style import (
-                _WIDTH_MAX,
-                _WIDTH_MIN,
-                _build_strip_wave_str,
-            )
-
             width = max(
                 _WIDTH_MIN, min(shutil.get_terminal_size((80, 24)).columns, _WIDTH_MAX)
             )

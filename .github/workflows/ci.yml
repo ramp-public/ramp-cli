@@ -37,6 +37,28 @@ jobs:
 
       - run: .venv/bin/pytest tests/ -v
 
+      - name: CLI smoke test
+        run: |
+          .venv/bin/ramp --help
+          .venv/bin/ramp auth --help
+          .venv/bin/ramp config --help
+
+      - name: Import every module
+        run: |
+          failed=0
+          while IFS= read -r pyfile; do
+            mod="${pyfile#src/}"
+            mod="${mod%.py}"
+            mod="${mod%/__init__}"
+            mod="$(echo "$mod" | tr '/' '.')"
+            if ! .venv/bin/python -c "import $mod" 2>/tmp/import_err.txt; then
+              echo "::error::Failed to import $mod"
+              cat /tmp/import_err.txt
+              failed=1
+            fi
+          done < <(find src/ramp_cli -name '*.py' -not -path '*/__pycache__/*' | sort)
+          exit $failed
+
       - name: No Path(__file__) outside specs module
         run: |
           if grep -rn 'Path(__file__)' src/ramp_cli/ --include='*.py' | grep -v 'specs/__init__.py'; then
