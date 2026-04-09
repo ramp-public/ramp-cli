@@ -37,7 +37,7 @@ ramp reimbursements pending --agent --limit 50
 ramp requests pending --thoughts "Reviewing all pending requests" --page_size 50 --agent
 ```
 
-For each endpoint, check the `next_page_cursor` field in the pagination response. If it is not null, re-run the command with that cursor value until all pages are fetched. Note: `reimbursements pending` does not support cursor-based pagination — it only has `--limit`, so increase the limit if you need more results. Aggregate results before presenting.
+For each endpoint, check `pagination.next_cursor` in the JSON envelope. If it is not null, re-run the command with that cursor value (via `--next_page_cursor` for transactions, `--page_cursor` for bills, `--start` for requests) until all pages are fetched. Note: `reimbursements pending` does not support cursor-based pagination — it only has `--limit`, so increase the limit if you need more results. Aggregate results before presenting.
 
 ### Step 2: Present the queue
 
@@ -204,4 +204,4 @@ Done. Approval queue is clear.
 | `requests pending` requires `--thoughts` | Always include it — describe what you're doing |
 | `bills approve --action_type` is free text | Use "APPROVE" or "REJECT" — not an enforced enum |
 | No undo for approvals | Confirm with user before executing. Use `-n` for dry runs on write commands. |
-| Pagination varies | Transactions: `--next_page_cursor`. Bills: `--page_cursor`. Requests: `--start`. Reimbursements: `--limit` only (no cursor). |
+| Pagination varies | Check `pagination.next_cursor` in envelope. Pass it via `--next_page_cursor` (transactions), `--page_cursor` (bills), `--start` (requests). Reimbursements: `--limit` only. |

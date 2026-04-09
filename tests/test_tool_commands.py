@@ -6,7 +6,7 @@ import click
 from click.testing import CliRunner
 
 from ramp_cli.main import ToolGroup, cli
-from ramp_cli.tools.commands import build_tool_command
+from ramp_cli.tools.commands import _build_body, build_tool_command
 from ramp_cli.tools.parser import ParamType, ToolDef, ToolParam
 from ramp_cli.tools.registry import _registry, get_tool, list_tools
 
@@ -17,6 +17,7 @@ class TestRegistry:
         assert len(names) >= 40
         assert "get-funds" in names
         assert "activate-card" in names
+        assert "list-bills" in names
 
     def test_get_tool_found(self):
         tool = get_tool("get-funds")
@@ -311,8 +312,8 @@ class TestPositionalIdParams:
             ["get-bill-details", "abc-123", "--dry_run"],
         )
         assert result.exit_code == 0
-        assert "DRY RUN" in result.output
-        body = json.loads(result.output.split("\n", 1)[1])
+        assert "dry_run" in result.output
+        body = json.loads(result.output)["data"][0]["body"]
         assert body["bill_id"] == "abc-123"
 
     def test_missing_positional_id_errors(self):
@@ -347,8 +348,8 @@ class TestPositionalIdParams:
             ["get-bill-details", "--json", '{"bill_id": "abc-123"}', "--dry_run"],
         )
         assert result.exit_code == 0
-        assert "DRY RUN" in result.output
-        body = json.loads(result.output.split("\n", 1)[1])
+        assert "dry_run" in result.output
+        body = json.loads(result.output)["data"][0]["body"]
         assert body["bill_id"] == "abc-123"
 
     def test_json_with_positional_id_also_works(self):
@@ -365,7 +366,7 @@ class TestPositionalIdParams:
             ],
         )
         assert result.exit_code == 0
-        body = json.loads(result.output.split("\n", 1)[1])
+        body = json.loads(result.output)["data"][0]["body"]
         assert body["bill_id"] == "from-json"
 
 
@@ -485,8 +486,8 @@ class TestDryRun:
             ["get-funds", "--dry_run", "--funds_to_retrieve", "MY_FUNDS"],
         )
         assert result.exit_code == 0
-        assert "DRY RUN" in result.output
-        body = json.loads(result.output.split("\n", 1)[1])
+        assert "dry_run" in result.output
+        body = json.loads(result.output)["data"][0]["body"]
         assert body["funds_to_retrieve"] == "MY_FUNDS"
 
     def test_dry_run_with_json(self):
@@ -500,6 +501,29 @@ class TestDryRun:
 
 
 class TestBodyBuilding:
+    def test_required_param_default_is_used_when_omitted(self):
+        tool = ToolDef(
+            name="list-bills",
+            path="/developer/v1/agent-tools/search-bills",
+            http_method="post",
+            summary="List bills",
+            description="List bills",
+            category="bills",
+            alias="list",
+            params=[
+                ToolParam(
+                    name="query",
+                    flag="query",
+                    description="Optional bill search query",
+                    type=ParamType.STRING,
+                    required=True,
+                    default="",
+                )
+            ],
+        )
+
+        assert _build_body(tool, {"query": None}) == {"query": ""}
+
     def test_bool_flag_included_when_set(self):
         runner = CliRunner()
         result = runner.invoke(
@@ -507,8 +531,18 @@ class TestBodyBuilding:
             ["get-funds", "--dry_run", "--include_balance"],
         )
         assert result.exit_code == 0
-        body = json.loads(result.output.split("\n", 1)[1])
+        body = json.loads(result.output)["data"][0]["body"]
         assert body["include_balance"] is True
+
+    def test_bool_flag_included_when_explicitly_false(self):
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["get-funds", "--dry_run", "--no-include_balance"],
+        )
+        assert result.exit_code == 0
+        body = json.loads(result.output)["data"][0]["body"]
+        assert body["include_balance"] is False
 
     def test_bool_flag_excluded_when_not_set(self):
         runner = CliRunner()
@@ -517,7 +551,7 @@ class TestBodyBuilding:
             ["get-funds", "--dry_run"],
         )
         assert result.exit_code == 0
-        body = json.loads(result.output.split("\n", 1)[1])
+        body = json.loads(result.output)["data"][0]["body"]
         assert "include_balance" not in body
 
     def test_required_param_missing_errors(self):
@@ -525,6 +559,13 @@ class TestBodyBuilding:
         result = runner.invoke(cli, ["activate-card", "--dry_run"])
         assert result.exit_code != 0
         assert "last_four" in result.output
+
+    def test_bills_list_omits_query_flag_but_sends_empty_query(self):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["bills", "list", "--dry_run"])
+        assert result.exit_code == 0
+        body = json.loads(result.output)["data"][0]["body"]
+        assert body["query"] == ""
 
 
 class TestCLIIntegration:
@@ -585,3 +626,48 @@ class TestCLIIntegration:
         result = runner.invoke(cli, ["get-funds", "--json", "not-json"])
         assert result.exit_code != 0
         assert "invalid JSON" in result.output
+
+
+class TestGetEndpointDryRun:
+    def test_dry_run_shows_get_method(self):
+        tool = ToolDef(
+            name="get-status",
+            path="/developer/v1/agent-tools/get-status",
+            http_method="get",
+            summary="Get status",
+            description="Get status",
+            category="vendors",
+            alias="status",
+            params=[
+                ToolParam(
+                    name="batch_id",
+                    flag="batch_id",
+                    description="The batch ID",
+                    type=ParamType.STRING,
+                    required=True,
+                ),
+            ],
+            required_scopes=["vendors:read"],
+        )
+        cmd = build_tool_command(tool)
+        group = click.Group("test")
+        group.add_command(cmd, "get-status")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            group,
+            ["get-status", "--dry_run", "abc-123"],
+            obj={
+                "env": "sandbox",
+                "format": "json",
+                "config_format": "json",
+                "quiet": False,
+                "no_input": True,
+                "wide": False,
+                "agent_mode": True,
+            },
+        )
+        assert result.exit_code == 0
+        parsed = json.loads(result.output)
+        assert parsed["data"][0]["method"] == "GET"
+        assert parsed["data"][0]["body"] == {"batch_id": "abc-123"}

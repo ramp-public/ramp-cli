@@ -1,5 +1,7 @@
 """Tests for the agent-tool OpenAPI spec parser."""
 
+import json
+
 import pytest
 
 from ramp_cli.specs import AGENT_TOOL_SPEC
@@ -7,6 +9,7 @@ from ramp_cli.tools.parser import (
     ParamType,
     ToolDef,
     ToolParam,
+    extract_all_scopes,
     parse_spec,
     parse_spec_dict,
 )
@@ -42,9 +45,11 @@ class TestSpecLoading:
         for tool in tools:
             assert tool.path.startswith("/developer/v1/agent-tools/")
 
-    def test_all_tools_are_post(self, tools: list[ToolDef]):
+    def test_all_tools_have_valid_method(self, tools: list[ToolDef]):
         for tool in tools:
-            assert tool.http_method == "post", f"{tool.name} is {tool.http_method}"
+            assert tool.http_method in ("post", "get"), (
+                f"{tool.name} has unexpected method {tool.http_method}"
+            )
 
     def test_most_tools_have_scopes(self, tools: list[ToolDef]):
         tools_with_scopes = [t for t in tools if t.required_scopes]
@@ -52,7 +57,8 @@ class TestSpecLoading:
 
     def test_all_tools_have_request_schema(self, tools: list[ToolDef]):
         for tool in tools:
-            assert tool.request_schema_name, f"{tool.name} has no request schema"
+            if tool.http_method == "post":
+                assert tool.request_schema_name, f"{tool.name} has no request schema"
 
 
 # ── Specific tools ──
@@ -153,6 +159,22 @@ class TestSearchBills:
 
     def test_scopes(self, tool_map: dict[str, ToolDef]):
         assert "bills:read" in tool_map["search-bills"].required_scopes
+
+
+class TestListBills:
+    def test_exists(self, tool_map: dict[str, ToolDef]):
+        assert "list-bills" in tool_map
+
+    def test_alias(self, tool_map: dict[str, ToolDef]):
+        assert tool_map["list-bills"].alias == "list"
+
+    def test_scopes(self, tool_map: dict[str, ToolDef]):
+        assert "bills:read" in tool_map["list-bills"].required_scopes
+
+    def test_query_defaults_to_empty_string(self, tool_map: dict[str, ToolDef]):
+        param = _find_param(tool_map["list-bills"], "query")
+        assert param is not None
+        assert param.default == ""
 
 
 # ── Param type classification ──
@@ -300,6 +322,228 @@ class TestEdgeCases:
         assert len(tools) == 1
         assert tools[0].name == "test"
         assert tools[0].params[0].type is ParamType.STRING
+
+    def test_skips_non_cli_tools(self):
+        spec = {
+            "paths": {
+                "/developer/v1/agent-tools/cli-tool": {
+                    "post": {
+                        "summary": "CLI tool",
+                        "x-platforms": ["cli", "mcp"],
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/CliReq"}
+                                }
+                            }
+                        },
+                    }
+                },
+                "/developer/v1/agent-tools/no-platform-tool": {
+                    "post": {
+                        "summary": "No platform tool",
+                        "x-platforms": [],
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "$ref": "#/components/schemas/NoPlatformReq"
+                                    }
+                                }
+                            }
+                        },
+                    }
+                },
+                "/developer/v1/agent-tools/mcp-tool": {
+                    "post": {
+                        "summary": "MCP tool",
+                        "x-platforms": ["mcp"],
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/McpReq"}
+                                }
+                            }
+                        },
+                    }
+                },
+            },
+            "components": {
+                "schemas": {
+                    "CliReq": {"type": "object", "properties": {}},
+                    "McpReq": {"type": "object", "properties": {}},
+                    "NoPlatformReq": {"type": "object", "properties": {}},
+                }
+            },
+        }
+
+        tools = parse_spec_dict(spec)
+        assert [tool.name for tool in tools] == ["cli-tool"]
+
+    def test_missing_platform_metadata_defaults_to_visible(self):
+        spec = {
+            "paths": {
+                "/developer/v1/agent-tools/test-tool": {
+                    "post": {
+                        "summary": "Test tool",
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/TestReq"}
+                                }
+                            }
+                        },
+                    }
+                }
+            },
+            "components": {
+                "schemas": {"TestReq": {"type": "object", "properties": {}}}
+            },
+        }
+
+        tools = parse_spec_dict(spec)
+        assert [tool.name for tool in tools] == ["test-tool"]
+
+
+# ── GET endpoint parsing ──
+
+
+class TestGetEndpointParsing:
+    def test_get_with_query_params(self):
+        spec = {
+            "paths": {
+                "/developer/v1/agent-tools/get-status": {
+                    "get": {
+                        "summary": "Get status",
+                        "x-alias": "status",
+                        "tags": ["Agent Tool", "vendors"],
+                        "security": [{"oauth2": ["vendors:read"]}],
+                        "parameters": [
+                            {
+                                "in": "query",
+                                "name": "batch_id",
+                                "required": True,
+                                "schema": {
+                                    "type": "string",
+                                    "description": "The batch ID",
+                                    "title": "Batch Id",
+                                },
+                            },
+                            {
+                                "in": "query",
+                                "name": "is_active",
+                                "required": False,
+                                "schema": {
+                                    "type": "boolean",
+                                    "default": None,
+                                    "nullable": True,
+                                    "description": "Filter by active status",
+                                    "title": "Is Active",
+                                },
+                            },
+                        ],
+                        "responses": {
+                            "200": {
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "$ref": "#/components/schemas/StatusResult"
+                                        }
+                                    }
+                                },
+                                "description": "Success",
+                            }
+                        },
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "StatusResult": {
+                        "type": "object",
+                        "properties": {"ok": {"type": "boolean"}},
+                    }
+                }
+            },
+        }
+        tools = parse_spec_dict(spec)
+        assert len(tools) == 1
+        tool = tools[0]
+        assert tool.name == "get-status"
+        assert tool.http_method == "get"
+        assert tool.alias == "status"
+        assert tool.category == "vendors"
+        assert tool.required_scopes == ["vendors:read"]
+        assert tool.response_schema_name == "StatusResult"
+        assert len(tool.params) == 2
+        # Required param first
+        assert tool.params[0].name == "batch_id"
+        assert tool.params[0].required is True
+        assert tool.params[0].type is ParamType.STRING
+        # Optional param second
+        assert tool.params[1].name == "is_active"
+        assert tool.params[1].required is False
+        assert tool.params[1].type is ParamType.BOOL
+
+
+class TestScopeExtraction:
+    def test_extract_all_scopes_skips_non_cli_tools(self, tmp_path):
+        spec = {
+            "paths": {
+                "/developer/v1/agent-tools/cli-tool": {
+                    "post": {
+                        "summary": "CLI tool",
+                        "x-platforms": ["cli"],
+                        "security": [{"oauth2": ["cli:read"]}],
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/CliReq"}
+                                }
+                            }
+                        },
+                    }
+                },
+                "/developer/v1/agent-tools/mcp-tool": {
+                    "post": {
+                        "summary": "MCP tool",
+                        "x-platforms": ["mcp"],
+                        "security": [{"oauth2": ["mcp:read"]}],
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/McpReq"}
+                                }
+                            }
+                        },
+                    }
+                },
+                "/developer/v1/agent-tools/legacy-tool": {
+                    "post": {
+                        "summary": "Legacy tool",
+                        "security": [{"oauth2": ["legacy:read"]}],
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/LegacyReq"}
+                                }
+                            }
+                        },
+                    }
+                },
+            },
+            "components": {
+                "schemas": {
+                    "CliReq": {"type": "object", "properties": {}},
+                    "McpReq": {"type": "object", "properties": {}},
+                    "LegacyReq": {"type": "object", "properties": {}},
+                }
+            },
+        }
+        spec_path = tmp_path / "agent-tool.json"
+        spec_path.write_text(json.dumps(spec))
+
+        assert extract_all_scopes(spec_path) == ["cli:read", "legacy:read"]
 
 
 # ── Helpers ──

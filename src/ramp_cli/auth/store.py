@@ -89,6 +89,7 @@ def save_tokens(
     access_token_expires_in: int = 0,
     refresh_token_expires_in: int = 0,
     issued_at: int | None = None,
+    granted_scopes: str | None = None,
 ) -> None:
     state = _build_token_state(
         access_token,
@@ -106,6 +107,10 @@ def save_tokens(
     ec.access_token_expires_in = state.access_token_expires_in
     ec.refresh_token_issued_at = state.refresh_token_issued_at
     ec.refresh_token_expires_in = state.refresh_token_expires_in
+    # Only overwrite scopes when explicitly provided (non-None, non-empty).
+    # Token refresh responses often omit scope — preserve prior stored scopes.
+    if granted_scopes:
+        ec.granted_scopes = granted_scopes
     settings.save(cfg)
 
 
@@ -118,7 +123,17 @@ def clear_tokens(env: str) -> None:
     ec.access_token_expires_in = 0
     ec.refresh_token_issued_at = 0
     ec.refresh_token_expires_in = 0
+    ec.granted_scopes = ""
     settings.save(cfg)
+
+
+def get_granted_scopes(env: str) -> set[str]:
+    """Return the set of OAuth scopes granted to the current token."""
+    cfg = settings.load()
+    ec: settings.EnvConfig = getattr(cfg, env, settings.EnvConfig())
+    if not ec.granted_scopes:
+        return set()
+    return set(ec.granted_scopes.split())
 
 
 def has_tokens(env: str) -> bool:

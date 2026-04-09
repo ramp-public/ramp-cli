@@ -60,8 +60,6 @@ def login(ctx: click.Context, token_stdin: bool, no_browser: bool) -> None:
             _show_default_env_hint(env)
         return
 
-    click.echo(f"Logging into {label}...", err=True)
-
     opts = LoginOptions(no_browser=no_browser)
     token_resp = do_login(env, opts)
 
@@ -71,7 +69,17 @@ def login(ctx: click.Context, token_stdin: bool, no_browser: bool) -> None:
         token_resp.refresh_token,
         access_token_expires_in=token_resp.expires_in,
         refresh_token_expires_in=token_resp.refresh_token_expires_in,
+        granted_scopes=token_resp.scope,
     )
+
+    if not token_resp.scope:
+        click.echo(
+            "\n  ⚠  Your token was issued with no scopes.\n"
+            "     All tool calls will fail. Try logging in again:\n\n"
+            "       ramp auth login\n\n"
+            "     If this keeps happening, run: ramp tools refresh\n",
+            err=True,
+        )
 
     show_nyc(duration=5.0)
 
@@ -96,6 +104,7 @@ def status(ctx: click.Context) -> None:
             env: {
                 "authenticated": store.is_authenticated(env),
                 "base_url": base_url(env),
+                "scopes": sorted(store.get_granted_scopes(env)),
             }
             for env in (ENV_SANDBOX, ENV_PRODUCTION)
         }
@@ -106,6 +115,19 @@ def status(ctx: click.Context) -> None:
             for e in (ENV_SANDBOX, ENV_PRODUCTION)
         ]
         show_status_box(envs)
+
+        # Show scope warnings for authenticated environments
+        current_env = ctx.obj["env"]
+        if store.is_authenticated(current_env):
+            scopes = store.get_granted_scopes(current_env)
+            if not scopes:
+                click.echo(
+                    f"\n  ⚠  No scopes on your {env_label(current_env)} token."
+                    "\n     Tools will fail. Log in again:  ramp auth login",
+                    err=True,
+                )
+            else:
+                click.echo(f"  Scopes: {len(scopes)} granted", err=True)
 
 
 @auth_group.command()

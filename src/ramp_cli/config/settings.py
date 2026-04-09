@@ -22,6 +22,7 @@ class EnvConfig:
     access_token_expires_in: int = 0
     refresh_token_issued_at: int = 0
     refresh_token_expires_in: int = 0
+    granted_scopes: str = ""
 
 
 @dataclass
@@ -65,6 +66,7 @@ def load() -> Config:
             access_token_expires_in=section.get("access_token_expires_in", 0),
             refresh_token_issued_at=section.get("refresh_token_issued_at", 0),
             refresh_token_expires_in=section.get("refresh_token_expires_in", 0),
+            granted_scopes=section.get("granted_scopes", ""),
         )
         setattr(cfg, env_name, ec)
 
@@ -109,6 +111,8 @@ def save(cfg: Config) -> None:
             section["refresh_token_issued_at"] = ec.refresh_token_issued_at
         if ec.refresh_token_expires_in:
             section["refresh_token_expires_in"] = ec.refresh_token_expires_in
+        if ec.granted_scopes:
+            section["granted_scopes"] = ec.granted_scopes
         if section:
             raw[env_name] = section
 

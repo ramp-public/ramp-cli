@@ -11,6 +11,7 @@ import httpx
 from ramp_cli import __version__ as VERSION
 from ramp_cli.auth import store
 from ramp_cli.auth.refresh import try_refresh
+from ramp_cli.client.session import get_session_id
 from ramp_cli.config.constants import base_url
 from ramp_cli.errors import ApiError, AuthRequiredError, RefreshFailedError
 
@@ -139,6 +140,7 @@ class RampClient:
             "Authorization": f"Bearer {token}",
             "User-Agent": f"ramp-cli/{VERSION}",
             "Accept": "application/json",
+            "X-External-Session-Id": get_session_id(),
         }
         if body is not None:
             headers["Content-Type"] = "application/json"
@@ -157,6 +159,7 @@ class RampClient:
             "Authorization": f"Bearer {token}",
             "User-Agent": f"ramp-cli/{VERSION}",
             "Accept": "application/json",
+            "X-External-Session-Id": get_session_id(),
         }
         # Do NOT set Content-Type — httpx sets the multipart boundary automatically
         return http.request(method, url, headers=headers, data=data, files=files)

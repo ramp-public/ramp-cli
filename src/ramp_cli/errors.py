@@ -41,11 +41,11 @@ class ApiError(RampCLIError):
         except Exception:
             detail = self.body[:500]
 
-        # UX-6: Append scope hint for 403 errors
+        # UX-6: Append actionable hint for 403 errors
         if status_code == 403:
             detail += (
-                " — Check that your token has the required scope."
-                " Run `ramp auth status` to see current auth."
+                "\n\n  This usually means your token doesn't have the required scope."
+                "\n  To fix this, log in again:  ramp auth login"
             )
 
         super().__init__(f"API error {status_code}: {detail}")

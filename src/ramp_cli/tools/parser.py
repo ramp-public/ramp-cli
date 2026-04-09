@@ -7,13 +7,14 @@ ToolParam definitions for CLI flag generation.
 """
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 _AGENT_TOOLS_PREFIX = "/developer/v1/agent-tools/"
 _HTTP_METHODS = frozenset({"get", "post", "put", "patch", "delete"})
+_CLI_PLATFORM = "cli"
 
 
 class ParamType(StrEnum):
@@ -108,42 +109,105 @@ def parse_spec_dict(spec: dict) -> list[ToolDef]:
             # Skip OpenAPI extension keys like "x-source-details"
             if method.startswith("x-") or method not in _HTTP_METHODS:
                 continue
+            if not _supports_cli(method_def):
+                continue
             tool = _parse_endpoint(path, method, method_def, schemas)
             if tool is not None:
                 tools.append(tool)
 
+    tools.extend(_synthesize_cli_tools(tools))
+
     return sorted(tools, key=lambda t: t.name)
+
+
+def _synthesize_cli_tools(tools: list[ToolDef]) -> list[ToolDef]:
+    """Add small CLI-only wrappers for existing tools when UX needs differ."""
+    search_bills = next((tool for tool in tools if tool.name == "search-bills"), None)
+    if search_bills is None:
+        return []
+
+    return [
+        replace(
+            search_bills,
+            name="list-bills",
+            summary="List bills without requiring a search query",
+            description=(
+                "List bills with optional filters. If no query is provided, "
+                "returns the default bill enumeration."
+            ),
+            alias="list",
+            params=[
+                replace(
+                    param,
+                    description="Optional bill search query. Leave unset to list bills.",
+                    required=True,
+                    default="",
+                )
+                if param.name == "query"
+                else param
+                for param in search_bills.params
+            ],
+        )
+    ]
 
 
 def _parse_endpoint(
     path: str, method: str, method_def: dict, schemas: dict
 ) -> ToolDef | None:
-    request_ref = _deep_get(
-        method_def, "requestBody", "content", "application/json", "schema", "$ref"
-    )
-    if not request_ref:
-        return None
-
-    schema_name = request_ref.split("/")[-1]
-    schema_def = schemas.get(schema_name, {})
     summary = method_def.get("summary", "")
     response_ref = _deep_get(
         method_def, "responses", "200", "content", "application/json", "schema", "$ref"
     )
+    if not response_ref:
+        response_ref = _deep_get(
+            method_def,
+            "responses",
+            "201",
+            "content",
+            "application/json",
+            "schema",
+            "$ref",
+        )
 
-    return ToolDef(
-        name=path.split("/")[-1],
-        path=path,
-        http_method=method,
-        summary=summary,
-        description=schema_def.get("description", summary),
-        category=_extract_category(method_def.get("tags", [])),
-        alias=method_def.get("x-alias", ""),
-        params=_parse_params(schema_def, schemas),
-        required_scopes=_extract_scopes(method_def),
-        request_schema_name=schema_name,
-        response_schema_name=response_ref.split("/")[-1] if response_ref else "",
+    # POST-style: params from requestBody schema
+    request_ref = _deep_get(
+        method_def, "requestBody", "content", "application/json", "schema", "$ref"
     )
+    if request_ref:
+        schema_name = request_ref.split("/")[-1]
+        schema_def = schemas.get(schema_name, {})
+        return ToolDef(
+            name=path.split("/")[-1],
+            path=path,
+            http_method=method,
+            summary=summary,
+            description=schema_def.get("description", summary),
+            category=_extract_category(method_def.get("tags", [])),
+            alias=method_def.get("x-alias", ""),
+            params=_parse_params(schema_def, schemas),
+            required_scopes=_extract_scopes(method_def),
+            request_schema_name=schema_name,
+            response_schema_name=response_ref.split("/")[-1] if response_ref else "",
+        )
+
+    # GET-style: params from top-level parameters array
+    raw_params = method_def.get("parameters")
+    if raw_params:
+        return ToolDef(
+            name=path.split("/")[-1],
+            path=path,
+            http_method=method,
+            summary=summary,
+            description=method_def.get("description", summary),
+            category=_extract_category(method_def.get("tags", [])),
+            alias=method_def.get("x-alias", ""),
+            params=_parse_query_params(raw_params, schemas),
+            required_scopes=_extract_scopes(method_def),
+            request_schema_name="",
+            response_schema_name=response_ref.split("/")[-1] if response_ref else "",
+        )
+
+    return None
 
 
 def _extract_scopes(method_def: dict) -> list[str]:
@@ -152,6 +216,21 @@ def _extract_scopes(method_def: dict) -> list[str]:
         if "oauth2" in sec_req:
             scopes.extend(sec_req["oauth2"])
     return scopes
+
+
+def _supports_cli(method_def: dict) -> bool:
+    """Return True when the endpoint is exposed to the CLI platform.
+
+    `x-platforms` is optional in older specs, so missing metadata defaults to
+    visible for backwards compatibility.
+    """
+
+    platforms = method_def.get("x-platforms")
+    if platforms is None:
+        return True
+    if isinstance(platforms, str):
+        return platforms == _CLI_PLATFORM
+    return _CLI_PLATFORM in platforms
 
 
 def _parse_params(schema_def: dict, schemas: dict) -> list[ToolParam]:
@@ -165,6 +244,20 @@ def _parse_params(schema_def: dict, schemas: dict) -> list[ToolParam]:
         params.append(param)
 
     return sorted(params, key=lambda p: (not p.required, p.name))
+
+
+def _parse_query_params(parameters: list[dict], schemas: dict) -> list[ToolParam]:
+    """Convert OpenAPI query parameters into a sorted list of ToolParams."""
+    params: list[ToolParam] = []
+    for p in parameters:
+        if p.get("in") != "query":
+            continue
+        name = p["name"]
+        schema = p.get("schema", {})
+        param = _classify_property(name, schema, schemas)
+        param.required = p.get("required", False)
+        params.append(param)
+    return sorted(params, key=lambda tp: (not tp.required, tp.name))
 
 
 def _classify_property(name: str, prop: dict, schemas: dict) -> ToolParam:
@@ -293,6 +386,8 @@ def extract_all_scopes(spec_path: Path) -> list[str]:
             continue
         for method, method_def in path_def.items():
             if method.startswith("x-") or method not in _HTTP_METHODS:
+                continue
+            if not _supports_cli(method_def):
                 continue
             scopes.update(_extract_scopes(method_def))
 

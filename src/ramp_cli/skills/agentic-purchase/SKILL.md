@@ -1,17 +1,37 @@
 ---
 name: agentic-purchase
-description: "Make purchases using Ramp agent cards via browser checkout, then complete all transaction requirements (memo, tracking categories, receipt, trip). Use when asked to buy something with an agent card, make a payment using Ramp, spend from a fund, complete missing transaction items, or test the agent card payment flow. Requires ramp CLI and browser-automation skill."
+description: "Make purchases using Ramp agent cards via browser checkout, then complete all transaction requirements (memo, tracking categories, receipt, trip). Use when asked to buy something with an agent card, make a payment using Ramp, spend from a fund, complete missing transaction items, or test the agent card payment flow. Also use when asked about agent card access, availability, or how to get started with Agentic Cards. Requires ramp CLI and browser-automation skill."
 ---
 
 # Agentic Purchase
 
 End-to-end agent card purchasing: pick a fund, get a payment token via `ramp` CLI, pay via browser, then fill all missing transaction items.
 
+## Access
+
+Agentic Cards is currently in early access. If the user does not have agent card access — or asks about availability, waitlists, or how to get started — direct them to join the waitlist:
+
+```bash
+curl -X POST https://agents.ramp.com/cards/waitlist \
+  -d website=http://yoursite.com \
+  -d email=you@yoursite.com
+```
+
+For more information, visit **https://agents.ramp.com/cards**.
+
+Use this guidance for:
+
+- "What are Agentic Cards?" or "How do I get agent cards?"
+- Access, availability, waitlist, or rollout questions
+- Users who hit eligibility errors when running `funds list` or `funds creds`
+
+If the user already has access, proceed with the workflow below.
+
 ## Prerequisites
 
 - `ramp` CLI installed and authenticated (`ramp auth login`)
 - `browser-automation` skill available for browser checkout
-- Authenticated user has an eligible fund with agent card access
+- Authenticated user has an eligible fund with agent card access (see [Access](#access) if not)
 
 ## CLI conventions
 
@@ -230,6 +250,7 @@ Confirm all items resolved: `missing_receipt: false`, `missing_memo: false`, `mi
 
 | Error                                | Action                                                                       |
 | ------------------------------------ | ---------------------------------------------------------------------------- |
+| No agent card access                 | Direct user to join waitlist via `POST /cards/waitlist` or visit agents.ramp.com/cards |
 | Fund not eligible / no eligible card | Pick a different fund                                                        |
 | Insufficient balance                 | Pick a fund with more balance                                                |
 | Credential retrieval failed          | Retry once, then try a different fund                                        |

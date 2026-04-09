@@ -186,6 +186,26 @@ class TestMaybeSync:
 
         mock_fetch.assert_called_once_with("production", known_hash="newhash")
 
+    @pytest.mark.parametrize(
+        "_mock_httpx",
+        [[_mock_response(json_body={})]],
+        indirect=True,
+    )
+    @patch("ramp_cli.specs.sync.fetch_spec")
+    def test_empty_remote_hash_triggers_fetch(
+        self, mock_fetch, _mock_httpx, sync_paths
+    ):
+        """When the server returns no content_hash, fetch the full spec
+        instead of treating empty == empty as a match."""
+        hash_file = sync_paths / "hash-production.txt"
+        hash_file.write_text("")
+        old_time = time.time() - _COOLDOWN_SECONDS - 100
+        os.utime(hash_file, (old_time, old_time))
+
+        maybe_sync("production")
+
+        mock_fetch.assert_called_once_with("production", known_hash=None)
+
     def test_network_error_silently_returns(self, sync_paths):
         client_instance = MagicMock()
         client_instance.get.side_effect = httpx.ConnectError("offline")

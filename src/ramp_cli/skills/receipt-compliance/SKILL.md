@@ -133,7 +133,7 @@ Flag uncertain matches as "possible match — verify" rather than auto-uploading
 
 ## Pagination
 
-If `next_page_cursor` is not null in the response, there are more results:
+If `pagination.next_cursor` is not null in the JSON envelope, there are more results:
 ```bash
 ramp transactions list --transactions_to_retrieve my_transactions \
   --from_date {start} --state cleared --agent --page_size 50 \

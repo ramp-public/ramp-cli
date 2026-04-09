@@ -429,7 +429,11 @@ def _resolve_scopes(env: str) -> str:
     try:
         all_scopes.update(extract_all_scopes(_resolve_spec_path(env)))
     except Exception:
-        pass
+        click.echo(
+            "\n  ⚠  Could not read tool definitions — some scopes may be missing."
+            "\n     Run 'ramp tools refresh' then 'ramp auth login' to fix.\n",
+            err=True,
+        )
     return " ".join(sorted(all_scopes))
 
 

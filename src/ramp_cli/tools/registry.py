@@ -5,6 +5,7 @@ Spec resolution order:
   2. Bundled spec inside the package at ramp_cli/specs/agent-tool.json
 """
 
+from ramp_cli.auth.store import get_granted_scopes
 from ramp_cli.config.settings import resolve_environment
 from ramp_cli.specs import AGENT_TOOL_SPEC, local_agent_tool_spec
 from ramp_cli.tools.parser import ToolDef, parse_spec
@@ -70,6 +71,18 @@ class _Registry:
 _registry = _Registry()
 
 
+def _filter_by_scopes(tools: list[ToolDef], env: str) -> list[ToolDef]:
+    """Filter tools to only those the current token has scopes for."""
+    granted = get_granted_scopes(env)
+    if not granted:
+        # No scope info stored — show all tools (backwards compatible with
+        # tokens saved before scope persistence was added).
+        return tools
+    return [
+        t for t in tools if not t.required_scopes or set(t.required_scopes) <= granted
+    ]
+
+
 def list_tools(env: str | None = None) -> list[str]:
     """Return sorted tool names."""
     return _registry.list_names(env)
@@ -86,8 +99,10 @@ def get_tool(name: str, env: str | None = None) -> ToolDef | None:
 
 
 def list_categories(env: str | None = None) -> dict[str, list[ToolDef]]:
-    """Return tools grouped by category."""
-    tools = list_tool_defs(env)
+    """Return tools grouped by category, filtered to accessible tools."""
+    if env is None:
+        env = _default_env()
+    tools = _filter_by_scopes(list_tool_defs(env), env)
     categories: dict[str, list[ToolDef]] = {}
     for t in tools:
         cat = t.category or "general"

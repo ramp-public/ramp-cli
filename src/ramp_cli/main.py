@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import sys
 import traceback
+from dataclasses import dataclass
+from enum import StrEnum
 
 import click
 
@@ -15,6 +17,8 @@ from ramp_cli.commands.config import config_group
 from ramp_cli.commands.env import env_cmd
 from ramp_cli.commands.feedback import feedback_cmd
 from ramp_cli.commands.skills import skills_group
+from ramp_cli.commands.tools import tools_group
+from ramp_cli.commands.update import update_cmd
 from ramp_cli.config.settings import load, resolve_environment
 from ramp_cli.easter_eggs.flip import card_cmd
 from ramp_cli.easter_eggs.invoice import invoice_cmd
@@ -27,15 +31,39 @@ from ramp_cli.output.help import (
     make_box_formatter,
     suppress_help_text,
 )
+from ramp_cli.specs.sync import maybe_sync
 from ramp_cli.tools.commands import build_tool_command
 from ramp_cli.tools.registry import get_tool, list_categories
 
-# ── Display constants ────────────────────────────────────────────────────────
+# ── Enums & data ─────────────────────────────────────────────────────────────
 
-_CATEGORY_REMAP: dict[str, str] = {
-    "cards": "funds",
-    "agent_cards": "funds",
-}
+
+class OutputMode(StrEnum):
+    JSON = "json"
+    TABLE = "table"
+
+
+class Resource(StrEnum):
+    """Tool categories exposed as CLI resource groups."""
+
+    ACCOUNTING = "accounting"
+    BILLS = "bills"
+    FUNDS = "funds"
+    GENERAL = "general"
+    PURCHASE_ORDERS = "purchase_orders"
+    RECEIPTS = "receipts"
+    REIMBURSEMENTS = "reimbursements"
+    REQUESTS = "requests"
+    TRANSACTIONS = "transactions"
+    TRAVEL = "travel"
+    TREASURY = "treasury"
+    USERS = "users"
+    VENDORS = "vendors"
+
+    @property
+    def help_text(self) -> str:
+        return _RESOURCE_HELP[self.value]
+
 
 _RESOURCE_HELP: dict[str, str] = {
     "accounting": "Manage tracking categories and GL codes for expense classification",
@@ -48,8 +76,115 @@ _RESOURCE_HELP: dict[str, str] = {
     "requests": "Make and review requests for funds and purchases",
     "transactions": "Search, review, and manage card transaction data and metadata",
     "travel": "Search and book flights, hotels, and manage trip itineraries",
+    "treasury": "Query treasury account balances, transfers, and investment positions",
     "users": "Look up user details, org charts, and search the company directory",
+    "vendors": "Upload and manage vendor documents and track bulk upload progress",
 }
+
+CATEGORY_REMAP: dict[str, str] = {
+    "cards": Resource.FUNDS,
+    "agent_cards": Resource.FUNDS,
+}
+
+VALID_ENVS = frozenset({"sandbox", "production", "prod"})
+VALID_FORMATS = frozenset({m.value for m in OutputMode})
+
+
+@dataclass(slots=True)
+class CLIContext:
+    """Typed container for ctx.obj — replaces the raw dict."""
+
+    env: str
+    flag_env: str | None
+    format: str | None
+    config_format: str
+    quiet: bool
+    no_input: bool
+    wide: bool
+    agent_mode: bool
+
+    @classmethod
+    def from_params(
+        cls,
+        flag_env: str | None,
+        flag_output: str | None,
+        quiet: bool,
+        no_input: bool,
+        wide: bool,
+        flag_agent: bool,
+        flag_human: bool,
+    ) -> CLIContext:
+        if flag_agent:
+            fmt = OutputMode.JSON
+        elif flag_human:
+            fmt = OutputMode.TABLE
+        else:
+            fmt = flag_output
+
+        cfg = load()
+        return cls(
+            env=resolve_environment(flag_env),
+            flag_env=flag_env,
+            format=fmt,
+            config_format=cfg.format,
+            quiet=quiet,
+            no_input=no_input or flag_agent,
+            wide=wide,
+            agent_mode=flag_agent,
+        )
+
+    def to_dict(self) -> dict:
+        """Convert to dict for ctx.obj (Click expects a dict)."""
+        return {
+            "env": self.env,
+            "flag_env": self.flag_env,
+            "format": self.format,
+            "config_format": self.config_format,
+            "quiet": self.quiet,
+            "no_input": self.no_input,
+            "wide": self.wide,
+            "agent_mode": self.agent_mode,
+        }
+
+
+# ── Arg parsing ──────────────────────────────────────────────────────────────
+
+_ROOT_FLAGS = frozenset(
+    {
+        "--env",
+        "-e",
+        "--output",
+        "-o",
+        "--quiet",
+        "-q",
+        "--no-input",
+        "--wide",
+        "--agent",
+        "--human",
+    }
+)
+_FLAGS_WITH_VALUE = frozenset({"--env", "-e", "--output", "-o"})
+
+
+def _split_root_flags(args: list[str]) -> tuple[list[str], list[str]]:
+    """Separate root flags from subcommand args."""
+    root: list[str] = []
+    rest: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in _FLAGS_WITH_VALUE:
+            root.append(arg)
+            if i + 1 < len(args):
+                i += 1
+                root.append(args[i])
+        elif arg in _ROOT_FLAGS:
+            root.append(arg)
+        else:
+            rest.append(arg)
+        i += 1
+    return root, rest
+
 
 # ── Formatter patches ────────────────────────────────────────────────────────
 
@@ -67,35 +202,28 @@ click.Context.make_formatter = _box_make_formatter  # type: ignore[method-assign
 
 
 class ToolGroup(click.Group):
-    """A group whose subcommands are agent tools. Labels section 'Tools'
-    and shows correct usage: `ramp <resource> <tool> [OPTIONS]`."""
+    """A group whose subcommands are agent tools."""
 
     def format_usage(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
-        prog = ctx.command_path
-        formatter.write_usage(prog, "<tool> [OPTIONS]")
+        formatter.write_usage(ctx.command_path, "<tool> [OPTIONS]")
 
     def format_commands(
         self, ctx: click.Context, formatter: click.HelpFormatter
     ) -> None:
-        rows = []
-        for name in self.list_commands(ctx):
-            cmd = self.get_command(ctx, name)
-            if cmd is None or getattr(cmd, "hidden", False):
-                continue
-            rows.append((name, cmd.get_short_help_str(limit=150)))
+        rows = [
+            (name, cmd.get_short_help_str(limit=150))
+            for name in self.list_commands(ctx)
+            if (cmd := self.get_command(ctx, name))
+            and not getattr(cmd, "hidden", False)
+        ]
         if rows:
             with formatter.section("Tools"):
                 formatter.write_dl(rows)
 
     @staticmethod
     def build(name: str, tools: list, help_text: str) -> ToolGroup:
-        """Build a ToolGroup from a list of ToolDefs."""
-
         @click.group(
-            name=name,
-            cls=ToolGroup,
-            help=help_text,
-            invoke_without_command=True,
+            name=name, cls=ToolGroup, help=help_text, invoke_without_command=True
         )
         @click.pass_context
         def group(ctx: click.Context) -> None:
@@ -104,13 +232,11 @@ class ToolGroup(click.Group):
 
         for tool in tools:
             group.add_command(build_tool_command(tool), tool.alias or tool.name)
-
         return group
 
 
 class RampGroup(click.Group):
-    """Root CLI group. Discovers tool categories from the spec and splits
-    help into Commands (CLI builtins) and Resources (tool categories)."""
+    """Root CLI group with flag hoisting."""
 
     def format_usage(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         prog = ctx.command_path
@@ -119,70 +245,41 @@ class RampGroup(click.Group):
         )
 
     def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
-        """Hoist root flags to the front so they work anywhere in the command."""
-        root_flags = {
-            "--env",
-            "-e",
-            "--output",
-            "-o",
-            "--quiet",
-            "-q",
-            "--no-input",
-            "--wide",
-            "--agent",
-            "--human",
-        }
-        takes_value = {"--env", "-e", "--output", "-o"}
-        root_args: list[str] = []
-        rest: list[str] = []
-        i = 0
-        while i < len(args):
-            arg = args[i]
-            if arg in takes_value:
-                root_args.append(arg)
-                if i + 1 < len(args):
-                    i += 1
-                    root_args.append(args[i])
-            elif arg in root_flags:
-                root_args.append(arg)
-            else:
-                rest.append(arg)
-            i += 1
-        return super().parse_args(ctx, root_args + rest)
+        root, rest = _split_root_flags(args)
+        return super().parse_args(ctx, root + rest)
 
     def list_commands(self, ctx: click.Context) -> list[str]:
         base = set(super().list_commands(ctx))
         multi, singletons = self._split_categories(ctx)
-        visible = set(multi.keys())
+        resource_names = set(multi.keys())
         if singletons:
-            visible.add("general")
-        return sorted(base | visible)
+            resource_names.add(Resource.GENERAL)
+        return sorted(base | resource_names)
 
     def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
-        # Eagerly-registered commands first (auth, config, etc.)
-        cmd = super().get_command(ctx, cmd_name)
-        if cmd is not None:
+        if cmd := super().get_command(ctx, cmd_name):
             return cmd
 
         multi, singletons = self._split_categories(ctx)
 
-        # "general" collects singleton categories
-        if cmd_name == "general" and singletons:
-            help_text = _RESOURCE_HELP.get(
-                "general", f"General ({len(singletons)} tools)"
+        if cmd_name == Resource.GENERAL and singletons:
+            return ToolGroup.build(
+                Resource.GENERAL,
+                singletons,
+                _RESOURCE_HELP.get(
+                    Resource.GENERAL, f"General ({len(singletons)} tools)"
+                ),
             )
-            return ToolGroup.build("general", singletons, help_text)
 
-        # Multi-tool category group (e.g. "ramp transactions")
         if cmd_name in multi:
             tools = multi[cmd_name]
-            fallback = f"{cmd_name.replace('_', ' ').title()} ({len(tools)} tools)"
-            help_text = _RESOURCE_HELP.get(cmd_name, fallback)
-            return ToolGroup.build(cmd_name, tools, help_text)
+            aliases = ", ".join(sorted(t.alias or t.name for t in tools))
+            fallback = f"{cmd_name.replace('_', ' ').title()} \u2014 {aliases}"
+            return ToolGroup.build(
+                cmd_name, tools, _RESOURCE_HELP.get(cmd_name, fallback)
+            )
 
-        # Flat tool access (e.g. "ramp get-funds") for agents
-        tool_def = get_tool(cmd_name, env=self._resolve_env(ctx))
-        if tool_def is not None:
+        if tool_def := get_tool(cmd_name, env=self._resolve_env(ctx)):
             return build_tool_command(tool_def)
 
         return None
@@ -190,23 +287,18 @@ class RampGroup(click.Group):
     def format_commands(
         self, ctx: click.Context, formatter: click.HelpFormatter
     ) -> None:
-        """Split help into Commands (CLI builtins) and Resources (tool categories)."""
         multi, singletons = self._split_categories(ctx)
         resource_names = set(multi.keys())
         if singletons:
-            resource_names.add("general")
+            resource_names.add(Resource.GENERAL)
 
-        command_rows = []
-        resource_rows = []
+        command_rows, resource_rows = [], []
         for name in self.list_commands(ctx):
             cmd = self.get_command(ctx, name)
             if cmd is None or getattr(cmd, "hidden", False):
                 continue
-            help_text = cmd.get_short_help_str(limit=150)
-            if name in resource_names:
-                resource_rows.append((name, help_text))
-            else:
-                command_rows.append((name, help_text))
+            row = (name, cmd.get_short_help_str(limit=150))
+            (resource_rows if name in resource_names else command_rows).append(row)
 
         if command_rows:
             with formatter.section("Commands"):
@@ -220,18 +312,15 @@ class RampGroup(click.Group):
         return resolve_environment(flag_env)
 
     def _split_categories(self, ctx: click.Context) -> tuple[dict[str, list], list]:
-        """Split categories into multi-tool groups and singleton tools.
+        env = self._resolve_env(ctx)
+        if not getattr(ctx, "_ramp_synced", False):
+            maybe_sync(env)
+            ctx._ramp_synced = True  # type: ignore[attr-defined]
+        cats = list_categories(env)
 
-        Applies _CATEGORY_REMAP to merge related categories (e.g. cards → funds),
-        then splits multi-tool groups from singletons.
-        """
-        cats = list_categories(self._resolve_env(ctx))
-
-        # Remap and merge categories
         merged: dict[str, list] = {}
         for cat, tools in cats.items():
-            target = _CATEGORY_REMAP.get(cat, cat)
-            merged.setdefault(target, []).extend(tools)
+            merged.setdefault(CATEGORY_REMAP.get(cat, cat), []).extend(tools)
 
         multi: dict[str, list] = {}
         singletons: list = []
@@ -303,69 +392,71 @@ def cli(
     Use a tool:    ramp funds list --funds_to_retrieve MY_FUNDS
     Environment:   ramp env [sandbox|production]
     """
+    _validate_flags(flag_env, flag_output, flag_agent, flag_human)
+
+    cli_ctx = CLIContext.from_params(
+        flag_env=flag_env,
+        flag_output=flag_output,
+        quiet=quiet,
+        no_input=no_input,
+        wide=wide,
+        flag_agent=flag_agent,
+        flag_human=flag_human,
+    )
+    ctx.ensure_object(dict)
+    ctx.obj.update(cli_ctx.to_dict())
+    set_quiet(quiet)
+
+
+def _validate_flags(
+    flag_env: str | None,
+    flag_output: str | None,
+    flag_agent: bool,
+    flag_human: bool,
+) -> None:
     if flag_agent and flag_human:
         raise click.UsageError("--agent and --human are mutually exclusive")
 
-    if flag_agent and flag_output and flag_output.lower() == "table":
+    if flag_agent and flag_output and flag_output.lower() == OutputMode.TABLE:
         click.echo("Warning: --agent overrides -o table; outputting JSON", err=True)
-    if flag_human and flag_output and flag_output.lower() == "json":
+    if flag_human and flag_output and flag_output.lower() == OutputMode.JSON:
         click.echo("Warning: --human overrides -o json; outputting table", err=True)
 
-    VALID_ENVS = {"sandbox", "production", "prod"}
     if flag_env is not None and flag_env not in VALID_ENVS:
         raise click.BadParameter(
             f"invalid environment '{flag_env}'. Choose from: {', '.join(sorted(VALID_ENVS))}",
             param_hint="'-e'",
         )
-
-    VALID_FORMATS = {"json", "table"}
     if flag_output is not None and flag_output.lower() not in VALID_FORMATS:
         raise click.BadParameter(
             f"unsupported format '{flag_output}'. Choose from: json, table",
             param_hint="'-o'",
         )
 
-    cfg = load()
-    env = resolve_environment(flag_env)
-
-    ctx.ensure_object(dict)
-    ctx.obj["env"] = env
-    ctx.obj["flag_env"] = flag_env
-    if flag_agent:
-        effective_format = "json"
-    elif flag_human:
-        effective_format = "table"
-    else:
-        effective_format = flag_output
-    ctx.obj["format"] = effective_format
-    ctx.obj["config_format"] = cfg.format
-    ctx.obj["quiet"] = quiet
-    ctx.obj["no_input"] = no_input or flag_agent
-    ctx.obj["wide"] = wide
-    ctx.obj["agent_mode"] = flag_agent
-
-    set_quiet(quiet)
-
 
 # ── Command registration ────────────────────────────────────────────────────
 
-cli.add_command(applications_group)
-cli.add_command(auth_group)
-cli.add_command(card_cmd)
-cli.add_command(config_group)
-cli.add_command(env_cmd)
-cli.add_command(feedback_cmd)
-cli.add_command(invoice_cmd)
-cli.add_command(nyc_cmd)
-cli.add_command(rampy_cmd)
-cli.add_command(skills_group)
+for _cmd in (
+    applications_group,
+    auth_group,
+    card_cmd,
+    config_group,
+    env_cmd,
+    feedback_cmd,
+    invoice_cmd,
+    nyc_cmd,
+    rampy_cmd,
+    skills_group,
+    tools_group,
+    update_cmd,
+):
+    cli.add_command(_cmd)
 
 
-# ── Utilities ────────────────────────────────────────────────────────────────
+# ── Error handling ───────────────────────────────────────────────────────────
 
 
 def _is_agent_mode() -> bool:
-    """Check if agent mode is active. Uses sys.argv as fallback for pre-parse errors."""
     if "--agent" in sys.argv:
         return True
     if "--human" in sys.argv:
@@ -373,30 +464,28 @@ def _is_agent_mode() -> bool:
     return not (hasattr(sys.stdout, "isatty") and sys.stdout.isatty())
 
 
-def _handle_error(code: int, message: str, *, exit_code: int | None = None) -> None:
-    """Print error in agent or human mode and exit.
-
-    code: the error code shown in agent JSON (e.g., HTTP 401 for auth errors).
-    exit_code: the POSIX exit status (0-255). Defaults to code if not provided.
-    """
+def _emit_error(code: int, message: str) -> None:
     if _is_agent_mode():
         print_error_json(code, message)
     else:
         click.echo(f"Error: {message}", err=True)
-    sys.exit(exit_code if exit_code is not None else code)
 
 
 def main() -> None:
     try:
         cli(standalone_mode=False)
     except click.exceptions.Abort:
-        _handle_error(130, "Operation aborted by user")
+        _emit_error(130, "Operation aborted by user")
+        sys.exit(130)
     except AuthRequiredError as e:
-        _handle_error(401, str(e), exit_code=e.code)
+        _emit_error(401, str(e))
+        sys.exit(e.code)
     except ApiError as e:
-        _handle_error(e.status_code, str(e), exit_code=EXIT_RUNTIME)
+        _emit_error(e.status_code, str(e))
+        sys.exit(EXIT_RUNTIME)
     except RampCLIError as e:
-        _handle_error(e.code, str(e))
+        _emit_error(e.code, str(e))
+        sys.exit(e.code)
     except click.UsageError as e:
         if _is_agent_mode():
             print_error_json(e.exit_code, e.format_message())
@@ -416,7 +505,8 @@ def main() -> None:
     except Exception as e:
         if os.environ.get("RAMP_DEBUG"):
             traceback.print_exc()
-        _handle_error(EXIT_RUNTIME, f"{type(e).__name__}: internal error")
+        _emit_error(EXIT_RUNTIME, f"{type(e).__name__}: internal error")
+        sys.exit(EXIT_RUNTIME)
 
 
 if __name__ == "__main__":

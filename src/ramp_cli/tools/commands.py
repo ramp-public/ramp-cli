@@ -1,6 +1,6 @@
 """Build Click commands from ToolDef structures.
 
-Each ToolDef is converted into a Click command that POSTs to the
+Each ToolDef is converted into a Click command that calls the
 corresponding agent-tool endpoint. Simple params become typed CLI
 flags; complex nested params require the --json escape hatch.
 """
@@ -13,6 +13,7 @@ from typing import Any
 
 import click
 
+from ramp_cli.auth.store import get_granted_scopes
 from ramp_cli.client.api import RampClient
 from ramp_cli.config.constants import base_url
 from ramp_cli.output.formatter import (
@@ -106,10 +107,13 @@ def _build_option(param: ToolParam) -> click.Option:
     """Convert a ToolParam into a Click Option based on its ParamType."""
     flag = f"--{param.flag}"
     kwargs: dict[str, Any] = {"help": param.description}
+    decls = [flag]
 
     match param.type:
         case ParamType.BOOL:
-            kwargs.update(is_flag=True, default=False, show_default=False)
+            # Tri-state bools: unset (omit), true, or false.
+            decls = [f"{flag}/--no-{param.flag}"]
+            kwargs.update(default=None, show_default=False)
         case ParamType.INT:
             kwargs.update(type=int, default=None)
         case ParamType.ENUM:
@@ -132,7 +136,6 @@ def _build_option(param: ToolParam) -> click.Option:
             kwargs.update(type=str, default=None)
 
     # Click derives kwarg names from flags; add a secondary name if they differ
-    decls = [flag]
     kwarg_name = param.flag.replace("-", "_")
     if kwarg_name != param.flag:
         decls.append(kwarg_name)
@@ -141,7 +144,7 @@ def _build_option(param: ToolParam) -> click.Option:
 
 
 def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> None:
-    """Build the JSON body, optionally dry-run, then POST to the agent-tool endpoint."""
+    """Build the JSON body, optionally dry-run, then call the agent-tool endpoint."""
     env: str = ctx.obj["env"]
     fmt: str | None = ctx.obj["format"]
     config_format: str = ctx.obj["config_format"]
@@ -156,12 +159,40 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
     else:
         body = _build_body(tool, kwargs)
 
-    body_bytes = json.dumps(body).encode()
+    is_get = tool.http_method == "get"
+    method_label = "GET" if is_get else "POST"
 
     if dry_run:
-        click.echo(f"DRY RUN: POST {base_url(env)}{tool.path}", err=True)
-        print_json(body)
+        resolved = resolve_format(fmt, config_format)
+        if resolved == "json":
+            print_agent_json(
+                {
+                    "dry_run": True,
+                    "method": method_label,
+                    "url": f"{base_url(env)}{tool.path}",
+                    "body": body,
+                },
+                pagination=None,
+            )
+        else:
+            click.echo(f"DRY RUN: {method_label} {base_url(env)}{tool.path}", err=True)
+            print_json(body)
         return
+
+    # Pre-flight scope check: fail fast with a clear message instead of
+    # sending a doomed request that returns an opaque 403.
+    if tool.required_scopes:
+        granted = get_granted_scopes(env)
+        if granted:  # only check if we have scope info persisted
+            missing = set(tool.required_scopes) - granted
+            if missing:
+                missing_str = ", ".join(sorted(missing))
+                raise click.ClickException(
+                    f"Your token is missing the required scope: {missing_str}\n\n"
+                    f"  To fix this, log in again to get a fresh token:\n\n"
+                    f"    ramp auth login\n\n"
+                    f"  This will request all the scopes needed for your tools."
+                )
 
     # Refresh cached spec in the background for the *next* invocation.
     # The current command is already resolved, so this only updates the cache.
@@ -174,7 +205,11 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
     t0 = time.monotonic()
 
     client = RampClient(env)
-    resp_bytes = client.post(tool.path, body_bytes)
+    if is_get:
+        params = {k: str(v) for k, v in body.items() if v is not None}
+        resp_bytes = client.get(tool.path, params)
+    else:
+        resp_bytes = client.post(tool.path, json.dumps(body).encode())
     data = json.loads(resp_bytes)
 
     elapsed = time.monotonic() - t0
@@ -182,7 +217,7 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
         stop_spinner()
 
     if resolved == "json":
-        print_agent_json(data, pagination=None)
+        print_agent_json(data, pagination=_extract_pagination(data))
     else:
         wide: bool = ctx.obj.get("wide", False)
         _print_summary(tool.display_name, data, elapsed)
@@ -199,7 +234,7 @@ def _build_body(tool: ToolDef, kwargs: dict[str, Any]) -> dict[str, Any]:
     """Assemble a JSON request body from Click flag values.
 
     Skips complex params (they must be provided via --json) and unset
-    optional params. Bools are only included when explicitly set to True
+    optional params. Bools are only included when explicitly set
     so the API receives its own defaults for unset flags.
     """
     body: dict[str, Any] = {}
@@ -207,17 +242,24 @@ def _build_body(tool: ToolDef, kwargs: dict[str, Any]) -> dict[str, Any]:
 
     for param in tool.params:
         if param.is_complex:
+            if param.required:
+                missing.append(f"--json ({param.name})")
             continue
 
         val = kwargs.get(param.flag.replace("-", "_"))
 
-        # Bools default to False in Click; only send when explicitly True
         if param.type is ParamType.BOOL:
-            if val:
-                body[param.name] = True
+            if val is None:
+                if param.required:
+                    missing.append(f"--{param.flag}/--no-{param.flag}")
+                continue
+            body[param.name] = bool(val)
             continue
 
         if val is None:
+            if param.required and param.default is not None:
+                body[param.name] = param.default
+                continue
             if param.required:
                 label = param.flag.upper() if is_id_param(param) else f"--{param.flag}"
                 missing.append(label)
@@ -359,6 +401,24 @@ def _detect_cursor_param(tool: ToolDef) -> str:
         if name in param_names:
             return name
     return "next_page_cursor"
+
+
+_PAGINATION_KEYS = ("next_page_cursor", "page_cursor", "cursor", "next")
+
+
+def _extract_pagination(data: Any) -> dict | None:
+    """Extract pagination info from an API response for the agent JSON envelope.
+
+    Looks for common cursor fields in the top-level response dict.
+    Returns a dict like {"next_page_cursor": "tok_abc"} or None if no cursor.
+    """
+    if not isinstance(data, dict):
+        return None
+    for key in _PAGINATION_KEYS:
+        value = data.get(key)
+        if value is not None:
+            return {"next_cursor": value}
+    return None
 
 
 def _extract_list_field(data: Any) -> tuple[str | None, list[dict]]:
