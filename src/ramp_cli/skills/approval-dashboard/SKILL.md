@@ -94,11 +94,8 @@ ramp transactions approve {transaction_uuid} \
   --thoughts "Missing receipt and over budget" \
   --user_reason "Please attach the receipt and update the memo"
 
-# Approve a bill
-ramp bills approve {bill_id} --action_type APPROVE
-
-# Reject a bill
-ramp bills approve {bill_id} --action_type REJECT --reason "Duplicate invoice"
+# Approve a bill — not yet available via CLI.
+# Bill approvals must be done in the Ramp app: https://app.ramp.com/bills
 
 # Approve a reimbursement
 ramp reimbursements approve {reimbursement_uuid} --action approve
@@ -169,14 +166,16 @@ Want to review individually or approve all?
 
 User: Approve the bills and reimbursements. Let me see the transaction first.
 
-Agent: Approving 5 items...
-> ramp bills approve bill-001 --action_type APPROVE
-> ramp bills approve bill-002 --action_type APPROVE
+Agent: I can approve the reimbursements now. Bills must be approved in the Ramp app — I'll send you the links.
 > ramp reimbursements approve reimb-001 --action approve
 > ramp reimbursements approve reimb-002 --action approve
 > ramp reimbursements approve reimb-003 --action approve
 
-All 5 approved. Now let me get details on that DoorDash transaction:
+3 reimbursements approved. For the 2 bills, approve them here:
+  https://app.ramp.com/bills/bill-001
+  https://app.ramp.com/bills/bill-002
+
+Now let me get details on that DoorDash transaction:
 > ramp transactions get txn-001 --agent
 > ramp transactions missing txn-001
 

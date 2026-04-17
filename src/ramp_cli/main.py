@@ -34,6 +34,7 @@ from ramp_cli.output.help import (
 from ramp_cli.specs.sync import maybe_sync
 from ramp_cli.tools.commands import build_tool_command
 from ramp_cli.tools.registry import get_tool, list_categories
+from ramp_cli.version_check import check_for_update, emit_update_notice
 
 # ── Enums & data ─────────────────────────────────────────────────────────────
 
@@ -472,6 +473,7 @@ def _emit_error(code: int, message: str) -> None:
 
 
 def main() -> None:
+    check_for_update()
     try:
         cli(standalone_mode=False)
     except click.exceptions.Abort:
@@ -507,6 +509,11 @@ def main() -> None:
             traceback.print_exc()
         _emit_error(EXIT_RUNTIME, f"{type(e).__name__}: internal error")
         sys.exit(EXIT_RUNTIME)
+    finally:
+        try:
+            emit_update_notice(_is_agent_mode())
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

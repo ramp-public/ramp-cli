@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import sys
 from typing import Callable, TextIO
 
@@ -16,6 +17,12 @@ from ramp_cli.output.style import (
     _show_cursor,
     show_table_card,
 )
+
+# Non-data lines consumed by the table card + footer: blank above, frame top,
+# header, frame bottom, shadow bar, blank below, footer gap, footer buttons,
+# plus 1 for the cursor line after the trailing newline = 9.
+_TABLE_CHROME_LINES = 9
+_MIN_VISIBLE_ROWS = 1
 
 
 class _LineCounter:
@@ -70,6 +77,7 @@ class ToolPaginator:
 
         self._page_idx = 0
         self._selected = 0
+        self._viewport_start = 0  # index of first visible row
         self._last_line_count = 0
 
     def run(self) -> dict | None:
@@ -118,6 +126,7 @@ class ToolPaginator:
         if self._page_idx + 1 < len(self._pages):
             self._page_idx += 1
             self._selected = 0
+            self._viewport_start = 0
             self._render()
             return
 
@@ -137,6 +146,7 @@ class ToolPaginator:
         self._cursors.append(new_cursor)
         self._page_idx += 1
         self._selected = 0
+        self._viewport_start = 0
         self._render()
 
     def _prev_page(self) -> None:
@@ -144,7 +154,25 @@ class ToolPaginator:
         if self._page_idx > 0:
             self._page_idx -= 1
             self._selected = 0
+            self._viewport_start = 0
             self._render()
+
+    def _max_visible_rows(self) -> int:
+        """How many data rows fit on screen given current terminal height."""
+        term_h = shutil.get_terminal_size((80, 24)).lines
+        return max(_MIN_VISIBLE_ROWS, term_h - _TABLE_CHROME_LINES)
+
+    def _clamp_viewport(self, page: list[dict]) -> None:
+        """Ensure selected row is visible and viewport is within bounds."""
+        cap = self._max_visible_rows()
+        # Scroll viewport so selected row is visible.
+        if self._selected < self._viewport_start:
+            self._viewport_start = self._selected
+        elif self._selected >= self._viewport_start + cap:
+            self._viewport_start = self._selected - cap + 1
+        # Don't let viewport extend past end of page.
+        max_start = max(0, len(page) - cap)
+        self._viewport_start = min(self._viewport_start, max_start)
 
     def _render(self) -> None:
         """Render the current page using show_table_card + footer."""
@@ -154,7 +182,19 @@ class ToolPaginator:
             self._page_idx + 1 < len(self._pages)
         )
 
+        # Compute viewport slice so the table fits the terminal height.
+        self._clamp_viewport(page)
+        cap = self._max_visible_rows()
+        vp_start = self._viewport_start
+        vp_end = min(vp_start + cap, len(page))
+        visible_rows = page[vp_start:vp_end]
+        # Translate selected index to viewport-relative index.
+        vis_selected = self._selected - vp_start
+
+        # Build title with page + scroll position info.
         page_title = f"{self._title} [Page {self._page_idx + 1}]"
+        if len(page) > cap:
+            page_title += f"  {vp_start + 1}\u2013{vp_end} of {len(page)}"
 
         if self._last_line_count > 0:
             # Return to column 0 (in case _render_loading left cursor mid-line),
@@ -163,6 +203,11 @@ class ToolPaginator:
             # ESC[s / ESC[u (save/restore cursor) approach which breaks when
             # the table content scrolls past the saved cursor position.
             self._write(f"\r{ESC}[{self._last_line_count}A{ESC}[J")
+        else:
+            # First render: clear screen and home cursor so pre-existing
+            # output (e.g. summary line) doesn't eat into the table's
+            # available height.
+            self._write(f"{ESC}[H{ESC}[J")
 
         # Wrap the output file to count newlines while preserving TTY
         # color detection (StringIO buffering would lose isatty()).
@@ -170,13 +215,18 @@ class ToolPaginator:
         show_table_card(
             page_title,
             self._headers,
-            page,
+            visible_rows,
             file=counter,
-            selected_row=self._selected,
+            selected_row=vis_selected,
         )
 
-        # Footer
-        footer = "\n" + self._build_footer(has_prev, has_next)
+        # Footer — add scroll arrows when rows are clipped.
+        scroll_hint = ""
+        if vp_start > 0:
+            scroll_hint += f" ▲ {vp_start} more"
+        if vp_end < len(page):
+            scroll_hint += f" ▼ {len(page) - vp_end} more"
+        footer = "\n" + self._build_footer(has_prev, has_next, scroll_hint)
         counter.write(footer)
         counter.flush()
 
@@ -190,7 +240,9 @@ class ToolPaginator:
             msg = "\r  Loading next page..."
         self._write(msg)
 
-    def _build_footer(self, has_prev: bool, has_next: bool) -> str:
+    def _build_footer(
+        self, has_prev: bool, has_next: bool, scroll_hint: str = ""
+    ) -> str:
         """Build the keyboard hint footer."""
         buttons = [("ESC", "Exit"), ("↑↓", "Select")]
         if has_prev:
@@ -200,5 +252,11 @@ class ToolPaginator:
         buttons.append(("↵", "Open"))
 
         if self._use_color:
-            return "  ".join(_render_button(k, v) for k, v in buttons) + "\n"
-        return "  ".join(f"[{k}] {v}" for k, v in buttons) + "\n"
+            bar = "  ".join(_render_button(k, v) for k, v in buttons)
+            if scroll_hint:
+                bar += f"  {_fg(120, 120, 120)}{scroll_hint}{_reset()}"
+            return bar + "\n"
+        bar = "  ".join(f"[{k}] {v}" for k, v in buttons)
+        if scroll_hint:
+            bar += f"  {scroll_hint}"
+        return bar + "\n"

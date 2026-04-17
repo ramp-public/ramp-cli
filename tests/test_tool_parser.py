@@ -74,7 +74,7 @@ class TestGetFunds:
 
     def test_param_count(self, tool_map: dict[str, ToolDef]):
         tool = tool_map["get-funds"]
-        assert len(tool.params) == 9
+        assert len(tool.params) == 10
 
     def test_no_required_params(self, tool_map: dict[str, ToolDef]):
         tool = tool_map["get-funds"]
@@ -141,16 +141,12 @@ class TestGetTransactions:
         assert len(required) >= 1
 
 
-class TestApproveOrRejectBill:
+class TestGetBillsForApproval:
     def test_exists(self, tool_map: dict[str, ToolDef]):
-        assert "approve-or-reject-bill" in tool_map
+        assert "get-bills-for-approval" in tool_map
 
     def test_scopes(self, tool_map: dict[str, ToolDef]):
-        assert "bills:write" in tool_map["approve-or-reject-bill"].required_scopes
-
-    def test_has_required_params(self, tool_map: dict[str, ToolDef]):
-        required = [p for p in tool_map["approve-or-reject-bill"].params if p.required]
-        assert len(required) >= 2
+        assert "bills:read" in tool_map["get-bills-for-approval"].required_scopes
 
 
 class TestSearchBills:

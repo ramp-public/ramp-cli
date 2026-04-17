@@ -21,13 +21,14 @@ from ramp_cli.tools.parser import parse_spec
 
 class TestSkillDiscovery:
     def test_skill_names_discovers_all(self):
-        """All 7 skills should be discovered from the skills/ directory."""
+        """All 8 skills should be discovered from the skills/ directory."""
         names = skill_names()
-        assert len(names) == 7
+        assert len(names) == 8
         assert "agentic-purchase" in names
         assert "browser-automation" in names
         assert "approval-dashboard" in names
         assert "receipt-compliance" in names
+        assert "submit-reimbursement" in names
         assert "transaction-cleanup" in names
         assert "apply-to-ramp" in names
         assert "vendor-document-upload" in names
@@ -45,7 +46,7 @@ class TestSkillsList:
         assert result.exit_code == 0
 
         data = json.loads(result.output)
-        assert len(data["data"]) == 7
+        assert len(data["data"]) == 8
         names = {s["name"] for s in data["data"]}
         assert "browser-automation" in names
         assert "agentic-purchase" in names
@@ -55,7 +56,7 @@ class TestSkillsList:
         runner = CliRunner()
         result = runner.invoke(cli, ["--human", "skills", "list"])
         assert result.exit_code == 0
-        assert "7 Skills" in result.output
+        assert "8 Skills" in result.output
         assert "browser-automation" in result.output
         assert "vendor-document-upload" in result.output
 
@@ -98,7 +99,7 @@ class TestSkillsInstall:
         )
         assert result.exit_code == 0
         installed = [d.name for d in tmp_path.iterdir() if d.is_dir()]
-        assert len(installed) == 7
+        assert len(installed) == 8
 
     def test_install_overwrites(self, tmp_path):
         """Installing twice succeeds and returns 'updated' on second run."""

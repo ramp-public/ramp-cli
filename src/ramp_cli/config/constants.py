@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 ENV_SANDBOX = "sandbox"
 ENV_PRODUCTION = "production"
 
@@ -44,6 +46,8 @@ DEVAPI_SCOPES = [
     "purchase_orders:read",
     "purchase_orders:write",
     "receipts:read",
+    "reimbursements:read",
+    "reimbursements:write",
     "spend_programs:read",
     "spend_programs:write",
     "statements:read",
@@ -56,6 +60,9 @@ DEVAPI_SCOPES = [
 
 
 def base_url(env: str) -> str:
+    override = os.environ.get("RAMP_API_URL")
+    if override:
+        return override.rstrip("/")
     if env == ENV_PRODUCTION:
         return PRODUCTION_BASE_URL
     return SANDBOX_BASE_URL

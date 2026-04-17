@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
 from urllib.parse import urlencode
@@ -26,7 +27,7 @@ class RampClient:
     def __init__(self, env: str, access_token: str | None = None) -> None:
         self.env = env
         self.base_url = base_url(env)
-        self._static_access_token = access_token
+        self._static_access_token = access_token or os.environ.get("RAMP_ACCESS_TOKEN")
 
     def get(self, path: str, params: dict[str, str] | None = None) -> bytes:
         url = self.base_url + path
@@ -142,6 +143,9 @@ class RampClient:
             "Accept": "application/json",
             "X-External-Session-Id": get_session_id(),
         }
+        devtool_token = os.environ.get("RAMP_DEVTOOL_TOKEN")
+        if devtool_token:
+            headers["X-Rampy-Auth"] = devtool_token
         if body is not None:
             headers["Content-Type"] = "application/json"
         return http.request(method, url, headers=headers, content=body)
