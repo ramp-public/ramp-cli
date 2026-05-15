@@ -43,6 +43,7 @@ def try_refresh(env: str) -> str | None:
                 token_resp.refresh_token,
                 access_token_expires_in=token_resp.expires_in,
                 refresh_token_expires_in=token_resp.refresh_token_expires_in,
+                agent_key_uuid=token_resp.agent_key_uuid,
             )
             return token_resp.access_token
     except OAuthTokenError as exc:

@@ -7,7 +7,7 @@ import json
 from click.testing import CliRunner
 
 from ramp_cli.config import settings
-from ramp_cli.config.constants import ENV_PRODUCTION, ENV_SANDBOX
+from ramp_cli.config.constants import ENV_PRODUCTION, ENV_SANDBOX, environment_usage
 from ramp_cli.main import cli
 
 
@@ -127,6 +127,14 @@ class TestConfigProdAlias:
         assert result.exit_code == 0
         cfg = settings.load()
         assert cfg.environment == "production"
+
+
+class TestEnvCommand:
+    def test_help_shows_environment_options(self, isolated_config):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["env", "--help"], catch_exceptions=False)
+        assert result.exit_code == 0
+        assert f"[{environment_usage()}]" in result.output
 
 
 class TestOutputValidation:

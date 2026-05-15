@@ -248,7 +248,7 @@ class TestPreFlightScopeCheck:
         runner = CliRunner()
         result = runner.invoke(
             cli,
-            ["get-funds", "--dry_run"],
+            ["get-funds", "--dry_run", "--rationale", "Testing scope preflight"],
         )
         assert result.exit_code == 0
         assert "dry_run" in result.output

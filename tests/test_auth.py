@@ -20,8 +20,10 @@ from ramp_cli.auth.oauth import (
     _generate_challenge,
     _generate_verifier,
 )
+from ramp_cli.commands import auth as auth_command_module
 from ramp_cli.errors import RefreshFailedError
 from ramp_cli.main import BoxHelpFormatter, cli, main
+from ramp_cli.onboarding import record_first_login
 
 
 def test_pkce_verifier_length():
@@ -281,6 +283,38 @@ def test_refresh_tokens__classifies_ramp_refresh_not_found_as_invalid_grant(
     assert exc_info.value.error == "invalid_grant"
 
 
+def test_token_request__sends_extra_auth_header(monkeypatch):
+    captured = {}
+
+    def fake_post(url, data, headers):
+        captured["url"] = url
+        captured["data"] = data
+        captured["headers"] = headers
+
+        class FakeResponse:
+            status_code = 200
+            is_error = False
+
+            @staticmethod
+            def json():
+                return {"access_token": "access"}
+
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        oauth_module,
+        "extra_auth_headers",
+        lambda env: {"X-Extra-Auth": f"{env}-token"},
+    )
+    monkeypatch.setattr(oauth_module.httpx, "post", fake_post)
+
+    oauth_module._do_token_request("sandbox", "https://example.test/token", {})
+
+    assert captured["headers"]["X-Extra-Auth"] == "sandbox-token"
+    assert captured["headers"]["Content-Type"] == "application/x-www-form-urlencoded"
+    assert captured["data"]["client_id"]
+
+
 def test_try_refresh__raises_on_transient_refresh_failure(isolated_config, monkeypatch):
     store.save_tokens("sandbox", "access-old", "refresh-old")
 
@@ -455,6 +489,90 @@ class TestResolveScopes:
         assert "business:read" in scopes
 
 
+class TestAuthLoginSpecRefresh:
+    """Verify CLI login refreshes tool specs before requesting OAuth scopes."""
+
+    def _patch_success_ui(self, monkeypatch):
+        monkeypatch.setattr(auth_command_module, "show_nyc", lambda duration=5.0: None)
+        monkeypatch.setattr(auth_command_module, "show_status_box", lambda envs: None)
+        monkeypatch.setattr(auth_command_module, "is_first_login", lambda: False)
+        monkeypatch.setattr(auth_command_module, "record_first_login", lambda: None)
+
+    def test_login_refreshes_spec_before_oauth(self, isolated_config, monkeypatch):
+        self._patch_success_ui(monkeypatch)
+        calls: list[tuple[str, str]] = []
+
+        def fake_fetch_spec(env: str) -> int:
+            calls.append(("fetch", env))
+            return 1
+
+        def fake_login(env: str, opts: oauth_module.LoginOptions) -> TokenResponse:
+            calls.append(("login", env))
+            return TokenResponse(
+                access_token="access",
+                refresh_token="refresh",
+                scope="tasks:read",
+            )
+
+        monkeypatch.setattr(auth_command_module, "fetch_spec", fake_fetch_spec)
+        monkeypatch.setattr(auth_command_module, "do_login", fake_login)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["--human", "--env", "sandbox", "auth", "login"],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert calls == [("fetch", "sandbox"), ("login", "sandbox")]
+        assert store.get_granted_scopes("sandbox") == {"tasks:read"}
+
+    def test_login_continues_if_spec_refresh_fails(self, isolated_config, monkeypatch):
+        self._patch_success_ui(monkeypatch)
+
+        def fail_fetch_spec(env: str) -> int:
+            raise RuntimeError("network down")
+
+        monkeypatch.setattr(auth_command_module, "fetch_spec", fail_fetch_spec)
+        monkeypatch.setattr(
+            auth_command_module,
+            "do_login",
+            lambda env, opts: TokenResponse(
+                access_token="access",
+                refresh_token="refresh",
+                scope="users:read",
+            ),
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["--human", "--env", "sandbox", "auth", "login"],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert "Could not refresh tool definitions before login" in result.output
+        assert store.get_granted_scopes("sandbox") == {"users:read"}
+
+    def test_refresh_skips_when_custom_scopes_configured(
+        self, isolated_config, monkeypatch
+    ):
+        monkeypatch.setattr(
+            auth_command_module.settings,
+            "configured_scopes",
+            lambda: "users:read",
+        )
+        monkeypatch.setattr(
+            auth_command_module,
+            "fetch_spec",
+            lambda env: pytest.fail("fetch_spec should not be called"),
+        )
+
+        auth_command_module._refresh_tool_spec_before_login("sandbox")
+
+
 class TestPostLoginEnvHint:
     """Verify the default-env hint is shown after login."""
 
@@ -484,3 +602,104 @@ class TestPostLoginEnvHint:
         assert "Token saved" in data["data"][0]["message"]
         # JSON output should not contain the hint
         assert "ramp env" not in result.output
+
+    def test_repeat_oauth_login_recommends_funds_enroll(
+        self, isolated_config, monkeypatch
+    ):
+        record_first_login()
+
+        monkeypatch.setattr("ramp_cli.commands.auth.show_nyc", lambda duration: None)
+        monkeypatch.setattr(
+            "ramp_cli.commands.auth.do_login",
+            lambda env, opts: TokenResponse(
+                access_token="access", refresh_token="refresh", scope="business:read"
+            ),
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["--human", "--env", "production", "auth", "login", "--no_browser"],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert "Next step:  ramp funds enroll" in result.output
+        assert "Explore all commands:  ramp --help" in result.output
+        assert "ramp env production" in result.output
+
+
+class TestEnvironmentAuthPreflight:
+    def test_login_requires_environment_auth_human(
+        self, isolated_config, monkeypatch, capsys
+    ):
+        monkeypatch.setattr("ramp_cli.main.check_for_update", lambda: None)
+        monkeypatch.setattr("ramp_cli.main.emit_update_notice", lambda agent: None)
+        monkeypatch.setattr(
+            "ramp_cli.commands.auth.missing_required_environment_auth",
+            lambda env: True,
+        )
+        monkeypatch.setattr(
+            "ramp_cli.commands.auth.environment_auth_required_message",
+            lambda env: f"{env} requires extra auth. Ask the user for a token.",
+        )
+        monkeypatch.setattr(
+            sys, "argv", ["ramp", "--human", "--env", "sandbox", "auth", "login"]
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+
+        captured = capsys.readouterr()
+        assert exc_info.value.code == 4
+        assert "sandbox requires extra auth" in captured.err
+        assert "Ask the user for a token" in captured.err
+
+    def test_login_requires_environment_auth_agent(
+        self, isolated_config, monkeypatch, capsys
+    ):
+        monkeypatch.setattr("ramp_cli.main.check_for_update", lambda: None)
+        monkeypatch.setattr("ramp_cli.main.emit_update_notice", lambda agent: None)
+        monkeypatch.setattr(
+            "ramp_cli.commands.auth.missing_required_environment_auth",
+            lambda env: True,
+        )
+        monkeypatch.setattr(
+            "ramp_cli.commands.auth.environment_auth_required_message",
+            lambda env: f"{env} requires extra auth. Agents should request it.",
+        )
+        monkeypatch.setattr(
+            sys, "argv", ["ramp", "--agent", "--env", "sandbox", "auth", "login"]
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert exc_info.value.code == 4
+        assert data["error"]["code"] == 4
+        assert "sandbox requires extra auth" in data["error"]["message"]
+
+
+class TestOAuthLoginFailures:
+    """The two failure-paths in oauth.login() raise click.ClickException so
+    main() renders them as `Error: <message>` instead of leaking
+    `Error: RuntimeError: internal error`."""
+
+    def test_timeout_raises_click_exception(self, monkeypatch):
+        # Skip the actual browser hand-off.
+        monkeypatch.setattr(oauth_module, "_open_browser", lambda url: True)
+
+        # Drop the wait timeout to ~0 so the test doesn't actually wait.
+        original_event = oauth_module.threading.Event
+
+        class _NoWaitEvent(original_event):
+            def wait(self, timeout=None):
+                return False
+
+        monkeypatch.setattr(oauth_module.threading, "Event", _NoWaitEvent)
+
+        with pytest.raises(click.ClickException) as exc_info:
+            oauth_module.login("sandbox", oauth_module.LoginOptions(no_browser=True))
+        assert "timed out" in str(exc_info.value).lower()

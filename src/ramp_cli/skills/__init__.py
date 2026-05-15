@@ -71,7 +71,7 @@ def list_skills() -> list[dict[str, str]]:
     skills: list[dict[str, str]] = []
     for name in skill_names():
         path = SKILLS_DIR / name / "SKILL.md"
-        fm = _parse_frontmatter(path.read_text())
+        fm = _parse_frontmatter(path.read_text(encoding="utf-8"))
         desc = fm.get("description", "")
         # Take only the first sentence for the short description
         first_line = desc.split(". ")[0].rstrip(".") if desc else ""
@@ -83,7 +83,7 @@ def get_skill_content(name: str) -> str | None:
     """Return full SKILL.md content for a skill, or None if not found."""
     path = SKILLS_DIR / name / "SKILL.md"
     if path.is_file():
-        return path.read_text()
+        return path.read_text(encoding="utf-8")
     return None
 
 
@@ -121,13 +121,13 @@ def install_skill(name: str, target_dir: Path) -> str:
     # Inject user-invocable: true for .claude/skills/ targets
     needs_inject = target_dir.name == "skills" and target_dir.parent.name == ".claude"
     if needs_inject:
-        content = dest_file.read_text()
+        content = dest_file.read_text(encoding="utf-8")
         if "user-invocable:" not in content:
             content = content.replace(
                 "\n---\n",
                 "\nuser-invocable: true\n---\n",
                 1,
             )
-            dest_file.write_text(content)
+            dest_file.write_text(content, encoding="utf-8")
 
     return status

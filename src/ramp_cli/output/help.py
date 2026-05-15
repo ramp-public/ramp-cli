@@ -20,26 +20,8 @@ from ramp_cli.output.style import (
     _frame_bottom,
     _frame_top,
     _reset,
+    wrap_text,
 )
-
-
-def _wrap_text(text: str, width: int) -> list[str]:
-    """Word-wrap text to the given width."""
-    if not text:
-        return [""]
-    lines: list[str] = []
-    current = ""
-    for word in text.split():
-        candidate = current + " " + word if current else word
-        if len(candidate) <= width:
-            current = candidate
-        else:
-            if current:
-                lines.append(current)
-            current = word
-    if current:
-        lines.append(current)
-    return lines or [""]
 
 
 def _framed_line(box_v: str, content: str, inner: int) -> str:
@@ -118,7 +100,7 @@ class BoxHelpFormatter(click.HelpFormatter):
                 first = first[: inner - 1] + "\u2026"
 
             pad = max(1, offset - len(first))
-            desc_lines = _wrap_text(second, desc_width)
+            desc_lines = wrap_text(second, desc_width)
 
             # First line: name + first description line
             if use_color:

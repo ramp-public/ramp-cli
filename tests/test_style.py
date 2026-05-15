@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import time
 
 import ramp_cli.views.invoice as bill_invoice_mod
@@ -26,6 +27,7 @@ from ramp_cli.output.style import (
     show_table_card,
     start_waiting_animation,
     status_line,
+    wrap_text,
 )
 from ramp_cli.views.invoice import render_bill_invoice
 
@@ -272,6 +274,114 @@ def test_show_detail_card_plain(monkeypatch):
     assert "status:" in output
     assert "ACTIVE" in output
     assert "\033[" not in output  # no ANSI codes
+
+
+# === wrap_text ===
+
+
+def test_wrap_text_empty():
+    assert wrap_text("", 10) == [""]
+
+
+def test_wrap_text_short():
+    assert wrap_text("hi there", 80) == ["hi there"]
+
+
+def test_wrap_text_exact_width():
+    assert wrap_text("abcdefghij", 10) == ["abcdefghij"]
+
+
+def test_wrap_text_wraps_on_word_boundary():
+    assert wrap_text("hello world foo", 11) == ["hello world", "foo"]
+
+
+def test_wrap_text_long_token_emitted_whole():
+    # A single token longer than the width should not be hard-cut.
+    assert wrap_text("aaaaaaaaaaaa", 5) == ["aaaaaaaaaaaa"]
+    assert wrap_text("a aaaaaaaaaa b", 5) == ["a", "aaaaaaaaaa", "b"]
+
+
+# === show_detail_card wrap behavior ===
+
+
+def test_show_detail_card_long_value_wraps_not_truncates(monkeypatch):
+    """Long string values wrap onto continuation rows; full text is preserved."""
+    buf = io.StringIO()
+    buf.isatty = lambda: True  # type: ignore[attr-defined]
+    monkeypatch.setattr("ramp_cli.output.style._color_supported", lambda f: True)
+    monkeypatch.setattr("ramp_cli.output.style._term_width", lambda: 90)
+    msg = (
+        "This business is already enrolled in agent cards. To start using "
+        "agent cards, create a fund with spend controls and a card to fund it."
+    )
+    show_detail_card("Result", {"output": msg}, file=buf)
+    raw = buf.getvalue()
+    plain = _strip_ansi(raw)
+    # No ellipsis truncation marker
+    assert "..." not in plain
+    # Full message present (split across rows is fine — assert key fragments)
+    assert "already enrolled in agent cards" in plain
+    assert "create a fund with spend controls" in plain
+    assert "card to fund it." in plain
+    # Multiple rows rendered (top + at least 2 wrapped rows + bottom)
+    assert plain.count("│") >= 4
+
+
+def test_show_detail_card_long_value_wraps_plain(monkeypatch):
+    """Long string values also wrap in the no-color path."""
+    buf = io.StringIO()
+    monkeypatch.setattr("ramp_cli.output.style._color_supported", lambda f: False)
+    monkeypatch.setattr("ramp_cli.output.style._term_width", lambda: 90)
+    msg = "abc " * 60  # ~240 chars; far exceeds inner width
+    show_detail_card("Result", {"output": msg.strip()}, file=buf)
+    out = buf.getvalue()
+    assert "\033[" not in out
+    assert "..." not in out
+    # Should produce more than one content line for the value
+    content_lines = [
+        line for line in out.splitlines() if line.startswith("│") and "abc" in line
+    ]
+    assert len(content_lines) >= 2
+
+
+def test_show_detail_card_overlong_token_does_not_break_frame(monkeypatch):
+    """A single token longer than the value column is clamped, not overflowed.
+
+    Regression: an unbroken URL/UUID would previously push the right border
+    past the frame because ``wrap_text`` emits long tokens whole.
+    """
+    buf = io.StringIO()
+    buf.isatty = lambda: True  # type: ignore[attr-defined]
+    monkeypatch.setattr("ramp_cli.output.style._color_supported", lambda f: True)
+    monkeypatch.setattr("ramp_cli.output.style._term_width", lambda: 90)
+    long_token = "a" * 500  # far exceeds the inner width
+    show_detail_card("Result", {"output": long_token}, file=buf)
+    plain_lines = _strip_ansi(buf.getvalue()).splitlines()
+    # Every framed value row must have the same visible width — no overflow.
+    # Colored output appends a shadow char (▐) to value rows; the trailing
+    # box border │ comes immediately before it.
+    framed = [ln for ln in plain_lines if ln.startswith("  │") and "│" in ln[3:]]
+    assert framed, "expected at least one framed row"
+    widths = {len(ln) for ln in framed}
+    assert len(widths) == 1, f"frame rows have inconsistent widths: {widths}"
+    # The clamped row should end with an ellipsis marker.
+    assert any("\u2026" in ln for ln in framed)
+
+
+def test_show_detail_card_overlong_token_plain(monkeypatch):
+    """Same clamp behavior in the no-color path."""
+    buf = io.StringIO()
+    monkeypatch.setattr("ramp_cli.output.style._color_supported", lambda f: False)
+    monkeypatch.setattr("ramp_cli.output.style._term_width", lambda: 90)
+    show_detail_card("Result", {"output": "z" * 500}, file=buf)
+    framed = [ln for ln in buf.getvalue().splitlines() if ln.startswith("│")]
+    widths = {len(ln) for ln in framed}
+    assert len(widths) == 1, f"frame rows have inconsistent widths: {widths}"
+    assert any("\u2026" in ln for ln in framed)
+
+
+def _strip_ansi(s: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", s)
 
 
 # === Bill Invoice Tests ===

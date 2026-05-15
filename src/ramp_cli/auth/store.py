@@ -71,7 +71,7 @@ def get_tokens(env: str) -> tuple[str, str]:
 
 def get_token_state(env: str) -> TokenState:
     cfg = settings.load()
-    ec: settings.EnvConfig = getattr(cfg, env, settings.EnvConfig())
+    ec = settings.get_env_config(cfg, env)
     return TokenState(
         access_token=ec.access_token,
         refresh_token=ec.refresh_token,
@@ -90,6 +90,7 @@ def save_tokens(
     refresh_token_expires_in: int = 0,
     issued_at: int | None = None,
     granted_scopes: str | None = None,
+    agent_key_uuid: str | None = None,
 ) -> None:
     state = _build_token_state(
         access_token,
@@ -100,7 +101,7 @@ def save_tokens(
     )
 
     cfg = settings.load()
-    ec: settings.EnvConfig = getattr(cfg, env)
+    ec = settings.ensure_env_config(cfg, env)
     ec.access_token = state.access_token
     ec.refresh_token = state.refresh_token
     ec.access_token_issued_at = state.access_token_issued_at
@@ -111,12 +112,18 @@ def save_tokens(
     # Token refresh responses often omit scope — preserve prior stored scopes.
     if granted_scopes:
         ec.granted_scopes = granted_scopes
+    # agent_key_uuid contract:
+    #   - refresh callers omit it (None) → preserve stored value
+    #   - login/credential-replacement callers pass the new value explicitly,
+    #     including "" to clear a stale key when no key was issued
+    if agent_key_uuid is not None:
+        ec.agent_key_uuid = agent_key_uuid
     settings.save(cfg)
 
 
 def clear_tokens(env: str) -> None:
     cfg = settings.load()
-    ec: settings.EnvConfig = getattr(cfg, env)
+    ec = settings.ensure_env_config(cfg, env)
     ec.access_token = ""
     ec.refresh_token = ""
     ec.access_token_issued_at = 0
@@ -124,13 +131,20 @@ def clear_tokens(env: str) -> None:
     ec.refresh_token_issued_at = 0
     ec.refresh_token_expires_in = 0
     ec.granted_scopes = ""
+    ec.agent_key_uuid = ""
     settings.save(cfg)
+
+
+def get_agent_key_uuid(env: str) -> str:
+    cfg = settings.load()
+    ec = settings.get_env_config(cfg, env)
+    return ec.agent_key_uuid
 
 
 def get_granted_scopes(env: str) -> set[str]:
     """Return the set of OAuth scopes granted to the current token."""
     cfg = settings.load()
-    ec: settings.EnvConfig = getattr(cfg, env, settings.EnvConfig())
+    ec = settings.get_env_config(cfg, env)
     if not ec.granted_scopes:
         return set()
     return set(ec.granted_scopes.split())

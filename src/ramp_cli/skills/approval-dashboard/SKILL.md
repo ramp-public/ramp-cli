@@ -15,6 +15,7 @@ description: |-
 - Confirm with the user before executing approvals — especially bulk operations.
 - Present items sorted by priority: highest dollar amount first.
 - Amounts vary by endpoint: bills are in **cents** (divide by 100), reimbursements are in **dollars**, transactions are formatted strings ("$135.40").
+- **Deep links**: If the response contains a `bill_url` (bills) or `reimbursement_link` (reimbursements) field, include it when presenting entity details so the user can click through to the Ramp web app. If these fields are absent, direct the user to the relevant Ramp page (e.g., `https://app.ramp.com/bills`) instead. Never fabricate deep link URLs.
 
 ## Workflow
 
@@ -41,19 +42,19 @@ For each endpoint, check `pagination.next_cursor` in the JSON envelope. If it is
 
 ### Step 2: Present the queue
 
-Summarize what's pending:
+Summarize what's pending. If the response includes `bill_url` or `reimbursement_link` fields, include them so the user can open items directly in the Ramp web app:
 
 ```
 Approval queue: 14 items ($23,450 total)
 
 Bills (4 items, $8,200):
-  $3,500  HighSpot        Invoice #1234    Due 2026-03-28
-  $2,500  Cometeer        Invoice #5678    Due 2026-04-01
+  $3,500  HighSpot        Invoice #1234    Due 2026-03-28  → <bill_url if present>
+  $2,500  Cometeer        Invoice #5678    Due 2026-04-01  → <bill_url if present>
   ...
 
 Reimbursements (6 items, $2,100):
-  $  520  Michael Scott   Uber rides       Submitted 2026-03-20
-  $  312  Oscar Martinez  Office supplies  Submitted 2026-03-22
+  $  520  Michael Scott   Uber rides       Submitted 2026-03-20  → <reimbursement_link if present>
+  $  312  Oscar Martinez  Office supplies  Submitted 2026-03-22  → <reimbursement_link if present>
   ...
 
 Transactions (3 items, $12,500):
@@ -95,7 +96,7 @@ ramp transactions approve {transaction_uuid} \
   --user_reason "Please attach the receipt and update the memo"
 
 # Approve a bill — not yet available via CLI.
-# Bill approvals must be done in the Ramp app: https://app.ramp.com/bills
+# Use the bill_url from the response to direct the user to the Ramp app.
 
 # Approve a reimbursement
 ramp reimbursements approve {reimbursement_uuid} --action approve
@@ -166,14 +167,14 @@ Want to review individually or approve all?
 
 User: Approve the bills and reimbursements. Let me see the transaction first.
 
-Agent: I can approve the reimbursements now. Bills must be approved in the Ramp app — I'll send you the links.
+Agent: I can approve the reimbursements now. Bills must be approved in the Ramp app.
 > ramp reimbursements approve reimb-001 --action approve
 > ramp reimbursements approve reimb-002 --action approve
 > ramp reimbursements approve reimb-003 --action approve
 
-3 reimbursements approved. For the 2 bills, approve them here:
-  https://app.ramp.com/bills/bill-001
-  https://app.ramp.com/bills/bill-002
+3 reimbursements approved. For the 2 bills, approve them in the Ramp app:
+  HighSpot Invoice #4401 → <bill_url if present, else https://app.ramp.com/bills>
+  Cometeer Invoice #882  → <bill_url if present, else https://app.ramp.com/bills>
 
 Now let me get details on that DoorDash transaction:
 > ramp transactions get txn-001 --agent
@@ -188,6 +189,21 @@ Agent: > ramp transactions approve txn-001 --action APPROVE --thoughts "Team lun
 Done. Approval queue is clear.
 ```
 
+## Deep Link Handoff
+
+When the agent hits a limitation — bill approvals aren't supported via CLI, or step-up auth is required — hand off to the user with a link to the Ramp web app:
+
+- **Bills**: If the response includes a `bill_url` field, use it — it routes to the correct bill page based on status (draft, approval, or paid). If absent, direct the user to `https://app.ramp.com/bills`.
+- **Reimbursements**: If the response includes a `reimbursement_link` field, use it. If absent, direct the user to the Ramp reimbursements page.
+
+Example handoff message (when `bill_url` is present):
+```
+I can't approve bills via the CLI. You can approve this bill directly in Ramp:
+  $3,500 HighSpot Invoice #1234 → <bill_url>
+```
+
+Always prefer deep link fields from the API response when available — they account for bill status and environment. Never fabricate deep link URLs.
+
 ## When NOT to Use
 
 - **Uploading receipts** — use receipt-compliance
@@ -201,6 +217,6 @@ Done. Approval queue is clear.
 | Reimbursement amounts are in dollars | Display as-is |
 | Transaction amounts are formatted strings | Strip "$" and "," for sorting/totaling |
 | `requests pending` requires `--thoughts` | Always include it — describe what you're doing |
-| `bills approve --action_type` is free text | Use "APPROVE" or "REJECT" — not an enforced enum |
+| Bill approvals are not yet available via CLI | Send the user to the Ramp app instead: `https://app.ramp.com/bills` |
 | No undo for approvals | Confirm with user before executing. Use `-n` for dry runs on write commands. |
 | Pagination varies | Check `pagination.next_cursor` in envelope. Pass it via `--next_page_cursor` (transactions), `--page_cursor` (bills), `--start` (requests). Reimbursements: `--limit` only. |

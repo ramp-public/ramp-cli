@@ -57,51 +57,67 @@ class TestFeedbackSuccess:
         assert "Ramp CLI v" in params["feedback"]
         assert "agent=false" in params["feedback"]
         assert "The transactions endpoint returns stale data" in params["feedback"]
+        # No identifying params when unauthenticated
+        assert "business_id" not in params
+        assert "user_id" not in params
 
     @patch("ramp_cli.commands.feedback.httpx.Client")
     @patch("ramp_cli.commands.feedback.store")
-    def test_authenticated_submit(self, mock_store, mock_client_cls, isolated_config):
+    def test_authenticated_submit_with_token_info(
+        self, mock_store, mock_client_cls, isolated_config
+    ):
+        """Token info endpoint returns both business_id and user_id."""
         mock_store.has_tokens.return_value = True
         mock_store.get_tokens.return_value = ("fake-access-token", "fake-refresh-token")
 
-        # The enrichment call returns business info, the submit call succeeds
-        biz_resp = MagicMock()
-        biz_resp.content = json.dumps(
+        # GET /developer/v1/token/info returns both IDs
+        token_info_resp = MagicMock()
+        token_info_resp.content = json.dumps(
             {
-                "id": "biz-uuid-123",
-                "business_name_on_card": "Acme Corp",
+                "user_id": "user-uuid-456",
+                "business_id": "biz-uuid-123",
+                "client_id": "ramp_id_test",
+                "auth_level": "user",
+                "scopes": ["transactions:read"],
             }
         ).encode()
-        biz_resp.raise_for_status = MagicMock()
+        token_info_resp.raise_for_status = MagicMock()
 
         submit_resp = MagicMock()
         submit_resp.raise_for_status = MagicMock()
 
-        mock_http = MagicMock()
-        mock_http.__enter__ = MagicMock(return_value=mock_http)
-        mock_http.__exit__ = MagicMock(return_value=False)
-        # First Client() call is for enrichment (3s timeout), second is for submit (15s timeout)
-        mock_http.get.side_effect = [biz_resp, submit_resp]
-        mock_client_cls.return_value = mock_http
+        # First Client(timeout=3.0) for token/info, second Client(timeout=15.0) for submit
+        token_http = MagicMock()
+        token_http.__enter__ = MagicMock(return_value=token_http)
+        token_http.__exit__ = MagicMock(return_value=False)
+        token_http.get.return_value = token_info_resp
+
+        submit_http = MagicMock()
+        submit_http.__enter__ = MagicMock(return_value=submit_http)
+        submit_http.__exit__ = MagicMock(return_value=False)
+        submit_http.get.return_value = submit_resp
+
+        mock_client_cls.side_effect = [token_http, submit_http]
 
         result = _invoke(["feedback", "Great API documentation"])
         assert result.exit_code == 0
 
-        # The submit call is the second .get() call
-        submit_call_args = mock_http.get.call_args_list[1]
-        params = submit_call_args[1]["params"]
-        assert "Acme Corp" not in params["feedback"]
+        # The submit call should include structured business_id and user_id params
+        params = submit_http.get.call_args[1]["params"]
+        assert params["business_id"] == "biz-uuid-123"
+        assert params["user_id"] == "user-uuid-456"
         assert "biz=biz-uuid-123" in params["feedback"]
 
     @patch("ramp_cli.commands.feedback.httpx.Client")
     @patch("ramp_cli.commands.feedback.store")
-    def test_business_fetch_failure_graceful(
+    def test_token_info_failure_graceful(
         self, mock_store, mock_client_cls, isolated_config
     ):
+        """Token info call failure doesn't abort feedback."""
         mock_store.has_tokens.return_value = True
         mock_store.get_tokens.return_value = ("fake-access-token", "fake-refresh-token")
 
-        # Enrichment call fails, submit call succeeds
+        # Token info call fails
         enrich_http = MagicMock()
         enrich_http.__enter__ = MagicMock(return_value=enrich_http)
         enrich_http.__exit__ = MagicMock(return_value=False)
@@ -114,16 +130,40 @@ class TestFeedbackSuccess:
         submit_http.__exit__ = MagicMock(return_value=False)
         submit_http.get.return_value = submit_resp
 
-        # First Client() for enrichment, second for submit
         mock_client_cls.side_effect = [enrich_http, submit_http]
 
         result = _invoke(["feedback", "Feedback without business info"])
         assert result.exit_code == 0
         assert "Feedback submitted" in result.output
 
-        # Should still submit, just without business info
+        # Should still submit, just without identifying params
         params = submit_http.get.call_args[1]["params"]
-        assert "Business:" not in params["feedback"]
+        assert "business_id" not in params
+        assert "user_id" not in params
+
+    @patch("ramp_cli.commands.feedback.httpx.Client")
+    @patch("ramp_cli.commands.feedback.store")
+    def test_token_store_error_graceful(
+        self, mock_store, mock_client_cls, isolated_config
+    ):
+        """Token-store read errors (e.g. malformed config) don't abort feedback."""
+        mock_store.has_tokens.side_effect = Exception("tomllib parse error")
+
+        submit_resp = MagicMock()
+        submit_resp.raise_for_status = MagicMock()
+        submit_http = MagicMock()
+        submit_http.__enter__ = MagicMock(return_value=submit_http)
+        submit_http.__exit__ = MagicMock(return_value=False)
+        submit_http.get.return_value = submit_resp
+        mock_client_cls.return_value = submit_http
+
+        result = _invoke(["feedback", "Feedback with broken config"])
+        assert result.exit_code == 0
+        assert "Feedback submitted" in result.output
+
+        params = submit_http.get.call_args[1]["params"]
+        assert "business_id" not in params
+        assert "user_id" not in params
 
 
 class TestFeedbackAgentMode:

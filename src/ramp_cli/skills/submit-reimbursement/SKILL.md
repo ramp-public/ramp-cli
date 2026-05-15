@@ -137,26 +137,31 @@ ramp reimbursements submit {reimbursement_uuid}
 
 ## Duplicating a Previous Reimbursement
 
-For recurring expenses (e.g., monthly gym membership):
+`ramp reimbursements duplicate` exists, but it is not a complete CLI path for a new receipt-backed reimbursement.
+The duplicate keeps the prior coding context, but it does **not** copy the receipt, and the CLI cannot attach a new receipt to that duplicated draft afterward.
+
+If the user needs to submit a new reimbursement with a new receipt, the executable CLI path is:
 
 ```bash
-# Find a previous reimbursement to copy
+# Find a previous reimbursement to reference
 ramp reimbursements list --reimbursements_to_retrieve my_reimbursements --page_size 10
 
-# Duplicate it (creates a new draft with same merchant, memo, fund, categories)
+# Duplicate exists, but the draft will still be missing a receipt
 ramp reimbursements duplicate {previous_reimbursement_uuid}
 
-# The duplicate does NOT copy the receipt — upload a new one
+# Upload the new receipt
 ramp receipts upload --content_type "image/jpeg" --filename "gym-apr.jpg" \
   --file_content_base64 "{base64}"
 
-# Attach receipt via edit (receipts attach is for card transactions only)
-# Note: if the duplicate is missing a receipt, create a fresh reimbursement
-# from the receipt instead of duplicating
+# Create a fresh reimbursement from that receipt
+ramp reimbursements create {receipt_uuid}
 
-# Edit amount/date if needed, then submit
-ramp reimbursements submit {new_reimbursement_uuid}
+# Re-apply memo, fund, and tracking categories, then submit
+ramp reimbursements edit {reimbursement_uuid} --memo "Monthly gym membership"
+ramp reimbursements submit {reimbursement_uuid}
 ```
+
+Do not imply that a new receipt can be attached to the duplicated reimbursement via CLI. `receipts attach` is for card transactions only, and `submit` can fail with "receipt must be specified" if the duplicate has no receipt.
 
 ## Example Session
 

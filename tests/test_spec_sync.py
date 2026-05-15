@@ -127,6 +127,29 @@ class TestFetchSpec:
         # Only one get() call (spec), not two
         assert _mock_httpx.get.call_count == 1
 
+    @pytest.mark.parametrize(
+        "_mock_httpx",
+        [
+            [
+                _mock_response(json_body=FAKE_SPEC),
+                _mock_response(json_body={"content_hash": "abc123"}),
+            ]
+        ],
+        indirect=True,
+    )
+    def test_sends_extra_auth_headers(self, _mock_httpx, sync_paths, monkeypatch):
+        monkeypatch.setattr(
+            "ramp_cli.specs.sync.extra_auth_headers",
+            lambda env: {"X-Rampy-Auth": f"{env}-token"},
+        )
+
+        fetch_spec("production")
+
+        assert [call.kwargs["headers"] for call in _mock_httpx.get.call_args_list] == [
+            {"X-Rampy-Auth": "production-token"},
+            {"X-Rampy-Auth": "production-token"},
+        ]
+
 
 class TestMaybeSync:
     @pytest.mark.parametrize(
@@ -141,6 +164,27 @@ class TestMaybeSync:
         maybe_sync("production")
         mock_fetch.assert_called_once_with("production", known_hash="newhash")
 
+    @pytest.mark.parametrize(
+        "_mock_httpx",
+        [[_mock_response(json_body={"content_hash": "newhash"})]],
+        indirect=True,
+    )
+    @patch("ramp_cli.specs.sync.fetch_spec")
+    def test_hash_check_sends_extra_auth_headers(
+        self, mock_fetch, _mock_httpx, sync_paths, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "ramp_cli.specs.sync.extra_auth_headers",
+            lambda env: {"X-Rampy-Auth": f"{env}-token"},
+        )
+
+        maybe_sync("production")
+
+        mock_fetch.assert_called_once_with("production", known_hash="newhash")
+        assert _mock_httpx.get.call_args.kwargs["headers"] == {
+            "X-Rampy-Auth": "production-token"
+        }
+
     def test_fresh_hash_file_skips_network(self, sync_paths):
         hash_file = sync_paths / "hash-production.txt"
         hash_file.write_text("somehash")
@@ -148,6 +192,20 @@ class TestMaybeSync:
         with patch("ramp_cli.specs.sync.httpx.Client") as mock_cls:
             maybe_sync("production")
             mock_cls.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "_mock_httpx",
+        [[_mock_response(json_body={"content_hash": "newhash"})]],
+        indirect=True,
+    )
+    @patch("ramp_cli.specs.sync.fetch_spec")
+    def test_force_bypasses_fresh_hash_file(self, mock_fetch, _mock_httpx, sync_paths):
+        hash_file = sync_paths / "hash-production.txt"
+        hash_file.write_text("oldhash")
+
+        maybe_sync("production", force=True)
+
+        mock_fetch.assert_called_once_with("production", known_hash="newhash")
 
     @pytest.mark.parametrize(
         "_mock_httpx",

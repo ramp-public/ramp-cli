@@ -11,7 +11,13 @@ from pathlib import Path
 
 import tomli_w
 
-from .constants import ENV_PRODUCTION, ENV_SANDBOX
+from .constants import (
+    ENV_PRODUCTION,
+    ENV_SANDBOX,
+    default_environment,
+    environment_names,
+    normalize_env,
+)
 
 
 @dataclass
@@ -23,6 +29,9 @@ class EnvConfig:
     refresh_token_issued_at: int = 0
     refresh_token_expires_in: int = 0
     granted_scopes: str = ""
+    # Bound agent key (UUID) when the agent-key flow is enabled.
+    # Surfaced in `ramp auth status` so users can see which key is in use.
+    agent_key_uuid: str = ""
 
 
 @dataclass
@@ -30,8 +39,11 @@ class Config:
     environment: str = ""
     format: str = ""
     scopes: str = ""
+    first_login_at: int = 0
+    tools_used: str = ""  # space-separated category names
     sandbox: EnvConfig = field(default_factory=EnvConfig)
     production: EnvConfig = field(default_factory=EnvConfig)
+    extra_envs: dict[str, EnvConfig] = field(default_factory=dict)
 
 
 def config_dir() -> Path:
@@ -57,7 +69,9 @@ def load() -> Config:
     cfg.environment = raw.get("environment", "")
     cfg.format = raw.get("format", "")
     cfg.scopes = raw.get("scopes", "")
-    for env_name in ("sandbox", "production"):
+    cfg.first_login_at = raw.get("first_login_at", 0)
+    cfg.tools_used = raw.get("tools_used", "")
+    for env_name in _env_section_names():
         section = raw.get(env_name, {})
         ec = EnvConfig(
             access_token=section.get("access_token", ""),
@@ -67,8 +81,9 @@ def load() -> Config:
             refresh_token_issued_at=section.get("refresh_token_issued_at", 0),
             refresh_token_expires_in=section.get("refresh_token_expires_in", 0),
             granted_scopes=section.get("granted_scopes", ""),
+            agent_key_uuid=section.get("agent_key_uuid", ""),
         )
-        setattr(cfg, env_name, ec)
+        set_env_config(cfg, env_name, ec)
 
     # Warn on loose permissions
     try:
@@ -96,8 +111,12 @@ def save(cfg: Config) -> None:
         raw["format"] = cfg.format
     if cfg.scopes:
         raw["scopes"] = cfg.scopes
-    for env_name in ("sandbox", "production"):
-        ec: EnvConfig = getattr(cfg, env_name)
+    if cfg.first_login_at:
+        raw["first_login_at"] = cfg.first_login_at
+    if cfg.tools_used:
+        raw["tools_used"] = cfg.tools_used
+    for env_name in _env_section_names():
+        ec = get_env_config(cfg, env_name)
         section: dict = {}
         if ec.access_token:
             section["access_token"] = ec.access_token
@@ -113,6 +132,8 @@ def save(cfg: Config) -> None:
             section["refresh_token_expires_in"] = ec.refresh_token_expires_in
         if ec.granted_scopes:
             section["granted_scopes"] = ec.granted_scopes
+        if ec.agent_key_uuid:
+            section["agent_key_uuid"] = ec.agent_key_uuid
         if section:
             raw[env_name] = section
 
@@ -134,13 +155,16 @@ def save(cfg: Config) -> None:
 
 def resolve_environment(flag_value: str = "") -> str:
     if flag_value:
-        return _normalize_env(flag_value)
+        return normalize_env(flag_value)
     env_var = os.environ.get("RAMP_ENVIRONMENT", "")
     if env_var:
-        return _normalize_env(env_var)
+        return normalize_env(env_var)
+    env_default = default_environment()
+    if env_default:
+        return normalize_env(env_default)
     cfg = load()
     if cfg.environment:
-        return _normalize_env(cfg.environment)
+        return normalize_env(cfg.environment)
     return ENV_PRODUCTION
 
 
@@ -148,8 +172,33 @@ def configured_scopes() -> str:
     return load().scopes
 
 
-def _normalize_env(env: str) -> str:
-    lower = env.strip().lower()
-    if lower in ("sandbox", "demo"):
-        return ENV_SANDBOX
-    return ENV_PRODUCTION
+def _env_section_names() -> tuple[str, ...]:
+    return tuple(sorted(environment_names()))
+
+
+def get_env_config(cfg: Config, env: str) -> EnvConfig:
+    env = normalize_env(env)
+    if env == ENV_SANDBOX:
+        return cfg.sandbox
+    if env == ENV_PRODUCTION:
+        return cfg.production
+    return cfg.extra_envs.get(env, EnvConfig())
+
+
+def ensure_env_config(cfg: Config, env: str) -> EnvConfig:
+    env = normalize_env(env)
+    if env == ENV_SANDBOX:
+        return cfg.sandbox
+    if env == ENV_PRODUCTION:
+        return cfg.production
+    return cfg.extra_envs.setdefault(env, EnvConfig())
+
+
+def set_env_config(cfg: Config, env: str, env_config: EnvConfig) -> None:
+    env = normalize_env(env)
+    if env == ENV_SANDBOX:
+        cfg.sandbox = env_config
+    elif env == ENV_PRODUCTION:
+        cfg.production = env_config
+    else:
+        cfg.extra_envs[env] = env_config

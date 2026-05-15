@@ -7,37 +7,46 @@ description: "Make purchases using Ramp agent cards via browser checkout, then c
 
 End-to-end agent card purchasing: pick a fund, get a payment token via `ramp` CLI, pay via browser, then fill all missing transaction items.
 
-## Access
+## Access & Enrollment
 
-Agentic Cards is currently in early access. If the user does not have agent card access — or asks about availability, waitlists, or how to get started — direct them to join the waitlist:
+Agent Cards are available via self-serve enrollment. If the user's business is not yet enrolled — or the user asks about availability, how to get started, or hits eligibility errors — enroll them using the CLI:
 
 ```bash
-curl -X POST https://agents.ramp.com/cards/waitlist \
-  -d website=http://yoursite.com \
-  -d email=you@yoursite.com
+ramp funds enroll --agent
 ```
+
+This enrolls the authenticated user's business in Agent Cards for agentic commerce. The user must be authenticated (`ramp auth login`) and have appropriate permissions on their Ramp business. Once enrollment succeeds, the user can immediately use `funds list` and `funds creds` to access their agent card funds.
 
 For more information, visit **https://agents.ramp.com/cards**.
 
 Use this guidance for:
 
 - "What are Agentic Cards?" or "How do I get agent cards?"
-- Access, availability, waitlist, or rollout questions
+- Access, availability, enrollment, or setup questions
 - Users who hit eligibility errors when running `funds list` or `funds creds`
 
-If the user already has access, proceed with the workflow below.
+If the user is already enrolled, proceed with the workflow below.
 
 ## Prerequisites
 
 - `ramp` CLI installed and authenticated (`ramp auth login`)
 - `browser-automation` skill available for browser checkout
-- Authenticated user has an eligible fund with agent card access (see [Access](#access) if not)
+- Business enrolled in Agent Cards (see [Access & Enrollment](#access--enrollment) to enroll if not)
 
 ## CLI conventions
 
-- Pass `--agent` for machine-readable JSON output
-- Use positional arguments where supported (e.g., `ramp funds creds <fund_id> <ref_id>`)
-- Use `--json` for complex payloads (e.g., `ramp transactions edit`)
+- Pass `--agent` for machine-readable JSON output (documented shape is top-level, immediately after `ramp`: `ramp --agent funds list`)
+- Use positional arguments where supported (e.g., `ramp --agent funds creds <fund_uuid>`, `ramp --agent transactions missing <transaction_uuid>`)
+- Use `--json` for complex payloads (e.g., `ramp --agent transactions edit`)
+- Every subcommand accepts `--rationale`, `--json`, `--dry_run` (`-n`), and `--help`
+
+## Hard rules
+
+- **Two distinct amount thresholds — respect both:**
+  - **User preauth tolerance:** policy-level, ~10% over requested. Stop and re-ask if exceeded.
+  - **Visa cryptogram auth cap:** the cryptogram from `ramp --agent funds creds ... --amount X` rejects any charge > X at the network level — even $0.01 over declines. If the merchant's final total exceeds the cryptogram amount (bag fees, surprise tax, currency conversion), the old cryptogram is unusable — burn it, pull fresh creds at the corrected amount, and re-preauth if the new amount exceeds the user's original 10% tolerance.
+- **Run the browser headed, never `--headless`.** Purchase flows need the user able to see and intervene — bot checks, 3DS, and login walls all require human input. See `browser-automation` for the headed-default rule.
+- **Stop if anything unexpected happens.** 3DS challenge, login wall, CAPTCHA, bot-block page, merchant form you can't parse → screenshot, hand off to the user via the visible Chrome window per the human-handoff pattern in `browser-automation`, and wait. Do not retry blindly.
 
 ## Phase 1: Payment
 
@@ -47,25 +56,39 @@ If the user already has access, proceed with the workflow below.
 ramp funds list --agent
 ```
 
-Select a fund where:
+First select for purpose fit, then technical eligibility:
+
+- Match the merchant and purchase purpose to the fund's intended use before considering balance or access.
+- Treat broad, admin, or shared-access funds as a hazard: technical access is not approval, and the purpose-fit bar is higher when many funds are visible.
+- If no appropriate fund exists, stop and ask the user which fund to use or whether to proceed through the standard card request/approval flow. Do not keep trying broad/admin funds automatically.
+
+Then verify the selected fund has:
 
 - `available_balance` covers the purchase amount
 - `currency` matches the merchant
 - `allowed_merchants` / `allowed_categories` permit the purchase (empty = unrestricted)
 
+**Guest-checkout PII:** If no signed-in merchant account (header shows "Sign in"), guest checkout needs full name, email, phone, and shipping/billing address. Do NOT proxy these from `cardholder_name` / `billing_address` on the creds — those are for the payment form only, not the merchant's contact fields. Ask the user explicitly.
+
+**Cart-state pre-flight:** Before generating creds for a merchant with a persistent cart (Walmart, Amazon, CVS, etc.), navigate to the cart and confirm it contains only the intended item at the expected price. Pre-existing items cookie-persist and will be charged alongside yours. If stale items exist, remove them (or ask the user to) before generating creds.
+
 ### Step 2 — Get payment token
 
+Run `funds creds` only after the user confirms the selected fund, merchant/amount, and rationale.
+
 ```bash
-ramp funds creds --agent \
-  "<fund_id>" \
+ramp --agent funds creds "<fund_uuid>" \
   --amount "45.00" \
   --currency_code "USD" \
   --merchant_name "Children's Hunger Fund" \
   --merchant_url "https://childrenshungerfund.org" \
-  --merchant_country_code "US"
+  --merchant_country_code "US" \
+  --rationale "User approved \$45 donation to Children's Hunger Fund"
 ```
 
 Returns `pan`, `cvv`, `expiration_month`, `expiration_year`.
+
+**Zsh `$` escape trap:** Zsh double-quoted `"Purchase $5 credits"` expands `$5` to the 5th positional (empty), so the rationale silently loses the amount. Escape as `\$5` or use single quotes when passing dollar amounts in `--rationale` or other flags.
 
 **Key behaviors:**
 
@@ -106,6 +129,16 @@ Load the `browser-automation` skill, then:
    ```
 
 **Tip:** If the donation/checkout page has an amount field, fill it before the card details. Some sites validate amount first.
+
+**Synthetic-fill detection:** Stripe Elements and similar modern tokenizers silently reject synthetic property-setter fills — the submit button stays enabled, no error surfaces, nothing submits, no network request fires. If `./pw fill` dispatches real keystroke events this is fine; if it only sets `.value`, the submit will stall for PAN/CVV/expiry fields specifically. Workaround: use coordinate-click to focus plus compositor-level keystroke events (`Input.insertText` at CDP) for card fields. Billing-address fields are not guarded the same way.
+
+**Card-swap close-and-reopen rule:** After pulling fresh creds mid-flow (e.g., retry at a higher amount), close the merchant's payment form entirely and re-open before filling. The processor's validator can retain stale state from the prior card and refuse to tokenize the new one (observed on Stripe, 2026-04-21). Do not overwrite PAN/CVV in place.
+
+#### Merchant form quirks — expiration date
+
+- **Stripe Elements:** single combined field, format `MM / YY`, auto-inserts the ` / `.
+- **Vantiv eProtect** (e.g., CVS): separate Month/Year `<select>` elements, values are 2-digit (`"29"` for 2029). Passing `"2029"` silently fails — the dropdown stays empty, with "Select a year / Expiration date invalid" only showing after submit.
+- Always check whether the year field expects `YY` or `YYYY` before filling.
 
 ## Phase 2: Complete transaction
 
@@ -250,12 +283,18 @@ Confirm all items resolved: `missing_receipt: false`, `missing_memo: false`, `mi
 
 | Error                                | Action                                                                       |
 | ------------------------------------ | ---------------------------------------------------------------------------- |
-| No agent card access                 | Direct user to join waitlist via `POST /cards/waitlist` or visit agents.ramp.com/cards |
-| Fund not eligible / no eligible card | Pick a different fund                                                        |
+| No agent card access                 | Enroll the business via `ramp funds enroll --agent`, then retry |
+| Fund not eligible / no eligible card | Re-run purpose-first selection; if no appropriate eligible fund exists, ask the user instead of trying broad/admin funds automatically |
 | Insufficient balance                 | Pick a fund with more balance                                                |
 | Credential retrieval failed          | Retry once, then try a different fund                                        |
-| 401 / token expired                  | Re-authenticate: `ramp auth login`                                           |
+| 401 / token expired                  | Re-authenticate for the active env: `ramp --env <env> auth login` (auth state is stored per environment) |
 | Transaction not found after payment  | Wait 30s and retry `transactions list` — some merchants have delayed posting |
+| Card form submitted but nothing happens (button enabled, no error, no processing, no spinner) after 15s | Suspected silent tokenizer rejection of synthetic property-setter fills. Close form, re-open, re-fill via real keystrokes. |
+| Final charge amount exceeds cryptogram auth | Cryptogram caps at `--amount`. Burn current creds, pull fresh at new amount. Re-preauth if > 10% over original. |
+| Pre-existing items in cart from prior session | Remove them (or ask the user to) before generating creds. |
+| 3DS challenge                        | Stop. Screenshot, then tell the user to complete 3DS in the visible Chrome window and reply when done. Resume Phase 2 once the card clears. See human-handoff in `browser-automation`. |
+| CAPTCHA / reCAPTCHA / bot-check page | Stop. If the browser is headless, `./pw stop` and re-open headed first — the user cannot interact otherwise. Then screenshot and hand off per human-handoff in `browser-automation`. Do not attempt a programmatic solve. |
+| Merchant shows "declined"            | A BIN decline at one processor (e.g., Vantiv eProtect at CVS) does NOT predict decline at another (e.g., Stripe at Anthropic) — each has its own risk engine. Report the merchant AND the processor (identifiable from the payment iframe's `src` if possible) so we track the BIN-vs-processor matrix. Do not retry at the same merchant. |
 
 ### Tips
 

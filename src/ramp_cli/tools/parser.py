@@ -6,6 +6,8 @@ has a Pydantic-derived request body schema that we convert into typed
 ToolParam definitions for CLI flag generation.
 """
 
+from __future__ import annotations
+
 import json
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
@@ -60,6 +62,17 @@ class ToolParam:
 
 
 @dataclass(slots=True)
+class JsonSchema:
+    """Small schema model used to validate raw --json bodies."""
+
+    properties: dict[str, JsonSchema] = field(default_factory=dict)
+    enum_values: list[str] | None = None
+    array_item: JsonSchema | None = None
+    additional_properties_allowed: bool = True
+    nullable: bool = False
+
+
+@dataclass(slots=True)
 class ToolDef:
     """An agent tool parsed from the OpenAPI spec."""
 
@@ -74,6 +87,7 @@ class ToolDef:
     required_scopes: list[str] = field(default_factory=list)
     request_schema_name: str = ""
     response_schema_name: str = ""
+    json_schema: JsonSchema | None = None
 
     @property
     def display_name(self) -> str:
@@ -122,6 +136,11 @@ def parse_spec_dict(spec: dict) -> list[ToolDef]:
 
 def _synthesize_cli_tools(tools: list[ToolDef]) -> list[ToolDef]:
     """Add small CLI-only wrappers for existing tools when UX needs differ."""
+    # If the spec already has a real list-bills endpoint, skip the synthetic
+    # wrapper — it was only needed before core provided its own tool.
+    if any(tool.name == "list-bills" for tool in tools):
+        return []
+
     search_bills = next((tool for tool in tools if tool.name == "search-bills"), None)
     if search_bills is None:
         return []
@@ -155,6 +174,7 @@ def _parse_endpoint(
     path: str, method: str, method_def: dict, schemas: dict
 ) -> ToolDef | None:
     summary = method_def.get("summary", "")
+    tool_name = path.rsplit("/", 1)[-1]
     response_ref = _deep_get(
         method_def, "responses", "200", "content", "application/json", "schema", "$ref"
     )
@@ -177,7 +197,7 @@ def _parse_endpoint(
         schema_name = request_ref.split("/")[-1]
         schema_def = schemas.get(schema_name, {})
         return ToolDef(
-            name=path.split("/")[-1],
+            name=tool_name,
             path=path,
             http_method=method,
             summary=summary,
@@ -188,13 +208,14 @@ def _parse_endpoint(
             required_scopes=_extract_scopes(method_def),
             request_schema_name=schema_name,
             response_schema_name=response_ref.split("/")[-1] if response_ref else "",
+            json_schema=_parse_json_schema(schema_def, schemas),
         )
 
     # GET-style: params from top-level parameters array
     raw_params = method_def.get("parameters")
     if raw_params:
         return ToolDef(
-            name=path.split("/")[-1],
+            name=tool_name,
             path=path,
             http_method=method,
             summary=summary,
@@ -205,6 +226,7 @@ def _parse_endpoint(
             required_scopes=_extract_scopes(method_def),
             request_schema_name="",
             response_schema_name=response_ref.split("/")[-1] if response_ref else "",
+            json_schema=_parse_query_json_schema(raw_params, schemas),
         )
 
     return None
@@ -258,6 +280,68 @@ def _parse_query_params(parameters: list[dict], schemas: dict) -> list[ToolParam
         param.required = p.get("required", False)
         params.append(param)
     return sorted(params, key=lambda tp: (not tp.required, tp.name))
+
+
+def _parse_query_json_schema(parameters: list[dict], schemas: dict) -> JsonSchema:
+    """Build an object schema for GET tools backed by query parameters."""
+    properties: dict[str, JsonSchema] = {}
+    for p in parameters:
+        if p.get("in") != "query":
+            continue
+        properties[p["name"]] = _parse_json_schema(p.get("schema", {}), schemas)
+    return JsonSchema(properties=properties)
+
+
+def _parse_json_schema(
+    schema: dict, schemas: dict, seen_refs: frozenset[str] = frozenset()
+) -> JsonSchema:
+    """Extract object property and enum metadata from an OpenAPI schema."""
+    result = JsonSchema(nullable=schema.get("nullable") is True)
+
+    if not isinstance(schema, dict):
+        return JsonSchema()
+
+    if "$ref" in schema:
+        ref_name = schema["$ref"].split("/")[-1]
+        if ref_name in seen_refs:
+            return result
+        ref_schema = _parse_json_schema(
+            schemas.get(ref_name, {}), schemas, seen_refs | frozenset({ref_name})
+        )
+        ref_schema.nullable = ref_schema.nullable or result.nullable
+        return ref_schema
+
+    for sub_schema in schema.get("allOf", []):
+        _merge_json_schema(result, _parse_json_schema(sub_schema, schemas, seen_refs))
+
+    if "enum" in schema:
+        result.enum_values = schema["enum"]
+
+    result.additional_properties_allowed = (
+        result.additional_properties_allowed
+        and schema.get("additionalProperties") is not False
+    )
+
+    if schema.get("type") == "array":
+        result.array_item = _parse_json_schema(schema.get("items", {}), schemas)
+
+    for name, prop in schema.get("properties", {}).items():
+        result.properties[name] = _parse_json_schema(prop, schemas, seen_refs)
+
+    return result
+
+
+def _merge_json_schema(target: JsonSchema, source: JsonSchema) -> None:
+    """Merge allOf fragments into a single shallow validation schema."""
+    target.properties.update(source.properties)
+    target.additional_properties_allowed = (
+        target.additional_properties_allowed and source.additional_properties_allowed
+    )
+    if target.enum_values is None:
+        target.enum_values = source.enum_values
+    if target.array_item is None:
+        target.array_item = source.array_item
+    target.nullable = target.nullable or source.nullable
 
 
 def _classify_property(name: str, prop: dict, schemas: dict) -> ToolParam:

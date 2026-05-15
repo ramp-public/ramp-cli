@@ -28,11 +28,6 @@ _ERROR_CODE_HINTS: dict[str, str] = {
     "DEVELOPER_7028": (
         "Your access token has expired.\n  Run `ramp auth login` to re-authenticate."
     ),
-    # Fund not eligible for agent card payments.
-    "DEVELOPER_7078": (
-        "Run `ramp funds list` to see which funds support agent card payments.\n"
-        "  If the list is empty, virtual cards may not be enabled on your funds."
-    ),
     # Insufficient OAuth scope.
     "DEVELOPER_7100": (
         "Your token is missing the OAuth scope required by this endpoint.\n"
@@ -111,6 +106,11 @@ class AuthRequiredError(RampCLIError):
             code=EXIT_AUTH_REQUIRED,
         )
         self.env = env
+
+
+class EnvironmentAuthRequiredError(RampCLIError):
+    def __init__(self, message: str) -> None:
+        super().__init__(message, code=EXIT_AUTH_REQUIRED)
 
 
 class RefreshFailedError(RampCLIError):

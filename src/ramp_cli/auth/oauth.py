@@ -5,23 +5,28 @@ from __future__ import annotations
 import base64
 import hashlib
 import html as html_mod
+import json
 import secrets
 import socket
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlparse
 
 import click
 import httpx
 
 from ramp_cli.auth.constants import INVALID_GRANT
+from ramp_cli.auth.environment import extra_auth_headers
 from ramp_cli.config.constants import (
     DEVAPI_SCOPES,
     PREFERRED_CALLBACK_PORT,
+    append_query_params,
+    auth_setup_url,
     auth_url,
     client_id,
     token_url,
@@ -39,6 +44,9 @@ class TokenResponse:
     expires_in: int = 0
     refresh_token_expires_in: int = 0
     scope: str = ""
+    # Populated from the JWT `ak` claim when the server is running the
+    # agent-key flow. Empty for opaque tokens or non-agent-key sessions.
+    agent_key_uuid: str = ""
 
 
 @dataclass
@@ -160,6 +168,7 @@ def login(env: str, opts: LoginOptions | None = None) -> TokenResponse:
 
     scopes = _resolve_scopes(env)
     auth = _build_auth_url(env, redirect_uri, state, challenge, scopes)
+    setup_auth = auth_setup_url(env)
 
     # Channel for the authorization code
     result: dict[str, Any] = {}
@@ -248,11 +257,25 @@ def login(env: str, opts: LoginOptions | None = None) -> TokenResponse:
 
     try:
         if opts.no_browser:
+            if setup_auth:
+                click.echo(
+                    "Open this URL first to set the QA dev-deploy override:"
+                    f"\n\n  {setup_auth}\n",
+                    err=True,
+                )
             click.echo(
                 f"Open this URL in your browser to authenticate:\n\n  {auth}\n",
                 err=True,
             )
         else:
+            if setup_auth:
+                if not _open_browser(setup_auth):
+                    click.echo(
+                        "Could not open browser to set the QA dev-deploy override. "
+                        f"Open this URL manually first:\n\n  {setup_auth}\n",
+                        err=True,
+                    )
+                time.sleep(1)
             if not _open_browser(auth):
                 click.echo(
                     f"Could not open browser. Open this URL manually:\n\n  {auth}\n",
@@ -261,12 +284,12 @@ def login(env: str, opts: LoginOptions | None = None) -> TokenResponse:
 
         click.echo("Waiting for authentication in browser...", err=True)
         if not event.wait(timeout=300):
-            raise RuntimeError("Authentication timed out after 5 minutes")
+            raise click.ClickException("Authentication timed out after 5 minutes")
     finally:
         server.shutdown()
 
     if "error" in result:
-        raise RuntimeError(result["error"])
+        raise click.ClickException(result["error"])
 
     return _exchange_code(env, result["code"], redirect_uri, verifier)
 
@@ -282,13 +305,15 @@ def refresh_tokens(env: str, refresh_token: str) -> TokenResponse:
     resp = _do_token_request(env, url, data)
     body = _parse_token_response(resp)
     _raise_for_token_error(resp, body, grant_type="refresh_token")
+    access_token = body["access_token"]
     return TokenResponse(
-        access_token=body["access_token"],
+        access_token=access_token,
         refresh_token=body.get("refresh_token", ""),
         token_type=body.get("token_type", ""),
         expires_in=body.get("expires_in", 0),
         refresh_token_expires_in=body.get("refresh_token_expires_in", 0),
         scope=body.get("scope", ""),
+        agent_key_uuid=_extract_agent_key_uuid(access_token),
     )
 
 
@@ -319,11 +344,14 @@ def _build_auth_url(
         "code_challenge": challenge,
         "code_challenge_method": "S256",
     }
-    return auth_url(env) + "?" + urlencode(params)
+    return append_query_params(auth_url(env), params)
 
 
 def _exchange_code(
-    env: str, code: str, redirect_uri: str, verifier: str
+    env: str,
+    code: str,
+    redirect_uri: str,
+    verifier: str,
 ) -> TokenResponse:
     url = token_url(env)
     data = {
@@ -335,23 +363,58 @@ def _exchange_code(
     resp = _do_token_request(env, url, data)
     body = _parse_token_response(resp)
     _raise_for_token_error(resp, body, grant_type="authorization_code")
+    access_token = body["access_token"]
     return TokenResponse(
-        access_token=body["access_token"],
+        access_token=access_token,
         refresh_token=body.get("refresh_token", ""),
         token_type=body.get("token_type", ""),
         expires_in=body.get("expires_in", 0),
         refresh_token_expires_in=body.get("refresh_token_expires_in", 0),
         scope=body.get("scope", ""),
+        agent_key_uuid=_extract_agent_key_uuid(access_token),
     )
+
+
+def _extract_agent_key_uuid(access_token: str) -> str:
+    """Read the `ak` claim from a JWT-formatted access token.
+
+    The server stamps `ak` (and `ak_exp`) into the access-token JWT only
+    for agent-key sessions. For opaque tokens, malformed JWTs, or
+    non-agent-key sessions, the claim is absent and we return "".
+
+    No signature verification: the token came from the trusted token
+    endpoint over TLS, and `ak` is non-secret metadata that the server
+    will re-validate on every API call anyway.
+    """
+    if not access_token:
+        return ""
+    parts = access_token.split(".")
+    if len(parts) != 3:
+        return ""
+    payload_segment = parts[1]
+    padding = "=" * (-len(payload_segment) % 4)
+    try:
+        payload_bytes = base64.urlsafe_b64decode(payload_segment + padding)
+        payload = json.loads(payload_bytes)
+    except (ValueError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    ak = payload.get("ak")
+    return ak if isinstance(ak, str) else ""
 
 
 def _do_token_request(env: str, url: str, data: dict[str, str]) -> Any:
     # Public client: client_id in form body, PKCE for security
     data["client_id"] = client_id(env)
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        **extra_auth_headers(env),
+    }
     return httpx.post(
         url,
         data=data,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        headers=headers,
     )
 
 
@@ -405,6 +468,9 @@ def _classify_token_error(status_code: int, grant_type: str, description: str) -
             "refresh token expired",
             "refresh token revoked",
             "invalid_grant",
+            # Agent-key session lapsed — no refresh path can recover; user must re-auth.
+            "agent-key-authorized session has expired",
+            "session has expired",
         )
         if any(marker in lower for marker in refresh_invalid_markers):
             return INVALID_GRANT

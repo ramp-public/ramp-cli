@@ -9,8 +9,41 @@ import httpx
 
 from ramp_cli import __version__ as VERSION
 from ramp_cli.auth import store
-from ramp_cli.config.constants import PRODUCTION_BASE_URL, base_url
+from ramp_cli.auth.environment import extra_auth_headers
+from ramp_cli.config.constants import PRODUCTION_BASE_URL, api_url
 from ramp_cli.output.formatter import print_agent_json
+
+
+def _fetch_user_context(env: str) -> tuple[str, str]:
+    """Return (business_id, user_id) if authenticated, else ("", "").
+
+    Calls ``GET /developer/v1/token/info`` which returns both
+    ``business_id`` and ``user_id`` for the current token.  This endpoint
+    requires any valid Bearer token (no specific OAuth scope) and is the
+    same one the MCP server uses for session context.
+    """
+    try:
+        if not store.has_tokens(env):
+            return "", ""
+        access_token, _ = store.get_tokens(env)
+    except Exception:
+        # Malformed or unreadable config — enrichment is best-effort.
+        return "", ""
+
+    try:
+        with httpx.Client(timeout=3.0) as http:
+            resp = http.get(
+                api_url(env, "/developer/v1/token/info"),
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    **extra_auth_headers(env),
+                },
+            )
+            resp.raise_for_status()
+            data = json.loads(resp.content)
+        return data.get("business_id", ""), data.get("user_id", "")
+    except Exception:
+        return "", ""
 
 
 @click.command("feedback", help="Submit feedback about the CLI")
@@ -35,22 +68,10 @@ def feedback_cmd(ctx: click.Context, text: str) -> None:
         f"env={env}",
     ]
 
-    # Try to enrich with business info if authenticated (short timeout — optional context)
-    try:
-        if store.has_tokens(env):
-            access_token, _ = store.get_tokens(env)
-            with httpx.Client(timeout=3.0) as http:
-                resp = http.get(
-                    f"{base_url(env)}/developer/v1/business",
-                    headers={"Authorization": f"Bearer {access_token}"},
-                )
-                resp.raise_for_status()
-                data = json.loads(resp.content)
-            biz_id = data.get("id", "")
-            if biz_id:
-                context_parts.append(f"biz={biz_id}")
-    except Exception:
-        pass
+    # Fetch identifying info when authenticated (short timeout — optional).
+    biz_id, user_id = _fetch_user_context(env)
+    if biz_id:
+        context_parts.append(f"biz={biz_id}")
 
     header = "(" + ", ".join(context_parts) + ")"
     enriched = f"{header} {text}"
@@ -63,11 +84,21 @@ def feedback_cmd(ctx: click.Context, text: str) -> None:
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
+
+    # Build query params — always include feedback and source, optionally
+    # include business_id and user_id as structured params so they appear
+    # as indexed fields in Datadog rather than buried in freetext.
+    params: dict[str, str] = {"feedback": enriched, "source": "RAMP_CLI"}
+    if biz_id:
+        params["business_id"] = biz_id
+    if user_id:
+        params["user_id"] = user_id
+
     try:
         with httpx.Client(timeout=15.0) as http:
             resp = http.get(
                 url,
-                params={"feedback": enriched, "source": "RAMP_CLI"},
+                params=params,
                 headers=headers,
             )
             resp.raise_for_status()

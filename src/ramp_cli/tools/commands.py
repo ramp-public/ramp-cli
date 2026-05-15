@@ -15,7 +15,8 @@ import click
 
 from ramp_cli.auth.store import get_granted_scopes
 from ramp_cli.client.api import RampClient
-from ramp_cli.config.constants import base_url
+from ramp_cli.config.constants import api_url
+from ramp_cli.onboarding import maybe_show_category_tip
 from ramp_cli.output.formatter import (
     extract_headers,
     format_value,
@@ -28,11 +29,21 @@ from ramp_cli.output.formatter import (
 from ramp_cli.output.paginator import ToolPaginator
 from ramp_cli.output.style import show_detail_card, show_table_card
 from ramp_cli.specs.sync import maybe_sync
-from ramp_cli.tools.parser import ParamType, ToolDef, ToolParam
+from ramp_cli.tools.parser import JsonSchema, ParamType, ToolDef, ToolParam
+from ramp_cli.tools.registry import CATEGORY_REMAP, get_tool
 
 _SPINNER_CHARS = "░▒▓█▓▒"
 
 _ID_SUFFIXES = ("_id", "_uuid")
+
+# Common flag aliases for agent/Unix ergonomics.
+# Maps API param names to additional CLI flag declarations.
+# Agents guess ``--limit`` when the spec says ``page_size`` and vice-versa;
+# making both names work removes the need for ``--help`` discovery.
+_PARAM_ALIASES: dict[str, list[str]] = {
+    "page_size": ["--limit"],
+    "limit": ["--page_size"],
+}
 
 
 def is_id_param(param: ToolParam) -> bool:
@@ -74,7 +85,7 @@ def build_tool_command(tool: ToolDef) -> click.Command:
         click.Option(
             ["--json", "json_body"],
             default=None,
-            help="Raw JSON request body (bypasses flag validation)",
+            help="Raw JSON request body (validated against the tool schema)",
         )
     )
     params.append(
@@ -140,6 +151,12 @@ def _build_option(param: ToolParam) -> click.Option:
     if kwarg_name != param.flag:
         decls.append(kwarg_name)
 
+    # Inject common aliases (e.g. --limit for --page_size) so agents and
+    # users familiar with Unix conventions don't need to discover via --help.
+    for alias in _PARAM_ALIASES.get(param.name, []):
+        if alias not in decls:
+            decls.append(alias)
+
     return click.Option(decls, **kwargs)
 
 
@@ -150,12 +167,17 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
     config_format: str = ctx.obj["config_format"]
     json_body_raw: str | None = kwargs.get("json_body")
     dry_run: bool = kwargs.get("dry_run", False)
+    synced_for_json_validation = False
 
     if json_body_raw:
         try:
             body = json.loads(json_body_raw)
         except json.JSONDecodeError as e:
             raise click.BadParameter(f"invalid JSON: {e}", param_hint="'--json'")
+        if not dry_run:
+            tool = _sync_tool_for_json_validation(env, tool)
+            synced_for_json_validation = True
+        body = _validate_json_body(tool, body)
     else:
         body = _build_body(tool, kwargs)
 
@@ -169,13 +191,13 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
                 {
                     "dry_run": True,
                     "method": method_label,
-                    "url": f"{base_url(env)}{tool.path}",
+                    "url": api_url(env, tool.path),
                     "body": body,
                 },
                 pagination=None,
             )
         else:
-            click.echo(f"DRY RUN: {method_label} {base_url(env)}{tool.path}", err=True)
+            click.echo(f"DRY RUN: {method_label} {api_url(env, tool.path)}", err=True)
             print_json(body)
         return
 
@@ -194,9 +216,10 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
                     f"  This will request all the scopes needed for your tools."
                 )
 
-    # Refresh cached spec in the background for the *next* invocation.
-    # The current command is already resolved, so this only updates the cache.
-    maybe_sync(env)
+    # Refresh cached spec in the background for the *next* invocation. Non-dry-run
+    # --json bodies already forced a sync before schema validation above.
+    if not synced_for_json_validation:
+        maybe_sync(env)
 
     resolved = resolve_format(fmt, config_format)
     is_human = resolved != "json" and sys.stdout.isatty() and not is_quiet()
@@ -215,6 +238,15 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
     elapsed = time.monotonic() - t0
     if stop_spinner:
         stop_spinner()
+
+    # Record category usage and show a contextual tip on first invocation.
+    # This must happen before any early-return path (e.g. interactive table)
+    # so usage is always tracked and the tip is always shown.
+    # Use the remapped category so tracking matches invokable CLI groups
+    # (e.g. spec category "cards" → CLI group "funds").
+    if is_human and tool.category:
+        display_cat = CATEGORY_REMAP.get(tool.category, tool.category)
+        maybe_show_category_tip(display_cat)
 
     if resolved == "json":
         print_agent_json(data, pagination=_extract_pagination(data))
@@ -304,6 +336,85 @@ def _build_body(tool: ToolDef, kwargs: dict[str, Any]) -> dict[str, Any]:
         )
 
     return body
+
+
+def _validate_json_body(tool: ToolDef, body: Any) -> dict[str, Any]:
+    """Validate raw --json bodies against the parsed OpenAPI schema."""
+    if not isinstance(body, dict):
+        raise click.BadParameter("JSON body must be an object", param_hint="'--json'")
+
+    if tool.json_schema is not None:
+        _validate_json_object(tool.json_schema, body)
+
+    return body
+
+
+def _sync_tool_for_json_validation(env: str, tool: ToolDef) -> ToolDef:
+    """Refresh the local spec before validating raw --json schema fields."""
+    maybe_sync(env, force=True)
+    return get_tool(tool.name, env) or tool
+
+
+def _validate_json_object(
+    schema: JsonSchema, body: dict[str, Any], path: tuple[str, ...] = ()
+) -> None:
+    if schema.properties and not schema.additional_properties_allowed:
+        allowed = set(schema.properties)
+        for key in body:
+            if key not in allowed:
+                raise click.BadParameter(
+                    _unknown_field_message(path + (key,), schema.properties),
+                    param_hint="'--json'",
+                )
+
+    for key, value in body.items():
+        child_schema = schema.properties.get(key)
+        if child_schema is None:
+            continue
+        _validate_json_value(child_schema, value, path + (key,))
+
+
+def _validate_json_value(schema: JsonSchema, value: Any, path: tuple[str, ...]) -> None:
+    if value is None and schema.nullable:
+        return
+
+    if schema.enum_values:
+        if value not in schema.enum_values:
+            raise click.BadParameter(
+                _invalid_enum_message(path, value, schema.enum_values),
+                param_hint="'--json'",
+            )
+        return
+
+    if schema.properties and isinstance(value, dict):
+        _validate_json_object(schema, value, path)
+        return
+
+    if schema.array_item is not None and isinstance(value, list):
+        item_schema = schema.array_item
+        for index, item in enumerate(value):
+            item_path = (*path[:-1], f"{path[-1]}[{index}]")
+            _validate_json_value(item_schema, item, item_path)
+
+
+def _unknown_field_message(
+    field_path: tuple[str, ...], properties: dict[str, JsonSchema]
+) -> str:
+    field = ".".join(field_path)
+    valid = ", ".join(sorted(properties))
+    parent = ".".join(field_path[:-1])
+    if parent:
+        return f"unknown JSON field '{field}'. Valid fields at '{parent}': {valid}"
+    return f"unknown JSON field '{field}'. Valid fields: {valid}"
+
+
+def _invalid_enum_message(
+    path: tuple[str, ...], value: str, enum_values: list[str]
+) -> str:
+    return (
+        f"invalid enum value '{value}' at '{'.'.join(path)}'. "
+        f"Choose from: {', '.join(enum_values)}"
+    )
 
 
 def _start_spinner(tool_name: str):

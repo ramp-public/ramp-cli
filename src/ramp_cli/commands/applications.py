@@ -11,7 +11,7 @@ import httpx
 import jsonref
 
 from ramp_cli.client.api import RampClient
-from ramp_cli.config.constants import application_signup_token, base_url
+from ramp_cli.config.constants import api_url, application_signup_token
 from ramp_cli.output.formatter import print_agent_json, print_json, resolve_format
 
 _DEVELOPER_API_SPEC_URL = "https://docs.ramp.com/openapi/developer-api.json"
@@ -130,7 +130,7 @@ def _render_dry_run(
     env: str, body: dict[str, Any], format_flag: str | None, config_format: str
 ) -> None:
     fmt = resolve_format(format_flag, config_format)
-    url = f"{base_url(env)}{_APPLICATIONS_API_PATH}"
+    url = api_url(env, _APPLICATIONS_API_PATH)
 
     if fmt == "json":
         print_agent_json(

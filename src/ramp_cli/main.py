@@ -16,9 +16,11 @@ from ramp_cli.commands.auth import auth_group
 from ramp_cli.commands.config import config_group
 from ramp_cli.commands.env import env_cmd
 from ramp_cli.commands.feedback import feedback_cmd
+from ramp_cli.commands.getting_started import getting_started_cmd
 from ramp_cli.commands.skills import skills_group
 from ramp_cli.commands.tools import tools_group
 from ramp_cli.commands.update import update_cmd
+from ramp_cli.config.constants import environment_help, normalize_env
 from ramp_cli.config.settings import load, resolve_environment
 from ramp_cli.easter_eggs.flip import card_cmd
 from ramp_cli.easter_eggs.invoice import invoice_cmd
@@ -33,7 +35,7 @@ from ramp_cli.output.help import (
 )
 from ramp_cli.specs.sync import maybe_sync
 from ramp_cli.tools.commands import build_tool_command
-from ramp_cli.tools.registry import get_tool, list_categories
+from ramp_cli.tools.registry import CATEGORY_REMAP, get_tool, list_categories
 from ramp_cli.version_check import check_for_update, emit_update_notice
 
 # ── Enums & data ─────────────────────────────────────────────────────────────
@@ -55,6 +57,7 @@ class Resource(StrEnum):
     RECEIPTS = "receipts"
     REIMBURSEMENTS = "reimbursements"
     REQUESTS = "requests"
+    TASKS = "tasks"
     TRANSACTIONS = "transactions"
     TRAVEL = "travel"
     TREASURY = "treasury"
@@ -75,6 +78,7 @@ _RESOURCE_HELP: dict[str, str] = {
     "receipts": "Upload and attach receipts to transactions and reimbursements",
     "reimbursements": "Submit, review, and manage out-of-pocket expense reimbursements",
     "requests": "Make and review requests for funds and purchases",
+    "tasks": "Review tasks and items requiring your attention",
     "transactions": "Search, review, and manage card transaction data and metadata",
     "travel": "Search and book flights, hotels, and manage trip itineraries",
     "treasury": "Query treasury account balances, transfers, and investment positions",
@@ -82,12 +86,8 @@ _RESOURCE_HELP: dict[str, str] = {
     "vendors": "Upload and manage vendor documents and track bulk upload progress",
 }
 
-CATEGORY_REMAP: dict[str, str] = {
-    "cards": Resource.FUNDS,
-    "agent_cards": Resource.FUNDS,
-}
+_SINGLE_TOOL_RESOURCE_CATEGORIES = frozenset({"tasks"})
 
-VALID_ENVS = frozenset({"sandbox", "production", "prod"})
 VALID_FORMATS = frozenset({m.value for m in OutputMode})
 
 
@@ -208,6 +208,17 @@ class ToolGroup(click.Group):
     def format_usage(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         formatter.write_usage(ctx.command_path, "<tool> [OPTIONS]")
 
+    def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
+        if cmd := super().get_command(ctx, cmd_name):
+            return cmd
+
+        if tool := getattr(self, "_legacy_tools", {}).get(cmd_name):
+            cmd = build_tool_command(tool)
+            cmd.hidden = True
+            return cmd
+
+        return None
+
     def format_commands(
         self, ctx: click.Context, formatter: click.HelpFormatter
     ) -> None:
@@ -231,8 +242,44 @@ class ToolGroup(click.Group):
             if not ctx.invoked_subcommand:
                 click.echo(ctx.get_help())
 
+        # Resolve alias collisions caused by category remapping (e.g.
+        # cards→funds merges tools that share an alias like "list" or
+        # "lock").  When a collision is detected the tool whose *original*
+        # spec category matches the CLI group name keeps the short alias;
+        # remapped tools fall back to their full endpoint name.
+        alias_tools: dict[str, list] = {}
         for tool in tools:
-            group.add_command(build_tool_command(tool), tool.alias or tool.name)
+            key = tool.alias or tool.name
+            alias_tools.setdefault(key, []).append(tool)
+
+        visible_names: set[str] = set()
+        legacy_candidates = {}
+        for tool in tools:
+            preferred = tool.alias or tool.name
+            peers = alias_tools.get(preferred, [])
+            if len(peers) > 1:
+                # Collision — let the "native" tool (whose original spec
+                # category matches the CLI group name) keep the alias.
+                is_native = tool.category == name
+                other_native = any(p.category == name for p in peers if p is not tool)
+                # Use alias only if this tool is native and no other
+                # collider is also native (tie-break: all fall back).
+                if is_native and not other_native:
+                    cmd_name = preferred
+                else:
+                    cmd_name = tool.name
+            else:
+                cmd_name = preferred
+            group.add_command(build_tool_command(tool), cmd_name)
+            visible_names.add(cmd_name)
+            if tool.alias and cmd_name != tool.name:
+                legacy_candidates[tool.name] = tool
+
+        group._legacy_tools = {  # type: ignore[attr-defined]
+            tool_name: tool
+            for tool_name, tool in legacy_candidates.items()
+            if tool_name not in visible_names
+        }
         return group
 
 
@@ -310,7 +357,10 @@ class RampGroup(click.Group):
 
     def _resolve_env(self, ctx: click.Context | None) -> str:
         flag_env = (ctx.params.get("flag_env") or "") if ctx else ""
-        return resolve_environment(flag_env)
+        try:
+            return resolve_environment(flag_env)
+        except ValueError:
+            return "production"
 
     def _split_categories(self, ctx: click.Context) -> tuple[dict[str, list], list]:
         env = self._resolve_env(ctx)
@@ -326,7 +376,7 @@ class RampGroup(click.Group):
         multi: dict[str, list] = {}
         singletons: list = []
         for cat, tools in merged.items():
-            if len(tools) > 1:
+            if len(tools) > 1 or cat in _SINGLE_TOOL_RESOURCE_CATEGORIES:
                 multi[cat] = tools
             else:
                 singletons.extend(tools)
@@ -346,7 +396,11 @@ class RampGroup(click.Group):
 )
 @click.version_option(VERSION, prog_name="ramp-cli")
 @click.option(
-    "--env", "-e", "flag_env", default=None, help="Environment: sandbox or production"
+    "--env",
+    "-e",
+    "flag_env",
+    default=None,
+    help=f"Environment: {environment_help()}",
 )
 @click.option(
     "--output", "-o", "flag_output", default=None, help="Output format: json or table"
@@ -391,19 +445,22 @@ def cli(
     Authenticate:  ramp auth login
     Browse:        ramp transactions --help
     Use a tool:    ramp funds list --funds_to_retrieve MY_FUNDS
-    Environment:   ramp env [sandbox|production]
+    Environment:   ramp env [environment]
     """
     _validate_flags(flag_env, flag_output, flag_agent, flag_human)
 
-    cli_ctx = CLIContext.from_params(
-        flag_env=flag_env,
-        flag_output=flag_output,
-        quiet=quiet,
-        no_input=no_input,
-        wide=wide,
-        flag_agent=flag_agent,
-        flag_human=flag_human,
-    )
+    try:
+        cli_ctx = CLIContext.from_params(
+            flag_env=flag_env,
+            flag_output=flag_output,
+            quiet=quiet,
+            no_input=no_input,
+            wide=wide,
+            flag_agent=flag_agent,
+            flag_human=flag_human,
+        )
+    except ValueError as e:
+        raise click.BadParameter(str(e), param_hint="'--env'") from e
     ctx.ensure_object(dict)
     ctx.obj.update(cli_ctx.to_dict())
     set_quiet(quiet)
@@ -423,11 +480,14 @@ def _validate_flags(
     if flag_human and flag_output and flag_output.lower() == OutputMode.JSON:
         click.echo("Warning: --human overrides -o json; outputting table", err=True)
 
-    if flag_env is not None and flag_env not in VALID_ENVS:
-        raise click.BadParameter(
-            f"invalid environment '{flag_env}'. Choose from: {', '.join(sorted(VALID_ENVS))}",
-            param_hint="'-e'",
-        )
+    if flag_env is not None:
+        try:
+            normalize_env(flag_env)
+        except ValueError:
+            raise click.BadParameter(
+                f"invalid environment '{flag_env}'. Choose from: {environment_help()}",
+                param_hint="'-e'",
+            ) from None
     if flag_output is not None and flag_output.lower() not in VALID_FORMATS:
         raise click.BadParameter(
             f"unsupported format '{flag_output}'. Choose from: json, table",
@@ -444,6 +504,7 @@ for _cmd in (
     config_group,
     env_cmd,
     feedback_cmd,
+    getting_started_cmd,
     invoice_cmd,
     nyc_cmd,
     rampy_cmd,

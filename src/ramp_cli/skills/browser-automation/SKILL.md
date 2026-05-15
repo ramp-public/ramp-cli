@@ -63,16 +63,24 @@ cd ~/.pw-agent && ./pw open https://example.com
 ./pw stop            # Close browser
 ```
 
-### Headless mode
+### Headed by default — do not pass `--headless`
 
-On macOS, always ask the user before using `--headless` — users typically want to watch the browser.
+The default mode is headed and you should keep it that way. Headed mode lets the user see the browser, intervene on bot checks, and watch the agent — all of which matter most when money is moving.
+
+**Never pass `--headless` for:**
+
+- Agent-card purchases or any payment flow
+- Logged-in workflows where a session may need to be re-authenticated
+- Any task where the user is at the keyboard and would benefit from seeing the browser
+
+`--headless` is only appropriate for unattended scraping or background inspection where no human is watching, and even then ask the user first.
 
 ```bash
-./pw --headless open https://example.com   # Launch headless
+./pw --headless open https://example.com   # Launch headless (only when explicitly approved)
 ./pw snapshot                               # Already running — no flag needed
 ```
 
-Pass `--headless` only on the command that launches the browser (`open` for session 0, `start` for numbered sessions). Once launched, the session retains its mode.
+Pass `--headless` only on the command that launches the browser (`open` for session 0, `start` for numbered sessions). Once launched, the session retains its mode for its lifetime — switching requires `./pw stop` and re-opening.
 
 ### Multi-session support
 
@@ -234,6 +242,21 @@ When a site requires login:
 2. If you need credentials, ask the user — never guess passwords
 3. For sites with saved sessions, the persistent profile may already be authenticated
 4. After logging in, the session persists in the profile for future use
+
+## Bot checks, CAPTCHAs, and human handoff
+
+When you hit a CAPTCHA, reCAPTCHA, 3DS challenge, login wall, "verify you're human" page, or anything else that requires human input, do not retry programmatically. The agent will not solve these reliably, and on payment flows it should not try. Instead, hand the wheel to the user:
+
+1. **Confirm the browser is headed.** If you launched with `--headless`, the user cannot interact with the page — `./pw stop` and re-open without the flag before continuing.
+2. **Screenshot the current state** so the user knows what they are looking at:
+   ```bash
+   ./pw screenshot
+   ```
+3. **Hand off to the user in plain language.** Tell them what is on the screen and what to do in the visible Chrome window. Example: "There's a reCAPTCHA on the Gumroad checkout. Switch to the Chrome window I opened, solve it, and reply when you're past it."
+4. **Wait.** Do not poll the page or re-snapshot. Wait for the user's reply before doing anything else.
+5. **Resume.** Once the user confirms, snapshot again and continue from where you stopped. Element refs may have changed during their interaction — re-grep before clicking.
+
+This pattern works because the persistent profile and headed Chrome mean the user shares the same browser session as the agent. They do not need to restart anything, log in again, or copy URLs — they just interact with the window that's already on their screen.
 
 ## Debugging checkout issues
 

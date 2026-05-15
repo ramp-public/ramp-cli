@@ -74,12 +74,12 @@ class TestGetFunds:
 
     def test_param_count(self, tool_map: dict[str, ToolDef]):
         tool = tool_map["get-funds"]
-        assert len(tool.params) == 10
+        assert len(tool.params) == 11
 
-    def test_no_required_params(self, tool_map: dict[str, ToolDef]):
+    def test_rationale_is_required(self, tool_map: dict[str, ToolDef]):
         tool = tool_map["get-funds"]
         required = [p for p in tool.params if p.required]
-        assert len(required) == 0
+        assert [p.name for p in required] == ["rationale"]
 
     def test_funds_to_retrieve_is_enum(self, tool_map: dict[str, ToolDef]):
         param = _find_param(tool_map["get-funds"], "funds_to_retrieve")
@@ -113,10 +113,9 @@ class TestActivateCard:
     def test_scopes(self, tool_map: dict[str, ToolDef]):
         assert "cards:write" in tool_map["activate-card"].required_scopes
 
-    def test_has_one_required_param(self, tool_map: dict[str, ToolDef]):
+    def test_has_expected_required_params(self, tool_map: dict[str, ToolDef]):
         required = [p for p in tool_map["activate-card"].params if p.required]
-        assert len(required) == 1
-        assert required[0].name == "last_four"
+        assert [p.name for p in required] == ["last_four", "rationale"]
         assert required[0].type is ParamType.STRING
 
 
@@ -167,10 +166,15 @@ class TestListBills:
     def test_scopes(self, tool_map: dict[str, ToolDef]):
         assert "bills:read" in tool_map["list-bills"].required_scopes
 
-    def test_query_defaults_to_empty_string(self, tool_map: dict[str, ToolDef]):
+    def test_query_is_optional(self, tool_map: dict[str, ToolDef]):
         param = _find_param(tool_map["list-bills"], "query")
         assert param is not None
-        assert param.default == ""
+        assert not param.required
+
+
+class TestEnrollBusinessInAgentCards:
+    def test_alias(self, tool_map: dict[str, ToolDef]):
+        assert tool_map["enroll-business-in-agent-cards"].alias == "enroll"
 
 
 # ── Param type classification ──
@@ -274,9 +278,72 @@ class TestAlias:
         assert len(tools) == 1
         assert tools[0].alias == ""
 
+    def test_unified_request_search_alias_comes_from_spec(self, tools: list[ToolDef]):
+        tool = next(t for t in tools if t.name == "search-unified-requests")
+        assert tool.alias == "search"
+
     def test_bundled_spec_tools_have_alias_or_empty(self, tools: list[ToolDef]):
         for tool in tools:
             assert isinstance(tool.alias, str), f"{tool.name}: alias is not a string"
+
+
+class TestJsonSchema:
+    def test_unified_request_search_schema_has_nested_filters(
+        self, tool_map: dict[str, ToolDef]
+    ):
+        schema = tool_map["search-unified-requests"].json_schema
+        assert schema is not None
+        assert set(schema.properties) == {
+            "filters",
+            "limit",
+            "page_cursor",
+            "rationale",
+        }
+
+        filters = schema.properties["filters"]
+        assert "search" in filters.properties
+        assert "request_statuses" in filters.properties
+        assert "unified_spend_request_types" in filters.properties
+
+    def test_unified_request_search_schema_tracks_enum_arrays(
+        self, tool_map: dict[str, ToolDef]
+    ):
+        filters = tool_map["search-unified-requests"].json_schema.properties["filters"]
+
+        request_statuses = filters.properties["request_statuses"]
+        assert request_statuses.array_item is not None
+        assert request_statuses.array_item.enum_values == [
+            "APPROVED",
+            "DRAFT",
+            "PENDING",
+            "REJECTED",
+        ]
+
+        request_types = filters.properties["unified_spend_request_types"]
+        assert request_types.array_item is not None
+        assert "PURCHASE_ORDER" in request_types.array_item.enum_values
+
+    def test_purchase_order_search_schema_preserves_distinct_status_enum(
+        self, tool_map: dict[str, ToolDef]
+    ):
+        filters = tool_map["search-purchase-orders"].json_schema.properties["filters"]
+        statuses = filters.properties["spend_request_statuses"]
+        assert statuses.array_item is not None
+        assert statuses.array_item.enum_values == [
+            "APPROVED",
+            "DRAFT",
+            "REJECTED",
+            "SUBMITTED",
+        ]
+
+    def test_nullable_is_preserved_through_all_of_enum_ref(
+        self, tool_map: dict[str, ToolDef]
+    ):
+        schema = tool_map["get-funds"].json_schema
+        assert schema is not None
+        funds_to_retrieve = schema.properties["funds_to_retrieve"]
+        assert funds_to_retrieve.nullable is True
+        assert funds_to_retrieve.enum_values == ["ALL_FUNDS", "MY_FUNDS"]
 
 
 class TestEdgeCases:

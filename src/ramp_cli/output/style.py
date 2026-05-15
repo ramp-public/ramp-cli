@@ -280,6 +280,31 @@ def _frame_row_ansi(text: str, visible_len: int, width: int) -> str:
 # === Window Shadow + Framing ===
 
 
+def wrap_text(text: str, width: int) -> list[str]:
+    """Greedy whitespace-split word wrap.
+
+    Single canonical wrap helper used across the CLI for any text that needs
+    to fit inside a frame (help descriptions, auth-required message, detail
+    card values). Tokens longer than ``width`` are emitted on their own line
+    rather than being hard-cut, so URLs/UUIDs stay intact.
+    """
+    if not text:
+        return [""]
+    lines: list[str] = []
+    current = ""
+    for word in text.split():
+        candidate = f"{current} {word}" if current else word
+        if len(candidate) <= width:
+            current = candidate
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines or [""]
+
+
 def _window_wrap(lines: list[str], width: int) -> list[str]:
     """Wrap rendered content lines with margin and 1ch offset hard shadow.
 
@@ -862,21 +887,7 @@ def access_denied(command: str, env: str) -> None:
     buf.append(top2 + "\n")
 
     # Word-wrap message to fit inside frame
-    words = msg.split()
-    lines: list[str] = []
-    current = ""
-    for word in words:
-        test = f"{current} {word}".strip()
-        if len(test) <= inner:
-            current = test
-        else:
-            if current:
-                lines.append(current)
-            current = word
-    if current:
-        lines.append(current)
-
-    for line in lines:
+    for line in wrap_text(msg, inner):
         buf.append(_frame_row(line, width) + "\n")
 
     buf.append(bottom2 + "\n")
@@ -1071,8 +1082,12 @@ def show_detail_card(
     if not use_color:
         # Plain key:value output
         click.echo(_frame_top(title, width, use_color=False), file=file)
+        label_w_plain = 25
+        # value column width inside the frame: inner minus label, minus the
+        # single space separator between label and value
+        max_val_w_plain = max(1, inner - label_w_plain - 1)
         for k, v in fields.items():
-            label = f"{k + ':':<25s}"
+            label = f"{k + ':':<{label_w_plain}s}"
             if isinstance(v, dict):
                 click.echo(_frame_row(f"{label} {{...}}", width), file=file)
             elif isinstance(v, list):
@@ -1083,7 +1098,20 @@ def show_detail_card(
                         _frame_row(f"{label} [{len(v)} items]", width), file=file
                     )
             else:
-                click.echo(_frame_row(f"{label} {v}", width), file=file)
+                val_str = str(v) if v is not None else ""
+                val_lines = wrap_text(val_str, max_val_w_plain)
+                # Hard-cap unbroken tokens longer than the value column so
+                # the frame border stays aligned (see colored path).
+                val_lines = [
+                    ln
+                    if len(ln) <= max_val_w_plain
+                    else ln[: max(1, max_val_w_plain - 1)] + "\u2026"
+                    for ln in val_lines
+                ]
+                click.echo(_frame_row(f"{label} {val_lines[0]}", width), file=file)
+                cont_indent = " " * (label_w_plain + 1)
+                for cont in val_lines[1:]:
+                    click.echo(_frame_row(f"{cont_indent}{cont}", width), file=file)
         click.echo(_frame_bottom(width), file=file)
         return
 
@@ -1125,27 +1153,52 @@ def show_detail_card(
 
             val_str = str(v) if v is not None else ""
 
-            # Truncate values that would overflow the frame
-            max_val_w = inner - label_vis - 1  # 1 for space between label and value
-            if len(val_str) > max_val_w and max_val_w > 3:
-                val_str = val_str[: max_val_w - 3] + "..."
+            # Wrap values that would overflow the frame so the full value
+            # remains visible. Keep wrap deterministic by working on plain
+            # text, then apply per-line coloring so ANSI never spans rows.
+            max_val_w = max(1, inner - label_vis - 1)  # 1 for label/value gap
+            val_lines = wrap_text(val_str, max_val_w)
+            # Hard-cap any line that exceeds the value column. ``wrap_text``
+            # emits unbroken tokens (URLs/UUIDs) whole on their own line, so
+            # a single token longer than ``max_val_w`` would otherwise push
+            # the right border past the frame.
+            val_lines = [
+                ln if len(ln) <= max_val_w else ln[: max(1, max_val_w - 1)] + "\u2026"
+                for ln in val_lines
+            ]
 
-            # Status coloring
+            # Status coloring (per line — applied to each wrapped row)
             is_status_field = k.lower() in (
                 "status",
                 "approval_status",
                 "state",
                 "sync_status",
             )
-            if is_status_field and val_str.upper() in _STATUS_GREEN:
-                val_display = f"{_fg(0, 200, 0)}{val_str}{_reset_fg()}"
-            elif is_status_field and val_str.upper() in _STATUS_GRAY:
-                val_display = f"{_fg(100, 100, 100)}{val_str}{_reset_fg()}"
-            else:
-                val_display = _gradient_text(val_str)
 
-            vis_len = label_vis + 1 + len(val_str)
-            buf_lines.append(_detail_row(f"{label} {val_display}", vis_len))
+            def _color(line: str, _is_status: bool = is_status_field) -> str:
+                if _is_status and line.upper() in _STATUS_GREEN:
+                    return f"{_fg(0, 200, 0)}{line}{_reset_fg()}"
+                if _is_status and line.upper() in _STATUS_GRAY:
+                    return f"{_fg(100, 100, 100)}{line}{_reset_fg()}"
+                return _gradient_text(line)
+
+            # First line sits next to the label.
+            first = val_lines[0]
+            buf_lines.append(
+                _detail_row(
+                    f"{label} {_color(first)}",
+                    label_vis + 1 + len(first),
+                )
+            )
+            # Continuation lines hang under the value column with no label.
+            cont_prefix = " " * (label_vis + 1)
+            for cont in val_lines[1:]:
+                buf_lines.append(
+                    _detail_row(
+                        f"{cont_prefix}{_color(cont)}",
+                        label_vis + 1 + len(cont),
+                    )
+                )
 
     _render_fields(fields)
     buf_lines.append(bottom)

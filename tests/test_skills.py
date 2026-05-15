@@ -7,7 +7,7 @@ import re
 
 from click.testing import CliRunner
 
-from ramp_cli.main import CATEGORY_REMAP, cli
+from ramp_cli.main import _SINGLE_TOOL_RESOURCE_CATEGORIES, CATEGORY_REMAP, cli
 from ramp_cli.skills import (
     SKILLS_DIR,
     detect_agent_dir,
@@ -21,17 +21,21 @@ from ramp_cli.tools.parser import parse_spec
 
 class TestSkillDiscovery:
     def test_skill_names_discovers_all(self):
-        """All 8 skills should be discovered from the skills/ directory."""
+        """All 12 skills should be discovered from the skills/ directory."""
         names = skill_names()
-        assert len(names) == 8
+        assert len(names) == 12
         assert "agentic-purchase" in names
         assert "browser-automation" in names
         assert "approval-dashboard" in names
+        assert "manage-procurement" in names
+        assert "manage-bills" in names
         assert "receipt-compliance" in names
         assert "submit-reimbursement" in names
         assert "transaction-cleanup" in names
         assert "apply-to-ramp" in names
         assert "vendor-document-upload" in names
+        assert "payment-lookup" in names
+        assert "spend-analysis" in names
 
     def test_skill_names_empty_dir(self, tmp_path, monkeypatch):
         """Returns empty list when skills dir has no skill subdirectories."""
@@ -46,18 +50,22 @@ class TestSkillsList:
         assert result.exit_code == 0
 
         data = json.loads(result.output)
-        assert len(data["data"]) == 8
+        assert len(data["data"]) == 12
         names = {s["name"] for s in data["data"]}
         assert "browser-automation" in names
         assert "agentic-purchase" in names
+        assert "manage-procurement" in names
+        assert "manage-bills" in names
         assert "vendor-document-upload" in names
 
     def test_list_skills_human(self):
         runner = CliRunner()
         result = runner.invoke(cli, ["--human", "skills", "list"])
         assert result.exit_code == 0
-        assert "8 Skills" in result.output
+        assert "12 Skills" in result.output
         assert "browser-automation" in result.output
+        assert "manage-procurement" in result.output
+        assert "manage-bills" in result.output
         assert "vendor-document-upload" in result.output
 
 
@@ -81,6 +89,17 @@ class TestSkillsShow:
         result = runner.invoke(cli, ["skills", "show", "nonexistent"])
         assert result.exit_code != 0
 
+    def test_show_all_skills_returns_content(self):
+        """Every discovered skill should be fetchable via skills show."""
+        runner = CliRunner()
+        for name in skill_names():
+            result = runner.invoke(cli, ["skills", "show", name])
+            assert result.exit_code == 0, f"skills show {name} failed"
+            file_content = (SKILLS_DIR / name / "SKILL.md").read_text()
+            assert result.output.strip() == file_content.strip(), (
+                f"skills show {name} output doesn't match SKILL.md"
+            )
+
 
 class TestSkillsInstall:
     def test_install_single(self, tmp_path):
@@ -92,14 +111,14 @@ class TestSkillsInstall:
         assert "Browser Automation" in dest.read_text()
 
     def test_install_all(self, tmp_path):
-        """--all installs all 7 skills."""
+        """--all installs all 12 skills."""
         runner = CliRunner()
         result = runner.invoke(
             cli, ["skills", "install", "--all", "--target", str(tmp_path)]
         )
         assert result.exit_code == 0
         installed = [d.name for d in tmp_path.iterdir() if d.is_dir()]
-        assert len(installed) == 8
+        assert len(installed) == 12
 
     def test_install_overwrites(self, tmp_path):
         """Installing twice succeeds and returns 'updated' on second run."""
@@ -235,10 +254,9 @@ def _build_valid_commands() -> set[tuple[str, str]]:
 
     valid: set[tuple[str, str]] = set()
     for cat, cat_tools in merged.items():
-        if len(cat_tools) > 1:
+        if len(cat_tools) > 1 or cat in _SINGLE_TOOL_RESOURCE_CATEGORIES:
             for t in cat_tools:
-                if t.alias:
-                    valid.add((cat, t.alias))
+                valid.add((cat, t.alias or t.name))
         else:
             # Singletons fold into "general"
             for t in cat_tools:
@@ -261,12 +279,11 @@ def _build_tool_param_index() -> dict[tuple[str, str], set[str]]:
 
     index: dict[tuple[str, str], set[str]] = {}
     for cat, cat_tools in merged.items():
-        if len(cat_tools) > 1:
+        if len(cat_tools) > 1 or cat in _SINGLE_TOOL_RESOURCE_CATEGORIES:
             for t in cat_tools:
-                if t.alias:
-                    key = (cat, t.alias)
-                    # Merge params when multiple tools share (category, alias).
-                    index.setdefault(key, set()).update(p.name for p in t.params)
+                key = (cat, t.alias or t.name)
+                # Merge params when multiple tools share (category, alias).
+                index.setdefault(key, set()).update(p.name for p in t.params)
         else:
             for t in cat_tools:
                 alias = t.alias or t.name

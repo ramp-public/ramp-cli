@@ -6,14 +6,23 @@ Spec resolution order:
 """
 
 from ramp_cli.auth.store import get_granted_scopes
+from ramp_cli.config.constants import environment_cache_key
 from ramp_cli.config.settings import resolve_environment
 from ramp_cli.specs import AGENT_TOOL_SPEC, local_agent_tool_spec
 from ramp_cli.tools.parser import ToolDef, parse_spec
 
+# Category names in the spec that should be merged into a different CLI
+# resource group.  Used by main.py for command routing and by
+# getting_started.py so the onboarding guide shows invokable names.
+CATEGORY_REMAP: dict[str, str] = {
+    "cards": "funds",
+    "agent_cards": "funds",
+}
+
 
 def _resolve_spec_path(env: str):
     """Return the most up-to-date spec path available for *env*."""
-    local = local_agent_tool_spec(env)
+    local = local_agent_tool_spec(environment_cache_key(env))
     if local.exists():
         return local
     return AGENT_TOOL_SPEC

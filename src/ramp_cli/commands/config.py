@@ -7,7 +7,12 @@ import os
 import click
 
 from ramp_cli.config import settings
-from ramp_cli.config.constants import ENV_PRODUCTION, ENV_SANDBOX, client_id
+from ramp_cli.config.constants import (
+    client_id,
+    environment_help,
+    iter_environments,
+    normalize_env,
+)
 from ramp_cli.output.formatter import print_agent_json, print_table, resolve_format
 
 
@@ -25,12 +30,12 @@ def config_set(ctx: click.Context, key: str, value: str) -> None:
     cfg = settings.load()
 
     if key == "environment":
-        if value == "prod":
-            value = "production"
-        if value not in ("sandbox", "production"):
+        try:
+            value = normalize_env(value)
+        except ValueError:
             raise click.BadParameter(
-                f"Invalid environment {value!r} — use 'sandbox' or 'production'"
-            )
+                f"Invalid environment {value!r} — use {environment_help()}"
+            ) from None
         cfg.environment = value
     elif key == "format":
         if value == "auto":
@@ -67,7 +72,7 @@ def config_get(ctx: click.Context, key: str) -> None:
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
 
     if key == "environment":
-        display_value = cfg.environment or "sandbox (default)"
+        display_value = cfg.environment or "production (default)"
     elif key == "format":
         display_value = cfg.format or "(auto-detect)"
     elif key == "client_id":
@@ -93,7 +98,7 @@ def config_list(ctx: click.Context) -> None:
 
     # environment
     val, src = _resolve_with_source(
-        flag_env, "RAMP_ENVIRONMENT", cfg.environment, "sandbox"
+        flag_env, "RAMP_ENVIRONMENT", cfg.environment, "production"
     )
     rows.append(("environment", val, src))
 
@@ -102,8 +107,8 @@ def config_list(ctx: click.Context) -> None:
     rows.append(("format", val, src))
 
     # Client IDs (read-only, from constants)
-    for e in (ENV_SANDBOX, ENV_PRODUCTION):
-        rows.append((f"client_id ({e})", _mask(client_id(e)), "built-in"))
+    for env in iter_environments():
+        rows.append((f"client_id ({env.name})", _mask(client_id(env.name)), "built-in"))
 
     rows.append(("config_path", str(settings.config_path()), "-"))
 

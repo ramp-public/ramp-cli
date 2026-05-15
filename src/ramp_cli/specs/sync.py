@@ -8,7 +8,12 @@ import time
 
 import httpx
 
-from ramp_cli.config.constants import agent_tool_spec_hash_url, agent_tool_spec_url
+from ramp_cli.auth.environment import extra_auth_headers
+from ramp_cli.config.constants import (
+    agent_tool_spec_hash_url,
+    agent_tool_spec_url,
+    environment_cache_key,
+)
 from ramp_cli.specs import local_agent_tool_hash, local_agent_tool_spec
 from ramp_cli.tools.registry import reload
 
@@ -23,16 +28,18 @@ def fetch_spec(env: str, *, known_hash: str | None = None) -> int:
     If *known_hash* is provided (e.g. from a prior ``/hash`` check),
     it is stored directly and no extra hash request is made.
     """
-    spec_path = local_agent_tool_spec(env)
-    hash_path = local_agent_tool_hash(env)
+    cache_key = environment_cache_key(env)
+    spec_path = local_agent_tool_spec(cache_key)
+    hash_path = local_agent_tool_hash(cache_key)
+    headers = extra_auth_headers(env)
 
     with httpx.Client(timeout=30.0) as client:
-        resp = client.get(agent_tool_spec_url(env))
+        resp = client.get(agent_tool_spec_url(env), headers=headers)
         resp.raise_for_status()
         spec = resp.json()
 
         if known_hash is None:
-            hash_resp = client.get(agent_tool_spec_hash_url(env))
+            hash_resp = client.get(agent_tool_spec_hash_url(env), headers=headers)
             hash_resp.raise_for_status()
             known_hash = hash_resp.json().get("content_hash", "")
 
@@ -43,12 +50,16 @@ def fetch_spec(env: str, *, known_hash: str | None = None) -> int:
     return len([p for p in spec.get("paths", {}) if "agent-tools" in p])
 
 
-def maybe_sync(env: str) -> None:
-    """Check the hash endpoint and refresh if the spec changed. 1h cooldown."""
-    hash_path = local_agent_tool_hash(env)
+def maybe_sync(env: str, *, force: bool = False) -> None:
+    """Check the hash endpoint and refresh if the spec changed.
+
+    The normal path uses a 1h cooldown. Callers that must validate user input
+    against the latest schema can force a hash check before proceeding.
+    """
+    hash_path = local_agent_tool_hash(environment_cache_key(env))
 
     try:
-        if hash_path.exists():
+        if not force and hash_path.exists():
             age = time.time() - hash_path.stat().st_mtime
             if age < _COOLDOWN_SECONDS:
                 return
@@ -57,8 +68,9 @@ def maybe_sync(env: str) -> None:
         return
 
     try:
+        headers = extra_auth_headers(env)
         with httpx.Client(timeout=3.0) as client:
-            resp = client.get(agent_tool_spec_hash_url(env))
+            resp = client.get(agent_tool_spec_hash_url(env), headers=headers)
             resp.raise_for_status()
             remote_hash = resp.json().get("content_hash", "")
     except Exception:
