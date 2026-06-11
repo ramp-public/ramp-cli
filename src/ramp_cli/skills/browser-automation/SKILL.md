@@ -55,17 +55,28 @@ The managed local profile is temporary: cookies and logins survive navigation wi
 
 When a site requires login: prefer SSO/OAuth, ask the user for credentials (never guess), and finish the task before stopping the session.
 
-## Bot checks, CAPTCHAs, and human handoff
+## Bot checks, CAPTCHAs, and stealth
 
-When you hit a CAPTCHA, reCAPTCHA, 3DS challenge, login wall, or "verify you're human" page, do not retry programmatically. On payment flows the agent should not attempt a programmatic solve. Hand the wheel to the user:
+### Preferred: Browserbase Verified mode (requires `BROWSERBASE_API_KEY`)
 
-1. **Confirm the user can see the page.** Local: the window must be headed — if you opened headless, `browse stop` and re-open with `--headed`. Remote: get the live view link with `browse cloud sessions debug <session-id>` and send the user the `debuggerFullscreenUrl`.
+When a site blocks you with CAPTCHAs or bot detection, run the session remotely with Verified browser mode and proxies — Browserbase handles CAPTCHAs and bot checks in the cloud instead of you handing off:
+
+```bash
+browse cloud sessions create --verified --proxies    # note the connectUrl in the output
+browse open <url> --cdp "<connectUrl>"               # attach the driver to that session
+```
+
+The user can still watch or intervene via the live view: `browse cloud sessions debug <session-id>` returns a `debuggerFullscreenUrl` to send them. For the full stealth surface (regions, ad blocking, CAPTCHA options), see the installed `browse` skill, `browse cloud sessions create --help`, or [docs.browserbase.com](https://docs.browserbase.com).
+
+### Backup: human handoff (local-only, no API key)
+
+Without Browserbase credentials — or for challenges only a human may complete, like **3DS on payment flows, which you must never attempt to solve programmatically** — hand the wheel to the user:
+
+1. **Confirm the user can see the page.** The window must be headed — if you opened headless, `browse stop` and re-open with `--headed`.
 2. **Screenshot the current state:** `browse screenshot --path handoff.png`
-3. **Hand off in plain language.** Example: "There's a reCAPTCHA on the checkout. Switch to the Chrome window I opened (or open the live view link), solve it, and reply when you're past it."
+3. **Hand off in plain language.** Example: "There's a reCAPTCHA on the checkout. Switch to the Chrome window I opened, solve it, and reply when you're past it."
 4. **Wait.** Do not poll the page. Wait for the user's reply.
 5. **Resume.** Re-snapshot before clicking — refs may have changed during their interaction.
-
-For non-payment workflows on bot-protected sites, `--remote` runs the session on Browserbase with stealth and proxy support — often avoiding the block entirely instead of handing it off.
 
 ## Debugging checkout issues
 
