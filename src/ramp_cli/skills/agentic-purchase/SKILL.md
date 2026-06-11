@@ -45,7 +45,7 @@ If the user is already enrolled, proceed with the workflow below.
 - **Two distinct amount thresholds — respect both:**
   - **User preauth tolerance:** policy-level, ~10% over requested. Stop and re-ask if exceeded.
   - **Visa cryptogram auth cap:** the cryptogram from `ramp --agent funds creds ... --amount X` rejects any charge > X at the network level — even $0.01 over declines. If the merchant's final total exceeds the cryptogram amount (bag fees, surprise tax, currency conversion), the old cryptogram is unusable — burn it, pull fresh creds at the corrected amount, and re-preauth if the new amount exceeds the user's original 10% tolerance.
-- **Run the browser headed, never `--headless`.** Purchase flows need the user able to see and intervene — bot checks, 3DS, and login walls all require human input. See `browser-automation` for the headed-default rule.
+- **Run the browser headed — always pass `--headed` when opening the session.** Purchase flows need the user able to see and intervene — bot checks, 3DS, and login walls all require human input. See `browser-automation` for the headed rule.
 - **Stop if anything unexpected happens.** 3DS challenge, login wall, CAPTCHA, bot-block page, merchant form you can't parse → screenshot, hand off to the user via the visible Chrome window per the human-handoff pattern in `browser-automation`, and wait. Do not retry blindly.
 
 ## Phase 1: Payment
@@ -100,37 +100,35 @@ Returns `pan`, `cvv`, `expiration_month`, `expiration_year`.
 
 Load the `browser-automation` skill, then:
 
-1. Open merchant site:
+1. Open merchant site (headed, so the user can watch and intervene):
    ```bash
-   cd ~/.pw-agent && ./pw open "https://merchant.com/donate"
+   browse open "https://merchant.com/donate" --local --headed
    ```
 2. Navigate to checkout / donation page
 3. Take a snapshot to find form fields:
    ```bash
-   ./pw snapshot
-   SNAPSHOT=$(ls -t .playwright-cli/*.yml | head -1)
-   grep -iE "card|number|name|expir|cvv|cvc|amount|donate" "$SNAPSHOT" | head -20
+   browse snapshot --filter /card|number|name|expir|cvv|cvc|amount|donate/i
    ```
 4. Fill payment form:
    ```bash
-   ./pw fill <card_number_ref> "<pan>"
-   ./pw fill <name_ref> "<cardholder_name>"
-   ./pw fill <expiry_ref> "<MM/YY>"
-   ./pw fill <cvv_ref> "<cvv>"
+   browse fill <card_number_ref> "<pan>"
+   browse fill <name_ref> "<cardholder_name>"
+   browse fill <expiry_ref> "<MM/YY>"
+   browse fill <cvv_ref> "<cvv>"
    ```
 5. If the merchant has saved cards, click "Add a new card" first
 6. Submit the payment:
    ```bash
-   ./pw click <submit_ref>
+   browse click <submit_ref>
    ```
 7. Take a screenshot to confirm success:
    ```bash
-   ./pw screenshot
+   browse screenshot --path confirmation.png
    ```
 
 **Tip:** If the donation/checkout page has an amount field, fill it before the card details. Some sites validate amount first.
 
-**Synthetic-fill detection:** Stripe Elements and similar modern tokenizers silently reject synthetic property-setter fills — the submit button stays enabled, no error surfaces, nothing submits, no network request fires. If `./pw fill` dispatches real keystroke events this is fine; if it only sets `.value`, the submit will stall for PAN/CVV/expiry fields specifically. Workaround: use coordinate-click to focus plus compositor-level keystroke events (`Input.insertText` at CDP) for card fields. Billing-address fields are not guarded the same way.
+**Synthetic-fill detection:** Stripe Elements and similar modern tokenizers silently reject synthetic property-setter fills — the submit button stays enabled, no error surfaces, nothing submits, no network request fires. If `browse fill` stalls on PAN/CVV/expiry fields specifically, switch to real keystrokes: `browse click <ref>` to focus the field, then `browse type "<value>"`. Billing-address fields are not guarded the same way.
 
 **Card-swap close-and-reopen rule:** After pulling fresh creds mid-flow (e.g., retry at a higher amount), close the merchant's payment form entirely and re-open before filling. The processor's validator can retain stale state from the prior card and refuse to tokenize the new one (observed on Stripe, 2026-04-21). Do not overwrite PAN/CVV in place.
 
@@ -293,7 +291,7 @@ Confirm all items resolved: `missing_receipt: false`, `missing_memo: false`, `mi
 | Final charge amount exceeds cryptogram auth | Cryptogram caps at `--amount`. Burn current creds, pull fresh at new amount. Re-preauth if > 10% over original. |
 | Pre-existing items in cart from prior session | Remove them (or ask the user to) before generating creds. |
 | 3DS challenge                        | Stop. Screenshot, then tell the user to complete 3DS in the visible Chrome window and reply when done. Resume Phase 2 once the card clears. See human-handoff in `browser-automation`. |
-| CAPTCHA / reCAPTCHA / bot-check page | Stop. If the browser is headless, `./pw stop` and re-open headed first — the user cannot interact otherwise. Then screenshot and hand off per human-handoff in `browser-automation`. Do not attempt a programmatic solve. |
+| CAPTCHA / reCAPTCHA / bot-check page | Stop. If the browser is headless, `browse stop` and re-open with `--headed` first — the user cannot interact otherwise. Then screenshot and hand off per human-handoff in `browser-automation`. Do not attempt a programmatic solve. |
 | Merchant shows "declined"            | A BIN decline at one processor (e.g., Vantiv eProtect at CVS) does NOT predict decline at another (e.g., Stripe at Anthropic) — each has its own risk engine. Report the merchant AND the processor (identifiable from the payment iframe's `src` if possible) so we track the BIN-vs-processor matrix. Do not retry at the same merchant. |
 
 ### Tips
