@@ -7,6 +7,7 @@ import re
 import time
 from collections.abc import Mapping
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -18,13 +19,14 @@ from ramp_cli.auth.environment import (
     missing_required_environment_auth,
 )
 from ramp_cli.auth.refresh import try_refresh
-from ramp_cli.client.session import get_session_id
-from ramp_cli.config.constants import api_url
+from ramp_cli.client.headers import agent_headers
+from ramp_cli.config.constants import api_url, base_url
 from ramp_cli.errors import (
     ApiError,
     AuthRequiredError,
     EnvironmentAuthRequiredError,
     RefreshFailedError,
+    UnsafeRequestUrlError,
 )
 
 # Client timeout should exceed the server-side timeout (60s) so we always
@@ -35,9 +37,6 @@ _REQUEST_TIMEOUT = 75.0
 _CLIENT_OVERRIDE_ENV = "RAMP_CLIENT_NAME"
 
 # Exact env-var sentinels for harnesses whose vendors commit to setting them.
-# Exact match only — prefix matching pulled in unrelated tools that happen to
-# share a namespace (e.g. CODEX_REVIEW from another product). TERM_PROGRAM /
-# SHELL are intentionally excluded: a human in a terminal is not an agent.
 _HARNESS_SENTINELS: tuple[tuple[str, str], ...] = (
     ("CLAUDECODE", "claude-code"),
     ("OPENCODE", "opencode"),
@@ -59,6 +58,8 @@ class RampClient:
         return self._do_request("GET", api_url(self.env, path, params))
 
     def get_url(self, url: str) -> bytes:
+        if not _same_origin(url, base_url(self.env)):
+            raise UnsafeRequestUrlError(url)
         return self._do_request("GET", url)
 
     def post(self, path: str, json_body: bytes) -> bytes:
@@ -77,8 +78,18 @@ class RampClient:
         self, path: str, data: dict[str, str], files: dict[str, tuple]
     ) -> bytes:
         """POST multipart/form-data (for file uploads)."""
+        return self.request_multipart("POST", path, data, files)
+
+    def request_multipart(
+        self,
+        method: str,
+        path: str,
+        data: dict[str, str],
+        files: dict[str, tuple],
+    ) -> bytes:
+        """Send multipart/form-data using the operation's declared method."""
         return self._do_request_multipart(
-            "POST", api_url(self.env, path), data=data, files=files
+            method.upper(), api_url(self.env, path), data=data, files=files
         )
 
     def _do_request_multipart(
@@ -217,12 +228,31 @@ class RampClient:
             "Authorization": f"Bearer {token}",
             "User-Agent": user_agent_string(),
             "Accept": "application/json",
-            "X-External-Session-Id": get_session_id(),
+            **agent_headers(infer_harness_name()),
         }
         headers.update(
             extra_headers if extra_headers is not None else extra_auth_headers(self.env)
         )
         return headers
+
+
+def _same_origin(url: str, expected_base_url: str) -> bool:
+    actual = _origin(url)
+    expected = _origin(expected_base_url)
+    return actual is not None and actual == expected
+
+
+def _origin(url: str) -> tuple[str, str, int | None] | None:
+    parts = urlsplit(url)
+    if not parts.scheme or not parts.hostname or parts.username or parts.password:
+        return None
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    if port is None:
+        port = {"http": 80, "https": 443}.get(parts.scheme.lower())
+    return parts.scheme.lower(), parts.hostname.lower(), port
 
 
 def user_agent_string(environ: Mapping[str, str] | None = None) -> str:
@@ -251,11 +281,13 @@ def infer_client_name(environ: Mapping[str, str] | None = None) -> str | None:
     if override:
         return override
 
-    for env_key, client_name in _HARNESS_SENTINELS:
-        if env.get(env_key):
-            return client_name
+    return infer_harness_name(env)
 
-    return None
+
+def infer_harness_name(environ: Mapping[str, str] | None = None) -> str | None:
+    """Return the host harness name when an exact sentinel is present."""
+    env = environ if environ is not None else os.environ
+    return next((name for key, name in _HARNESS_SENTINELS if env.get(key)), None)
 
 
 def _sanitize_comment(value: str | None) -> str | None:

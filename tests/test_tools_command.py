@@ -1,5 +1,6 @@
 """Tests for the ramp tools command group."""
 
+import json
 from unittest.mock import patch
 
 import httpx
@@ -7,7 +8,8 @@ import pytest
 from click.testing import CliRunner
 
 from ramp_cli.main import cli
-from ramp_cli.tools.parser import ToolDef
+from ramp_cli.specs import AGENT_TOOL_SPEC
+from ramp_cli.tools.parser import ToolDef, parse_spec
 
 
 @pytest.fixture()
@@ -31,6 +33,29 @@ FAKE_TOOLS = [
         path="/v1/agent-tools/get-transactions",
         http_method="POST",
         category="transactions",
+    ),
+]
+
+COLLIDING_TOOLS = [
+    ToolDef(
+        name="get-user-trips",
+        alias="list",
+        description="List trips",
+        summary="List trips",
+        path="/developer/v1/agent-tools/get-user-trips",
+        http_method="POST",
+        category="travel",
+        request_schema_name="GetUserTrips",
+    ),
+    ToolDef(
+        name="list-eligible-travel-funds",
+        alias="list",
+        description="List eligible travel funds",
+        summary="List eligible travel funds",
+        path="/developer/v1/agent-tools/list-eligible-travel-funds",
+        http_method="POST",
+        category="travel",
+        request_schema_name="ListEligibleTravelFunds",
     ),
 ]
 
@@ -117,6 +142,21 @@ class TestToolsList:
         runner.invoke(cli, ["tools", "list"])
         mock_sync.assert_called_once_with("production")
 
+    @patch(
+        "ramp_cli.commands.tools.list_categories",
+        return_value={"travel": COLLIDING_TOOLS},
+    )
+    @patch("ramp_cli.commands.tools.maybe_sync")
+    @patch("ramp_cli.main.maybe_sync")
+    def test_list_json_uses_invokable_names_for_alias_collisions(
+        self, _root_sync, _tool_sync, _mock_categories, runner
+    ):
+        result = runner.invoke(cli, ["--agent", "tools", "list"])
+
+        assert result.exit_code == 0
+        names = {item["name"] for item in json.loads(result.output)["data"]}
+        assert names == {"get-user-trips", "list-eligible-travel-funds"}
+
 
 class TestToolsGroup:
     @patch("ramp_cli.main.maybe_sync")
@@ -125,3 +165,92 @@ class TestToolsGroup:
         assert result.exit_code == 0
         assert "refresh" in result.output
         assert "list" in result.output
+        assert "schema" in result.output
+
+
+class TestToolsSchema:
+    @staticmethod
+    def _use_bundled_tools(monkeypatch):
+        monkeypatch.setattr(
+            "ramp_cli.commands.tools.list_tool_defs",
+            lambda env: parse_spec(AGENT_TOOL_SPEC),
+        )
+
+    @patch("ramp_cli.main.maybe_sync")
+    @patch("ramp_cli.commands.tools.maybe_sync")
+    def test_prints_schema_by_category_and_alias(
+        self, _tool_sync, _root_sync, isolated_config, monkeypatch, runner
+    ):
+        self._use_bundled_tools(monkeypatch)
+        result = runner.invoke(
+            cli,
+            ["--agent", "tools", "schema", "applications", "edit"],
+        )
+
+        assert result.exit_code == 0
+        schema = json.loads(result.output)["data"][0]
+        assert "$ref" not in json.dumps(schema)
+        assert "manual_bank_account" in schema["properties"]
+
+    @patch("ramp_cli.main.maybe_sync")
+    @patch("ramp_cli.commands.tools.maybe_sync")
+    def test_rejects_tool_without_request_body(
+        self, _tool_sync, _root_sync, isolated_config, monkeypatch, runner
+    ):
+        self._use_bundled_tools(monkeypatch)
+        result = runner.invoke(
+            cli,
+            ["--human", "tools", "schema", "applications", "progress"],
+        )
+
+        assert result.exit_code == 2
+        assert "does not accept a request body" in result.output
+
+    @patch("ramp_cli.main.maybe_sync")
+    @patch("ramp_cli.commands.tools.maybe_sync")
+    def test_rejects_ambiguous_alias_with_invokable_choices(
+        self, _tool_sync, _root_sync, monkeypatch, runner
+    ):
+        monkeypatch.setattr(
+            "ramp_cli.commands.tools.list_tool_defs",
+            lambda env: COLLIDING_TOOLS,
+        )
+
+        result = runner.invoke(
+            cli,
+            ["--human", "tools", "schema", "travel", "list"],
+        )
+
+        assert result.exit_code == 2
+        assert "Ambiguous generated tool 'travel list'" in result.output
+        assert "get-user-trips, list-eligible-travel-funds" in result.output
+
+    @patch("ramp_cli.main.maybe_sync")
+    @patch("ramp_cli.commands.tools.maybe_sync")
+    def test_accepts_collision_resolved_command_name(
+        self, _tool_sync, _root_sync, monkeypatch, runner
+    ):
+        monkeypatch.setattr(
+            "ramp_cli.commands.tools.list_tool_defs",
+            lambda env: COLLIDING_TOOLS,
+        )
+        monkeypatch.setattr(
+            "ramp_cli.commands.tools.load_component_schema",
+            lambda path, name: {"title": name},
+        )
+
+        result = runner.invoke(
+            cli,
+            [
+                "--agent",
+                "tools",
+                "schema",
+                "travel",
+                "list-eligible-travel-funds",
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert json.loads(result.output)["data"][0] == {
+            "title": "ListEligibleTravelFunds"
+        }

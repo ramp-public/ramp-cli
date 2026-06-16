@@ -91,13 +91,36 @@ def _refresh_tool_spec_before_login(env: str) -> None:
     default=False,
     help="Print login URL instead of opening browser",
 )
+@click.option(
+    "--scope",
+    "scopes",
+    multiple=True,
+    help="Request only this OAuth scope. Repeat for additional scopes.",
+)
+@click.option(
+    "--auth-level",
+    type=click.Choice(["auto", "business", "user"], case_sensitive=False),
+    default="auto",
+    show_default=True,
+    help="OAuth authorization level to request.",
+)
 @click.pass_context
-def login(ctx: click.Context, token_stdin: bool, no_browser: bool) -> None:
+def login(
+    ctx: click.Context,
+    token_stdin: bool,
+    no_browser: bool,
+    scopes: tuple[str, ...],
+    auth_level: str,
+) -> None:
     """Authenticate with Ramp via browser."""
     env = ctx.obj["env"]
     label = env_label(env)
 
     if token_stdin:
+        if scopes or auth_level != "auto":
+            raise click.UsageError(
+                "--scope and --auth-level cannot be used with --token_stdin."
+            )
         token = sys.stdin.readline().strip()
         if not token:
             raise click.UsageError("No token provided on stdin.")
@@ -118,7 +141,11 @@ def login(ctx: click.Context, token_stdin: bool, no_browser: bool) -> None:
 
     _refresh_tool_spec_before_login(env)
 
-    opts = LoginOptions(no_browser=no_browser)
+    opts = LoginOptions(
+        no_browser=no_browser,
+        scopes=scopes,
+        auth_level=auth_level,
+    )
     token_resp = do_login(env, opts)
 
     store.save_tokens(

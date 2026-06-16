@@ -220,8 +220,10 @@ class TestGettingStartedCommand:
         assert "transactions" not in payload["categories_unexplored"]
 
     def test_categories_are_remapped(self, isolated_config, monkeypatch):
-        """Spec categories like 'cards' are merged into 'funds' so the guide
-        shows names matching invokable CLI groups."""
+        """Spec category 'agent_cards' is merged into 'funds' so the guide
+        shows names matching invokable CLI groups. 'cards' is merged into
+        'funds' too AND additively surfaced as its own 'cards' alias group
+        (matching the invokable `ramp cards` resource)."""
         # Don't set granted_scopes — when no scope info is stored, the
         # scope filter shows all tools (backwards-compat path), which
         # guarantees 'cards'/'agent_cards' tools are present to remap.
@@ -242,8 +244,9 @@ class TestGettingStartedCommand:
         data = json.loads(result.output)
         payload = data["data"][0]
         cats = payload["categories_available"]
-        # Raw spec categories should be merged away
-        assert "cards" not in cats
+        # cards keeps its own group (matches invokable `ramp cards`)
+        assert "cards" in cats
+        # agent_cards should be merged away into funds
         assert "agent_cards" not in cats
         # Merged target should be present
         assert "funds" in cats
@@ -253,10 +256,12 @@ class TestGettingStartedCommand:
 
 
 class TestCategoryRemapping:
-    def test_remap_merges_cards_into_funds(self):
+    def test_remap_adds_cards_alias_group_while_keeping_funds(self):
+        # 'cards' is remapped into 'funds' (existing behavior preserved) AND
+        # additively surfaced as its own group (alias). Same tool in both.
         raw = {"cards": ["t1"], "funds": ["t2"], "bills": ["t3"]}
         result = _remap_categories(raw)
-        assert "cards" not in result
+        assert result["cards"] == ["t1"]
         assert set(result["funds"]) == {"t1", "t2"}
         assert result["bills"] == ["t3"]
 

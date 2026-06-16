@@ -75,6 +75,19 @@ class ApiError(RampCLIError):
                 or error_obj.get("message")
                 or self.body[:500]
             )
+            validation_details = (
+                parsed.get("errors")
+                or parsed.get("details")
+                or error_obj.get("details")
+            )
+            if validation_details:
+                rendered = json.dumps(
+                    validation_details,
+                    ensure_ascii=True,
+                    indent=2,
+                    sort_keys=True,
+                )
+                detail += f"\n\nValidation details:\n{rendered}"
             error_code = (
                 parsed.get("ramp_error_code")
                 or error_v2.get("error_code")
@@ -83,13 +96,6 @@ class ApiError(RampCLIError):
         except Exception:
             detail = self.body[:500]
             error_code = None
-
-        # UX-6: Append actionable hint for 403 errors
-        if status_code == 403:
-            detail += (
-                "\n\n  This usually means your token doesn't have the required scope."
-                "\n  To fix this, log in again:  ramp auth login"
-            )
 
         # Append actionable hints for known error codes
         hint = _ERROR_CODE_HINTS.get(error_code or "")
@@ -116,3 +122,11 @@ class EnvironmentAuthRequiredError(RampCLIError):
 class RefreshFailedError(RampCLIError):
     def __init__(self, message: str) -> None:
         super().__init__(message, code=EXIT_RUNTIME)
+
+
+class UnsafeRequestUrlError(RampCLIError):
+    def __init__(self, url: str) -> None:
+        super().__init__(
+            f"Refusing to send authenticated request to an untrusted URL: {url}",
+            code=EXIT_RUNTIME,
+        )

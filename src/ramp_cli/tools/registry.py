@@ -8,7 +8,11 @@ Spec resolution order:
 from ramp_cli.auth.store import get_granted_scopes
 from ramp_cli.config.constants import environment_cache_key
 from ramp_cli.config.settings import resolve_environment
-from ramp_cli.specs import AGENT_TOOL_SPEC, local_agent_tool_spec
+from ramp_cli.specs import (
+    AGENT_TOOL_DEFINITION,
+    GENERATED_TOOL_SPECS,
+    GeneratedToolSpec,
+)
 from ramp_cli.tools.parser import ToolDef, parse_spec
 
 # Category names in the spec that should be merged into a different CLI
@@ -19,13 +23,22 @@ CATEGORY_REMAP: dict[str, str] = {
     "agent_cards": "funds",
 }
 
+# Spec categories that are ADDITIVELY exposed as their own CLI resource
+# group, *in addition to* their CATEGORY_REMAP home.  The same underlying
+# tools stay reachable from their remapped group (e.g. ``funds list-cards``)
+# and also gain an intuitive alias group (e.g. ``cards list``).  This is a
+# non-breaking alias — no existing command path is removed or renamed.
+CATEGORY_ALIAS_GROUPS: frozenset[str] = frozenset({"cards"})
+
+
+def _resolve_generated_spec_path(definition: GeneratedToolSpec, env: str):
+    """Return the most up-to-date path for one generated-tool spec."""
+    return definition.resolve(environment_cache_key(env))
+
 
 def _resolve_spec_path(env: str):
-    """Return the most up-to-date spec path available for *env*."""
-    local = local_agent_tool_spec(environment_cache_key(env))
-    if local.exists():
-        return local
-    return AGENT_TOOL_SPEC
+    """Compatibility wrapper for the agent-tool OpenAPI document."""
+    return _resolve_generated_spec_path(AGENT_TOOL_DEFINITION, env)
 
 
 def _default_env() -> str:
@@ -49,7 +62,7 @@ class _Registry:
             env = _default_env()
         if self._tools is not None and self._loaded_env == env:
             return
-        self._tools = parse_spec(_resolve_spec_path(env))
+        self._tools = _load_tools(env)
         self._index = {t.name: t for t in self._tools}
         self._loaded_env = env
 
@@ -57,7 +70,7 @@ class _Registry:
         """Force reload from disk (after refresh)."""
         if env is None:
             env = _default_env()
-        self._tools = parse_spec(_resolve_spec_path(env))
+        self._tools = _load_tools(env)
         self._index = {t.name: t for t in self._tools}
         self._loaded_env = env
 
@@ -78,6 +91,20 @@ class _Registry:
 
 
 _registry = _Registry()
+
+
+def _load_tools(env: str) -> list[ToolDef]:
+    tools: list[ToolDef] = []
+    for definition in GENERATED_TOOL_SPECS:
+        tools.extend(
+            parse_spec(
+                _resolve_generated_spec_path(definition, env),
+                source=definition.source,
+                path_prefix=definition.path_prefix,
+                synthesize_cli_tools=definition.synthesize_cli_tools,
+            )
+        )
+    return sorted(tools, key=lambda tool: (tool.category, tool.name))
 
 
 def _filter_by_scopes(tools: list[ToolDef], env: str) -> list[ToolDef]:

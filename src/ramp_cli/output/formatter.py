@@ -173,6 +173,8 @@ CATEGORY_DISPLAY_FIELDS: dict[str, list[str]] = {
     "cards": [
         "display_name",
         "last_four",
+        "card_state",
+        "activation_status",
         "card_type",
         "is_physical",
         "id",

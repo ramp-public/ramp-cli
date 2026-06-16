@@ -2,10 +2,16 @@
 
 import io
 import os
+from unittest.mock import MagicMock
 
 from ramp_cli.output.paginator import ToolPaginator, _LineCounter
 from ramp_cli.output.style import ESC
-from ramp_cli.tools.commands import _detect_cursor_param, _extract_list_field
+from ramp_cli.tools.commands import (
+    _detect_cursor_param,
+    _extract_list_field,
+    _prepare_request,
+    _try_interactive_table,
+)
 from ramp_cli.tools.parser import ParamType, ToolDef, ToolParam
 
 
@@ -79,6 +85,71 @@ class TestDetectCursorParam:
     def test_defaults_to_next_page_cursor(self):
         tool = self._make_tool(["query", "limit"])
         assert _detect_cursor_param(tool) == "next_page_cursor"
+
+
+def test_interactive_pagination_reuses_prepared_request(monkeypatch):
+    tool = ToolDef(
+        name="list-things",
+        path="/developer/v1/groups/{group_id}/things",
+        http_method="get",
+        summary="List things",
+        description="List things",
+        params=[
+            ToolParam(
+                name="group_id",
+                flag="group_id",
+                description="Group ID",
+                type=ParamType.STRING,
+                required=True,
+                location="path",
+            ),
+            ToolParam(
+                name="page_size",
+                flag="page_size",
+                description="Page size",
+                type=ParamType.INT,
+                location="query",
+            ),
+            ToolParam(
+                name="cursor",
+                flag="cursor",
+                description="Cursor",
+                type=ParamType.STRING,
+                location="query",
+            ),
+        ],
+    )
+    request = _prepare_request(
+        tool,
+        {"group_id": "group/1", "page_size": 2},
+        {},
+    )
+    client = MagicMock()
+    client.get.return_value = b'{"data":[],"page":{"next":null}}'
+
+    class FetchNextPage:
+        def __init__(self, **kwargs):
+            self.fetch_next_page = kwargs["fetch_next_page"]
+
+        def run(self):
+            self.fetch_next_page("next-token")
+            return None
+
+    monkeypatch.setattr(
+        "ramp_cli.tools.commands.ToolPaginator",
+        FetchNextPage,
+    )
+
+    assert _try_interactive_table(
+        tool,
+        {"data": [{"id": "thing-1"}], "cursor": "first"},
+        request,
+        client,
+    )
+    client.get.assert_called_once_with(
+        "/developer/v1/groups/group%2F1/things",
+        {"page_size": "2", "cursor": "next-token"},
+    )
 
 
 class TestPaginatorPageCaching:

@@ -10,9 +10,18 @@ import click
 import httpx
 import jsonref
 
+from ramp_cli.auth import store
+from ramp_cli.auth.oauth import (
+    OAuthTokenError,
+    PkceCallback,
+    TokenResponse,
+    exchange_pkce_callback_code,
+    start_pkce_callback,
+)
 from ramp_cli.client.api import RampClient
 from ramp_cli.config.constants import api_url, application_signup_token
 from ramp_cli.output.formatter import print_agent_json, print_json, resolve_format
+from ramp_cli.tools.commands import GeneratedToolGroup
 
 _DEVELOPER_API_SPEC_URL = "https://docs.ramp.com/openapi/developer-api.json"
 
@@ -23,6 +32,11 @@ APPLICATION_CREATED_MESSAGE = (
 )
 
 _APPLICATIONS_API_PATH = "/developer/v1/applications"
+_APPLICATION_AUTH_FALLBACK_SCOPES = (
+    "applications:read",
+    "applications:write",
+    "bank_accounts:read",
+)
 
 APPLICATION_EXAMPLE: dict[str, Any] = {
     "applicant": {
@@ -94,6 +108,7 @@ APPLICATION_EXAMPLE: dict[str, Any] = {
     "oauth_authorize_params": {
         "redirect_uri": "https://partner.example.com/oauth/callback",
         "state": "abc123",
+        "code_challenge": "base64url-encoded-sha256-pkce-challenge",
     },
 }
 
@@ -126,6 +141,52 @@ def _render_success_message(format_flag: str | None, config_format: str) -> None
     click.echo(APPLICATION_CREATED_MESSAGE)
 
 
+def _manual_auth_fallback_command(env: str) -> str:
+    scope_flags = " ".join(
+        f"--scope {scope}" for scope in _APPLICATION_AUTH_FALLBACK_SCOPES
+    )
+    return f"ramp --env {env} auth login --auth-level business {scope_flags}"
+
+
+def _render_handoff_result(
+    env: str,
+    authenticated: bool,
+    auth_error: str | None,
+    format_flag: str | None,
+    config_format: str,
+) -> None:
+    fmt = resolve_format(format_flag, config_format)
+    fallback_command = None if authenticated else _manual_auth_fallback_command(env)
+    message = APPLICATION_CREATED_MESSAGE
+    if authenticated:
+        message += " Ramp credentials were saved for this environment."
+    else:
+        message += " CLI authentication was not completed; use the fallback command."
+
+    payload = {
+        "message": message,
+        "environment": env,
+        "authenticated": authenticated,
+        "fallback_command": fallback_command,
+    }
+    if auth_error:
+        payload["auth_error"] = auth_error
+
+    if fmt == "json":
+        print_agent_json(payload, pagination={"has_more": False, "next": None})
+        return
+
+    click.echo(APPLICATION_CREATED_MESSAGE)
+    if authenticated:
+        click.echo("Ramp credentials were saved for this environment.")
+        return
+
+    if auth_error:
+        click.echo(f"CLI authentication was not completed: {auth_error}", err=True)
+    click.echo("Manual scoped auth fallback:", err=True)
+    click.echo(f"  {fallback_command}", err=True)
+
+
 def _render_dry_run(
     env: str, body: dict[str, Any], format_flag: str | None, config_format: str
 ) -> None:
@@ -148,12 +209,49 @@ def _render_dry_run(
     print_json(body)
 
 
-@click.group("applications", help="Apply for a Ramp account")
+def _inject_pkce_authorize_params(body: dict[str, Any], callback: PkceCallback) -> None:
+    params = body.setdefault("oauth_authorize_params", {})
+    if not isinstance(params, dict):
+        raise click.BadParameter(
+            "oauth_authorize_params must be a JSON object when --wait_for_auth is used",
+            param_hint="'--json'",
+        )
+
+    params.update(
+        {
+            "redirect_uri": callback.redirect_uri,
+            "state": callback.state,
+            "code_challenge": callback.code_challenge,
+        }
+    )
+
+
+def _save_token_response(env: str, token_resp: TokenResponse) -> None:
+    store.save_tokens(
+        env,
+        token_resp.access_token,
+        token_resp.refresh_token,
+        access_token_expires_in=token_resp.expires_in,
+        refresh_token_expires_in=token_resp.refresh_token_expires_in,
+        granted_scopes=token_resp.scope,
+        agent_key_uuid=token_resp.agent_key_uuid,
+    )
+
+
+@click.group(
+    "applications",
+    cls=GeneratedToolGroup,
+    tool_category="applications",
+    help="Start a new application or continue the authenticated applicant's current one",
+)
 def applications_group() -> None:
     pass
 
 
-@applications_group.command("create")
+@applications_group.command(
+    "create",
+    short_help="Start a new financing application (signup flow)",
+)
 @click.option(
     "--json",
     "json_body",
@@ -175,12 +273,37 @@ def applications_group() -> None:
     default=False,
     help="Print a full example JSON payload and exit",
 )
+@click.option(
+    "--wait_for_auth",
+    "--wait-for-auth",
+    is_flag=True,
+    default=False,
+    help=(
+        "Inject localhost PKCE OAuth params, then wait for invite acceptance "
+        "and save the resulting credentials."
+    ),
+)
+@click.option(
+    "--auth_timeout",
+    "--auth-timeout",
+    type=click.IntRange(1),
+    default=900,
+    show_default=True,
+    help="Seconds to wait for the OAuth redirect when --wait_for_auth is used.",
+)
 @click.pass_context
 def create_application(
-    ctx: click.Context, json_body: str | None, dry_run: bool, example: bool
+    ctx: click.Context,
+    json_body: str | None,
+    dry_run: bool,
+    example: bool,
+    wait_for_auth: bool,
+    auth_timeout: int,
 ) -> None:
-    """Create a financing application.
+    """Start a new financing application.
 
+    This starts the signup flow. To continue an existing authenticated
+    application, begin with `ramp applications progress`.
     Use --example to see the full JSON schema.
     """
     if example:
@@ -201,14 +324,55 @@ def create_application(
 
     env = ctx.obj["env"]
     body = _parse_json_body(json_body)
+    callback = None
 
-    if dry_run:
-        _render_dry_run(env, body, ctx.obj["format"], ctx.obj["config_format"])
-        return
+    if dry_run and wait_for_auth:
+        raise click.UsageError("--wait_for_auth cannot be used with --dry_run")
 
-    client = RampClient(env, access_token=application_signup_token(env))
-    client.post(_APPLICATIONS_API_PATH, json.dumps(body).encode())
-    _render_success_message(ctx.obj["format"], ctx.obj["config_format"])
+    try:
+        if wait_for_auth:
+            callback = start_pkce_callback()
+            _inject_pkce_authorize_params(body, callback)
+
+        if dry_run:
+            _render_dry_run(env, body, ctx.obj["format"], ctx.obj["config_format"])
+            return
+
+        client = RampClient(env, access_token=application_signup_token(env))
+        client.post(_APPLICATIONS_API_PATH, json.dumps(body).encode())
+        if not callback:
+            _render_success_message(ctx.obj["format"], ctx.obj["config_format"])
+            return
+
+        fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
+        if fmt != "json":
+            click.echo(
+                "Waiting for the applicant to accept the invite in their browser...",
+                err=True,
+            )
+        authenticated = False
+        auth_error = None
+        try:
+            code = callback.wait_for_code(
+                auth_timeout,
+                timeout_message=f"OAuth redirect timed out after {auth_timeout} seconds",
+            )
+            token_resp = exchange_pkce_callback_code(env, callback, code)
+            _save_token_response(env, token_resp)
+            authenticated = True
+        except (click.ClickException, OAuthTokenError, httpx.HTTPError, OSError) as exc:
+            auth_error = str(exc)
+
+        _render_handoff_result(
+            env,
+            authenticated,
+            auth_error,
+            ctx.obj["format"],
+            ctx.obj["config_format"],
+        )
+    finally:
+        if callback:
+            callback.shutdown()
 
 
 def _deep_merge(target: dict[str, Any], source: dict[str, Any]) -> None:

@@ -6,16 +6,22 @@ flags; complex nested params require the --json escape hatch.
 """
 
 import json
+import mimetypes
 import sys
 import threading
 import time
+from contextlib import ExitStack
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, quote, urlparse
 
 import click
 
 from ramp_cli.auth.store import get_granted_scopes
 from ramp_cli.client.api import RampClient
-from ramp_cli.config.constants import api_url
+from ramp_cli.config.constants import api_url, append_query_params
+from ramp_cli.config.settings import resolve_environment
 from ramp_cli.onboarding import maybe_show_category_tip
 from ramp_cli.output.formatter import (
     extract_headers,
@@ -30,7 +36,7 @@ from ramp_cli.output.paginator import ToolPaginator
 from ramp_cli.output.style import show_detail_card, show_table_card
 from ramp_cli.specs.sync import maybe_sync
 from ramp_cli.tools.parser import JsonSchema, ParamType, ToolDef, ToolParam
-from ramp_cli.tools.registry import CATEGORY_REMAP, get_tool
+from ramp_cli.tools.registry import CATEGORY_REMAP, get_tool, list_tool_defs
 
 _SPINNER_CHARS = "░▒▓█▓▒"
 
@@ -44,6 +50,53 @@ _PARAM_ALIASES: dict[str, list[str]] = {
     "page_size": ["--limit"],
     "limit": ["--page_size"],
 }
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedRequest:
+    """Transport-ready request derived from a tool and its input values."""
+
+    method: str
+    path: str
+    query: dict[str, Any]
+    body: dict[str, Any]
+    form: dict[str, Any]
+    files: dict[str, Path]
+    content_type: str
+
+    def display_body(self) -> dict[str, Any]:
+        if self.content_type != "multipart/form-data":
+            return self.body
+        return {
+            **self.form,
+            **{name: str(path) for name, path in self.files.items()},
+        }
+
+
+def resolve_tool_command_names(
+    group_name: str, tools: list[ToolDef]
+) -> list[tuple[str, ToolDef]]:
+    """Resolve the public command name for each tool in a CLI group."""
+    alias_tools: dict[str, list[ToolDef]] = {}
+    for tool in tools:
+        preferred = tool.alias or tool.name
+        alias_tools.setdefault(preferred, []).append(tool)
+
+    resolved: list[tuple[str, ToolDef]] = []
+    for tool in tools:
+        preferred = tool.alias or tool.name
+        peers = alias_tools[preferred]
+        if len(peers) == 1:
+            command_name = preferred
+        else:
+            native_peers = [peer for peer in peers if peer.category == group_name]
+            command_name = (
+                preferred
+                if tool.category == group_name and len(native_peers) == 1
+                else tool.name
+            )
+        resolved.append((command_name, tool))
+    return resolved
 
 
 def is_id_param(param: ToolParam) -> bool:
@@ -81,13 +134,17 @@ def build_tool_command(tool: ToolDef) -> click.Command:
     for p in tool.params:
         if not p.is_complex and not is_id_param(p):
             params.append(_build_option(p))
-    params.append(
-        click.Option(
-            ["--json", "json_body"],
-            default=None,
-            help="Raw JSON request body (validated against the tool schema)",
-        )
+    has_json_input = bool(
+        tool.params or (tool.json_schema and tool.json_schema.properties)
     )
+    if has_json_input:
+        params.append(
+            click.Option(
+                ["--json", "json_body"],
+                default=None,
+                help=_json_option_help(tool),
+            )
+        )
     params.append(
         click.Option(
             ["--dry_run", "-n"],
@@ -112,6 +169,63 @@ def build_tool_command(tool: ToolDef) -> click.Command:
         short_help=tool.summary,
         params=params,
     )
+
+
+class GeneratedToolGroup(click.Group):
+    """A hand-written Click group augmented by one generated tool category."""
+
+    def __init__(self, *args: Any, tool_category: str, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.tool_category = tool_category
+
+    @staticmethod
+    def _resolve_env(ctx: click.Context) -> str:
+        root = ctx.find_root()
+        flag_env = root.params.get("flag_env") or ""
+        try:
+            return resolve_environment(flag_env)
+        except ValueError:
+            # Root option validation reports the invalid value after command
+            # discovery, so use the default spec while Click resolves commands.
+            return "production"
+
+    def _generated_tools(self, ctx: click.Context) -> list[ToolDef]:
+        root = ctx.find_root()
+        env = self._resolve_env(ctx)
+        if not getattr(root, "_ramp_synced", False):
+            maybe_sync(env)
+            root._ramp_synced = True  # type: ignore[attr-defined]
+        return [
+            tool for tool in list_tool_defs(env) if tool.category == self.tool_category
+        ]
+
+    def _generated_commands(self, ctx: click.Context) -> list[tuple[str, ToolDef]]:
+        return resolve_tool_command_names(
+            self.tool_category,
+            self._generated_tools(ctx),
+        )
+
+    def list_commands(self, ctx: click.Context) -> list[str]:
+        static = set(super().list_commands(ctx))
+        generated = {name for name, _tool in self._generated_commands(ctx)}
+        return sorted(static | generated)
+
+    def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
+        if command := super().get_command(ctx, cmd_name):
+            return command
+
+        for command_name, tool in self._generated_commands(ctx):
+            if cmd_name == command_name:
+                return build_tool_command(tool)
+        return None
+
+
+def _json_option_help(tool: ToolDef) -> str:
+    """Describe when raw JSON is useful for this operation."""
+    complex_fields = [param.name for param in tool.params if param.is_complex]
+    if not complex_fields:
+        return "Raw JSON input (validated against the tool schema)"
+    return f"Raw JSON input; required for complex fields: {', '.join(complex_fields)}"
 
 
 def _build_option(param: ToolParam) -> click.Option:
@@ -143,6 +257,16 @@ def _build_option(param: ToolParam) -> click.Option:
             kwargs.update(default=None, help=f"{param.description}{hint}")
         case ParamType.ARRAY:
             kwargs.update(default=None, help=f"{param.description} (JSON array string)")
+        case ParamType.FILE:
+            kwargs.update(
+                type=click.Path(
+                    exists=True,
+                    dir_okay=False,
+                    readable=True,
+                    path_type=Path,
+                ),
+                default=None,
+            )
         case _:
             kwargs.update(type=str, default=None)
 
@@ -171,34 +295,55 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
 
     if json_body_raw:
         try:
-            body = json.loads(json_body_raw)
+            raw_values = json.loads(json_body_raw)
         except json.JSONDecodeError as e:
             raise click.BadParameter(f"invalid JSON: {e}", param_hint="'--json'")
         if not dry_run:
             tool = _sync_tool_for_json_validation(env, tool)
             synced_for_json_validation = True
-        body = _validate_json_body(tool, body)
+        raw_values = _validate_json_body(tool, raw_values)
+        values = _build_body(tool, kwargs, allow_missing=True)
+        body = dict(raw_values)
+        for param in tool.params:
+            if param.location == "body" or param.name not in body:
+                continue
+            value = body.pop(param.name)
+            if param.type is ParamType.FILE:
+                if value is None:
+                    continue
+                value = _validate_file_path(value, param.flag)
+            values[param.name] = value
+        _validate_required_path_params(tool, values)
     else:
-        body = _build_body(tool, kwargs)
+        values = _build_body(tool, kwargs)
+        body = {
+            param.name: values[param.name]
+            for param in tool.params
+            if param.location == "body" and param.name in values
+        }
 
-    is_get = tool.http_method == "get"
-    method_label = "GET" if is_get else "POST"
+    request = _prepare_request(tool, values, body)
 
     if dry_run:
+        query = {name: str(value) for name, value in request.query.items()}
         resolved = resolve_format(fmt, config_format)
         if resolved == "json":
             print_agent_json(
                 {
                     "dry_run": True,
-                    "method": method_label,
-                    "url": api_url(env, tool.path),
-                    "body": body,
+                    "method": request.method.upper(),
+                    "url": api_url(env, request.path, query),
+                    "body": request.display_body(),
                 },
                 pagination=None,
             )
         else:
-            click.echo(f"DRY RUN: {method_label} {api_url(env, tool.path)}", err=True)
-            print_json(body)
+            click.echo(
+                f"DRY RUN: {request.method.upper()} "
+                f"{api_url(env, request.path, query)}",
+                err=True,
+            )
+            print_json(request.display_body())
         return
 
     # Pre-flight scope check: fail fast with a clear message instead of
@@ -228,12 +373,8 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
     t0 = time.monotonic()
 
     client = RampClient(env)
-    if is_get:
-        params = {k: str(v) for k, v in body.items() if v is not None}
-        resp_bytes = client.get(tool.path, params)
-    else:
-        resp_bytes = client.post(tool.path, json.dumps(body).encode())
-    data = json.loads(resp_bytes)
+    resp_bytes = _execute_prepared_request(client, request)
+    data = json.loads(resp_bytes) if resp_bytes.strip() else {}
 
     elapsed = time.monotonic() - t0
     if stop_spinner:
@@ -249,20 +390,130 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
         maybe_show_category_tip(display_cat)
 
     if resolved == "json":
-        print_agent_json(data, pagination=_extract_pagination(data))
+        print_agent_json(
+            data,
+            pagination=_extract_pagination(
+                data,
+                cursor_param=_declared_cursor_param(tool),
+            ),
+        )
     else:
         wide: bool = ctx.obj.get("wide", False)
         _print_summary(tool.display_name, data, elapsed)
 
         no_input: bool = ctx.obj.get("no_input", False)
         if is_human and sys.stdin.isatty() and not no_input:
-            if _try_interactive_table(tool, data, body, client, wide=wide):
+            if _try_interactive_table(tool, data, request, client, wide=wide):
                 return
 
         _render_human(data, wide=wide, category=tool.category)
 
 
-def _build_body(tool: ToolDef, kwargs: dict[str, Any]) -> dict[str, Any]:
+def _prepare_request(
+    tool: ToolDef,
+    values: dict[str, Any],
+    body: dict[str, Any],
+) -> PreparedRequest:
+    path_values = _values_for_location(tool, values, "path")
+    query_values = {
+        name: value
+        for name, value in _values_for_location(tool, values, "query").items()
+        if value is not None
+    }
+    form_values = {
+        param.name: values[param.name]
+        for param in tool.params
+        if param.location == "form"
+        and param.type is not ParamType.FILE
+        and param.name in values
+        and values[param.name] is not None
+    }
+    file_values = {
+        param.name: Path(values[param.name])
+        for param in tool.params
+        if param.location == "form"
+        and param.type is ParamType.FILE
+        and param.name in values
+        and values[param.name] is not None
+    }
+    return PreparedRequest(
+        method=tool.http_method,
+        path=_resolve_path(tool.path, path_values),
+        query=query_values,
+        body=body,
+        form=form_values,
+        files=file_values,
+        content_type=tool.request_content_type,
+    )
+
+
+def _execute_prepared_request(
+    client: RampClient,
+    request: PreparedRequest,
+) -> bytes:
+    params = {name: str(value) for name, value in request.query.items()}
+    path = append_query_params(request.path, params)
+
+    if request.content_type == "multipart/form-data":
+        with ExitStack() as stack:
+            files = {}
+            for name, file_path in request.files.items():
+                file_obj = stack.enter_context(file_path.open("rb"))
+                content_type = (
+                    mimetypes.guess_type(file_path.name)[0]
+                    or "application/octet-stream"
+                )
+                files[name] = (file_path.name, file_obj, content_type)
+            data = {name: str(value) for name, value in request.form.items()}
+            if request.method == "post":
+                return client.post_multipart(path, data, files)
+            return client.request_multipart(request.method, path, data, files)
+
+    if request.method == "get":
+        return client.get(request.path, params)
+    payload = json.dumps(request.body).encode() if request.body else None
+    if request.method == "patch":
+        return client.patch(path, payload or b"{}")
+    if request.method == "put":
+        return client.put(path, payload or b"{}")
+    if request.method == "delete":
+        return client.delete(path, payload)
+    return client.post(path, payload or b"{}")
+
+
+def _values_for_location(
+    tool: ToolDef,
+    values: dict[str, Any],
+    location: str,
+) -> dict[str, Any]:
+    return {
+        param.name: values[param.name]
+        for param in tool.params
+        if param.location == location and param.name in values
+    }
+
+
+def _validate_file_path(value: Any, flag: str) -> Path:
+    if not isinstance(value, (str, Path)):
+        raise click.BadParameter(
+            f"file path for --{flag} must be a string",
+            param_hint="'--json'",
+        )
+    path = Path(value)
+    if not path.is_file():
+        raise click.BadParameter(
+            f"file does not exist: {path}",
+            param_hint="'--json'",
+        )
+    return path
+
+
+def _build_body(
+    tool: ToolDef,
+    kwargs: dict[str, Any],
+    *,
+    allow_missing: bool = False,
+) -> dict[str, Any]:
     """Assemble a JSON request body from Click flag values.
 
     Skips complex params (they must be provided via --json) and unset
@@ -318,24 +569,51 @@ def _build_body(tool: ToolDef, kwargs: dict[str, Any]) -> dict[str, Any]:
         else:
             body[param.name] = val
 
-    if missing:
-        example_parts = [f"ramp {tool.display_name}"]
-        # Positional args first, then options
-        for param in tool.params:
-            if param.required and not param.is_complex and is_id_param(param):
-                example_parts.append(f"<{param.flag}>")
-        for param in tool.params:
-            if param.required and not param.is_complex and not is_id_param(param):
-                if param.type is ParamType.ENUM and param.enum_values:
-                    example_parts.append(f"--{param.flag} {param.enum_values[0]}")
-                else:
-                    example_parts.append(f"--{param.flag} <value>")
-        example = " ".join(example_parts)
-        raise click.UsageError(
-            f"Missing required flags: {', '.join(missing)}\n\n  Example: {example}"
-        )
+    if missing and not allow_missing:
+        _raise_missing_params(tool, missing)
 
     return body
+
+
+def _validate_required_path_params(
+    tool: ToolDef,
+    values: dict[str, Any],
+) -> None:
+    missing: list[str] = []
+    for param in tool.params:
+        if not param.required or param.location != "path":
+            continue
+        if values.get(param.name) is not None:
+            continue
+        if is_id_param(param):
+            missing.append(param.flag.upper())
+        else:
+            missing.append(f"--{param.flag}")
+    if missing:
+        _raise_missing_params(tool, missing)
+
+
+def _raise_missing_params(tool: ToolDef, missing: list[str]) -> None:
+    example_parts = [f"ramp {tool.display_name}"]
+    for param in tool.params:
+        if param.required and not param.is_complex and is_id_param(param):
+            example_parts.append(f"<{param.flag}>")
+    for param in tool.params:
+        if param.required and not param.is_complex and not is_id_param(param):
+            if param.type is ParamType.ENUM and param.enum_values:
+                example_parts.append(f"--{param.flag} {param.enum_values[0]}")
+            else:
+                example_parts.append(f"--{param.flag} <value>")
+    example = " ".join(example_parts)
+    raise click.UsageError(
+        f"Missing required flags: {', '.join(missing)}\n\n  Example: {example}"
+    )
+
+
+def _resolve_path(path: str, values: dict[str, Any]) -> str:
+    for name, value in values.items():
+        path = path.replace("{" + name + "}", quote(str(value), safe=""))
+    return path
 
 
 def _validate_json_body(tool: ToolDef, body: Any) -> dict[str, Any]:
@@ -463,7 +741,7 @@ def _print_summary(tool_name: str, data: Any, elapsed: float) -> None:
 def _try_interactive_table(
     tool: ToolDef,
     data: Any,
-    body: dict,
+    request: PreparedRequest,
     client: "RampClient",
     wide: bool = False,
 ) -> bool:
@@ -476,19 +754,19 @@ def _try_interactive_table(
     if not list_items:
         return False
 
-    next_cursor = data.get("next_page_cursor") if isinstance(data, dict) else None
+    next_cursor = _pagination_next(data)
     cursor_param = _detect_cursor_param(tool)
     headers = extract_headers(list_items[0], wide=wide, category=tool.category)
 
     def fetch_next(cursor: str) -> tuple[list[dict[str, str]], str | None]:
-        fetch_body = dict(body)
-        fetch_body[cursor_param] = cursor
-        resp = client.post(tool.path, json.dumps(fetch_body).encode())
+        if cursor.startswith(("https://", "http://")):
+            resp = client.get_url(cursor)
+        else:
+            next_request = _with_request_value(tool, request, cursor_param, cursor)
+            resp = _execute_prepared_request(client, next_request)
         page_data = json.loads(resp)
         _k, items = _extract_list_field(page_data)
-        return _format_rows(items, headers, wide=wide), page_data.get(
-            "next_page_cursor"
-        )
+        return _format_rows(items, headers, wide=wide), _pagination_next(page_data)
 
     selected = ToolPaginator(
         title=tool.display_name,
@@ -502,34 +780,90 @@ def _try_interactive_table(
     return True
 
 
+def _with_request_value(
+    tool: ToolDef,
+    request: PreparedRequest,
+    name: str,
+    value: Any,
+) -> PreparedRequest:
+    param = next((param for param in tool.params if param.name == name), None)
+    location = param.location if param is not None else "body"
+    field_name = {
+        "query": "query",
+        "form": "form",
+        "body": "body",
+    }.get(location, "body")
+    updated = dict(getattr(request, field_name))
+    updated[name] = value
+    return replace(request, **{field_name: updated})
+
+
 _CURSOR_PARAM_NAMES = ("next_page_cursor", "page_cursor", "cursor", "start")
 
 
 def _detect_cursor_param(tool: ToolDef) -> str:
     """Detect which input param name this tool uses for cursor pagination."""
+    return _declared_cursor_param(tool) or "next_page_cursor"
+
+
+def _declared_cursor_param(tool: ToolDef) -> str | None:
     param_names = {p.name for p in tool.params}
     for name in _CURSOR_PARAM_NAMES:
         if name in param_names:
             return name
-    return "next_page_cursor"
+    return None
 
 
 _PAGINATION_KEYS = ("next_page_cursor", "page_cursor", "cursor", "next")
 
 
-def _extract_pagination(data: Any) -> dict | None:
+def _extract_pagination(
+    data: Any,
+    *,
+    cursor_param: str | None = None,
+) -> dict | None:
     """Extract pagination info from an API response for the agent JSON envelope.
 
-    Looks for common cursor fields in the top-level response dict.
-    Returns a dict like {"next_page_cursor": "tok_abc"} or None if no cursor.
+    Full next-page URLs are reduced to the value accepted by the tool's cursor
+    parameter when one is known. Interactive pagination still uses the full URL.
     """
     if not isinstance(data, dict):
         return None
     for key in _PAGINATION_KEYS:
         value = data.get(key)
         if value is not None:
-            return {"next_cursor": value}
+            return {
+                "next_cursor": _agent_cursor_value(value, cursor_param=cursor_param)
+            }
+    page = data.get("page")
+    if isinstance(page, dict) and page.get("next") is not None:
+        return {
+            "next_cursor": _agent_cursor_value(
+                page["next"],
+                cursor_param=cursor_param,
+            )
+        }
     return None
+
+
+def _agent_cursor_value(value: Any, *, cursor_param: str | None) -> Any:
+    if (
+        cursor_param is None
+        or not isinstance(value, str)
+        or not value.startswith(("https://", "http://"))
+    ):
+        return value
+
+    values = parse_qs(urlparse(value).query).get(cursor_param)
+    return values[0] if values else value
+
+
+def _pagination_next(data: Any) -> str | None:
+    pagination = _extract_pagination(data)
+    if pagination is None:
+        return None
+    value = pagination.get("next_cursor")
+    return str(value) if value else None
 
 
 def _extract_list_field(data: Any) -> tuple[str | None, list[dict]]:

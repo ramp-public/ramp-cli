@@ -7,7 +7,12 @@ import re
 
 from click.testing import CliRunner
 
-from ramp_cli.main import _SINGLE_TOOL_RESOURCE_CATEGORIES, CATEGORY_REMAP, cli
+from ramp_cli.main import (
+    _SINGLE_TOOL_RESOURCE_CATEGORIES,
+    CATEGORY_ALIAS_GROUPS,
+    CATEGORY_REMAP,
+    cli,
+)
 from ramp_cli.skills import (
     SKILLS_DIR,
     detect_agent_dir,
@@ -21,10 +26,12 @@ from ramp_cli.tools.parser import parse_spec
 
 class TestSkillDiscovery:
     def test_skill_names_discovers_all(self):
-        """All 12 skills should be discovered from the skills/ directory."""
+        """All 14 skills should be discovered from the skills/ directory."""
         names = skill_names()
-        assert len(names) == 12
+        assert len(names) == 14
         assert "agentic-purchase" in names
+        assert "card-management" in names
+        assert "book-flight" in names
         assert "browser-automation" in names
         assert "approval-dashboard" in names
         assert "manage-procurement" in names
@@ -50,10 +57,12 @@ class TestSkillsList:
         assert result.exit_code == 0
 
         data = json.loads(result.output)
-        assert len(data["data"]) == 12
+        assert len(data["data"]) == 14
         names = {s["name"] for s in data["data"]}
         assert "browser-automation" in names
+        assert "card-management" in names
         assert "agentic-purchase" in names
+        assert "book-flight" in names
         assert "manage-procurement" in names
         assert "manage-bills" in names
         assert "vendor-document-upload" in names
@@ -62,7 +71,7 @@ class TestSkillsList:
         runner = CliRunner()
         result = runner.invoke(cli, ["--human", "skills", "list"])
         assert result.exit_code == 0
-        assert "12 Skills" in result.output
+        assert "14 Skills" in result.output
         assert "browser-automation" in result.output
         assert "manage-procurement" in result.output
         assert "manage-bills" in result.output
@@ -111,14 +120,14 @@ class TestSkillsInstall:
         assert "Browser Automation" in dest.read_text()
 
     def test_install_all(self, tmp_path):
-        """--all installs all 12 skills."""
+        """--all installs all 14 skills."""
         runner = CliRunner()
         result = runner.invoke(
             cli, ["skills", "install", "--all", "--target", str(tmp_path)]
         )
         assert result.exit_code == 0
         installed = [d.name for d in tmp_path.iterdir() if d.is_dir()]
-        assert len(installed) == 12
+        assert len(installed) == 14
 
     def test_install_overwrites(self, tmp_path):
         """Installing twice succeeds and returns 'updated' on second run."""
@@ -209,7 +218,7 @@ HAND_WRITTEN_COMMANDS: dict[str, set[str] | None] = {
     "env": {"sandbox", "production"},
     "feedback": None,
     "skills": {"list", "show", "install"},
-    "tools": {"refresh"},
+    "tools": {"refresh", "schema"},
 }
 
 SKILL_COMMAND_REFERENCES = {
@@ -263,6 +272,12 @@ def _build_valid_commands() -> set[tuple[str, str]]:
                 alias = t.alias or t.name
                 valid.add(("general", alias))
 
+    # Additive alias groups (e.g. cards): the tool's short alias is also
+    # reachable under its original spec category as its own group.
+    for t in tools:
+        if t.category in CATEGORY_ALIAS_GROUPS:
+            valid.add((t.category, t.alias or t.name))
+
     return valid | SKILL_COMMAND_REFERENCES
 
 
@@ -289,6 +304,13 @@ def _build_tool_param_index() -> dict[tuple[str, str], set[str]]:
                 alias = t.alias or t.name
                 key = ("general", alias)
                 index.setdefault(key, set()).update(p.name for p in t.params)
+
+    # Additive alias groups (e.g. cards): index the tool's params under its
+    # own spec-category group as well.
+    for t in tools:
+        if t.category in CATEGORY_ALIAS_GROUPS:
+            key = (t.category, t.alias or t.name)
+            index.setdefault(key, set()).update(p.name for p in t.params)
 
     return index
 

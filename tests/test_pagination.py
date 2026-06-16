@@ -32,6 +32,11 @@ class TestExtractPagination:
                 id="next",
             ),
             pytest.param(
+                {"data": [], "page": {"next": "https://api.ramp.com/things?start=2"}},
+                {"next_cursor": "https://api.ramp.com/things?start=2"},
+                id="nested_page_next",
+            ),
+            pytest.param(
                 {"transactions": [], "total_count": 5},
                 None,
                 id="no_cursor_field",
@@ -55,3 +60,15 @@ class TestExtractPagination:
     )
     def test_extract_pagination(self, data, expected):
         assert _extract_pagination(data) == expected
+
+    def test_extracts_declared_cursor_from_next_page_url(self):
+        data = {
+            "data": [],
+            "page": {
+                "next": "https://api.ramp.com/things?page_size=2&start=entity%2F2"
+            },
+        }
+
+        assert _extract_pagination(data, cursor_param="start") == {
+            "next_cursor": "entity/2"
+        }

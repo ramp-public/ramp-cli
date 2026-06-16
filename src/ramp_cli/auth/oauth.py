@@ -29,11 +29,17 @@ from ramp_cli.config.constants import (
     auth_setup_url,
     auth_url,
     client_id,
+    environment_cache_key,
     token_url,
 )
 from ramp_cli.config.settings import configured_scopes
+from ramp_cli.specs import AGENT_TOOL_SPEC, local_agent_tool_hash
 from ramp_cli.tools.parser import extract_all_scopes
 from ramp_cli.tools.registry import _resolve_spec_path
+
+_SCOPE_SPEC_CACHE_FRESH_SECONDS = 3600
+_OAUTH_CALLBACK_TIMEOUT_SECONDS = 900
+_AUTH_SETUP_BROWSER_DELAY_SECONDS = 1.0
 
 
 @dataclass
@@ -52,6 +58,32 @@ class TokenResponse:
 @dataclass
 class LoginOptions:
     no_browser: bool = False
+    scopes: tuple[str, ...] = ()
+    auth_level: str = "auto"
+
+
+@dataclass
+class PkceCallback:
+    redirect_uri: str
+    state: str
+    code_challenge: str
+    _verifier: str
+    _server: HTTPServer
+    _thread: threading.Thread
+    _event: threading.Event
+    _result: dict[str, Any]
+
+    def wait_for_code(self, timeout: int, *, timeout_message: str) -> str:
+        if not self._event.wait(timeout=timeout):
+            raise click.ClickException(timeout_message)
+        if "error" in self._result:
+            raise click.ClickException(self._result["error"])
+        return str(self._result["code"])
+
+    def shutdown(self) -> None:
+        self._server.shutdown()
+        self._thread.join(timeout=1)
+        self._server.server_close()
 
 
 class OAuthTokenError(Exception):
@@ -158,6 +190,60 @@ def login(env: str, opts: LoginOptions | None = None) -> TokenResponse:
 
     opts = opts or LoginOptions()
 
+    callback = start_pkce_callback()
+
+    scopes = _resolve_login_scopes(env, opts.scopes)
+    auth = _build_auth_url(
+        env,
+        callback.redirect_uri,
+        callback.state,
+        callback.code_challenge,
+        scopes,
+        auth_level=opts.auth_level,
+    )
+    setup_auth = auth_setup_url(env)
+
+    try:
+        if opts.no_browser:
+            if setup_auth:
+                click.echo(
+                    "Open this URL first to prepare your browser for authentication:"
+                    f"\n\n  {setup_auth}\n",
+                    err=True,
+                )
+            click.echo(
+                f"Open this URL in your browser to authenticate:\n\n  {auth}\n",
+                err=True,
+            )
+        else:
+            if setup_auth:
+                if not _open_browser(setup_auth):
+                    click.echo(
+                        "Could not open browser for the authentication setup step. "
+                        f"Open this URL manually first:\n\n  {setup_auth}\n",
+                        err=True,
+                    )
+                # The setup page may need a moment to apply browser-local routing
+                # before the OAuth authorize URL opens in the same browser profile.
+                time.sleep(_AUTH_SETUP_BROWSER_DELAY_SECONDS)
+            if not _open_browser(auth):
+                click.echo(
+                    f"Could not open browser. Open this URL manually:\n\n  {auth}\n",
+                    err=True,
+                )
+
+        click.echo("Waiting for authentication in browser...", err=True)
+        code = callback.wait_for_code(
+            _OAUTH_CALLBACK_TIMEOUT_SECONDS,
+            timeout_message="Authentication timed out after 15 minutes",
+        )
+    finally:
+        callback.shutdown()
+
+    return exchange_pkce_callback_code(env, callback, code)
+
+
+def start_pkce_callback() -> PkceCallback:
     verifier = _generate_verifier()
     challenge = _generate_challenge(verifier)
     state = _generate_state()
@@ -166,11 +252,6 @@ def login(env: str, opts: LoginOptions | None = None) -> TokenResponse:
     port = listener.getsockname()[1]
     redirect_uri = f"http://localhost:{port}/callback"
 
-    scopes = _resolve_scopes(env)
-    auth = _build_auth_url(env, redirect_uri, state, challenge, scopes)
-    setup_auth = auth_setup_url(env)
-
-    # Channel for the authorization code
     result: dict[str, Any] = {}
     event = threading.Event()
 
@@ -255,43 +336,24 @@ def login(env: str, opts: LoginOptions | None = None) -> TokenResponse:
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
 
-    try:
-        if opts.no_browser:
-            if setup_auth:
-                click.echo(
-                    "Open this URL first to set the QA dev-deploy override:"
-                    f"\n\n  {setup_auth}\n",
-                    err=True,
-                )
-            click.echo(
-                f"Open this URL in your browser to authenticate:\n\n  {auth}\n",
-                err=True,
-            )
-        else:
-            if setup_auth:
-                if not _open_browser(setup_auth):
-                    click.echo(
-                        "Could not open browser to set the QA dev-deploy override. "
-                        f"Open this URL manually first:\n\n  {setup_auth}\n",
-                        err=True,
-                    )
-                time.sleep(1)
-            if not _open_browser(auth):
-                click.echo(
-                    f"Could not open browser. Open this URL manually:\n\n  {auth}\n",
-                    err=True,
-                )
+    return PkceCallback(
+        redirect_uri=redirect_uri,
+        state=state,
+        code_challenge=challenge,
+        _verifier=verifier,
+        _server=server,
+        _thread=server_thread,
+        _event=event,
+        _result=result,
+    )
 
-        click.echo("Waiting for authentication in browser...", err=True)
-        if not event.wait(timeout=300):
-            raise click.ClickException("Authentication timed out after 5 minutes")
-    finally:
-        server.shutdown()
 
-    if "error" in result:
-        raise click.ClickException(result["error"])
-
-    return _exchange_code(env, result["code"], redirect_uri, verifier)
+def exchange_pkce_callback_code(
+    env: str,
+    callback: PkceCallback,
+    code: str,
+) -> TokenResponse:
+    return _exchange_code(env, code, callback.redirect_uri, callback._verifier)
 
 
 def refresh_tokens(env: str, refresh_token: str) -> TokenResponse:
@@ -332,10 +394,16 @@ def _listen_for_callback() -> socket.socket:
 
 
 def _build_auth_url(
-    env: str, redirect_uri: str, state: str, challenge: str, scopes: str
+    env: str,
+    redirect_uri: str,
+    state: str,
+    challenge: str,
+    scopes: str,
+    *,
+    auth_level: str = "auto",
 ) -> str:
     params = {
-        "auth_level": "auto",
+        "auth_level": auth_level,
         "response_type": "code",
         "client_id": client_id(env),
         "redirect_uri": redirect_uri,
@@ -483,24 +551,52 @@ def _resolve_scopes(env: str) -> str:
     """Build the OAuth scope string for login.
 
     Uses custom scopes if configured, otherwise merges DevAPI scopes
-    with scopes extracted from the agent-tool OpenAPI spec. Prefers
-    the env-specific cached spec (written by ``tools refresh``) so
-    that newly introduced scopes are requested after a sync.
+    with scopes extracted from the agent-tool OpenAPI spec. A freshly
+    synced env cache is authoritative for that environment; stale or
+    untracked caches are merged with the bundled spec so they cannot
+    hide scopes that the installed CLI already knows about.
     """
     custom = configured_scopes()
     if custom:
         return custom
 
     all_scopes = set(DEVAPI_SCOPES)
-    try:
-        all_scopes.update(extract_all_scopes(_resolve_spec_path(env)))
-    except Exception:
-        click.echo(
-            "\n  ⚠  Could not read tool definitions — some scopes may be missing."
-            "\n     Run 'ramp tools refresh' then 'ramp auth login' to fix.\n",
-            err=True,
-        )
+    for spec_path in _resolve_scope_spec_paths(env):
+        try:
+            all_scopes.update(extract_all_scopes(spec_path))
+        except Exception:
+            click.echo(
+                f"\n  ⚠  Could not read tool definitions from {spec_path}."
+                "\n     Some scopes may be missing."
+                "\n     Run 'ramp tools refresh' then 'ramp auth login' to fix.\n",
+                err=True,
+            )
     return " ".join(sorted(all_scopes))
+
+
+def _resolve_login_scopes(env: str, requested_scopes: tuple[str, ...]) -> str:
+    """Use an explicit least-privilege scope set or discover all tool scopes."""
+    if requested_scopes:
+        return " ".join(dict.fromkeys(requested_scopes))
+    return _resolve_scopes(env)
+
+
+def _resolve_scope_spec_paths(env: str):
+    cached_spec = _resolve_spec_path(env)
+    if cached_spec == AGENT_TOOL_SPEC:
+        return (AGENT_TOOL_SPEC,)
+    if _has_fresh_scope_spec_cache(env):
+        return (cached_spec,)
+    return (AGENT_TOOL_SPEC, cached_spec)
+
+
+def _has_fresh_scope_spec_cache(env: str) -> bool:
+    try:
+        hash_path = local_agent_tool_hash(environment_cache_key(env))
+        age = time.time() - hash_path.stat().st_mtime
+    except Exception:
+        return False
+    return age < _SCOPE_SPEC_CACHE_FRESH_SECONDS
 
 
 def _generate_verifier() -> str:

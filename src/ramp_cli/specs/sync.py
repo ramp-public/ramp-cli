@@ -1,4 +1,4 @@
-"""Fetch and cache the agent-tool OpenAPI spec from the public endpoint."""
+"""Fetch and cache OpenAPI documents used for generated CLI tools."""
 
 from __future__ import annotations
 
@@ -9,12 +9,8 @@ import time
 import httpx
 
 from ramp_cli.auth.environment import extra_auth_headers
-from ramp_cli.config.constants import (
-    agent_tool_spec_hash_url,
-    agent_tool_spec_url,
-    environment_cache_key,
-)
-from ramp_cli.specs import local_agent_tool_hash, local_agent_tool_spec
+from ramp_cli.config.constants import environment_cache_key
+from ramp_cli.specs import AGENT_TOOL_DEFINITION, GeneratedToolSpec
 from ramp_cli.tools.registry import reload
 
 log = logging.getLogger(__name__)
@@ -28,18 +24,35 @@ def fetch_spec(env: str, *, known_hash: str | None = None) -> int:
     If *known_hash* is provided (e.g. from a prior ``/hash`` check),
     it is stored directly and no extra hash request is made.
     """
+    spec = _fetch_spec(env, AGENT_TOOL_DEFINITION, known_hash=known_hash)
+    return sum(
+        1
+        for path_item in spec.get("paths", {}).values()
+        for method, operation in path_item.items()
+        if method in {"get", "post", "put", "patch", "delete"}
+        and isinstance(operation, dict)
+        and "cli" in operation.get("x-platforms", ["cli"])
+    )
+
+
+def _fetch_spec(
+    env: str,
+    definition: GeneratedToolSpec,
+    *,
+    known_hash: str | None,
+) -> dict:
     cache_key = environment_cache_key(env)
-    spec_path = local_agent_tool_spec(cache_key)
-    hash_path = local_agent_tool_hash(cache_key)
+    spec_path = definition.local_spec(cache_key)
+    hash_path = definition.local_hash(cache_key)
     headers = extra_auth_headers(env)
 
     with httpx.Client(timeout=30.0) as client:
-        resp = client.get(agent_tool_spec_url(env), headers=headers)
+        resp = client.get(definition.spec_url(env), headers=headers)
         resp.raise_for_status()
         spec = resp.json()
 
         if known_hash is None:
-            hash_resp = client.get(agent_tool_spec_hash_url(env), headers=headers)
+            hash_resp = client.get(definition.hash_url(env), headers=headers)
             hash_resp.raise_for_status()
             known_hash = hash_resp.json().get("content_hash", "")
 
@@ -47,7 +60,7 @@ def fetch_spec(env: str, *, known_hash: str | None = None) -> int:
     spec_path.write_text(json.dumps(spec, indent=2) + "\n")
     hash_path.write_text(known_hash)
 
-    return len([p for p in spec.get("paths", {}) if "agent-tools" in p])
+    return spec
 
 
 def maybe_sync(env: str, *, force: bool = False) -> None:
@@ -56,7 +69,8 @@ def maybe_sync(env: str, *, force: bool = False) -> None:
     The normal path uses a 1h cooldown. Callers that must validate user input
     against the latest schema can force a hash check before proceeding.
     """
-    hash_path = local_agent_tool_hash(environment_cache_key(env))
+    definition = AGENT_TOOL_DEFINITION
+    hash_path = definition.local_hash(environment_cache_key(env))
 
     try:
         if not force and hash_path.exists():
@@ -70,7 +84,7 @@ def maybe_sync(env: str, *, force: bool = False) -> None:
     try:
         headers = extra_auth_headers(env)
         with httpx.Client(timeout=3.0) as client:
-            resp = client.get(agent_tool_spec_hash_url(env), headers=headers)
+            resp = client.get(definition.hash_url(env), headers=headers)
             resp.raise_for_status()
             remote_hash = resp.json().get("content_hash", "")
     except Exception:

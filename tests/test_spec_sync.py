@@ -10,7 +10,17 @@ import pytest
 
 from ramp_cli.specs.sync import _COOLDOWN_SECONDS, fetch_spec, maybe_sync
 
-FAKE_SPEC = {"paths": {"/v1/agent-tools/a": {}, "/v1/agent-tools/b": {}, "/other": {}}}
+FAKE_SPEC = {
+    "paths": {
+        "/v1/agent-tools/a": {
+            "post": {"x-platforms": ["cli"], "responses": {"200": {}}}
+        },
+        "/developer/v1/applications": {
+            "get": {"x-platforms": ["cli"], "responses": {"200": {}}}
+        },
+        "/mcp-only": {"get": {"x-platforms": ["mcp"], "responses": {"200": {}}}},
+    }
+}
 
 
 def _mock_response(*, json_body=None, status_code=200, headers=None):
@@ -45,14 +55,7 @@ def _mock_httpx(request):
 @pytest.fixture()
 def sync_paths(tmp_path, monkeypatch):
     """Point local_agent_tool_spec and local_agent_tool_hash at tmp_path."""
-    monkeypatch.setattr(
-        "ramp_cli.specs.sync.local_agent_tool_spec",
-        lambda env: tmp_path / f"spec-{env}.json",
-    )
-    monkeypatch.setattr(
-        "ramp_cli.specs.sync.local_agent_tool_hash",
-        lambda env: tmp_path / f"hash-{env}.txt",
-    )
+    monkeypatch.setattr("ramp_cli.specs.config_dir", lambda: tmp_path)
     return tmp_path
 
 
@@ -71,8 +74,8 @@ class TestFetchSpec:
         count = fetch_spec("production")
 
         assert count == 2
-        spec_file = sync_paths / "spec-production.json"
-        hash_file = sync_paths / "hash-production.txt"
+        spec_file = sync_paths / "agent-tool-production.json"
+        hash_file = sync_paths / "agent-tool-production-hash.txt"
         assert json.loads(spec_file.read_text()) == FAKE_SPEC
         assert hash_file.read_text() == "abc123"
 
@@ -88,7 +91,7 @@ class TestFetchSpec:
     )
     def test_no_content_hash_writes_empty(self, _mock_httpx, sync_paths):
         fetch_spec("sandbox")
-        assert (sync_paths / "hash-sandbox.txt").read_text() == ""
+        assert (sync_paths / "agent-tool-sandbox-hash.txt").read_text() == ""
 
     @pytest.mark.parametrize(
         "_mock_httpx",
@@ -96,7 +99,18 @@ class TestFetchSpec:
             [
                 _mock_response(json_body=FAKE_SPEC),
                 _mock_response(json_body={"content_hash": "prod_hash"}),
-                _mock_response(json_body={"paths": {"/v1/agent-tools/x": {}}}),
+                _mock_response(
+                    json_body={
+                        "paths": {
+                            "/v1/agent-tools/x": {
+                                "post": {
+                                    "x-platforms": ["cli"],
+                                    "responses": {"200": {}},
+                                }
+                            }
+                        }
+                    }
+                ),
                 _mock_response(json_body={"content_hash": "sandbox_hash"}),
             ]
         ],
@@ -107,12 +121,16 @@ class TestFetchSpec:
         fetch_spec("production")
         fetch_spec("sandbox")
 
-        prod_spec = json.loads((sync_paths / "spec-production.json").read_text())
-        sandbox_spec = json.loads((sync_paths / "spec-sandbox.json").read_text())
+        prod_spec = json.loads((sync_paths / "agent-tool-production.json").read_text())
+        sandbox_spec = json.loads((sync_paths / "agent-tool-sandbox.json").read_text())
         assert prod_spec != sandbox_spec
 
-        assert (sync_paths / "hash-production.txt").read_text() == "prod_hash"
-        assert (sync_paths / "hash-sandbox.txt").read_text() == "sandbox_hash"
+        assert (
+            sync_paths / "agent-tool-production-hash.txt"
+        ).read_text() == "prod_hash"
+        assert (
+            sync_paths / "agent-tool-sandbox-hash.txt"
+        ).read_text() == "sandbox_hash"
 
     @pytest.mark.parametrize(
         "_mock_httpx",
@@ -123,7 +141,9 @@ class TestFetchSpec:
         """When known_hash is provided, only one request (spec) is made."""
         fetch_spec("production", known_hash="pre-fetched")
 
-        assert (sync_paths / "hash-production.txt").read_text() == "pre-fetched"
+        assert (
+            sync_paths / "agent-tool-production-hash.txt"
+        ).read_text() == "pre-fetched"
         # Only one get() call (spec), not two
         assert _mock_httpx.get.call_count == 1
 
@@ -186,7 +206,7 @@ class TestMaybeSync:
         }
 
     def test_fresh_hash_file_skips_network(self, sync_paths):
-        hash_file = sync_paths / "hash-production.txt"
+        hash_file = sync_paths / "agent-tool-production-hash.txt"
         hash_file.write_text("somehash")
 
         with patch("ramp_cli.specs.sync.httpx.Client") as mock_cls:
@@ -200,7 +220,7 @@ class TestMaybeSync:
     )
     @patch("ramp_cli.specs.sync.fetch_spec")
     def test_force_bypasses_fresh_hash_file(self, mock_fetch, _mock_httpx, sync_paths):
-        hash_file = sync_paths / "hash-production.txt"
+        hash_file = sync_paths / "agent-tool-production-hash.txt"
         hash_file.write_text("oldhash")
 
         maybe_sync("production", force=True)
@@ -216,7 +236,7 @@ class TestMaybeSync:
     def test_stale_hash_same_value_touches_file(
         self, mock_fetch, _mock_httpx, sync_paths
     ):
-        hash_file = sync_paths / "hash-production.txt"
+        hash_file = sync_paths / "agent-tool-production-hash.txt"
         hash_file.write_text("samehash")
         old_time = time.time() - _COOLDOWN_SECONDS - 100
         os.utime(hash_file, (old_time, old_time))
@@ -235,7 +255,7 @@ class TestMaybeSync:
     def test_stale_hash_different_value_fetches(
         self, mock_fetch, _mock_httpx, sync_paths
     ):
-        hash_file = sync_paths / "hash-production.txt"
+        hash_file = sync_paths / "agent-tool-production-hash.txt"
         hash_file.write_text("oldhash")
         old_time = time.time() - _COOLDOWN_SECONDS - 100
         os.utime(hash_file, (old_time, old_time))
@@ -255,7 +275,7 @@ class TestMaybeSync:
     ):
         """When the server returns no content_hash, fetch the full spec
         instead of treating empty == empty as a match."""
-        hash_file = sync_paths / "hash-production.txt"
+        hash_file = sync_paths / "agent-tool-production-hash.txt"
         hash_file.write_text("")
         old_time = time.time() - _COOLDOWN_SECONDS - 100
         os.utime(hash_file, (old_time, old_time))
@@ -275,7 +295,7 @@ class TestMaybeSync:
 
     def test_stale_production_does_not_suppress_sandbox(self, sync_paths):
         """Per-env cooldown: a fresh production hash must not block sandbox checks."""
-        prod_hash = sync_paths / "hash-production.txt"
+        prod_hash = sync_paths / "agent-tool-production-hash.txt"
         prod_hash.write_text("prod_hash")  # fresh — written just now
 
         with patch("ramp_cli.specs.sync.httpx.Client") as mock_cls:

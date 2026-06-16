@@ -5,10 +5,14 @@ from __future__ import annotations
 import click
 import httpx
 
-from ramp_cli.output.formatter import print_agent_json, resolve_format
+from ramp_cli.config.constants import environment_cache_key
+from ramp_cli.output.formatter import print_agent_json, print_json, resolve_format
 from ramp_cli.output.help import BoxHelpFormatter
+from ramp_cli.specs import AGENT_TOOL_DEFINITION
 from ramp_cli.specs.sync import fetch_spec, maybe_sync
-from ramp_cli.tools.registry import list_categories, reload
+from ramp_cli.tools.commands import resolve_tool_command_names
+from ramp_cli.tools.parser import load_component_schema
+from ramp_cli.tools.registry import list_categories, list_tool_defs, reload
 
 
 @click.group("tools", help="Manage agent-tool specifications")
@@ -53,9 +57,13 @@ def tools_list(ctx: click.Context) -> None:
     if fmt == "json":
         print_agent_json(
             [
-                {"name": t.name, "category": cat, "description": t.description}
+                {
+                    "name": name,
+                    "category": cat,
+                    "description": tool.description,
+                }
                 for cat, tools in sorted(categories.items())
-                for t in tools
+                for name, tool in resolve_tool_command_names(cat, tools)
             ],
             pagination=None,
         )
@@ -66,7 +74,10 @@ def tools_list(ctx: click.Context) -> None:
         formatter = BoxHelpFormatter()
         total = 0
         for cat, tools in sorted(categories.items()):
-            dl_rows = [(t.alias or t.name, t.description or "") for t in tools]
+            dl_rows = [
+                (name, tool.description or "")
+                for name, tool in resolve_tool_command_names(cat, tools)
+            ]
             total += len(dl_rows)
             with formatter.section(cat.replace("_", " ").title()):
                 formatter.write_dl(dl_rows)
@@ -74,3 +85,45 @@ def tools_list(ctx: click.Context) -> None:
     finally:
         BoxHelpFormatter._suppress_wave = False
     click.echo(f"\n  {total} tools across {len(categories)} categories")
+
+
+@tools_group.command("schema", help="Show a generated tool's request schema")
+@click.argument("category")
+@click.argument("tool_name")
+@click.pass_context
+def tools_schema(ctx: click.Context, category: str, tool_name: str) -> None:
+    """Print the OpenAPI request schema for CATEGORY TOOL_NAME."""
+    env: str = ctx.obj["env"]
+    maybe_sync(env, force=True)
+
+    category_tools = [
+        candidate for candidate in list_tool_defs(env) if candidate.category == category
+    ]
+    named_tools = resolve_tool_command_names(category, category_tools)
+    tool = next(
+        (candidate for name, candidate in named_tools if name == tool_name),
+        None,
+    )
+    if tool is None:
+        alias_matches = [
+            name for name, candidate in named_tools if candidate.alias == tool_name
+        ]
+        if len(alias_matches) > 1:
+            choices = ", ".join(sorted(alias_matches))
+            raise click.UsageError(
+                f"Ambiguous generated tool '{category} {tool_name}'. "
+                f"Use one of: {choices}."
+            )
+        raise click.UsageError(f"Unknown generated tool '{category} {tool_name}'.")
+    if not tool.request_schema_name:
+        raise click.UsageError(
+            f"Tool '{category} {tool_name}' does not accept a request body."
+        )
+
+    spec_path = AGENT_TOOL_DEFINITION.resolve(environment_cache_key(env))
+    schema = load_component_schema(spec_path, tool.request_schema_name)
+    fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
+    if fmt == "json":
+        print_agent_json(schema, pagination={"has_more": False, "next": None})
+    else:
+        print_json(schema)

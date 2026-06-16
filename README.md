@@ -10,6 +10,12 @@ curl -fsSL https://agents.ramp.com/install.sh | sh
 
 This detects your platform, downloads a pre-built binary, and sets up the `ramp` command.
 
+**Homebrew** (macOS and Linux):
+
+```bash
+brew install ramp-public/ramp/ramp-cli
+```
+
 **Alternative** (if you already have uv):
 
 ```bash
@@ -22,6 +28,8 @@ uv tool install git+https://github.com/ramp-public/ramp-cli.git
 ramp auth login                              # OAuth via browser
 ramp users me                                # Current user details
 ramp bills search --query "Acme"             # Search bills by vendor name
+ramp cards list                              # List your cards (card_state shows ACTIVE)
+ramp cards list --agent | jq '[.data[0].cards[] | select((.card_state // "" | ascii_downcase) == "active")] | length'  # Count active cards
 ramp transactions list --transactions_to_retrieve my_transactions
 ramp transactions list --transactions_to_retrieve my_transactions --from_date 2025-01-01
 ramp transactions list --agent               # JSON output for scripting
@@ -40,12 +48,13 @@ ramp transactions list --agent               # JSON output for scripting
 
 ## Resources
 
-11 resources, each with their own tools:
+12 resources, each with their own tools:
 
 | Resource          | Tools                                                        |
 | ----------------- | ------------------------------------------------------------ |
 | `accounting`      | `categories`, `category-options`                             |
 | `bills`           | `search`, `get`, `draft`, `pending`, `approve`, `attachments`|
+| `cards`           | `list`, `activate`, `lock` (aliases also under `funds`)      |
 | `funds`           | `list`, `activate`, `creds`, `lock`                          |
 | `general`         | `comment`, `explain`, `help-center`, `policy`                |
 | `purchase_orders` | `search`, `get`                                              |

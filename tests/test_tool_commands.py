@@ -6,10 +6,20 @@ from unittest.mock import MagicMock
 import click
 from click.testing import CliRunner
 
+from ramp_cli.auth import store
 from ramp_cli.main import ToolGroup, cli
 from ramp_cli.specs import AGENT_TOOL_SPEC
-from ramp_cli.tools.commands import _build_body, build_tool_command
-from ramp_cli.tools.parser import JsonSchema, ParamType, ToolDef, ToolParam
+from ramp_cli.tools.commands import (
+    _build_body,
+    build_tool_command,
+)
+from ramp_cli.tools.parser import (
+    JsonSchema,
+    ParamType,
+    ToolDef,
+    ToolParam,
+    parse_spec_dict,
+)
 from ramp_cli.tools.registry import _registry, get_tool, list_tool_defs, list_tools
 from ramp_cli.tools.registry import reload as reload_tools
 
@@ -17,7 +27,8 @@ from ramp_cli.tools.registry import reload as reload_tools
 def _use_bundled_spec(monkeypatch):
     monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
     monkeypatch.setattr(
-        "ramp_cli.tools.registry.local_agent_tool_spec", lambda env: AGENT_TOOL_SPEC
+        "ramp_cli.tools.registry._resolve_generated_spec_path",
+        lambda definition, env: AGENT_TOOL_SPEC,
     )
     reload_tools("production")
 
@@ -79,10 +90,7 @@ class TestRegistry:
         prod_file.write_text(json.dumps(prod_spec))
         sandbox_file.write_text(json.dumps(sandbox_spec))
 
-        monkeypatch.setattr(
-            "ramp_cli.tools.registry.local_agent_tool_spec",
-            lambda env: tmp_path / f"agent-tool-{env}.json",
-        )
+        monkeypatch.setattr("ramp_cli.specs.config_dir", lambda: tmp_path)
 
         # Force a fresh load
         _registry._tools = None
@@ -160,6 +168,251 @@ class TestBuildToolCommand:
         option_names = {p.name for p in cmd.params if isinstance(p, click.Option)}
         assert "json_body" in option_names
         assert "dry_run" in option_names
+
+    def test_parameterless_tool_omits_json_option(self):
+        tool = ToolDef(
+            name="progress",
+            path="/developer/v1/things/progress",
+            http_method="get",
+            summary="Fetch progress",
+            description="Fetch progress",
+        )
+
+        cmd = build_tool_command(tool)
+
+        option_names = {p.name for p in cmd.params if isinstance(p, click.Option)}
+        assert "json_body" not in option_names
+        assert "dry_run" in option_names
+
+    def test_json_query_fields_are_not_sent_as_a_body(self):
+        tool = ToolDef(
+            name="list-things",
+            path="/developer/v1/things",
+            http_method="get",
+            summary="List things",
+            description="List things",
+            params=[
+                ToolParam(
+                    name="page_size",
+                    flag="page_size",
+                    description="Page size",
+                    type=ParamType.INT,
+                    location="query",
+                )
+            ],
+            json_schema=JsonSchema(properties={"page_size": JsonSchema()}),
+        )
+        command = build_tool_command(tool)
+
+        result = CliRunner().invoke(
+            command,
+            ["--dry_run", "--json", '{"page_size":2}'],
+            obj={
+                "env": "sandbox",
+                "format": "json",
+                "config_format": "json",
+                "quiet": False,
+                "no_input": True,
+                "wide": False,
+                "agent_mode": True,
+            },
+        )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)["data"][0]
+        assert payload["url"].endswith("/developer/v1/things?page_size=2")
+        assert payload["body"] == {}
+
+    def test_multipart_uses_declared_method_and_omits_null_fields(
+        self, tmp_path, monkeypatch
+    ):
+        document = tmp_path / "document.pdf"
+        document.write_bytes(b"test document")
+        tool = ToolDef(
+            name="upload-document",
+            path="/developer/v1/documents",
+            http_method="patch",
+            summary="Upload a document",
+            description="Upload a document",
+            params=[
+                ToolParam(
+                    name="file",
+                    flag="file",
+                    description="Document file",
+                    type=ParamType.FILE,
+                    required=True,
+                    location="form",
+                ),
+                ToolParam(
+                    name="association_id",
+                    flag="association_id",
+                    description="Optional association",
+                    type=ParamType.STRING,
+                    location="form",
+                ),
+            ],
+            json_schema=JsonSchema(
+                properties={
+                    "file": JsonSchema(),
+                    "association_id": JsonSchema(nullable=True),
+                }
+            ),
+            request_content_type="multipart/form-data",
+        )
+        command = build_tool_command(tool)
+        client = MagicMock()
+        client.request_multipart.return_value = b"{}"
+        monkeypatch.setattr("ramp_cli.tools.commands.RampClient", lambda env: client)
+        monkeypatch.setattr(
+            "ramp_cli.tools.commands._sync_tool_for_json_validation",
+            lambda env, current_tool: current_tool,
+        )
+
+        result = CliRunner().invoke(
+            command,
+            [
+                "--json",
+                json.dumps(
+                    {
+                        "file": str(document),
+                        "association_id": None,
+                    }
+                ),
+            ],
+            obj={
+                "env": "sandbox",
+                "format": "json",
+                "config_format": "json",
+                "quiet": False,
+                "no_input": True,
+                "wide": False,
+                "agent_mode": True,
+            },
+        )
+
+        assert result.exit_code == 0
+        method, path, form_data, files = client.request_multipart.call_args.args
+        assert method == "patch"
+        assert path == "/developer/v1/documents"
+        assert form_data == {}
+        assert set(files) == {"file"}
+
+    def test_closed_body_schema_routes_path_query_and_body_inputs(self, monkeypatch):
+        spec = {
+            "paths": {
+                "/developer/v1/things/{thing_id}": {
+                    "parameters": [
+                        {
+                            "name": "thing_id",
+                            "in": "path",
+                            "required": True,
+                            "schema": {"type": "string"},
+                        }
+                    ],
+                    "patch": {
+                        "summary": "Update a thing",
+                        "parameters": [
+                            {
+                                "name": "page_size",
+                                "in": "query",
+                                "schema": {"type": "integer"},
+                            }
+                        ],
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "additionalProperties": False,
+                                        "properties": {
+                                            "name": {"type": "string"},
+                                        },
+                                    }
+                                }
+                            }
+                        },
+                    },
+                }
+            }
+        }
+        tool = parse_spec_dict(
+            spec,
+            path_prefix=None,
+            synthesize_cli_tools=False,
+        )[0]
+        client = MagicMock()
+        client.patch.return_value = b"{}"
+        monkeypatch.setattr("ramp_cli.tools.commands.RampClient", lambda env: client)
+        monkeypatch.setattr(
+            "ramp_cli.tools.commands._sync_tool_for_json_validation",
+            lambda env, current_tool: current_tool,
+        )
+
+        result = CliRunner().invoke(
+            build_tool_command(tool),
+            [
+                "--json",
+                '{"thing_id":"thing/1","page_size":2,"name":"Updated"}',
+            ],
+            obj={
+                "env": "sandbox",
+                "format": "json",
+                "config_format": "json",
+                "quiet": False,
+                "no_input": True,
+                "wide": False,
+                "agent_mode": True,
+            },
+        )
+
+        assert result.exit_code == 0
+        path, payload = client.patch.call_args.args
+        assert path == "/developer/v1/things/thing%2F1?page_size=2"
+        assert json.loads(payload) == {"name": "Updated"}
+
+    def test_empty_delete_response_is_supported(self, monkeypatch):
+        tool = ToolDef(
+            name="delete-thing",
+            path="/developer/v1/things/{thing_id}",
+            http_method="delete",
+            summary="Delete a thing",
+            description="Delete a thing",
+            params=[
+                ToolParam(
+                    name="thing_id",
+                    flag="thing_id",
+                    description="Thing ID",
+                    type=ParamType.STRING,
+                    required=True,
+                    location="path",
+                )
+            ],
+        )
+        client = MagicMock()
+        client.delete.return_value = b""
+        monkeypatch.setattr("ramp_cli.tools.commands.RampClient", lambda env: client)
+        monkeypatch.setattr("ramp_cli.tools.commands.maybe_sync", lambda env: None)
+
+        result = CliRunner().invoke(
+            build_tool_command(tool),
+            ["thing/1"],
+            obj={
+                "env": "sandbox",
+                "format": "json",
+                "config_format": "json",
+                "quiet": False,
+                "no_input": True,
+                "wide": False,
+                "agent_mode": True,
+            },
+        )
+
+        assert result.exit_code == 0
+        client.delete.assert_called_once_with(
+            "/developer/v1/things/thing%2F1",
+            None,
+        )
+        assert json.loads(result.output)["data"] == [{}]
 
     def test_has_param_options(self):
         cmd = build_tool_command(self._simple_tool())
@@ -680,7 +933,8 @@ class TestCLIIntegration:
         assert "transactions" in result.output
         assert "funds" in result.output
         assert "bills" in result.output
-        # cards and agent_cards should be remapped into funds
+        # cards is its own resource group; agent_cards is remapped into funds
+        assert "cards" in result.output
         assert "agent_cards" not in result.output
 
     def test_tasks_singleton_stays_resource(self, monkeypatch):
@@ -713,21 +967,175 @@ class TestCLIIntegration:
         assert result.exit_code == 0
         assert "list" in result.output
 
+    def test_hidden_resource_reports_missing_scope(self, monkeypatch, isolated_config):
+        task_tool = ToolDef(
+            name="get-attention-feed",
+            path="/developer/v1/agent-tools/get-attention-feed",
+            http_method="post",
+            summary="Get attention feed",
+            description="Return the authenticated user's homepage attention feed",
+            category="tasks",
+            alias="list",
+            params=[],
+            required_scopes=["tasks:read"],
+        )
+        store.save_tokens("production", "tok", "refresh", granted_scopes="users:read")
+
+        monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
+        monkeypatch.setattr("ramp_cli.main.list_categories", lambda env: {})
+        monkeypatch.setattr(
+            "ramp_cli.main.list_tool_defs",
+            lambda env: [task_tool],
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["--env", "production", "tasks", "list"])
+
+        assert result.exit_code != 0
+        assert "tasks' resource is available" in result.output
+        assert "tasks:read" in result.output
+        assert "auth status --agent" in result.output
+
+    def test_hidden_singleton_category_stays_unknown_command(
+        self, monkeypatch, isolated_config
+    ):
+        communication_tool = ToolDef(
+            name="post-comment",
+            path="/developer/v1/agent-tools/post-comment",
+            http_method="post",
+            summary="Post comment",
+            description="Post a comment",
+            category="communication",
+            alias="comment",
+            params=[],
+            required_scopes=["comments:write"],
+        )
+        store.save_tokens("production", "tok", "refresh", granted_scopes="users:read")
+
+        monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
+        monkeypatch.setattr("ramp_cli.main.list_categories", lambda env: {})
+        monkeypatch.setattr(
+            "ramp_cli.main.list_tool_defs",
+            lambda env: [communication_tool],
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["--env", "production", "communication"])
+
+        assert result.exit_code != 0
+        assert "No such command 'communication'" in result.output
+        assert "missing the required scope" not in result.output
+
+    def test_partially_accessible_resource_stays_unknown_command(
+        self, monkeypatch, isolated_config
+    ):
+        accessible_tool = ToolDef(
+            name="get-requests-to-review",
+            path="/developer/v1/agent-tools/get-requests-to-review",
+            http_method="post",
+            summary="Get requests to review",
+            description="Get requests to review",
+            category="requests",
+            alias="review",
+            params=[],
+            required_scopes=["requests:read"],
+        )
+        hidden_tool = ToolDef(
+            name="approve-request",
+            path="/developer/v1/agent-tools/approve-request",
+            http_method="post",
+            summary="Approve request",
+            description="Approve request",
+            category="requests",
+            alias="approve",
+            params=[],
+            required_scopes=["requests:write"],
+        )
+        store.save_tokens(
+            "production", "tok", "refresh", granted_scopes="requests:read"
+        )
+
+        monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
+        monkeypatch.setattr("ramp_cli.main.list_categories", lambda env: {})
+        monkeypatch.setattr(
+            "ramp_cli.main.list_tool_defs",
+            lambda env: [accessible_tool, hidden_tool],
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["--env", "production", "requests"])
+
+        assert result.exit_code != 0
+        assert "No such command 'requests'" in result.output
+        assert "missing the required scope" not in result.output
+
     def test_funds_group_contains_card_tools(self):
+        # Existing (pre-alias) behavior must be preserved: card tools remain
+        # reachable under funds via the cards→funds remap.
         runner = CliRunner()
         result = runner.invoke(cli, ["funds", "--help"])
         assert result.exit_code == 0
         assert "activate-card" in result.output or "activate" in result.output
         assert "get-funds" in result.output or "list" in result.output
+        # The full endpoint name path is preserved (not renamed).
+        assert "list-cards" in result.output
+        assert "lock-or-unlock-card" in result.output
 
-    def test_cards_and_agent_cards_groups_gone(self):
+    def test_cards_group_contains_card_tools(self):
+        # Additive alias group: cards is its own group with short aliases.
+        runner = CliRunner()
+        result = runner.invoke(cli, ["cards", "--help"])
+        assert result.exit_code == 0
+        assert "list" in result.output
+        assert "activate" in result.output
+        assert "lock" in result.output
+
+    def test_cards_list_and_funds_list_cards_same_endpoint(self):
+        # `cards list` and `funds list-cards` must hit the same endpoint.
+        runner = CliRunner()
+        cards = runner.invoke(cli, ["cards", "list", "--rationale", "x", "--dry_run"])
+        funds = runner.invoke(
+            cli, ["funds", "list-cards", "--rationale", "x", "--dry_run"]
+        )
+        assert cards.exit_code == 0
+        assert funds.exit_code == 0
+        cards_url = json.loads(cards.output)["data"][0]["url"]
+        funds_url = json.loads(funds.output)["data"][0]["url"]
+        assert cards_url.endswith("/list-cards")
+        assert cards_url == funds_url
+
+    def test_cards_list_invokable_with_readonly_limits_scope(
+        self, monkeypatch, isolated_config
+    ):
+        # Regression: a read-only `limits:read` token sees `list-cards` but
+        # NOT the `cards:write` activate/lock tools. The cards alias group
+        # must stay grouped (not fold into `general`) so `cards list` works.
+        store.save_tokens("production", "tok", "refresh", granted_scopes="limits:read")
+        monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
+
+        runner = CliRunner()
+        help_res = runner.invoke(
+            cli, ["--env", "production", "cards", "list", "--help"]
+        )
+        assert help_res.exit_code == 0, help_res.output
+        assert "No such command 'cards'" not in help_res.output
+
+        dry = runner.invoke(
+            cli,
+            ["--env", "production", "cards", "list", "--rationale", "x", "--dry_run"],
+        )
+        assert dry.exit_code == 0, dry.output
+        assert json.loads(dry.output)["data"][0]["url"].endswith("/list-cards")
+
+    def test_cards_is_alias_group_agent_cards_merged_into_funds(self):
         runner = CliRunner()
         result = runner.invoke(cli, ["--help"])
-        # "cards" and "agent_cards" should not appear as standalone resource groups
-        # (they're merged into "funds")
+        # "cards" is an additive alias resource group; "agent_cards" is still
+        # merged into "funds" and should not appear as a standalone resource.
         lines = result.output.splitlines()
         resource_names = [line.strip().split()[0] for line in lines if line.strip()]
-        assert "cards" not in resource_names
+        assert "cards" in resource_names
+        assert "funds" in resource_names
         assert "agent_cards" not in resource_names
 
     def test_descriptive_help_text_present(self):

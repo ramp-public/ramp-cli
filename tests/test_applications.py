@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import json
 
+import click
+import httpx
 from click.testing import CliRunner
 
+from ramp_cli.auth import store
+from ramp_cli.auth.oauth import TokenResponse
 from ramp_cli.commands.applications import (
     APPLICATION_CREATED_MESSAGE,
     APPLICATION_EXAMPLE,
@@ -78,6 +82,7 @@ _FAKE_SPEC = {
                 "properties": {
                     "redirect_uri": {"type": "string"},
                     "state": {"type": "string"},
+                    "code_challenge": {"type": "string"},
                 },
             },
             "ApplicationCreateRequest": {
@@ -121,6 +126,22 @@ _FAKE_SPEC = {
         }
     },
 }
+
+
+class _FakePkceCallback:
+    redirect_uri = "http://localhost:19817/callback"
+    state = "state-123"
+    code_challenge = "challenge-123"
+
+    def __init__(self, code: str = "code-123") -> None:
+        self.code = code
+        self.shutdown_called = False
+
+    def wait_for_code(self, timeout: int, *, timeout_message: str) -> str:
+        return self.code
+
+    def shutdown(self) -> None:
+        self.shutdown_called = True
 
 
 def test_applications_create__prints_success_message(monkeypatch):
@@ -338,6 +359,310 @@ def test_applications_create__dry_run_prints_agent_json(monkeypatch):
         ],
         "pagination": {"has_more": False, "next": None},
     }
+
+
+def test_applications_create__wait_for_auth_injects_pkce_and_saves_tokens(
+    isolated_config, monkeypatch
+):
+    captured: dict[str, object] = {}
+    callback = _FakePkceCallback()
+
+    def fake_post(self, path: str, json_body: bytes) -> bytes:
+        captured["path"] = path
+        captured["body"] = json.loads(json_body)
+        return b'{"ignored":"response"}'
+
+    def fake_exchange(env, callback_arg, code):
+        captured["exchange"] = (env, callback_arg, code)
+        return TokenResponse(
+            access_token="access-token",
+            refresh_token="refresh-token",
+            expires_in=300,
+            refresh_token_expires_in=86400,
+            scope="applications:read applications:write",
+            agent_key_uuid="agent-key-uuid",
+        )
+
+    monkeypatch.setattr("ramp_cli.client.api.RampClient.post", fake_post)
+    monkeypatch.setattr(
+        "ramp_cli.commands.applications.start_pkce_callback", lambda: callback
+    )
+    monkeypatch.setattr(
+        "ramp_cli.commands.applications.exchange_pkce_callback_code", fake_exchange
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "--agent",
+            "--env",
+            "sandbox",
+            "applications",
+            "create",
+            "--json",
+            '{"applicant":{"email":"jane@example.com"}}',
+            "--wait_for_auth",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["path"] == "/developer/v1/applications"
+    assert captured["body"] == {
+        "applicant": {"email": "jane@example.com"},
+        "oauth_authorize_params": {
+            "redirect_uri": "http://localhost:19817/callback",
+            "state": "state-123",
+            "code_challenge": "challenge-123",
+        },
+    }
+    assert captured["exchange"] == ("sandbox", callback, "code-123")
+    assert callback.shutdown_called is True
+    assert store.get_tokens("sandbox") == ("access-token", "refresh-token")
+    assert store.get_agent_key_uuid("sandbox") == "agent-key-uuid"
+    payload = json.loads(result.output)
+    assert payload["data"][0]["authenticated"] is True
+    assert payload["data"][0]["fallback_command"] is None
+
+
+def test_applications_create__wait_for_auth_overrides_user_oauth_params(
+    isolated_config, monkeypatch
+):
+    captured: dict[str, object] = {}
+    callback = _FakePkceCallback()
+
+    def fake_post(self, path: str, json_body: bytes) -> bytes:
+        captured["body"] = json.loads(json_body)
+        return b"{}"
+
+    monkeypatch.setattr("ramp_cli.client.api.RampClient.post", fake_post)
+    monkeypatch.setattr(
+        "ramp_cli.commands.applications.start_pkce_callback", lambda: callback
+    )
+    monkeypatch.setattr(
+        "ramp_cli.commands.applications.exchange_pkce_callback_code",
+        lambda env, callback_arg, code: TokenResponse(access_token="access"),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--env",
+            "sandbox",
+            "applications",
+            "create",
+            "--json",
+            json.dumps(
+                {
+                    "applicant": {"email": "jane@example.com"},
+                    "oauth_authorize_params": {
+                        "redirect_uri": "https://old.example/callback",
+                        "state": "old-state",
+                    },
+                }
+            ),
+            "--wait_for_auth",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["body"]["oauth_authorize_params"] == {
+        "redirect_uri": "http://localhost:19817/callback",
+        "state": "state-123",
+        "code_challenge": "challenge-123",
+    }
+
+
+def test_applications_create__wait_for_auth_timeout_returns_fallback(
+    monkeypatch,
+):
+    class TimeoutCallback(_FakePkceCallback):
+        def wait_for_code(self, timeout: int, *, timeout_message: str) -> str:
+            raise click.ClickException(timeout_message)
+
+    callback = TimeoutCallback()
+
+    monkeypatch.setattr(
+        "ramp_cli.client.api.RampClient.post",
+        lambda self, path, json_body: b"{}",
+    )
+    monkeypatch.setattr(
+        "ramp_cli.commands.applications.start_pkce_callback", lambda: callback
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--agent",
+            "--env",
+            "sandbox",
+            "applications",
+            "create",
+            "--json",
+            '{"applicant":{"email":"jane@example.com"}}',
+            "--wait_for_auth",
+            "--auth_timeout",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert callback.shutdown_called is True
+    payload = json.loads(result.output)
+    data = payload["data"][0]
+    assert data["authenticated"] is False
+    assert data["auth_error"] == "OAuth redirect timed out after 1 seconds"
+    assert data["fallback_command"] == (
+        "ramp --env sandbox auth login --auth-level business "
+        "--scope applications:read --scope applications:write "
+        "--scope bank_accounts:read"
+    )
+
+
+def test_applications_create__wait_for_auth_exchange_error_returns_fallback(
+    monkeypatch,
+):
+    callback = _FakePkceCallback()
+
+    def fail_exchange(env, callback_arg, code):
+        raise httpx.ConnectError("token endpoint unavailable")
+
+    monkeypatch.setattr(
+        "ramp_cli.client.api.RampClient.post",
+        lambda self, path, json_body: b"{}",
+    )
+    monkeypatch.setattr(
+        "ramp_cli.commands.applications.start_pkce_callback", lambda: callback
+    )
+    monkeypatch.setattr(
+        "ramp_cli.commands.applications.exchange_pkce_callback_code",
+        fail_exchange,
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--agent",
+            "--env",
+            "sandbox",
+            "applications",
+            "create",
+            "--json",
+            '{"applicant":{"email":"jane@example.com"}}',
+            "--wait_for_auth",
+        ],
+    )
+
+    assert result.exit_code == 0
+    data = json.loads(result.output)["data"][0]
+    assert data["authenticated"] is False
+    assert data["auth_error"] == "token endpoint unavailable"
+    assert data["fallback_command"].startswith("ramp --env sandbox auth login")
+
+
+def test_applications_create__wait_for_auth_persistence_error_returns_fallback(
+    monkeypatch,
+):
+    callback = _FakePkceCallback()
+
+    def fail_save_tokens(*args, **kwargs):
+        raise OSError("could not write credentials")
+
+    monkeypatch.setattr(
+        "ramp_cli.client.api.RampClient.post",
+        lambda self, path, json_body: b"{}",
+    )
+    monkeypatch.setattr(
+        "ramp_cli.commands.applications.start_pkce_callback", lambda: callback
+    )
+    monkeypatch.setattr(
+        "ramp_cli.commands.applications.exchange_pkce_callback_code",
+        lambda env, callback_arg, code: TokenResponse(
+            access_token="access-token",
+            refresh_token="refresh-token",
+        ),
+    )
+    monkeypatch.setattr(store, "save_tokens", fail_save_tokens)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--agent",
+            "--env",
+            "sandbox",
+            "applications",
+            "create",
+            "--json",
+            '{"applicant":{"email":"jane@example.com"}}',
+            "--wait_for_auth",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert callback.shutdown_called is True
+    data = json.loads(result.output)["data"][0]
+    assert data["authenticated"] is False
+    assert data["auth_error"] == "could not write credentials"
+    assert data["fallback_command"].startswith("ramp --env sandbox auth login")
+
+
+def test_applications_create__dry_run_rejects_auth_wait_without_listener(
+    monkeypatch,
+):
+    def fail_start():
+        raise AssertionError("dry-run must not open a callback listener")
+
+    monkeypatch.setattr(
+        "ramp_cli.commands.applications.start_pkce_callback", fail_start
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--env",
+            "sandbox",
+            "applications",
+            "create",
+            "--json",
+            '{"applicant":{"email":"jane@example.com"}}',
+            "--dry_run",
+            "--wait_for_auth",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "--wait_for_auth cannot be used with --dry_run" in result.output
+
+
+def test_applications_create__wait_for_auth_rejects_non_object_oauth_params(
+    monkeypatch,
+):
+    callback = _FakePkceCallback()
+
+    def fail_post(self, path: str, json_body: bytes) -> bytes:
+        raise AssertionError("invalid body should not be sent")
+
+    monkeypatch.setattr("ramp_cli.client.api.RampClient.post", fail_post)
+    monkeypatch.setattr(
+        "ramp_cli.commands.applications.start_pkce_callback", lambda: callback
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--env",
+            "sandbox",
+            "applications",
+            "create",
+            "--json",
+            '{"applicant":{"email":"jane@example.com"},"oauth_authorize_params":[]}',
+            "--wait_for_auth",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "oauth_authorize_params must be a JSON object" in result.output
+    assert callback.shutdown_called is True
 
 
 # ── Schema subcommand tests ──

@@ -43,11 +43,11 @@ class TestSpecLoading:
 
     def test_all_tools_have_paths(self, tools: list[ToolDef]):
         for tool in tools:
-            assert tool.path.startswith("/developer/v1/agent-tools/")
+            assert tool.path.startswith("/developer/v1/")
 
     def test_all_tools_have_valid_method(self, tools: list[ToolDef]):
         for tool in tools:
-            assert tool.http_method in ("post", "get"), (
+            assert tool.http_method in ("post", "get", "patch", "delete"), (
                 f"{tool.name} has unexpected method {tool.http_method}"
             )
 
@@ -57,7 +57,9 @@ class TestSpecLoading:
 
     def test_all_tools_have_request_schema(self, tools: list[ToolDef]):
         for tool in tools:
-            if tool.http_method == "post":
+            if tool.http_method == "post" and any(
+                param.location in {"body", "form"} for param in tool.params
+            ):
                 assert tool.request_schema_name, f"{tool.name} has no request schema"
 
 
@@ -74,7 +76,7 @@ class TestGetFunds:
 
     def test_param_count(self, tool_map: dict[str, ToolDef]):
         tool = tool_map["get-funds"]
-        assert len(tool.params) == 11
+        assert len(tool.params) == 13
 
     def test_rationale_is_required(self, tool_map: dict[str, ToolDef]):
         tool = tool_map["get-funds"]
@@ -352,7 +354,7 @@ class TestEdgeCases:
 
     def test_spec_with_no_agent_tools(self):
         spec = {"paths": {"/developer/v1/users": {"get": {}}}}
-        assert parse_spec_dict(spec) == []
+        assert parse_spec_dict(spec, path_prefix="/developer/v1/agent-tools/") == []
 
     def test_skips_x_prefixed_keys(self):
         spec = {
@@ -547,6 +549,103 @@ class TestGetEndpointParsing:
         assert tool.params[1].name == "is_active"
         assert tool.params[1].required is False
         assert tool.params[1].type is ParamType.BOOL
+
+
+class TestGenericOpenAPIParsing:
+    def test_alias_selected_operations_share_the_main_parser(self):
+        spec = {
+            "paths": {
+                "/developer/v1/things/{thing_id}": {
+                    "parameters": [
+                        {
+                            "name": "thing_id",
+                            "in": "path",
+                            "required": True,
+                            "schema": {"type": "string"},
+                        }
+                    ],
+                    "patch": {
+                        "summary": "Update a thing",
+                        "x-alias": "update",
+                        "security": [{"oauth2": ["things:write"]}],
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "details": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "name": {"type": "string"}
+                                                },
+                                            }
+                                        },
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {"204": {"description": "Updated"}},
+                    },
+                },
+                "/developer/v1/things/documents": {
+                    "post": {
+                        "summary": "Upload a document",
+                        "x-alias": "upload-document",
+                        "requestBody": {
+                            "content": {
+                                "multipart/form-data": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["file"],
+                                        "properties": {
+                                            "file": {
+                                                "type": "string",
+                                                "format": "binary",
+                                            },
+                                            "purpose": {"type": "string"},
+                                        },
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {"201": {"description": "Created"}},
+                    }
+                },
+                "/developer/v1/internal": {
+                    "get": {
+                        "summary": "Not selected",
+                        "responses": {"200": {"description": "OK"}},
+                    }
+                },
+            }
+        }
+
+        tools = parse_spec_dict(
+            spec,
+            source="curated",
+            category="things",
+            path_prefix=None,
+            require_alias=True,
+            alias_as_name=True,
+            synthesize_cli_tools=False,
+        )
+        tool_map = {tool.name: tool for tool in tools}
+
+        assert set(tool_map) == {"update", "upload-document"}
+        update = tool_map["update"]
+        assert update.http_method == "patch"
+        assert update.required_scopes == ["things:write"]
+        assert update.source == "curated"
+        assert update.category == "things"
+        assert _find_param(update, "thing_id").location == "path"
+        assert _find_param(update, "details").location == "body"
+
+        upload = tool_map["upload-document"]
+        assert upload.request_content_type == "multipart/form-data"
+        assert _find_param(upload, "file").type is ParamType.FILE
+        assert _find_param(upload, "file").location == "form"
+        assert _find_param(upload, "purpose").location == "form"
 
 
 class TestScopeExtraction:

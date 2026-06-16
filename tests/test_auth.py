@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 from contextlib import nullcontext
+from urllib.parse import parse_qs, urlparse
 
 import click
 import pytest
@@ -42,6 +43,19 @@ def test_pkce_challenge_differs_for_different_verifiers():
     v1 = _generate_verifier()
     v2 = _generate_verifier()
     assert _generate_challenge(v1) != _generate_challenge(v2)
+
+
+def test_auth_url_uses_explicit_authorization_level():
+    url = oauth_module._build_auth_url(
+        "sandbox",
+        "http://localhost:19817/callback",
+        "state",
+        "challenge",
+        "applications:read",
+        auth_level="business",
+    )
+
+    assert parse_qs(urlparse(url).query)["auth_level"] == ["business"]
 
 
 def test_token_save_and_load(isolated_config):
@@ -432,7 +446,7 @@ class TestResolveScopes:
     """Verify _resolve_scopes uses env-specific cached spec when available."""
 
     def test_uses_env_specific_cached_spec(self, tmp_path, monkeypatch):
-        """If an env-specific cached spec exists, scopes are extracted from it."""
+        """If an env-specific cached spec exists, its scopes are included."""
         # Create a cached spec with a custom scope
         spec = {
             "paths": {
@@ -471,6 +485,149 @@ class TestResolveScopes:
         scopes = oauth_module._resolve_scopes("sandbox")
         assert "custom:special" in scopes
 
+    def test_bundled_spec_scopes_survive_stale_cached_spec(self, tmp_path, monkeypatch):
+        """A stale cached spec must not hide scopes shipped with the CLI."""
+        bundled_spec = {
+            "paths": {
+                "/developer/v1/agent-tools/get-attention-feed": {
+                    "post": {
+                        "operationId": "get-attention-feed",
+                        "summary": "Get attention feed",
+                        "description": "Get attention feed",
+                        "security": [{"oauth2": ["tasks:read"]}],
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/Req"}
+                                }
+                            }
+                        },
+                    }
+                }
+            },
+            "components": {"schemas": {"Req": {"type": "object", "properties": {}}}},
+        }
+        stale_cached_spec = {
+            "paths": {
+                "/developer/v1/agent-tools/get-users": {
+                    "post": {
+                        "operationId": "get-users",
+                        "summary": "Get users",
+                        "description": "Get users",
+                        "security": [{"oauth2": ["users:read"]}],
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/Req"}
+                                }
+                            }
+                        },
+                    }
+                }
+            },
+            "components": {"schemas": {"Req": {"type": "object", "properties": {}}}},
+        }
+        bundled_file = tmp_path / "bundled-agent-tool.json"
+        cached_file = tmp_path / "agent-tool-production.json"
+        bundled_file.write_text(json.dumps(bundled_spec))
+        cached_file.write_text(json.dumps(stale_cached_spec))
+
+        monkeypatch.setattr(oauth_module, "AGENT_TOOL_SPEC", bundled_file)
+        monkeypatch.setattr(
+            oauth_module,
+            "_resolve_spec_path",
+            lambda env: cached_file,
+        )
+        monkeypatch.setattr(
+            oauth_module,
+            "local_agent_tool_hash",
+            lambda cache_key: tmp_path / "missing-hash.txt",
+        )
+        monkeypatch.setattr(
+            oauth_module,
+            "configured_scopes",
+            lambda: "",
+        )
+
+        scopes = oauth_module._resolve_scopes("production").split()
+        assert "tasks:read" in scopes
+        assert "users:read" in scopes
+
+    def test_fresh_cached_spec_is_authoritative(self, tmp_path, monkeypatch):
+        """A freshly synced cache reflects the current env contract."""
+        bundled_spec = {
+            "paths": {
+                "/developer/v1/agent-tools/get-attention-feed": {
+                    "post": {
+                        "operationId": "get-attention-feed",
+                        "summary": "Get attention feed",
+                        "description": "Get attention feed",
+                        "security": [{"oauth2": ["tasks:read"]}],
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/Req"}
+                                }
+                            }
+                        },
+                    }
+                }
+            },
+            "components": {"schemas": {"Req": {"type": "object", "properties": {}}}},
+        }
+        fresh_cached_spec = {
+            "paths": {
+                "/developer/v1/agent-tools/get-users": {
+                    "post": {
+                        "operationId": "get-users",
+                        "summary": "Get users",
+                        "description": "Get users",
+                        "security": [{"oauth2": ["users:read"]}],
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/Req"}
+                                }
+                            }
+                        },
+                    }
+                }
+            },
+            "components": {"schemas": {"Req": {"type": "object", "properties": {}}}},
+        }
+        bundled_file = tmp_path / "bundled-agent-tool.json"
+        cached_file = tmp_path / "agent-tool-production.json"
+        hash_file = tmp_path / "agent-tool-production-hash.txt"
+        bundled_file.write_text(json.dumps(bundled_spec))
+        cached_file.write_text(json.dumps(fresh_cached_spec))
+        hash_file.write_text("fresh")
+
+        monkeypatch.setattr(oauth_module, "AGENT_TOOL_SPEC", bundled_file)
+        monkeypatch.setattr(
+            oauth_module,
+            "_resolve_spec_path",
+            lambda env: cached_file,
+        )
+        monkeypatch.setattr(
+            oauth_module,
+            "local_agent_tool_hash",
+            lambda cache_key: hash_file,
+        )
+        monkeypatch.setattr(
+            oauth_module,
+            "environment_cache_key",
+            lambda env: env,
+        )
+        monkeypatch.setattr(
+            oauth_module,
+            "configured_scopes",
+            lambda: "",
+        )
+
+        scopes = oauth_module._resolve_scopes("production").split()
+        assert "tasks:read" not in scopes
+        assert "users:read" in scopes
+
     def test_falls_back_to_bundled_spec(self, tmp_path, monkeypatch):
         """Without a cached spec, scopes come from the bundled spec."""
         monkeypatch.setattr(
@@ -487,6 +644,20 @@ class TestResolveScopes:
         scopes = oauth_module._resolve_scopes("production")
         # Bundled spec has standard scopes
         assert "business:read" in scopes
+
+    def test_explicit_login_scopes_override_discovery(self, monkeypatch):
+        monkeypatch.setattr(
+            oauth_module,
+            "_resolve_scopes",
+            lambda env: pytest.fail("scope discovery should not run"),
+        )
+
+        scopes = oauth_module._resolve_login_scopes(
+            "production",
+            ("applications:read", "applications:write", "applications:read"),
+        )
+
+        assert scopes == "applications:read applications:write"
 
 
 class TestAuthLoginSpecRefresh:
@@ -556,6 +727,51 @@ class TestAuthLoginSpecRefresh:
         assert "Could not refresh tool definitions before login" in result.output
         assert store.get_granted_scopes("sandbox") == {"users:read"}
 
+    def test_login_passes_explicit_oauth_options(self, isolated_config, monkeypatch):
+        self._patch_success_ui(monkeypatch)
+        requested_scopes = (
+            "applications:read",
+            "applications:write",
+            "bank_accounts:read",
+        )
+
+        monkeypatch.setattr(auth_command_module, "fetch_spec", lambda env: 1)
+
+        def fake_login(env: str, opts: oauth_module.LoginOptions) -> TokenResponse:
+            assert env == "sandbox"
+            assert opts.scopes == requested_scopes
+            assert opts.auth_level == "business"
+            return TokenResponse(
+                access_token="access",
+                refresh_token="refresh",
+                scope=" ".join(requested_scopes),
+            )
+
+        monkeypatch.setattr(auth_command_module, "do_login", fake_login)
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--human",
+                "--env",
+                "sandbox",
+                "auth",
+                "login",
+                "--scope",
+                "applications:read",
+                "--scope",
+                "applications:write",
+                "--scope",
+                "bank_accounts:read",
+                "--auth-level",
+                "business",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert store.get_granted_scopes("sandbox") == set(requested_scopes)
+
     def test_refresh_skips_when_custom_scopes_configured(
         self, isolated_config, monkeypatch
     ):
@@ -602,6 +818,27 @@ class TestPostLoginEnvHint:
         assert "Token saved" in data["data"][0]["message"]
         # JSON output should not contain the hint
         assert "ramp env" not in result.output
+
+    def test_login_token_stdin_rejects_oauth_options(self, isolated_config):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--human",
+                "auth",
+                "login",
+                "--token_stdin",
+                "--scope",
+                "applications:read",
+                "--auth-level",
+                "business",
+            ],
+            input="new-token\n",
+        )
+
+        assert result.exit_code == 2
+        assert "--scope and --auth-level cannot be used with --token_stdin" in (
+            result.output
+        )
 
     def test_repeat_oauth_login_recommends_funds_enroll(
         self, isolated_config, monkeypatch
@@ -688,17 +925,21 @@ class TestOAuthLoginFailures:
     `Error: RuntimeError: internal error`."""
 
     def test_timeout_raises_click_exception(self, monkeypatch):
-        # Skip the actual browser hand-off.
+        class TimeoutCallback:
+            redirect_uri = "http://localhost:19817/callback"
+            state = "state-123"
+            code_challenge = "challenge-123"
+
+            def wait_for_code(self, timeout, *, timeout_message):
+                raise click.ClickException(timeout_message)
+
+            def shutdown(self):
+                pass
+
+        monkeypatch.setattr(
+            oauth_module, "start_pkce_callback", lambda: TimeoutCallback()
+        )
         monkeypatch.setattr(oauth_module, "_open_browser", lambda url: True)
-
-        # Drop the wait timeout to ~0 so the test doesn't actually wait.
-        original_event = oauth_module.threading.Event
-
-        class _NoWaitEvent(original_event):
-            def wait(self, timeout=None):
-                return False
-
-        monkeypatch.setattr(oauth_module.threading, "Event", _NoWaitEvent)
 
         with pytest.raises(click.ClickException) as exc_info:
             oauth_module.login("sandbox", oauth_module.LoginOptions(no_browser=True))
