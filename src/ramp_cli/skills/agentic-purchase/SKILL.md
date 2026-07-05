@@ -12,7 +12,7 @@ End-to-end agent card purchasing: pick a fund, get a payment token via `ramp` CL
 Agent Cards are available via self-serve enrollment. If the user's business is not yet enrolled — or the user asks about availability, how to get started, or hits eligibility errors — enroll them using the CLI:
 
 ```bash
-ramp funds enroll --agent
+ramp funds enroll --agent --rationale "Enroll the business in Agent Cards"
 ```
 
 This enrolls the authenticated user's business in Agent Cards for agentic commerce. The user must be authenticated (`ramp auth login`) and have appropriate permissions on their Ramp business. Once enrollment succeeds, the user can immediately use `funds list` and `funds creds` to access their agent card funds.
@@ -38,7 +38,8 @@ If the user is already enrolled, proceed with the workflow below.
 - Pass `--agent` for machine-readable JSON output (documented shape is top-level, immediately after `ramp`: `ramp --agent funds list`)
 - Use positional arguments where supported (e.g., `ramp --agent funds creds <fund_uuid>`, `ramp --agent transactions missing <transaction_uuid>`)
 - Use `--json` for complex payloads (e.g., `ramp --agent transactions edit`)
-- Every subcommand accepts `--rationale`, `--json`, `--dry_run` (`-n`), and `--help`
+- Every subcommand accepts `--json`, `--dry_run` (`-n`), and `--help`
+- **`--rationale` is required on every subcommand** — a non-empty string (max 1024 chars) explaining why you are making the call. With `--json`, put it in the body as a `"rationale"` key instead. Omitting it returns `HTTP 422 (DEVELOPER_INVALID_SCHEMA)`, even in `--agent` mode.
 
 ## Hard rules
 
@@ -53,7 +54,7 @@ If the user is already enrolled, proceed with the workflow below.
 ### Step 1 — Pick a fund
 
 ```bash
-ramp funds list --agent
+ramp funds list --agent --rationale "List the user's funds"
 ```
 
 First select for purpose fit, then technical eligibility:
@@ -150,7 +151,7 @@ Digital merchants (donations, SaaS) post transactions **within seconds**. Physic
 ramp transactions list --agent \
   --transactions_to_retrieve my_transactions \
   --page_size 5 \
-  --details_to_include_in_response submitted_items
+  --details_to_include_in_response submitted_items --rationale "List the user's transactions"
 ```
 
 Match by amount + merchant name to find the transaction `id`.
@@ -158,7 +159,7 @@ Match by amount + merchant name to find the transaction `id`.
 ### Step 5 — Check missing items
 
 ```bash
-ramp transactions missing --agent "<transaction_id>"
+ramp transactions missing --agent "<transaction_id>" --rationale "Check missing items on the transaction"
 ```
 
 ### Step 6 — Fill missing items
@@ -168,7 +169,7 @@ ramp transactions missing --agent "<transaction_id>"
 Use AI suggestions when available:
 
 ```bash
-ramp transactions memo-suggestions --agent "<transaction_id>"
+ramp transactions memo-suggestions --agent "<transaction_id>" --rationale "Fetch AI-suggested memos"
 ```
 
 Then set the memo:
@@ -176,7 +177,7 @@ Then set the memo:
 ```bash
 ramp transactions edit --agent "<transaction_id>" \
   --memo "Donation to Children's Hunger Fund" \
-  --user_submitted_fields memo
+  --user_submitted_fields memo --rationale "Update the transaction for the user"
 ```
 
 #### Tracking categories
@@ -184,7 +185,7 @@ ramp transactions edit --agent "<transaction_id>" \
 First, list required categories:
 
 ```bash
-ramp accounting categories --agent --transaction_uuid "<transaction_id>"
+ramp accounting categories --agent --transaction_uuid "<transaction_id>" --rationale "List tracking categories"
 ```
 
 Then look up options for each category:
@@ -193,13 +194,14 @@ Then look up options for each category:
 ramp accounting category-options --agent "<category_uuid>" \
   --transaction_uuid "<transaction_id>" \
   --query_string "search term" \
-  --page_size 10
+  --page_size 10 --rationale "List options for the tracking category"
 ```
 
 Set categories via `--json` for batch updates:
 
 ```bash
 ramp transactions edit --agent --json '{
+  "rationale": "Update the transaction for the user",
   "transaction_uuid": "<transaction_id>",
   "tracking_category_selections": [
     {"category_uuid": "<cat_id>", "option_selection": "<option_uuid>"}
@@ -215,13 +217,14 @@ ramp transactions edit --agent --json '{
 For travel-related transactions:
 
 ```bash
-ramp transactions trips --agent
+ramp transactions trips --agent --rationale "List trips to assign to the transaction"
 ```
 
 Then assign:
 
 ```bash
 ramp transactions edit --agent --json '{
+  "rationale": "Update the transaction for the user",
   "transaction_uuid": "<transaction_id>",
   "trip_selection": {"trip_uuid": "<trip_uuid>"},
   "user_submitted_fields": ["trip_selection"]
@@ -232,6 +235,7 @@ Not travel-related:
 
 ```bash
 ramp transactions edit --agent --json '{
+  "rationale": "Update the transaction for the user",
   "transaction_uuid": "<transaction_id>",
   "trip_selection": {"mark_not_part_of_trip": true},
   "user_submitted_fields": ["trip_selection"]
@@ -247,26 +251,26 @@ ramp receipts upload --agent \
   --filename "receipt.png" \
   --content_type "image/png" \
   --file_content_base64 "$(base64 < /path/to/receipt.png)" \
-  --transaction_uuid "<transaction_id>"
+  --transaction_uuid "<transaction_id>" --rationale "Upload the receipt"
 ```
 
 **Attach an existing receipt:**
 
 ```bash
-ramp receipts attach --agent "<receipt_uuid>" "<transaction_id>"
+ramp receipts attach --agent "<receipt_uuid>" "<transaction_id>" --rationale "Attach the receipt to the transaction"
 ```
 
 **No receipt — provide reason:**
 
 ```bash
 ramp transactions explain-missing --agent "<transaction_id>" \
-  --reason "Online donation — no receipt issued"
+  --reason "Online donation — no receipt issued" --rationale "Record why the receipt is missing"
 ```
 
 **No receipt — flag as missing:**
 
 ```bash
-ramp transactions flag-missing --agent "<transaction_id>"
+ramp transactions flag-missing --agent "<transaction_id>" --rationale "Generate a missing-receipt affidavit link"
 ```
 
 **Pro tip:** After a successful browser checkout, take a screenshot of the confirmation page, save it, and upload it as the receipt. This covers the receipt requirement automatically.
@@ -274,7 +278,7 @@ ramp transactions flag-missing --agent "<transaction_id>"
 ### Step 7 — Verify completion
 
 ```bash
-ramp transactions missing --agent "<transaction_id>"
+ramp transactions missing --agent "<transaction_id>" --rationale "Check missing items on the transaction"
 ```
 
 Confirm all items resolved: `missing_receipt: false`, `missing_memo: false`, `missing_accounting_items: []`.

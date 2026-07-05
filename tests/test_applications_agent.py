@@ -30,7 +30,7 @@ def test_application_group_combines_create_and_generated_aliases(
     result = CliRunner().invoke(cli, ["applications", "--help"])
 
     assert result.exit_code == 0
-    for name in ("create", "progress", "edit", "upload", "followups", "accounts"):
+    for name in ("create", "progress", "edit", "upload", "followups"):
         assert name in result.output
     assert "patch_application_update_resource" not in result.output
 
@@ -97,7 +97,7 @@ def test_document_upload_omits_unset_multipart_fields(
     document.write_bytes(b"%PDF-test")
     captured = {}
 
-    def fake_post_multipart(self, path, data, files):
+    def fake_post_multipart(self, path, data, files, headers=None):
         filename, file_obj, content_type = files["file"]
         captured.update(
             path=path,
@@ -105,6 +105,7 @@ def test_document_upload_omits_unset_multipart_fields(
             filename=filename,
             contents=file_obj.read(),
             content_type=content_type,
+            headers=headers,
         )
         return b'{"id":"doc-1","purpose":"APPLICATION"}'
 
@@ -125,13 +126,24 @@ def test_document_upload_omits_unset_multipart_fields(
             "FOLLOWUP",
             "--followup_id",
             "followup-1",
+            "--data_source_summary",
+            "Uploaded by the test applicant",
+            "--user_prompt",
+            "Upload this follow-up document",
         ],
     )
 
     assert result.exit_code == 0
+    headers = captured.pop("headers")
+    assert headers["X-Idempotency-Key"]
     assert captured == {
         "path": "/developer/v1/applications/documents",
-        "data": {"purpose": "FOLLOWUP", "followup_id": "followup-1"},
+        "data": {
+            "data_source_summary": "Uploaded by the test applicant",
+            "followup_id": "followup-1",
+            "purpose": "FOLLOWUP",
+            "user_prompt": "Upload this follow-up document",
+        },
         "filename": "statement.pdf",
         "contents": b"%PDF-test",
         "content_type": "application/pdf",
@@ -145,14 +157,25 @@ def test_delete_document_supports_path_ids_and_empty_204(isolated_config, monkey
 
     result = CliRunner().invoke(
         cli,
-        ["--agent", "applications", "delete-document", "doc/id"],
+        [
+            "--agent",
+            "applications",
+            "delete-document",
+            "doc/id",
+            "--data_source_summary",
+            "Applicant asked to remove the document",
+            "--user_prompt",
+            "Delete this document",
+        ],
     )
 
     assert result.exit_code == 0
-    request.assert_called_once_with(
-        "/developer/v1/applications/documents/doc%2Fid",
-        None,
-    )
+    path, body = request.call_args.args
+    assert path == "/developer/v1/applications/documents/doc%2Fid"
+    assert json.loads(body) == {
+        "data_source_summary": "Applicant asked to remove the document",
+        "user_prompt": "Delete this document",
+    }
     assert json.loads(result.output)["data"] == [{}]
 
 

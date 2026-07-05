@@ -11,6 +11,7 @@ description: |-
 
 ## Non-Negotiables
 
+- **Pass `--rationale` on every command** — it is a required field on these agent-tools (a non-empty string, max 1024 chars). With `--json`, supply it as a `"rationale"` key in the body. Omitting it returns `HTTP 422 (DEVELOPER_INVALID_SCHEMA)`, in both agent and human modes.
 - Never attach a document to a `vendor_uuid` unless the user has confirmed the vendor and document category.
 - If the vendor identity is uncertain, omit `--vendor_uuid` and let Ramp's matching/triage flow handle it.
 - Always run `-n/--dry_run` before uploading when using a known `vendor_uuid`.
@@ -35,7 +36,7 @@ ramp vendors attach-document \
   --content_type "application/pdf" \
   --file_content_base64 "{base64_string}" \
   --document_category W9 \
-  --dry_run
+  --dry_run --rationale "Upload the vendor document"
 
 # If the request body is correct, upload for real
 ramp vendors attach-document \
@@ -43,7 +44,7 @@ ramp vendors attach-document \
   --filename "acme-w9.pdf" \
   --content_type "application/pdf" \
   --file_content_base64 "{base64_string}" \
-  --document_category W9
+  --document_category W9 --rationale "Upload the vendor document"
 ```
 
 The upload response includes:
@@ -63,7 +64,7 @@ ramp vendors attach-document \
   --filename "acme-contract.pdf" \
   --content_type "application/pdf" \
   --file_content_base64 "{base64_string}" \
-  --document_category VENDOR_CONTRACT
+  --document_category VENDOR_CONTRACT --rationale "Upload the vendor document"
 ```
 
 If `vendor_uuid` is omitted in the response, tell the user the document was uploaded into the matching flow and may need review in Ramp.
@@ -76,6 +77,7 @@ If `vendor_uuid` is omitted in the response, tell the user the document was uplo
 ramp vendors bulk-upload \
   --dry_run \
   --json '{
+    "rationale": "Bulk upload vendor documents",
     "documents": [
       {
         "filename": "acme-w9.pdf",

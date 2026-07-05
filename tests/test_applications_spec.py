@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from ramp_cli.auth import oauth
 from ramp_cli.specs import AGENT_TOOL_SPEC
 from ramp_cli.tools.parser import ParamType, parse_spec
@@ -17,7 +19,6 @@ EXPECTED_APPLICATION_ALIASES = {
     "post_application_followup_submit_resource": "submit",
     "patch_application_followup_resource": "update-followup",
     "get_application_progress_resource": "progress",
-    "get_bank_account_list_with_pagination": "accounts",
 }
 
 
@@ -53,9 +54,6 @@ class TestUnifiedApplicationOperations:
         assert edit.http_method == "patch"
         assert edit.required_scopes == ["applications:write"]
 
-        accounts = tools["get_bank_account_list_with_pagination"]
-        assert accounts.required_scopes == ["bank_accounts:read"]
-
         upload = tools["post_application_document_resource"]
         assert upload.request_content_type == "multipart/form-data"
         assert next(param for param in upload.params if param.name == "file").type is (
@@ -83,5 +81,15 @@ class TestUnifiedApplicationOperations:
         assert {
             "applications:read",
             "applications:write",
+            "agent_account_numbers:read",
             "bank_accounts:read",
+            "banking_drawdown_requests:write",
         } <= scopes
+
+    def test_oauth_scope_catalog_includes_generated_operation_scopes(self):
+        spec = json.loads(AGENT_TOOL_SPEC.read_text())
+        flows = spec["components"]["securitySchemes"]["oauth2"]["flows"]
+
+        for flow in flows.values():
+            assert "agent_account_numbers:read" in flow["scopes"]
+            assert "banking_drawdown_requests:write" in flow["scopes"]

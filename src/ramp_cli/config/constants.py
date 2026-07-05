@@ -31,7 +31,7 @@ SANDBOX_APPLICATION_SIGNUP_TOKEN = (
     "ramp_business_tok_29qMQpAGD1ZlLRJSYB9t6mOLEZZww1Lbgp2pJAIw0G"
 )
 PRODUCTION_APPLICATION_SIGNUP_TOKEN = (
-    "ramp_business_tok_LzWMhIyksTncPyD951JLTlkbe906cbEso9VwtvaXig"
+    "ramp_business_tok_8KULeP0pJzjWNTSXJTlDCfAZ6clIOF35u70hpvawt2"
 )
 
 PREFERRED_CALLBACK_PORT = 19817
@@ -143,11 +143,15 @@ def append_query_params(url: str, params: dict[str, str]) -> str:
 # Scopes needed by existing DevAPI resource commands. These are merged with
 # scopes extracted from the agent-tool spec at login time in oauth.py.
 DEVAPI_SCOPES = [
+    "applications:read",
+    "applications:write",
     "business:read",
     "cashbacks:read",
     "departments:read",
     "departments:write",
     "entities:read",
+    "incorporation:read",
+    "incorporation:write",
     "item_receipts:read",
     "limits:write",
     "locations:read",

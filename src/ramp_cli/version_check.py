@@ -20,6 +20,7 @@ from ramp_cli.config.settings import config_dir
 
 _PUBLIC_REPO = "ramp-public/ramp-cli"
 _COOLDOWN_SECONDS = 86400  # 24 hours
+_SUPPRESS_NEXT_UPDATE_NOTICE = False
 
 
 def parse_version(v: str) -> tuple[int, ...]:
@@ -128,12 +129,23 @@ def get_update_warning() -> str | None:
     )
 
 
+def suppress_next_update_notice() -> None:
+    """Skip the next passive update notice emitted at CLI shutdown."""
+    global _SUPPRESS_NEXT_UPDATE_NOTICE
+    _SUPPRESS_NEXT_UPDATE_NOTICE = True
+
+
 def emit_update_notice(agent_mode: bool) -> None:
     """Print update notice to stderr if an update is available.
 
     In human mode, prints a styled warning.
     In agent mode, prints a JSON object so agents can detect and act on it.
     """
+    global _SUPPRESS_NEXT_UPDATE_NOTICE
+    if _SUPPRESS_NEXT_UPDATE_NOTICE:
+        _SUPPRESS_NEXT_UPDATE_NOTICE = False
+        return
+
     if agent_mode:
         info = get_update_info()
         if not info:

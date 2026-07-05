@@ -20,6 +20,12 @@ from ramp_cli.errors import (
 )
 
 
+@pytest.fixture(autouse=True)
+def clear_agent_client_env(monkeypatch):
+    for key in ("CLAUDECODE", "OPENCODE", "CODEX_SANDBOX", "RAMP_CLIENT_NAME"):
+        monkeypatch.delenv(key, raising=False)
+
+
 def test_get_access_token__refreshes_when_only_refresh_token_exists(monkeypatch):
     client = RampClient("sandbox")
 
@@ -105,6 +111,27 @@ def test_request__sends_extra_auth_header(monkeypatch):
 
     assert result == b"ok"
     assert captured["headers"]["X-Extra-Auth"] == "sandbox-token"
+
+
+def test_request__sends_operation_headers(monkeypatch):
+    client = RampClient("sandbox")
+    captured = {}
+
+    class FakeHTTP:
+        def request(self, method, url, headers, content=None):
+            captured["headers"] = headers
+            return b"ok"
+
+    result = client._request(
+        FakeHTTP(),
+        "POST",
+        "https://example.test",
+        "access",
+        request_headers={"X-Idempotency-Key": "idem-123"},
+    )
+
+    assert result == b"ok"
+    assert captured["headers"]["X-Idempotency-Key"] == "idem-123"
 
 
 def test_request__user_agent_includes_client_comment_when_sentinel_set(monkeypatch):

@@ -33,6 +33,18 @@ def _use_bundled_spec(monkeypatch):
     reload_tools("production")
 
 
+def _ctx_obj() -> dict:
+    return {
+        "env": "sandbox",
+        "format": "json",
+        "config_format": "json",
+        "quiet": False,
+        "no_input": True,
+        "wide": False,
+        "agent_mode": True,
+    }
+
+
 class TestRegistry:
     def test_list_tools_returns_names(self):
         names = list_tools()
@@ -183,6 +195,234 @@ class TestBuildToolCommand:
         option_names = {p.name for p in cmd.params if isinstance(p, click.Option)}
         assert "json_body" not in option_names
         assert "dry_run" in option_names
+
+    def test_application_progress_tool_has_wait_options(self):
+        tool = ToolDef(
+            name="get_application_progress_resource",
+            path="/developer/v1/applications/progress",
+            http_method="get",
+            summary="Fetch financing application progress",
+            description="Fetch financing application progress",
+            category="applications",
+            alias="progress",
+        )
+
+        cmd = build_tool_command(tool)
+
+        option_names = {p.name for p in cmd.params if isinstance(p, click.Option)}
+        assert "wait_for_action" in option_names
+        assert "wait_for_phone_verification" in option_names
+        assert "wait_for_identity_verification" in option_names
+        assert "wait_interval" in option_names
+        assert "wait_timeout" in option_names
+
+    def test_application_progress_wait_polls_until_phone_action_disappears(
+        self, monkeypatch
+    ):
+        tool = ToolDef(
+            name="get_application_progress_resource",
+            path="/developer/v1/applications/progress",
+            http_method="get",
+            summary="Fetch financing application progress",
+            description="Fetch financing application progress",
+            category="applications",
+            alias="progress",
+        )
+        client = MagicMock()
+        client.get.side_effect = [
+            json.dumps(
+                {
+                    "status": "STARTED",
+                    "required_actions": [
+                        {
+                            "type": "COMPLETE_APPLICANT_ACTION",
+                            "applicant_action": "VERIFY_EMAIL_OR_PHONE",
+                            "page_key": "phone_verification",
+                            "section_key": "phone_verification",
+                        }
+                    ],
+                }
+            ).encode(),
+            json.dumps(
+                {
+                    "status": "STARTED",
+                    "required_actions": [],
+                    "ready_for_submission": True,
+                }
+            ).encode(),
+        ]
+        monkeypatch.setattr("ramp_cli.tools.commands.RampClient", lambda env: client)
+        monkeypatch.setattr("ramp_cli.tools.commands.maybe_sync", lambda env: None)
+        sleep_calls = []
+        monkeypatch.setattr(
+            "ramp_cli.tools.commands.time.sleep",
+            lambda seconds: sleep_calls.append(seconds),
+        )
+
+        result = CliRunner().invoke(
+            build_tool_command(tool),
+            [
+                "--wait_for_phone_verification",
+                "--wait_interval",
+                "1",
+                "--wait_timeout",
+                "5",
+            ],
+            obj=_ctx_obj(),
+        )
+
+        assert result.exit_code == 0
+        assert client.get.call_count == 2
+        assert sleep_calls == [1]
+        payload = json.loads(result.output)
+        assert payload["data"][0]["ready_for_submission"] is True
+
+    def test_application_progress_wait_accepts_identity_alias(self, monkeypatch):
+        tool = ToolDef(
+            name="get_application_progress_resource",
+            path="/developer/v1/applications/progress",
+            http_method="get",
+            summary="Fetch financing application progress",
+            description="Fetch financing application progress",
+            category="applications",
+            alias="progress",
+        )
+        client = MagicMock()
+        client.get.side_effect = [
+            json.dumps(
+                {
+                    "status": "FOLLOW_UPS_REQUIRED",
+                    "required_actions": [
+                        {
+                            "type": "COMPLETE_APPLICANT_ACTION",
+                            "applicant_action": "COMPLETE_IDENTITY_VERIFICATION",
+                        }
+                    ],
+                }
+            ).encode(),
+            json.dumps({"status": "IN_REVIEW", "required_actions": []}).encode(),
+        ]
+        monkeypatch.setattr("ramp_cli.tools.commands.RampClient", lambda env: client)
+        monkeypatch.setattr("ramp_cli.tools.commands.maybe_sync", lambda env: None)
+        monkeypatch.setattr("ramp_cli.tools.commands.time.sleep", lambda seconds: None)
+
+        result = CliRunner().invoke(
+            build_tool_command(tool),
+            [
+                "--wait_for_action",
+                "onfido",
+                "--wait_interval",
+                "1",
+                "--wait_timeout",
+                "5",
+            ],
+            obj=_ctx_obj(),
+        )
+
+        assert result.exit_code == 0
+        assert client.get.call_count == 2
+        assert json.loads(result.output)["data"][0]["status"] == "IN_REVIEW"
+
+    def test_application_progress_wait_matches_custom_page_key(self, monkeypatch):
+        tool = ToolDef(
+            name="get_application_progress_resource",
+            path="/developer/v1/applications/progress",
+            http_method="get",
+            summary="Fetch financing application progress",
+            description="Fetch financing application progress",
+            category="applications",
+            alias="progress",
+        )
+        client = MagicMock()
+        client.get.side_effect = [
+            json.dumps(
+                {
+                    "status": "STARTED",
+                    "required_actions": [
+                        {
+                            "type": "PROVIDE_APPLICATION_DATA",
+                            "page_key": "business_info",
+                            "section_key": "principal_place_of_business",
+                        }
+                    ],
+                }
+            ).encode(),
+            json.dumps(
+                {
+                    "status": "STARTED",
+                    "required_actions": [],
+                    "ready_for_submission": True,
+                }
+            ).encode(),
+        ]
+        monkeypatch.setattr("ramp_cli.tools.commands.RampClient", lambda env: client)
+        monkeypatch.setattr("ramp_cli.tools.commands.maybe_sync", lambda env: None)
+        monkeypatch.setattr("ramp_cli.tools.commands.time.sleep", lambda seconds: None)
+
+        result = CliRunner().invoke(
+            build_tool_command(tool),
+            [
+                "--wait_for_action",
+                "business_info",
+                "--wait_interval",
+                "1",
+                "--wait_timeout",
+                "5",
+            ],
+            obj=_ctx_obj(),
+        )
+
+        assert result.exit_code == 0
+        assert client.get.call_count == 2
+        assert json.loads(result.output)["data"][0]["ready_for_submission"] is True
+
+    def test_application_progress_wait_timeout_reports_pending_action(
+        self, monkeypatch
+    ):
+        tool = ToolDef(
+            name="get_application_progress_resource",
+            path="/developer/v1/applications/progress",
+            http_method="get",
+            summary="Fetch financing application progress",
+            description="Fetch financing application progress",
+            category="applications",
+            alias="progress",
+        )
+        client = MagicMock()
+        client.get.return_value = json.dumps(
+            {
+                "status": "STARTED",
+                "required_actions": [
+                    {
+                        "type": "COMPLETE_APPLICANT_ACTION",
+                        "applicant_action": "VERIFY_EMAIL_OR_PHONE",
+                        "page_key": "phone_verification",
+                    }
+                ],
+            }
+        ).encode()
+        monkeypatch.setattr("ramp_cli.tools.commands.RampClient", lambda env: client)
+        monkeypatch.setattr("ramp_cli.tools.commands.maybe_sync", lambda env: None)
+        monkeypatch.setattr(
+            "ramp_cli.tools.commands.time.monotonic",
+            MagicMock(side_effect=[0, 2]),
+        )
+
+        result = CliRunner().invoke(
+            build_tool_command(tool),
+            [
+                "--wait_for_phone_verification",
+                "--wait_interval",
+                "1",
+                "--wait_timeout",
+                "1",
+            ],
+            obj=_ctx_obj(),
+        )
+
+        assert result.exit_code == 1
+        assert "Timed out waiting for application actions" in result.output
+        assert "VERIFY_EMAIL_OR_PHONE" in result.output
 
     def test_json_query_fields_are_not_sent_as_a_body(self):
         tool = ToolDef(
@@ -840,6 +1080,167 @@ class TestDryRun:
         assert result.exit_code == 0
         assert "ALL_FUNDS" in result.output
 
+    def test_idempotency_header_defaults_from_session(self, monkeypatch):
+        monkeypatch.setattr("ramp_cli.tools.commands.get_session_id", lambda: "sid-123")
+        nonces = iter(["nonce-a", "nonce-b"])
+        monkeypatch.setattr("ramp_cli.tools.commands.uuid4", lambda: next(nonces))
+        tool = ToolDef(
+            name="request-funds",
+            path="/developer/v1/things/{thing_id}",
+            http_method="post",
+            summary="Request funds",
+            description="Request funds",
+            params=[
+                ToolParam(
+                    name="thing_id",
+                    flag="thing_id",
+                    description="Thing ID",
+                    type=ParamType.STRING,
+                    required=True,
+                    location="path",
+                ),
+                ToolParam(
+                    name="amount",
+                    flag="amount",
+                    description="Amount",
+                    type=ParamType.STRING,
+                    required=True,
+                    location="body",
+                ),
+                ToolParam(
+                    name="X-Idempotency-Key",
+                    flag="idempotency_key",
+                    description="Idempotency key",
+                    type=ParamType.STRING,
+                    required=True,
+                    location="header",
+                ),
+            ],
+        )
+        command = build_tool_command(tool)
+        runner = CliRunner()
+
+        first = runner.invoke(
+            command,
+            ["thing-1", "--amount", "12.34", "--dry_run"],
+            obj=_ctx_obj(),
+        )
+        second = runner.invoke(
+            command,
+            ["thing-1", "--amount", "12.34", "--dry_run"],
+            obj=_ctx_obj(),
+        )
+
+        assert first.exit_code == 0, first.output
+        assert second.exit_code == 0, second.output
+        first_payload = json.loads(first.output)["data"][0]
+        second_payload = json.loads(second.output)["data"][0]
+        first_key = first_payload["headers"]["X-Idempotency-Key"]
+        second_key = second_payload["headers"]["X-Idempotency-Key"]
+        assert first_key == "sid-123:request-funds:nonce-a"
+        assert second_key == "sid-123:request-funds:nonce-b"
+        assert first_key != second_key
+        assert len(first_key) <= 255
+        assert first_payload["body"] == {"amount": "12.34"}
+
+    def test_explicit_idempotency_header_is_sent(self, monkeypatch):
+        tool = ToolDef(
+            name="request-funds",
+            path="/developer/v1/things/{thing_id}",
+            http_method="post",
+            summary="Request funds",
+            description="Request funds",
+            params=[
+                ToolParam(
+                    name="thing_id",
+                    flag="thing_id",
+                    description="Thing ID",
+                    type=ParamType.STRING,
+                    required=True,
+                    location="path",
+                ),
+                ToolParam(
+                    name="X-Idempotency-Key",
+                    flag="idempotency_key",
+                    description="Idempotency key",
+                    type=ParamType.STRING,
+                    required=True,
+                    location="header",
+                ),
+            ],
+        )
+        command = build_tool_command(tool)
+        client = MagicMock()
+        client.post.return_value = b"{}"
+        monkeypatch.setattr("ramp_cli.tools.commands.RampClient", lambda env: client)
+        monkeypatch.setattr("ramp_cli.tools.commands.maybe_sync", lambda env: None)
+
+        result = CliRunner().invoke(
+            command,
+            ["thing-1", "--idempotency_key", "manual-key"],
+            obj=_ctx_obj(),
+        )
+
+        assert result.exit_code == 0, result.output
+        assert client.post.call_args.kwargs["headers"] == {
+            "X-Idempotency-Key": "manual-key"
+        }
+
+    def test_json_merges_positional_body_ids(self):
+        tool = ToolDef(
+            name="request-funds",
+            path="/developer/v1/banking/accounts/{banking_account_id}/drawdown-requests",
+            http_method="post",
+            summary="Request funds",
+            description="Request funds",
+            params=[
+                ToolParam(
+                    name="banking_account_id",
+                    flag="banking_account_id",
+                    description="Banking account ID",
+                    type=ParamType.STRING,
+                    required=True,
+                    location="path",
+                ),
+                ToolParam(
+                    name="external_bank_account_id",
+                    flag="external_bank_account_id",
+                    description="External bank account ID",
+                    type=ParamType.STRING,
+                    required=True,
+                    location="body",
+                ),
+                ToolParam(
+                    name="amount",
+                    flag="amount",
+                    description="Amount",
+                    type=ParamType.OBJECT,
+                    required=True,
+                    is_complex=True,
+                    location="body",
+                ),
+            ],
+        )
+
+        result = CliRunner().invoke(
+            build_tool_command(tool),
+            [
+                "bank-1",
+                "external-1",
+                "--json",
+                '{"amount":{"currency_code":"USD","amount":"12.00"}}',
+                "--dry_run",
+            ],
+            obj=_ctx_obj(),
+        )
+
+        assert result.exit_code == 0, result.output
+        body = json.loads(result.output)["data"][0]["body"]
+        assert body == {
+            "amount": {"currency_code": "USD", "amount": "12.00"},
+            "external_bank_account_id": "external-1",
+        }
+
 
 class TestBodyBuilding:
     def test_required_param_default_is_used_when_omitted(self):
@@ -933,6 +1334,9 @@ class TestCLIIntegration:
         assert "transactions" in result.output
         assert "funds" in result.output
         assert "bills" in result.output
+        assert "ai-spend" in result.output
+        assert "Inspect AI token spend" in result.output
+        assert "ai-token-spend" not in result.output
         # cards is its own resource group; agent_cards is remapped into funds
         assert "cards" in result.output
         assert "agent_cards" not in result.output
@@ -1069,63 +1473,163 @@ class TestCLIIntegration:
         assert "No such command 'requests'" in result.output
         assert "missing the required scope" not in result.output
 
-    def test_funds_group_contains_card_tools(self):
-        # Existing (pre-alias) behavior must be preserved: card tools remain
-        # reachable under funds via the cards→funds remap.
+    def test_ai_spend_group_contains_token_spend_tools(self, monkeypatch):
+        _use_bundled_spec(monkeypatch)
+        runner = CliRunner()
+
+        result = runner.invoke(cli, ["ai-spend", "--help"])
+
+        assert result.exit_code == 0
+        assert "aggregates" in result.output
+        assert "connections" in result.output
+        assert "current-spend" in result.output
+        assert "filter-options" in result.output
+
+    def test_ai_token_spend_legacy_group_still_works(self, monkeypatch):
+        _use_bundled_spec(monkeypatch)
+        runner = CliRunner()
+
+        result = runner.invoke(cli, ["ai-token-spend", "--help"])
+
+        assert result.exit_code == 0
+        assert "aggregates" in result.output
+        assert "connections" in result.output
+        assert "current-spend" in result.output
+        assert "filter-options" in result.output
+
+    def test_ai_spend_and_legacy_group_hit_same_endpoint(self, monkeypatch):
+        _use_bundled_spec(monkeypatch)
+        runner = CliRunner()
+        args = [
+            "aggregates",
+            "--rationale",
+            "Testing dry-run body",
+            "--start_at",
+            "2026-06-01T00:00:00Z",
+            "--end_at",
+            "2026-06-28T00:00:00Z",
+            "--metric",
+            "cost",
+            "--dry_run",
+        ]
+
+        ai_spend = runner.invoke(cli, ["ai-spend", *args])
+        legacy = runner.invoke(cli, ["ai-token-spend", *args])
+
+        assert ai_spend.exit_code == 0, ai_spend.output
+        assert legacy.exit_code == 0, legacy.output
+        ai_spend_payload = json.loads(ai_spend.output)["data"][0]
+        legacy_payload = json.loads(legacy.output)["data"][0]
+        assert ai_spend_payload["url"].endswith("/get-ai-token-spend-aggregates")
+        assert ai_spend_payload == legacy_payload
+
+    def test_ai_spend_missing_scope_message(self, monkeypatch, isolated_config):
+        _use_bundled_spec(monkeypatch)
+        store.save_tokens("production", "tok", "refresh", granted_scopes="users:read")
+        monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
+
+        runner = CliRunner()
+        public_result = runner.invoke(cli, ["--env", "production", "ai-spend"])
+        legacy_result = runner.invoke(cli, ["--env", "production", "ai-token-spend"])
+
+        assert public_result.exit_code != 0
+        assert "ai-spend' resource is available" in public_result.output
+        assert "ai_spend:read" in public_result.output
+        assert legacy_result.exit_code != 0
+        assert "ai-token-spend' resource is available" in legacy_result.output
+        assert "ai_spend:read" in legacy_result.output
+
+    def test_funds_group_contains_card_tools(self, monkeypatch):
+        _use_bundled_spec(monkeypatch)
+        # Write-oriented card tools remain reachable under funds via the
+        # cards->funds remap. Card listing now lives in the funds list tool.
         runner = CliRunner()
         result = runner.invoke(cli, ["funds", "--help"])
         assert result.exit_code == 0
         assert "activate-card" in result.output or "activate" in result.output
         assert "get-funds" in result.output or "list" in result.output
-        # The full endpoint name path is preserved (not renamed).
-        assert "list-cards" in result.output
         assert "lock-or-unlock-card" in result.output
 
-    def test_cards_group_contains_card_tools(self):
-        # Additive alias group: cards is its own group with short aliases.
+    def test_cards_group_contains_card_tools(self, monkeypatch):
+        _use_bundled_spec(monkeypatch)
+        # Additive alias group: cards is its own group with short aliases for
+        # the card-specific command surface exposed by the current spec.
         runner = CliRunner()
         result = runner.invoke(cli, ["cards", "--help"])
         assert result.exit_code == 0
-        assert "list" in result.output
         assert "activate" in result.output
         assert "lock" in result.output
 
-    def test_cards_list_and_funds_list_cards_same_endpoint(self):
-        # `cards list` and `funds list-cards` must hit the same endpoint.
+    def test_funds_list_uses_funds_endpoint(self, monkeypatch):
+        _use_bundled_spec(monkeypatch)
         runner = CliRunner()
-        cards = runner.invoke(cli, ["cards", "list", "--rationale", "x", "--dry_run"])
-        funds = runner.invoke(
-            cli, ["funds", "list-cards", "--rationale", "x", "--dry_run"]
-        )
-        assert cards.exit_code == 0
+        funds = runner.invoke(cli, ["funds", "list", "--rationale", "x", "--dry_run"])
         assert funds.exit_code == 0
-        cards_url = json.loads(cards.output)["data"][0]["url"]
         funds_url = json.loads(funds.output)["data"][0]["url"]
-        assert cards_url.endswith("/list-cards")
-        assert cards_url == funds_url
+        assert funds_url.endswith("/get-funds")
 
-    def test_cards_list_invokable_with_readonly_limits_scope(
+    def test_funds_list_invokable_with_readonly_limits_scope(
         self, monkeypatch, isolated_config
     ):
-        # Regression: a read-only `limits:read` token sees `list-cards` but
-        # NOT the `cards:write` activate/lock tools. The cards alias group
-        # must stay grouped (not fold into `general`) so `cards list` works.
+        _use_bundled_spec(monkeypatch)
+        # A read-only `limits:read` token can still list funds, while the
+        # card-specific alias group remains unavailable without `cards:write`.
         store.save_tokens("production", "tok", "refresh", granted_scopes="limits:read")
         monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
 
         runner = CliRunner()
         help_res = runner.invoke(
-            cli, ["--env", "production", "cards", "list", "--help"]
+            cli, ["--env", "production", "funds", "list", "--help"]
         )
         assert help_res.exit_code == 0, help_res.output
-        assert "No such command 'cards'" not in help_res.output
 
         dry = runner.invoke(
             cli,
-            ["--env", "production", "cards", "list", "--rationale", "x", "--dry_run"],
+            ["--env", "production", "funds", "list", "--rationale", "x", "--dry_run"],
         )
         assert dry.exit_code == 0, dry.output
-        assert json.loads(dry.output)["data"][0]["url"].endswith("/list-cards")
+        assert json.loads(dry.output)["data"][0]["url"].endswith("/get-funds")
+
+        cards = runner.invoke(cli, ["--env", "production", "cards"])
+        assert cards.exit_code != 0
+        assert "cards:write" in cards.output
+
+    def test_treasury_account_numbers_invokable_with_readonly_scope(
+        self, monkeypatch, isolated_config
+    ):
+        _use_bundled_spec(monkeypatch)
+        # Regression: a least-privilege account-number token only sees one
+        # treasury tool. Treasury must stay grouped so the advertised command
+        # path remains available instead of folding into ``general``.
+        store.save_tokens(
+            "production",
+            "tok",
+            "refresh",
+            granted_scopes="agent_account_numbers:read",
+        )
+        monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
+
+        runner = CliRunner()
+        help_res = runner.invoke(
+            cli, ["--env", "production", "treasury", "account-numbers", "--help"]
+        )
+        assert help_res.exit_code == 0, help_res.output
+        assert "No such command 'treasury'" not in help_res.output
+
+        dry = runner.invoke(
+            cli,
+            [
+                "--env",
+                "production",
+                "treasury",
+                "account-numbers",
+                "--dry_run",
+            ],
+        )
+        assert dry.exit_code == 0, dry.output
+        assert json.loads(dry.output)["data"][0]["url"].endswith(
+            "/banking/agent-account-numbers"
+        )
 
     def test_cards_is_alias_group_agent_cards_merged_into_funds(self):
         runner = CliRunner()
@@ -1197,6 +1701,33 @@ class TestCLIIntegration:
         assert payload["data"][0]["url"].endswith(
             "/developer/v1/agent-tools/search-unified-requests"
         )
+
+    def test_travel_search_keeps_legacy_alias(self, monkeypatch):
+        _use_bundled_spec(monkeypatch)
+        runner = CliRunner()
+
+        help_result = runner.invoke(cli, ["travel", "--help"])
+        assert help_result.exit_code == 0, help_result.output
+        assert "search-flight" in help_result.output
+
+        body = json.dumps(
+            {
+                "departure": "JFK",
+                "arrival": "SFO",
+                "departure_date": "2026-07-06",
+                "rationale": "Search flights for the user",
+            }
+        )
+        for command_name in ("search-flight", "search"):
+            result = runner.invoke(
+                cli,
+                ["travel", command_name, "--dry_run", "--json", body],
+            )
+            assert result.exit_code == 0, result.output
+            payload = json.loads(result.output)
+            assert payload["data"][0]["url"].endswith(
+                "/developer/v1/agent-tools/search-flights"
+            )
 
     def test_flat_tool_access_still_works(self):
         runner = CliRunner()

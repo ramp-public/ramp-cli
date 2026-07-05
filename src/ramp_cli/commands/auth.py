@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 
 import click
+import httpx
 
 from ramp_cli.animations.nyc import show_nyc
 from ramp_cli.auth import store
@@ -12,7 +13,7 @@ from ramp_cli.auth.environment import (
     environment_auth_required_message,
     missing_required_environment_auth,
 )
-from ramp_cli.auth.oauth import LoginOptions
+from ramp_cli.auth.oauth import LoginOptions, OAuthTokenError
 from ramp_cli.auth.oauth import login as do_login
 from ramp_cli.config import settings
 from ramp_cli.config.constants import base_url, iter_environments
@@ -146,7 +147,12 @@ def login(
         scopes=scopes,
         auth_level=auth_level,
     )
-    token_resp = do_login(env, opts)
+    try:
+        token_resp = do_login(env, opts)
+    except OAuthTokenError as exc:
+        raise click.ClickException(str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise click.ClickException(f"Token request failed: {exc}") from exc
 
     store.save_tokens(
         env,

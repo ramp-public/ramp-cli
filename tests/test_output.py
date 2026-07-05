@@ -76,3 +76,21 @@ def test_extract_headers_wide():
     item = {f"col{i}": i for i in range(20)}
     headers = extract_headers(item, wide=True)
     assert len(headers) == 20
+
+
+def test_transaction_headers_include_decline_reason():
+    item = {
+        "amount": "$12.34",
+        "merchant_name": "Coffee Shop",
+        "spent_by_user": "Ada Lovelace",
+        "transaction_time": "2026-05-21",
+        "merchant_category": "Coffee",
+        "spend_allocation_name": "Engineering",
+        "reason_or_justification": "Team sync",
+        "decline_reason": "Card suspended",
+        "transaction_uuid": "txn_123",
+    }
+
+    headers = extract_headers(item, category="transactions")
+
+    assert "decline_reason" in headers

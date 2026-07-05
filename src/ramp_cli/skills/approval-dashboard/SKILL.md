@@ -10,6 +10,7 @@ description: |-
 
 ## Non-Negotiables
 
+- **Pass `--rationale` on every command** — it is a required field on these agent-tools (a non-empty string, max 1024 chars). With `--json`, supply it as a `"rationale"` key in the body. Omitting it returns `HTTP 422 (DEVELOPER_INVALID_SCHEMA)`, in both agent and human modes.
 - Always show the item details before approving or rejecting. Never blind-approve.
 - Rejections require a reason. Approvals do not, but a note is helpful.
 - Confirm with the user before executing approvals — especially bulk operations.
@@ -26,16 +27,16 @@ Run these in parallel to build the full approval queue. **Paginate each endpoint
 ```bash
 # Pending transactions (paginate with --next_page_cursor)
 ramp transactions list --transactions_to_retrieve transactions_awaiting_my_approval \
-  --agent --page_size 50
+  --agent --page_size 50 --rationale "List the user's transactions"
 
 # Pending bills (paginate with --page_cursor)
-ramp bills pending --agent --limit 50
+ramp bills pending --agent --limit 50 --rationale "Review bills pending approval"
 
 # Pending reimbursements (no cursor pagination — use --limit)
-ramp reimbursements pending --agent --limit 50
+ramp reimbursements pending --agent --limit 50 --rationale "Review reimbursements pending approval"
 
 # Pending requests (paginate with --start; --thoughts is required)
-ramp requests pending --thoughts "Reviewing all pending requests" --page_size 50 --agent
+ramp requests pending --thoughts "Reviewing all pending requests" --page_size 50 --agent --rationale "Review pending requests"
 ```
 
 For each endpoint, check `pagination.next_cursor` in the JSON envelope. If it is not null, re-run the command with that cursor value (via `--next_page_cursor` for transactions, `--page_cursor` for bills, `--start` for requests) until all pages are fetched. Note: `reimbursements pending` does not support cursor-based pagination — it only has `--limit`, so increase the limit if you need more results. Aggregate results before presenting.
@@ -71,42 +72,42 @@ For each item the user wants to act on, get details first:
 
 ```bash
 # Bill details
-ramp bills get {bill_id} --agent
+ramp bills get {bill_id} --agent --rationale "Review bill details"
 
 # Transaction details
-ramp transactions get {transaction_uuid} --agent
+ramp transactions get {transaction_uuid} --agent --rationale "Review transaction details"
 
 # Transaction missing items (if relevant)
-ramp transactions missing {transaction_uuid}
+ramp transactions missing {transaction_uuid} --rationale "Check missing items on the transaction"
 
 # Reimbursement details (use list with specific UUID)
-ramp reimbursements list --reimbursement_uuids '["{uuid}"]' --include_policy_assessment --agent
+ramp reimbursements list --reimbursement_uuids '["{uuid}"]' --include_policy_assessment --agent --rationale "List the user's reimbursements"
 ```
 
 ### Step 4: Execute approvals
 
 ```bash
 # Approve a transaction
-ramp transactions approve {transaction_uuid} --action APPROVE --thoughts "Reviewed — within policy"
+ramp transactions approve {transaction_uuid} --action APPROVE --thoughts "Reviewed — within policy" --rationale "Act on the transaction approval"
 
 # Reject a transaction (reason required)
 ramp transactions approve {transaction_uuid} \
   --action REJECT_AND_REQUEST_CHANGES \
   --thoughts "Missing receipt and over budget" \
-  --user_reason "Please attach the receipt and update the memo"
+  --user_reason "Please attach the receipt and update the memo" --rationale "Act on the transaction approval"
 
 # Approve a bill — not yet available via CLI.
 # Use the bill_url from the response to direct the user to the Ramp app.
 
 # Approve a reimbursement
-ramp reimbursements approve {reimbursement_uuid} --action approve
+ramp reimbursements approve {reimbursement_uuid} --action approve --rationale "Act on the reimbursement approval"
 
 # Reject a reimbursement
 ramp reimbursements approve {reimbursement_uuid} --action reject \
-  --user_reason "Receipt doesn't match the claimed amount"
+  --user_reason "Receipt doesn't match the claimed amount" --rationale "Act on the reimbursement approval"
 
 # Approve a request
-ramp requests approve {request_uuid} --action APPROVE --thoughts "Approved — within team budget"
+ramp requests approve {request_uuid} --action APPROVE --thoughts "Approved — within team budget" --rationale "Act on the request approval"
 ```
 
 ### Step 5: Add comments (optional)
@@ -116,7 +117,7 @@ Leave a comment on any Ramp object for context:
 ```bash
 ramp general comment {object_uuid} \
   --ramp_object_type transaction \
-  --message "Approved — this covers the Q1 offsite catering"
+  --message "Approved — this covers the Q1 offsite catering" --rationale "Add a comment for the user"
 ```
 
 Valid object types: `bill`, `booking_request`, `card`, `payee`, `provisional_bill`, `reimbursement`, `spend_intent`, `spend_request`, `ticket`, `transaction`, `vendor_payment`.
@@ -144,10 +145,10 @@ When the user wants to approve multiple items at once:
 User: What needs my approval?
 
 Agent: Let me check all your pending queues.
-> ramp transactions list --transactions_to_retrieve transactions_awaiting_my_approval --agent --page_size 50
-> ramp bills pending --agent --limit 50
-> ramp reimbursements pending --agent --limit 50
-> ramp requests pending --thoughts "Checking approval queue" --page_size 50 --agent
+> ramp transactions list --transactions_to_retrieve transactions_awaiting_my_approval --agent --page_size 50 --rationale "List the user's transactions"
+> ramp bills pending --agent --limit 50 --rationale "Review bills pending approval"
+> ramp reimbursements pending --agent --limit 50 --rationale "Review reimbursements pending approval"
+> ramp requests pending --thoughts "Checking approval queue" --page_size 50 --agent --rationale "Review pending requests"
 
 Approval queue: 6 items ($4,350 total)
 
@@ -168,17 +169,17 @@ Want to review individually or approve all?
 User: Approve the bills and reimbursements. Let me see the transaction first.
 
 Agent: I can approve the reimbursements now. Bills must be approved in the Ramp app.
-> ramp reimbursements approve reimb-001 --action approve
-> ramp reimbursements approve reimb-002 --action approve
-> ramp reimbursements approve reimb-003 --action approve
+> ramp reimbursements approve reimb-001 --action approve --rationale "Act on the reimbursement approval"
+> ramp reimbursements approve reimb-002 --action approve --rationale "Act on the reimbursement approval"
+> ramp reimbursements approve reimb-003 --action approve --rationale "Act on the reimbursement approval"
 
 3 reimbursements approved. For the 2 bills, approve them in the Ramp app:
   HighSpot Invoice #4401 → <bill_url if present, else https://app.ramp.com/bills>
   Cometeer Invoice #882  → <bill_url if present, else https://app.ramp.com/bills>
 
 Now let me get details on that DoorDash transaction:
-> ramp transactions get txn-001 --agent
-> ramp transactions missing txn-001
+> ramp transactions get txn-001 --agent --rationale "Review transaction details"
+> ramp transactions missing txn-001 --rationale "Check missing items on the transaction"
 
 DoorDash $220 — Dana Alhasawi, 2026-03-15
 Memo: "Team lunch"  |  Receipt: attached  |  Accounting: complete

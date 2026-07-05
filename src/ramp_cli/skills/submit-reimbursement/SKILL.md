@@ -10,6 +10,7 @@ description: |-
 
 ## Non-Negotiables
 
+- **Pass `--rationale` on every command** — it is a required field on these agent-tools (a non-empty string, max 1024 chars). With `--json`, supply it as a `"rationale"` key in the body. Omitting it returns `HTTP 422 (DEVELOPER_INVALID_SCHEMA)`, in both agent and human modes.
 - Never submit without confirming the details with the user first. Show amount, merchant, memo, fund, and accounting categories before submitting.
 - Receipts must be **base64-encoded** for upload. Accepted types: PNG, JPEG, PDF, HEIC, WEBP.
 - All CLI flags use **underscores**, not hyphens (e.g., `--fund_uuid`, `--page_size`).
@@ -30,7 +31,7 @@ base64 -i /path/to/receipt.pdf | tr -d '\n'
 ramp receipts upload \
   --content_type "application/pdf" \
   --filename "receipt.pdf" \
-  --file_content_base64 "{base64_string}"
+  --file_content_base64 "{base64_string}" --rationale "Upload the receipt"
 ```
 
 Response returns `receipt_uuid`. Save it for the next step.
@@ -38,7 +39,7 @@ Response returns `receipt_uuid`. Save it for the next step.
 ### Step 2: Create a draft reimbursement from the receipt
 
 ```bash
-ramp reimbursements create {receipt_uuid}
+ramp reimbursements create {receipt_uuid} --rationale "Create the reimbursement from the receipt"
 ```
 
 Response returns:
@@ -66,13 +67,14 @@ Use suggestions from the create response when available:
 # Set memo and fund from suggestions
 ramp reimbursements edit {reimbursement_uuid} \
   --memo "Coffee with client" \
-  --fund_uuid "{suggested_fund_uuid}"
+  --fund_uuid "{suggested_fund_uuid}" --rationale "Update the reimbursement for the user"
 ```
 
 For tracking categories, use `--json`:
 
 ```bash
 ramp reimbursements edit {reimbursement_uuid} --json '{
+  "rationale": "Update the reimbursement for the user",
   "reimbursement_uuid": "{uuid}",
   "tracking_category_selections": [
     {
@@ -86,7 +88,7 @@ ramp reimbursements edit {reimbursement_uuid} --json '{
 If no suggestions are available for the fund, list the user's funds:
 
 ```bash
-ramp funds list --agent
+ramp funds list --agent --rationale "List the user's funds"
 ```
 
 **After each edit**, check the response's `missing_items`. Repeat until all required items are resolved (all `false` / empty).
@@ -110,7 +112,7 @@ Submit for approval?
 ### Step 5: Submit
 
 ```bash
-ramp reimbursements submit {reimbursement_uuid}
+ramp reimbursements submit {reimbursement_uuid} --rationale "Submit the reimbursement"
 ```
 
 Response returns `reimbursement_uuid` and `error_message` (null on success).
@@ -126,13 +128,13 @@ If a reimbursement was rejected and the user wants to fix and resubmit:
 
 ```bash
 # Revert to draft
-ramp reimbursements resubmit {reimbursement_uuid}
+ramp reimbursements resubmit {reimbursement_uuid} --rationale "Resubmit the reimbursement"
 
 # Edit as needed
-ramp reimbursements edit {reimbursement_uuid} --memo "Updated memo with details"
+ramp reimbursements edit {reimbursement_uuid} --memo "Updated memo with details" --rationale "Update the reimbursement for the user"
 
 # Submit again
-ramp reimbursements submit {reimbursement_uuid}
+ramp reimbursements submit {reimbursement_uuid} --rationale "Submit the reimbursement"
 ```
 
 ## Duplicating a Previous Reimbursement
@@ -144,21 +146,21 @@ If the user needs to submit a new reimbursement with a new receipt, the executab
 
 ```bash
 # Find a previous reimbursement to reference
-ramp reimbursements list --reimbursements_to_retrieve my_reimbursements --page_size 10
+ramp reimbursements list --reimbursements_to_retrieve my_reimbursements --page_size 10 --rationale "List the user's reimbursements"
 
 # Duplicate exists, but the draft will still be missing a receipt
-ramp reimbursements duplicate {previous_reimbursement_uuid}
+ramp reimbursements duplicate {previous_reimbursement_uuid} --rationale "Duplicate the reimbursement"
 
 # Upload the new receipt
 ramp receipts upload --content_type "image/jpeg" --filename "gym-apr.jpg" \
-  --file_content_base64 "{base64}"
+  --file_content_base64 "{base64}" --rationale "Upload the receipt"
 
 # Create a fresh reimbursement from that receipt
-ramp reimbursements create {receipt_uuid}
+ramp reimbursements create {receipt_uuid} --rationale "Create the reimbursement from the receipt"
 
 # Re-apply memo, fund, and tracking categories, then submit
-ramp reimbursements edit {reimbursement_uuid} --memo "Monthly gym membership"
-ramp reimbursements submit {reimbursement_uuid}
+ramp reimbursements edit {reimbursement_uuid} --memo "Monthly gym membership" --rationale "Update the reimbursement for the user"
+ramp reimbursements submit {reimbursement_uuid} --rationale "Submit the reimbursement"
 ```
 
 Do not imply that a new receipt can be attached to the duplicated reimbursement via CLI. `receipts attach` is for card transactions only, and `submit` can fail with "receipt must be specified" if the duplicate has no receipt.
@@ -171,11 +173,11 @@ User: I bought coffee for a meeting yesterday, here's the receipt ~/Downloads/bl
 Agent: Let me upload that receipt and create a reimbursement.
 > base64 -i ~/Downloads/bluebottle.jpg | tr -d '\n'
 > ramp receipts upload --content_type "image/jpeg" --filename "bluebottle.jpg" \
->   --file_content_base64 "{base64}"
+>   --file_content_base64 "{base64}" --rationale "Upload the receipt"
 
 Receipt uploaded (receipt_uuid: 0e5e5e0b-...).
 
-> ramp reimbursements create 0e5e5e0b-...
+> ramp reimbursements create 0e5e5e0b-... --rationale "Create the reimbursement from the receipt"
 
 Draft created. The receipt shows Blue Bottle Coffee, $12.50.
 Suggested memos: "Coffee at Blue Bottle for team meeting"
@@ -185,7 +187,7 @@ Missing: memo, fund, Category (GL account)
 Let me fill in the details using the suggestions:
 > ramp reimbursements edit c6698db2-... \
 >   --memo "Coffee at Blue Bottle for team meeting" \
->   --fund_uuid "5c87b1bf-..."
+>   --fund_uuid "5c87b1bf-..." --rationale "Update the reimbursement for the user"
 
 All required items resolved. Ready to submit:
   Amount:    $12.50

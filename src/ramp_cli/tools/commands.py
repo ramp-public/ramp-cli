@@ -15,11 +15,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
+from uuid import uuid4
 
 import click
 
 from ramp_cli.auth.store import get_granted_scopes
 from ramp_cli.client.api import RampClient
+from ramp_cli.client.session import get_session_id
 from ramp_cli.config.constants import api_url, append_query_params
 from ramp_cli.config.settings import resolve_environment
 from ramp_cli.onboarding import maybe_show_category_tip
@@ -41,6 +43,20 @@ from ramp_cli.tools.registry import CATEGORY_REMAP, get_tool, list_tool_defs
 _SPINNER_CHARS = "░▒▓█▓▒"
 
 _ID_SUFFIXES = ("_id", "_uuid")
+_IDEMPOTENCY_HEADER = "X-Idempotency-Key"
+_APPLICATION_PROGRESS_PATH = "/developer/v1/applications/progress"
+
+_APPLICATION_WAIT_ACTION_ALIASES: dict[str, str] = {
+    "idv": "identity_verification",
+    "identity": "identity_verification",
+    "identity_verification": "identity_verification",
+    "complete_identity_verification": "identity_verification",
+    "onfido": "identity_verification",
+    "phone": "phone_verification",
+    "phone_verification": "phone_verification",
+    "verify_phone": "phone_verification",
+    "verify_email_or_phone": "VERIFY_EMAIL_OR_PHONE",
+}
 
 # Common flag aliases for agent/Unix ergonomics.
 # Maps API param names to additional CLI flag declarations.
@@ -62,6 +78,7 @@ class PreparedRequest:
     body: dict[str, Any]
     form: dict[str, Any]
     files: dict[str, Path]
+    headers: dict[str, str]
     content_type: str
 
     def display_body(self) -> dict[str, Any]:
@@ -71,6 +88,13 @@ class PreparedRequest:
             **self.form,
             **{name: str(path) for name, path in self.files.items()},
         }
+
+
+@dataclass(frozen=True, slots=True)
+class WaitConfig:
+    actions: tuple[str, ...]
+    interval_seconds: int
+    timeout_seconds: int
 
 
 def resolve_tool_command_names(
@@ -153,6 +177,8 @@ def build_tool_command(tool: ToolDef) -> click.Command:
             help="Print request without sending",
         )
     )
+    if _supports_application_progress_wait(tool):
+        params.extend(_build_application_progress_wait_options())
 
     @click.pass_context
     def callback(ctx: click.Context, **kwargs: Any) -> None:
@@ -284,6 +310,51 @@ def _build_option(param: ToolParam) -> click.Option:
     return click.Option(decls, **kwargs)
 
 
+def _supports_application_progress_wait(tool: ToolDef) -> bool:
+    return tool.http_method == "get" and tool.path == _APPLICATION_PROGRESS_PATH
+
+
+def _build_application_progress_wait_options() -> list[click.Option]:
+    return [
+        click.Option(
+            ["--wait_for_action", "--wait-for-action"],
+            multiple=True,
+            metavar="ACTION",
+            help=(
+                "Poll until the named required action is no longer present. "
+                "Accepts phone_verification, identity_verification, or an exact "
+                "required action/applicant_action enum. May be repeated."
+            ),
+        ),
+        click.Option(
+            ["--wait_for_phone_verification", "--wait-for-phone-verification"],
+            is_flag=True,
+            default=False,
+            help="Poll until phone verification is complete.",
+        ),
+        click.Option(
+            ["--wait_for_identity_verification", "--wait-for-identity-verification"],
+            is_flag=True,
+            default=False,
+            help="Poll until identity verification is complete.",
+        ),
+        click.Option(
+            ["--wait_interval", "--wait-interval"],
+            type=click.IntRange(1),
+            default=15,
+            show_default=True,
+            help="Seconds between progress polling attempts.",
+        ),
+        click.Option(
+            ["--wait_timeout", "--wait-timeout"],
+            type=click.IntRange(1),
+            default=900,
+            show_default=True,
+            help="Maximum seconds to wait for required actions to complete.",
+        ),
+    ]
+
+
 def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> None:
     """Build the JSON body, optionally dry-run, then call the agent-tool endpoint."""
     env: str = ctx.obj["env"]
@@ -291,7 +362,13 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
     config_format: str = ctx.obj["config_format"]
     json_body_raw: str | None = kwargs.get("json_body")
     dry_run: bool = kwargs.get("dry_run", False)
+    wait_config = _application_progress_wait_config(tool, kwargs)
     synced_for_json_validation = False
+
+    if dry_run and wait_config is not None:
+        raise click.UsageError(
+            "application progress wait flags cannot be used with --dry_run"
+        )
 
     if json_body_raw:
         try:
@@ -303,7 +380,12 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
             synced_for_json_validation = True
         raw_values = _validate_json_body(tool, raw_values)
         values = _build_body(tool, kwargs, allow_missing=True)
-        body = dict(raw_values)
+        body = {
+            param.name: values[param.name]
+            for param in tool.params
+            if param.location == "body" and param.name in values
+        }
+        body.update(raw_values)
         for param in tool.params:
             if param.location == "body" or param.name not in body:
                 continue
@@ -328,13 +410,16 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
         query = {name: str(value) for name, value in request.query.items()}
         resolved = resolve_format(fmt, config_format)
         if resolved == "json":
+            payload = {
+                "dry_run": True,
+                "method": request.method.upper(),
+                "url": api_url(env, request.path, query),
+                "body": request.display_body(),
+            }
+            if request.headers:
+                payload["headers"] = request.headers
             print_agent_json(
-                {
-                    "dry_run": True,
-                    "method": request.method.upper(),
-                    "url": api_url(env, request.path, query),
-                    "body": request.display_body(),
-                },
+                payload,
                 pagination=None,
             )
         else:
@@ -373,8 +458,17 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
     t0 = time.monotonic()
 
     client = RampClient(env)
-    resp_bytes = _execute_prepared_request(client, request)
-    data = json.loads(resp_bytes) if resp_bytes.strip() else {}
+    if wait_config is None:
+        resp_bytes = _execute_prepared_request(client, request)
+        data = json.loads(resp_bytes) if resp_bytes.strip() else {}
+    else:
+        data = _execute_waiting_application_progress(
+            client,
+            request,
+            wait_config,
+            is_human=is_human,
+            started_at=t0,
+        )
 
     elapsed = time.monotonic() - t0
     if stop_spinner:
@@ -409,6 +503,124 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
         _render_human(data, wide=wide, category=tool.category)
 
 
+def _application_progress_wait_config(
+    tool: ToolDef,
+    kwargs: dict[str, Any],
+) -> WaitConfig | None:
+    if not _supports_application_progress_wait(tool):
+        return None
+
+    actions = [
+        _normalize_application_wait_action(action)
+        for action in kwargs.get("wait_for_action", ())
+    ]
+    if kwargs.get("wait_for_phone_verification"):
+        actions.append("phone_verification")
+    if kwargs.get("wait_for_identity_verification"):
+        actions.append("identity_verification")
+
+    deduped_actions = tuple(dict.fromkeys(action for action in actions if action))
+    if not deduped_actions:
+        return None
+
+    return WaitConfig(
+        actions=deduped_actions,
+        interval_seconds=kwargs["wait_interval"],
+        timeout_seconds=kwargs["wait_timeout"],
+    )
+
+
+def _normalize_application_wait_action(action: str) -> str:
+    key = action.strip().lower().replace("-", "_")
+    return _APPLICATION_WAIT_ACTION_ALIASES.get(key, action.strip())
+
+
+def _execute_waiting_application_progress(
+    client: RampClient,
+    request: PreparedRequest,
+    wait_config: WaitConfig,
+    *,
+    is_human: bool,
+    started_at: float,
+) -> dict[str, Any]:
+    deadline = started_at + wait_config.timeout_seconds
+    if is_human:
+        actions = ", ".join(wait_config.actions)
+        click.echo(f"Waiting for application actions to complete: {actions}", err=True)
+
+    while True:
+        resp_bytes = _execute_prepared_request(client, request)
+        data = json.loads(resp_bytes) if resp_bytes.strip() else {}
+        pending_actions = _matching_application_required_actions(
+            data,
+            wait_config.actions,
+        )
+        if not pending_actions:
+            return data
+
+        now = time.monotonic()
+        if now >= deadline:
+            pending = ", ".join(
+                _summarize_required_action(action) for action in pending_actions
+            )
+            raise click.ClickException(
+                "Timed out waiting for application actions to complete after "
+                f"{wait_config.timeout_seconds} seconds: {pending}"
+            )
+
+        time.sleep(min(wait_config.interval_seconds, max(0.0, deadline - now)))
+
+
+def _matching_application_required_actions(
+    data: dict[str, Any],
+    targets: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    required_actions = data.get("required_actions")
+    if not isinstance(required_actions, list):
+        return []
+
+    return [
+        action
+        for action in required_actions
+        if isinstance(action, dict)
+        and any(
+            _application_required_action_matches(action, target) for target in targets
+        )
+    ]
+
+
+def _application_required_action_matches(
+    action: dict[str, Any],
+    target: str,
+) -> bool:
+    if target == "identity_verification":
+        return action.get("applicant_action") == "COMPLETE_IDENTITY_VERIFICATION"
+
+    if target == "phone_verification":
+        has_phone_scope = (
+            action.get("page_key") is not None or action.get("section_key") is not None
+        )
+        return action.get("applicant_action") == "VERIFY_EMAIL_OR_PHONE" and (
+            not has_phone_scope
+            or action.get("page_key") == "phone_verification"
+            or action.get("section_key") == "phone_verification"
+        )
+
+    enum_target = target.upper().replace("-", "_")
+    key_target = target.lower().replace("-", "_")
+    return any(
+        action.get(field) == enum_target for field in ("type", "applicant_action")
+    ) or any(action.get(field) == key_target for field in ("page_key", "section_key"))
+
+
+def _summarize_required_action(action: dict[str, Any]) -> str:
+    return "/".join(
+        str(action[field])
+        for field in ("type", "applicant_action", "page_key", "section_key")
+        if action.get(field)
+    )
+
+
 def _prepare_request(
     tool: ToolDef,
     values: dict[str, Any],
@@ -436,15 +648,37 @@ def _prepare_request(
         and param.name in values
         and values[param.name] is not None
     }
+    header_values = {
+        name: str(value)
+        for name, value in _values_for_location(tool, values, "header").items()
+        if value is not None
+    }
+    resolved_path = _resolve_path(tool.path, path_values)
+    if _declares_idempotency_key(tool) and _IDEMPOTENCY_HEADER not in header_values:
+        header_values[_IDEMPOTENCY_HEADER] = _default_idempotency_key(tool)
     return PreparedRequest(
         method=tool.http_method,
-        path=_resolve_path(tool.path, path_values),
+        path=resolved_path,
         query=query_values,
         body=body,
         form=form_values,
         files=file_values,
+        headers=header_values,
         content_type=tool.request_content_type,
     )
+
+
+def _declares_idempotency_key(tool: ToolDef) -> bool:
+    return any(
+        param.location == "header" and param.name.lower() == _IDEMPOTENCY_HEADER.lower()
+        for param in tool.params
+    )
+
+
+def _default_idempotency_key(tool: ToolDef) -> str:
+    nonce = str(uuid4())
+    prefix = f"{get_session_id()}:{tool.name}:"
+    return f"{prefix[: 255 - len(nonce)]}{nonce}"
 
 
 def _execute_prepared_request(
@@ -453,6 +687,7 @@ def _execute_prepared_request(
 ) -> bytes:
     params = {name: str(value) for name, value in request.query.items()}
     path = append_query_params(request.path, params)
+    headers_kw = {"headers": request.headers} if request.headers else {}
 
     if request.content_type == "multipart/form-data":
         with ExitStack() as stack:
@@ -466,19 +701,21 @@ def _execute_prepared_request(
                 files[name] = (file_path.name, file_obj, content_type)
             data = {name: str(value) for name, value in request.form.items()}
             if request.method == "post":
-                return client.post_multipart(path, data, files)
-            return client.request_multipart(request.method, path, data, files)
+                return client.post_multipart(path, data, files, **headers_kw)
+            return client.request_multipart(
+                request.method, path, data, files, **headers_kw
+            )
 
     if request.method == "get":
-        return client.get(request.path, params)
+        return client.get(request.path, params, **headers_kw)
     payload = json.dumps(request.body).encode() if request.body else None
     if request.method == "patch":
-        return client.patch(path, payload or b"{}")
+        return client.patch(path, payload or b"{}", **headers_kw)
     if request.method == "put":
-        return client.put(path, payload or b"{}")
+        return client.put(path, payload or b"{}", **headers_kw)
     if request.method == "delete":
-        return client.delete(path, payload)
-    return client.post(path, payload or b"{}")
+        return client.delete(path, payload, **headers_kw)
+    return client.post(path, payload or b"{}", **headers_kw)
 
 
 def _values_for_location(
@@ -540,6 +777,8 @@ def _build_body(
             continue
 
         if val is None:
+            if _has_auto_default(param):
+                continue
             if param.required and param.default is not None:
                 body[param.name] = param.default
                 continue
@@ -573,6 +812,12 @@ def _build_body(
         _raise_missing_params(tool, missing)
 
     return body
+
+
+def _has_auto_default(param: ToolParam) -> bool:
+    return (
+        param.location == "header" and param.name.lower() == _IDEMPOTENCY_HEADER.lower()
+    )
 
 
 def _validate_required_path_params(

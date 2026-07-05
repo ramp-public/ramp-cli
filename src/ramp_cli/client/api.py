@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import re
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -19,6 +18,7 @@ from ramp_cli.auth.environment import (
     missing_required_environment_auth,
 )
 from ramp_cli.auth.refresh import try_refresh
+from ramp_cli.client.agent import infer_client_name, infer_harness_name
 from ramp_cli.client.headers import agent_headers
 from ramp_cli.config.constants import api_url, base_url
 from ramp_cli.errors import (
@@ -33,19 +33,6 @@ from ramp_cli.errors import (
 # receive the server's response rather than giving up prematurely.
 _REQUEST_TIMEOUT = 75.0
 
-# Explicit override that any harness or wrapper script can set.
-_CLIENT_OVERRIDE_ENV = "RAMP_CLIENT_NAME"
-
-# Exact env-var sentinels for harnesses whose vendors commit to setting them.
-_HARNESS_SENTINELS: tuple[tuple[str, str], ...] = (
-    ("CLAUDECODE", "claude-code"),
-    ("OPENCODE", "opencode"),
-    ("CODEX_SANDBOX", "codex"),
-)
-
-_SAFE_COMMENT_RE = re.compile(r"[^A-Za-z0-9._/+:-]+")
-_MAX_COMMENT_LEN = 64
-
 
 class RampClient:
     """Synchronous Ramp API client with auto-refresh."""
@@ -54,31 +41,61 @@ class RampClient:
         self.env = env
         self._static_access_token = access_token or os.environ.get("RAMP_ACCESS_TOKEN")
 
-    def get(self, path: str, params: dict[str, str] | None = None) -> bytes:
-        return self._do_request("GET", api_url(self.env, path, params))
+    def get(
+        self,
+        path: str,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> bytes:
+        return self._do_request(
+            "GET", api_url(self.env, path, params), request_headers=headers
+        )
 
     def get_url(self, url: str) -> bytes:
         if not _same_origin(url, base_url(self.env)):
             raise UnsafeRequestUrlError(url)
         return self._do_request("GET", url)
 
-    def post(self, path: str, json_body: bytes) -> bytes:
-        return self._do_request("POST", api_url(self.env, path), body=json_body)
+    def post(
+        self, path: str, json_body: bytes, headers: dict[str, str] | None = None
+    ) -> bytes:
+        return self._do_request(
+            "POST", api_url(self.env, path), body=json_body, request_headers=headers
+        )
 
-    def patch(self, path: str, json_body: bytes) -> bytes:
-        return self._do_request("PATCH", api_url(self.env, path), body=json_body)
+    def patch(
+        self, path: str, json_body: bytes, headers: dict[str, str] | None = None
+    ) -> bytes:
+        return self._do_request(
+            "PATCH", api_url(self.env, path), body=json_body, request_headers=headers
+        )
 
-    def put(self, path: str, json_body: bytes) -> bytes:
-        return self._do_request("PUT", api_url(self.env, path), body=json_body)
+    def put(
+        self, path: str, json_body: bytes, headers: dict[str, str] | None = None
+    ) -> bytes:
+        return self._do_request(
+            "PUT", api_url(self.env, path), body=json_body, request_headers=headers
+        )
 
-    def delete(self, path: str, json_body: bytes | None = None) -> bytes:
-        return self._do_request("DELETE", api_url(self.env, path), body=json_body)
+    def delete(
+        self,
+        path: str,
+        json_body: bytes | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> bytes:
+        return self._do_request(
+            "DELETE", api_url(self.env, path), body=json_body, request_headers=headers
+        )
 
     def post_multipart(
-        self, path: str, data: dict[str, str], files: dict[str, tuple]
+        self,
+        path: str,
+        data: dict[str, str],
+        files: dict[str, tuple],
+        headers: dict[str, str] | None = None,
     ) -> bytes:
         """POST multipart/form-data (for file uploads)."""
-        return self.request_multipart("POST", path, data, files)
+        return self.request_multipart("POST", path, data, files, headers=headers)
 
     def request_multipart(
         self,
@@ -86,14 +103,24 @@ class RampClient:
         path: str,
         data: dict[str, str],
         files: dict[str, tuple],
+        headers: dict[str, str] | None = None,
     ) -> bytes:
         """Send multipart/form-data using the operation's declared method."""
         return self._do_request_multipart(
-            method.upper(), api_url(self.env, path), data=data, files=files
+            method.upper(),
+            api_url(self.env, path),
+            data=data,
+            files=files,
+            request_headers=headers,
         )
 
     def _do_request_multipart(
-        self, method: str, url: str, data: dict[str, str], files: dict[str, tuple]
+        self,
+        method: str,
+        url: str,
+        data: dict[str, str],
+        files: dict[str, tuple],
+        request_headers: dict[str, str] | None = None,
     ) -> bytes:
         extra_headers = self._extra_auth_headers_or_raise()
         access_token = self._get_request_access_token()
@@ -107,6 +134,7 @@ class RampClient:
                 data=data,
                 files=files,
                 extra_headers=extra_headers,
+                request_headers=request_headers,
             )
 
             if resp.status_code == 401 and not self._static_access_token:
@@ -120,6 +148,7 @@ class RampClient:
                         data=data,
                         files=files,
                         extra_headers=extra_headers,
+                        request_headers=request_headers,
                     )
                 else:
                     raise AuthRequiredError(self.env)
@@ -130,13 +159,25 @@ class RampClient:
                 raise ApiError(resp.status_code, resp.text)
             return resp.content
 
-    def _do_request(self, method: str, url: str, body: bytes | None = None) -> bytes:
+    def _do_request(
+        self,
+        method: str,
+        url: str,
+        body: bytes | None = None,
+        request_headers: dict[str, str] | None = None,
+    ) -> bytes:
         extra_headers = self._extra_auth_headers_or_raise()
         access_token = self._get_request_access_token()
 
         with httpx.Client(timeout=_REQUEST_TIMEOUT) as http:
             resp = self._request(
-                http, method, url, access_token, body=body, extra_headers=extra_headers
+                http,
+                method,
+                url,
+                access_token,
+                body=body,
+                extra_headers=extra_headers,
+                request_headers=request_headers,
             )
 
             if resp.status_code == 401 and not self._static_access_token:
@@ -149,6 +190,7 @@ class RampClient:
                         new_token,
                         body=body,
                         extra_headers=extra_headers,
+                        request_headers=request_headers,
                     )
                 else:
                     raise AuthRequiredError(self.env)
@@ -199,10 +241,13 @@ class RampClient:
         token: str,
         body: bytes | None = None,
         extra_headers: dict[str, str] | None = None,
+        request_headers: dict[str, str] | None = None,
     ) -> Any:
         headers = self._base_headers(token, extra_headers)
         if body is not None:
             headers["Content-Type"] = "application/json"
+        if request_headers:
+            headers.update(request_headers)
         return http.request(method, url, headers=headers, content=body)
 
     def _request_multipart(
@@ -214,8 +259,11 @@ class RampClient:
         data: dict[str, str],
         files: dict[str, tuple],
         extra_headers: dict[str, str] | None = None,
+        request_headers: dict[str, str] | None = None,
     ) -> Any:
         headers = self._base_headers(token, extra_headers)
+        if request_headers:
+            headers.update(request_headers)
         # Do NOT set Content-Type — httpx sets the multipart boundary automatically
         return http.request(method, url, headers=headers, data=data, files=files)
 
@@ -263,35 +311,3 @@ def user_agent_string(environ: Mapping[str, str] | None = None) -> str:
     if client is None:
         return base
     return f"{base} ({client})"
-
-
-def infer_client_name(environ: Mapping[str, str] | None = None) -> str | None:
-    """Return a sanitized client-name string when we can identify the host
-    harness, otherwise None.
-
-    Detection is intentionally narrow: an explicit RAMP_CLIENT_NAME override or
-    one of a small list of exact env-var sentinels that the harness vendor
-    commits to setting. TERM_PROGRAM, SHELL, and env-var prefix matching are
-    deliberately excluded — they produced false positives for plain human CLI
-    use and for unrelated tools that share a vendor namespace.
-    """
-    env = environ if environ is not None else os.environ
-
-    override = _sanitize_comment(env.get(_CLIENT_OVERRIDE_ENV))
-    if override:
-        return override
-
-    return infer_harness_name(env)
-
-
-def infer_harness_name(environ: Mapping[str, str] | None = None) -> str | None:
-    """Return the host harness name when an exact sentinel is present."""
-    env = environ if environ is not None else os.environ
-    return next((name for key, name in _HARNESS_SENTINELS if env.get(key)), None)
-
-
-def _sanitize_comment(value: str | None) -> str | None:
-    if not value:
-        return None
-    cleaned = _SAFE_COMMENT_RE.sub("-", value.strip())[:_MAX_COMMENT_LEN].strip(" -")
-    return cleaned or None

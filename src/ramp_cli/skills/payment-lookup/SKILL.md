@@ -10,6 +10,7 @@ description: |-
 
 ## Non-Negotiables
 
+- **Pass `--rationale` on every command** — it is a required field on these agent-tools (a non-empty string, max 1024 chars). With `--json`, supply it as a `"rationale"` key in the body. Omitting it returns `HTTP 422 (DEVELOPER_INVALID_SCHEMA)`, in both agent and human modes.
 - Always search bills first, then enrich with `bills get` and `bills attachments` when available.
 - Report exactly what the API returns. Don't infer payment state beyond what the status says.
 - When checking whether a payment went out, search with `--include_paid` to include completed bills.
@@ -22,7 +23,7 @@ description: |-
 ### Step 1: Search for the bill
 
 ```bash
-ramp bills search --query "<vendor or invoice number>" --include_paid --limit 10 --agent
+ramp bills search --query "<vendor or invoice number>" --include_paid --limit 10 --agent --rationale "Search bills for the user"
 ```
 
 The `--query` flag matches against payee name, invoice number, and payment ID. Partial matches work (e.g., "UPS" matches "UPS Store").
@@ -33,13 +34,13 @@ If `next_page_cursor` is not null, paginate with `--page_cursor`:
 
 ```bash
 ramp bills search --query "<vendor>" --include_paid --limit 10 \
-  --page_cursor "<cursor>" --agent
+  --page_cursor "<cursor>" --agent --rationale "Search bills for the user"
 ```
 
 ### Step 2: Drill into details
 
 ```bash
-ramp bills get <bill_id> --agent
+ramp bills get <bill_id> --agent --rationale "Review bill details"
 ```
 
 This returns full payment detail including status, approval history, and metadata.
@@ -47,13 +48,13 @@ This returns full payment detail including status, approval history, and metadat
 Use `-n` (dry run) to preview the request without sending:
 
 ```bash
-ramp bills get <bill_id> --agent -n
+ramp bills get <bill_id> --agent -n --rationale "Review bill details"
 ```
 
 ### Step 3: Pull the invoice attachment
 
 ```bash
-ramp bills attachments <bill_id> --agent
+ramp bills attachments <bill_id> --agent --rationale "Fetch bill attachments"
 ```
 
 Returns invoice files associated with the bill for cross-reference.
@@ -101,7 +102,7 @@ Additional fields beyond search — exact schema depends on bill state. May incl
 User: Did we pay DHL this month?
 
 Agent: Let me check.
-> ramp bills search --query "DHL" --include_paid --limit 10 --agent
+> ramp bills search --query "DHL" --include_paid --limit 10 --agent --rationale "Search bills for the user"
 
 Found 1 bill:
   DHL — Invoice #24-165-12
@@ -111,7 +112,7 @@ Found 1 bill:
   Memo: Business package shipment and insurance
 
 Let me get full details.
-> ramp bills get fe8e01ce-12a4-4512-bd27-da8a7432466d --agent
+> ramp bills get fe8e01ce-12a4-4512-bd27-da8a7432466d --agent --rationale "Review bill details"
 
 Bill found: DHL
   Invoice #: 24-165-12

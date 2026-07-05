@@ -9,6 +9,7 @@ description: |-
 
 ## Non-Negotiables
 
+- **Pass `--rationale` on every command** — it is a required field on these agent-tools (a non-empty string, max 1024 chars). With `--json`, supply it as a `"rationale"` key in the body. Omitting it returns `HTTP 422 (DEVELOPER_INVALID_SCHEMA)`, in both agent and human modes.
 - Scope to the user's own transactions unless they explicitly request broader access.
 - Never upload a receipt without confirming the match — wrong receipt on wrong transaction is worse than no receipt.
 - When running in sweep mode, present the plan before uploading. Let the user confirm.
@@ -25,7 +26,7 @@ When the user has a receipt file and wants to attach it to a transaction:
 ```bash
 # Find the transaction
 ramp transactions list --transactions_to_retrieve my_transactions \
-  --from_date {date} --state cleared --agent --page_size 20
+  --from_date {date} --state cleared --agent --page_size 20 --rationale "List the user's transactions"
 
 # Base64 encode the file (agent does this)
 # For a file at /path/to/receipt.pdf:
@@ -36,27 +37,27 @@ ramp receipts upload \
   --content_type "application/pdf" \
   --filename "receipt.pdf" \
   --file_content_base64 "{base64_string}" \
-  --transaction_uuid {txn_uuid}
+  --transaction_uuid {txn_uuid} --rationale "Upload the receipt"
 ```
 
 The response returns `receipt_uuid` and `attached_to_transaction: true/false`.
 
 If `--transaction_uuid` is omitted, the receipt is uploaded but not attached. You can attach later with:
 ```bash
-ramp receipts attach {receipt_uuid} {transaction_uuid}
+ramp receipts attach {receipt_uuid} {transaction_uuid} --rationale "Attach the receipt to the transaction"
 ```
 
 ### Mode 2: Compliance sweep — find all missing receipts
 
 ```bash
 ramp transactions list --transactions_to_retrieve my_transactions \
-  --from_date {start} --to_date {end} --state cleared --agent --page_size 50
+  --from_date {start} --to_date {end} --state cleared --agent --page_size 50 --rationale "List the user's transactions"
 ```
 
 Filter results for transactions where `receipt_uuids` is null or empty. You can also check `missing_items` on individual transactions:
 
 ```bash
-ramp transactions missing {transaction_uuid}
+ramp transactions missing {transaction_uuid} --rationale "Check missing items on the transaction"
 ```
 
 This returns `missing_receipt` (bool), `missing_memo` (bool), and `missing_accounting_items` (array).
@@ -87,14 +88,14 @@ ramp receipts upload \
   --content_type "image/png" \
   --filename "uber-2026-03-01.png" \
   --file_content_base64 "{base64}" \
-  --transaction_uuid {txn_uuid} -n
+  --transaction_uuid {txn_uuid} -n --rationale "Upload the receipt"
 
 # If correct, upload for real (without -n)
 ramp receipts upload \
   --content_type "image/png" \
   --filename "uber-2026-03-01.png" \
   --file_content_base64 "{base64}" \
-  --transaction_uuid {txn_uuid}
+  --transaction_uuid {txn_uuid} --rationale "Upload the receipt"
 ```
 
 ### Mode 4: Explain why a receipt is missing
@@ -102,12 +103,12 @@ ramp receipts upload \
 If the user doesn't have a receipt and wants to provide a reason:
 
 ```bash
-ramp transactions explain-missing {transaction_uuid} --reason "Lost receipt — vendor confirmed purchase via email"
+ramp transactions explain-missing {transaction_uuid} --reason "Lost receipt — vendor confirmed purchase via email" --rationale "Record why the receipt is missing"
 ```
 
 Or generate a link to the missing receipt affidavit form (the user must complete it manually in the browser):
 ```bash
-ramp transactions flag-missing {transaction_uuid}
+ramp transactions flag-missing {transaction_uuid} --rationale "Generate a missing-receipt affidavit link"
 ```
 
 ## Matching Heuristics
@@ -137,7 +138,7 @@ If `pagination.next_cursor` is not null in the JSON envelope, there are more res
 ```bash
 ramp transactions list --transactions_to_retrieve my_transactions \
   --from_date {start} --state cleared --agent --page_size 50 \
-  --next_page_cursor "{cursor}"
+  --next_page_cursor "{cursor}" --rationale "List the user's transactions"
 ```
 
 ## Example Session
@@ -147,7 +148,7 @@ User: I have some missing receipts to clean up
 
 Agent: Let me check your recent transactions for missing receipts.
 > ramp transactions list --transactions_to_retrieve my_transactions \
->   --from_date 2026-03-01 --state cleared --agent --page_size 50
+>   --from_date 2026-03-01 --state cleared --agent --page_size 50 --rationale "List the user's transactions"
 
 Missing receipts: 3 transactions ($1,870 total)
 
@@ -164,7 +165,7 @@ Agent: Let me upload that receipt.
 > ramp receipts upload --content_type "application/pdf" \
 >   --filename "united-mar5.pdf" \
 >   --file_content_base64 "{base64}" \
->   --transaction_uuid "abc-123" -n
+>   --transaction_uuid "abc-123" -n --rationale "Upload the receipt"
 
 Dry run looks correct — uploading to United Airlines ($1,200) on 2026-03-05.
 Proceed?

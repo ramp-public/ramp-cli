@@ -1,31 +1,32 @@
-"""ramp incorporation commands — SSN env-var pattern (Phase 1.5).
+"""ramp incorporation commands.
 
-This module wires the ``ramp incorporation submit`` subcommand for PR 1
-(ADP-2789).  The full 8-verb ``ramp incorporation`` group (states, industries,
-countries, applicant create/get, submit, status, documents) lives in PR 2
-(ADP-2790) which stacks on top.
+The ``ramp incorporation`` group provides the full 8-verb surface for Ramp
+US LLC formation: states, industries, countries, applicant create/get, submit,
+status, and documents.
+
+Pre-EIN early access
+--------------------
+By default a financing application waits for a fully formed entity (an EIN)
+before it can proceed. When pre-EIN early access is enabled, a business can
+onboard once the formation has been filed with the state (submission status
+``SUBMITTED``) but before the IRS has issued the EIN: the account is granted
+limited access, and it auto-promotes to full access when Ramp receives the EIN
+(submission status ``APPROVED``). ``ramp incorporation status`` annotates the
+Ramp-facing ``formation_submission_status`` with this lifecycle so an agent
+knows what access it has and what unblocks full access. See
+``_pre_ein_status_note`` for the mapping.
 
 SSN handling
 ------------
-The CLI process reads SSN values from environment variables when constructing
-the request body.  The model never loads the SSN into its context; the tool's
-argument schema does **not** declare any SSN field.  Any caller-supplied SSN
-inside ``--json`` is rejected immediately with a structured error.
-
-Env vars (set in the shell, never in the model's tool call):
-
-    export RAMP_INCORPORATION_SSN_MEMBER_1=123-45-6789
-    export RAMP_INCORPORATION_SSN_MEMBER_2=987-65-4321   # if 2 members
-    export RAMP_INCORPORATION_SSN_RESPONSIBLE_PARTY=123-45-6789
-
-The CLI fails fast (exit 1, structured error) if any required slot is missing.
-No SSN value appears in stdout/stderr under any flag combination.
+The CLI never collects SSN values for incorporation. Any caller-supplied SSN
+field inside ``--json`` is rejected immediately with a structured error. SSN
+entry belongs in the Ramp-hosted application form, not in CLI arguments,
+environment variables, prompts, stdout, or stderr.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
 from typing import Any
 
@@ -33,16 +34,11 @@ import click
 
 from ramp_cli.client.api import RampClient
 from ramp_cli.config.constants import api_url
-from ramp_cli.errors import RampCLIError
 from ramp_cli.output.formatter import print_agent_json, print_json, resolve_format
 
-# TODO(workstream-1): reconcile with real path once ADP-2787 lands.
-# The endpoint is registered by ToolApiAdapter for IncorporationSubmitFormation.
-_INCORPORATION_SUBMIT_PATH = "/developer/v1/applications/incorporation/submit"
-
-# Env-var name templates (must match DESIGN.md §7 exactly)
-_SSN_MEMBER_ENV_TEMPLATE = "RAMP_INCORPORATION_SSN_MEMBER_{n}"
-_SSN_RESPONSIBLE_PARTY_ENV = "RAMP_INCORPORATION_SSN_RESPONSIBLE_PARTY"
+_INCORPORATION_BASE = "/developer/v1/incorporation"
+_INCORPORATION_SUBMIT_PATH = f"{_INCORPORATION_BASE}/formation"
+_INCORPORATION_STATUS_PATH = f"{_INCORPORATION_BASE}/company-status"
 
 # Caller-supplied SSNs in --json are rejected two independent ways, so neither
 # a clever key name nor an unexpected key can sneak an SSN past us:
@@ -51,8 +47,8 @@ _SSN_RESPONSIBLE_PARTY_ENV = "RAMP_INCORPORATION_SSN_RESPONSIBLE_PARTY"
 #   2. Value-shape detection (values) — any JSON value that *looks* like an SSN
 #      is rejected, regardless of the key it sits under.
 #
-# SSNs only ever arrive via env vars and are slotted in after the model's tool
-# call, so a legitimate formation body never contains either signal.
+# The CLI does not collect SSNs, so a legitimate formation body never contains
+# either signal.
 
 # A key token marks the key as SSN-related when it *starts with* "ssn" (so
 # "ssn", "ssn_number", and the concatenated "ssnvalue" all match) — but we do
@@ -60,10 +56,12 @@ _SSN_RESPONSIBLE_PARTY_ENV = "RAMP_INCORPORATION_SSN_RESPONSIBLE_PARTY"
 # abbreviation "assn" (association) are left alone.
 _SSN_TOKEN_PREFIX = "ssn"
 
-# Value-level SSN-shaped string: NNN-NN-NNNN or 9 consecutive digits.  Used to
-# (a) reject SSN-shaped values supplied in --json and (b) as a defense-in-depth
-# scan when rendering the request body to stdout/stderr (e.g. in --dry_run).
-_SSN_VALUE_RE = re.compile(r"\b(?:\d{3}-\d{2}-\d{4}|\d{9})\b")
+# Value-level full SSN-shaped string: NNN-NN-NNNN or 9 consecutive digits.
+# This is rejected globally. Exact 4-digit strings are only SSN-like when the
+# surrounding JSON path references SSN, because normal fields such as
+# non-US postal codes can be exactly four digits.
+_FULL_SSN_VALUE_RE = re.compile(r"\b(?:\d{3}-\d{2}-\d{4}|\d{9})\b")
+_SSN_LAST_4_RE = re.compile(r"^\d{4}$")
 
 
 def _key_references_ssn(key: str) -> bool:
@@ -90,32 +88,28 @@ def _key_references_ssn(key: str) -> bool:
     return "socialsecurity" in "".join(tokens)
 
 
-class MissingSSNEnvVarError(RampCLIError):
-    """Raised when a required SSN env var is absent."""
-
-    def __init__(self, var_name: str) -> None:
-        self.var_name = var_name
-        super().__init__(
-            f"Required env var not set: {var_name}\n"
-            f"  Set it in your shell before running this command:\n"
-            f"    export {var_name}=<ssn>\n"
-            f"  SSN is never passed as a CLI argument — it is always read from\n"
-            f"  the environment so the model cannot observe it.",
-            code=1,
-        )
+def _path_references_ssn(path: str) -> bool:
+    """Return True if any segment in a JSON path names an SSN field."""
+    path_segments = [
+        segment
+        for segment in re.split(r"[.\[\]]+", path)
+        if segment and not segment.isdigit()
+    ]
+    return any(_key_references_ssn(segment) for segment in path_segments)
 
 
 def _reject_ssn_in_json(body: dict[str, Any]) -> None:
     """Recursively scan *body* and raise if a caller tried to embed an SSN.
 
-    Two independent checks, applied separately:
+    These checks are applied separately:
 
-    * any *key* that references an SSN field (``_key_references_ssn``), and
-    * any *value* shaped like an SSN (``_SSN_VALUE_RE``), regardless of its key.
+    * any *key* that references an SSN field (``_key_references_ssn``),
+    * any full-SSN-shaped *value* (``_FULL_SSN_VALUE_RE``), regardless of key,
+      and
+    * any exact-4-digit *value* when its JSON path references SSN.
 
-    Callers must not pass SSN inside --json.  The env-var pattern is the only
-    supported collection path.  Error messages name the offending key/path but
-    never echo the SSN value itself.
+    Callers must not pass SSN inside --json. Error messages name the offending
+    key/path but never echo the SSN value itself.
     """
 
     def _walk(node: Any, path: str) -> None:
@@ -124,25 +118,26 @@ def _reject_ssn_in_json(body: dict[str, Any]) -> None:
                 if _key_references_ssn(k):
                     raise click.BadParameter(
                         f"SSN field '{k}' detected at JSON path '{path}.{k}'.\n"
-                        f"  SSN must be set via environment variables, not --json:\n"
-                        f"    export RAMP_INCORPORATION_SSN_MEMBER_N=<ssn>\n"
-                        f"    export RAMP_INCORPORATION_SSN_RESPONSIBLE_PARTY=<ssn>\n"
-                        f"  The model must never see SSN values.",
+                        f"  SSN must be entered in the Ramp application form,\n"
+                        f"  not collected by the CLI or passed in --json.",
                         param_hint="'--json'",
                     )
                 _walk(v, f"{path}.{k}")
         elif isinstance(node, list):
             for i, item in enumerate(node):
                 _walk(item, f"{path}[{i}]")
-        elif isinstance(node, str) and _SSN_VALUE_RE.search(node):
-            raise click.BadParameter(
-                f"SSN-shaped value detected at JSON path '{path or '(root)'}'.\n"
-                f"  SSN must be set via environment variables, not --json:\n"
-                f"    export RAMP_INCORPORATION_SSN_MEMBER_N=<ssn>\n"
-                f"    export RAMP_INCORPORATION_SSN_RESPONSIBLE_PARTY=<ssn>\n"
-                f"  The model must never see SSN values.",
-                param_hint="'--json'",
-            )
+        elif isinstance(node, str):
+            is_full_ssn = _FULL_SSN_VALUE_RE.search(node) is not None
+            is_ssn_last_4 = _SSN_LAST_4_RE.fullmatch(
+                node
+            ) is not None and _path_references_ssn(path)
+            if is_full_ssn or is_ssn_last_4:
+                raise click.BadParameter(
+                    f"SSN-shaped value detected at JSON path '{path or '(root)'}'.\n"
+                    f"  SSN must be entered in the Ramp application form,\n"
+                    f"  not collected by the CLI or passed in --json.",
+                    param_hint="'--json'",
+                )
 
     _walk(body, "")
 
@@ -159,54 +154,6 @@ def _parse_json_body(raw_json: str) -> dict[str, Any]:
         )
 
     return body
-
-
-def _read_member_ssns(members: list[Any]) -> list[str]:
-    """Read RAMP_INCORPORATION_SSN_MEMBER_N for each member (1-indexed).
-
-    Fails fast if any required var is absent.  Never returns a partial list.
-    """
-    ssns: list[str] = []
-    for i in range(1, len(members) + 1):
-        var = _SSN_MEMBER_ENV_TEMPLATE.format(n=i)
-        val = os.environ.get(var, "")
-        if not val:
-            raise MissingSSNEnvVarError(var)
-        ssns.append(val)
-    return ssns
-
-
-def _read_responsible_party_ssn(body: dict[str, Any]) -> str | None:
-    """Read RAMP_INCORPORATION_SSN_RESPONSIBLE_PARTY if the payload has a responsible_party."""
-    if "responsible_party" not in body:
-        return None
-    val = os.environ.get(_SSN_RESPONSIBLE_PARTY_ENV, "")
-    if not val:
-        raise MissingSSNEnvVarError(_SSN_RESPONSIBLE_PARTY_ENV)
-    return val
-
-
-def _slot_ssns_into_body(
-    body: dict[str, Any],
-    member_ssns: list[str],
-    rp_ssn: str | None,
-) -> dict[str, Any]:
-    """Return a copy of *body* with SSN fields inserted.
-
-    SSN values are slotted in *after* the model emits the tool call.  They
-    are never present in the model's context, in logs, or in stdout/stderr.
-    """
-    result = json.loads(json.dumps(body))  # deep copy via JSON round-trip
-
-    members = result.get("members", [])
-    for i, ssn in enumerate(member_ssns):
-        if i < len(members):
-            members[i]["ssn"] = ssn
-
-    if rp_ssn is not None and "responsible_party" in result:
-        result["responsible_party"]["ssn"] = rp_ssn
-
-    return result
 
 
 def _render_submit_success(
@@ -235,8 +182,8 @@ def _render_dry_run(
     fmt = resolve_format(format_flag, config_format)
     url = api_url(env, _INCORPORATION_SUBMIT_PATH)
 
-    # SECURITY: body already contains real SSNs at this point (slotted in from
-    # env vars).  Strip them before printing — replace with a redaction sentinel.
+    # SECURITY: SSN fields are rejected before this point. Redact defensively in
+    # case this helper is ever called from another path.
     safe_body = _redact_ssns(body)
 
     if fmt == "json":
@@ -246,7 +193,7 @@ def _render_dry_run(
                 "method": "POST",
                 "url": url,
                 "body": safe_body,
-                "ssn_note": "SSN fields redacted; values read from env vars at send time",
+                "ssn_note": "SSN fields are rejected; use the Ramp application form for SSN entry",
             },
             pagination={"has_more": False, "next": None},
         )
@@ -254,7 +201,7 @@ def _render_dry_run(
 
     click.echo(f"DRY RUN: POST {url}", err=True)
     click.echo(
-        "  Note: SSN fields are redacted below — actual values come from env vars",
+        "  Note: SSN fields are rejected; use the Ramp application form for SSN entry",
         err=True,
     )
     print_json(safe_body)
@@ -265,34 +212,37 @@ def _redact_ssns(body: dict[str, Any]) -> dict[str, Any]:
 
     Defense in depth: redact both by key name (anything `_key_references_ssn`
     flags) and by value shape (any string containing an NNN-NN-NNNN or 9-digit
-    run).  The env-var-slotted member/responsible-party SSNs live under "ssn"
-    keys and are redacted here before --dry_run prints the request body.
+    run, plus exact 4-digit values only under SSN-like paths). This guarantees
+    that --dry_run output never echoes SSN-like values even if a caller
+    smuggles one under an unexpected key.
     """
     raw = json.dumps(body)
     parsed = json.loads(raw)
 
-    def _redact_string(s: str) -> str:
-        return _SSN_VALUE_RE.sub("<redacted>", s)
+    def _redact_string(s: str, path: str) -> str:
+        if _SSN_LAST_4_RE.fullmatch(s) is not None and _path_references_ssn(path):
+            return "<redacted>"
+        return _FULL_SSN_VALUE_RE.sub("<redacted>", s)
 
-    def _walk(node: Any) -> Any:
+    def _walk(node: Any, path: str) -> Any:
         if isinstance(node, dict):
             for k in list(node.keys()):
                 if _key_references_ssn(k):
                     node[k] = "<redacted>"
                 else:
-                    node[k] = _walk(node[k])
+                    node[k] = _walk(node[k], f"{path}.{k}")
             return node
         if isinstance(node, list):
-            return [_walk(item) for item in node]
+            return [_walk(item, f"{path}[{i}]") for i, item in enumerate(node)]
         if isinstance(node, str):
-            return _redact_string(node)
+            return _redact_string(node, path)
         return node
 
-    _walk(parsed)
+    _walk(parsed, "")
     return parsed
 
 
-@click.group("incorporation", help="Manage US LLC incorporation via Doola")
+@click.group("incorporation", help="Manage Ramp US LLC incorporation")
 def incorporation_group() -> None:
     pass
 
@@ -304,18 +254,12 @@ def incorporation_group() -> None:
     required=True,
     metavar="JSON",
     help=(
-        "Formation request body (without SSN — those come from env vars).\n\n"
-        "Required env vars before running:\n\n"
-        "  export RAMP_INCORPORATION_SSN_MEMBER_1=<ssn>   # first LLC member\n"
-        "  export RAMP_INCORPORATION_SSN_MEMBER_N=<ssn>   # for each additional member\n"
-        "  export RAMP_INCORPORATION_SSN_RESPONSIBLE_PARTY=<ssn>   # if responsible_party present\n\n"
-        "Example (2-member LLC):\n\n"
-        "  export RAMP_INCORPORATION_SSN_MEMBER_1=123-45-6789\n"
-        "  export RAMP_INCORPORATION_SSN_MEMBER_2=987-65-4321\n"
-        "  export RAMP_INCORPORATION_SSN_RESPONSIBLE_PARTY=123-45-6789\n"
-        '  ramp incorporation submit --json \'{"state":"DE",...}\'\n\n'
-        "SSN values are read from env vars at send time — the model never sees them.\n"
-        "Passing an 'ssn' key inside --json is rejected as an error."
+        "Formation request body (without SSN fields).\n\n"
+        "The CLI never collects SSN values for incorporation. Use the Ramp\n"
+        "application form for SSN entry; passing an 'ssn' key inside --json is\n"
+        "rejected as an error.\n\n"
+        'Example: ramp incorporation submit --json \'{"state":"DE",...}\'\n\n'
+        "SSN values must not appear in CLI arguments, prompts, env vars, stdout, or stderr."
     ),
 )
 @click.option(
@@ -329,22 +273,18 @@ def incorporation_group() -> None:
 )
 @click.pass_context
 def submit_formation(ctx: click.Context, json_body: str, dry_run: bool) -> None:
-    """Submit a Doola LLC formation request.
+    """Submit a Ramp LLC formation request.
 
-    SSN values are read from environment variables — never from CLI arguments.
-    Set the required env vars before calling this command:
+    SSN values are never collected by this command. Enter SSN in the Ramp
+    application form; never pass SSN in CLI arguments or --json.
 
     \b
-        export RAMP_INCORPORATION_SSN_MEMBER_1=123-45-6789
-        export RAMP_INCORPORATION_SSN_RESPONSIBLE_PARTY=123-45-6789
         ramp incorporation submit --json '{...}'
 
-    The endpoint path is stubbed as:
+    Endpoint:
 
     \b
-        POST /developer/v1/applications/incorporation/submit
-
-    TODO(workstream-1): reconcile with real path once ADP-2787 / ADP-2786 land.
+        POST /developer/v1/incorporation/formation
     """
     env = ctx.obj["env"]
     body = _parse_json_body(json_body)
@@ -352,22 +292,275 @@ def submit_formation(ctx: click.Context, json_body: str, dry_run: bool) -> None:
     # Step 1: Reject any SSN that the caller tried to embed in --json.
     _reject_ssn_in_json(body)
 
-    # Step 2: Read SSN values from env vars.
-    members = body.get("members", [])
-    member_ssns = _read_member_ssns(members)
-    rp_ssn = _read_responsible_party_ssn(body)
-
-    # Step 3: Slot SSNs into request body (now the body is ready to POST).
-    full_body = _slot_ssns_into_body(body, member_ssns, rp_ssn)
-
     if dry_run:
-        _render_dry_run(env, full_body, ctx.obj["format"], ctx.obj["config_format"])
+        _render_dry_run(env, body, ctx.obj["format"], ctx.obj["config_format"])
         return
 
-    # Step 4: POST.  SSN travels in the request body to Ramp; Ramp forwards to
-    # Doola and drops the full value (stores only ssn_last_4).
+    # Step 2: POST the non-sensitive formation request body.
     client = RampClient(env)
-    response = client.post(_INCORPORATION_SUBMIT_PATH, json.dumps(full_body).encode())
+    response = client.post(_INCORPORATION_SUBMIT_PATH, json.dumps(body).encode())
 
-    # Step 5: Render response.  Never echo full_body or SSN values here.
+    # Step 3: Render response. Never echo request_body or SSN values here.
     _render_submit_success(response, ctx.obj["format"], ctx.obj["config_format"])
+
+
+# ── Read-only convenience commands ────────────────────────────────────────────
+#
+# These commands wire: IncorporationGetStateOptions, IncorporationSearchIndustries,
+# IncorporationListCountries, IncorporationCreateApplicant, IncorporationGetApplicant,
+# IncorporationGetCompanyStatus, and IncorporationGetDocuments.
+#
+def _render_get(
+    response: bytes,
+    format_flag: str | None,
+    config_format: str,
+) -> None:
+    fmt = resolve_format(format_flag, config_format)
+    try:
+        data = json.loads(response)
+    except (json.JSONDecodeError, ValueError):
+        data = {"raw": response.decode("utf-8", errors="replace")}
+
+    if fmt == "json":
+        print_agent_json(data, pagination={"has_more": False, "next": None})
+    else:
+        print_json(data)
+
+
+@incorporation_group.command("states")
+@click.pass_context
+def get_state_options(ctx: click.Context) -> None:
+    """List US states available for Ramp LLC formation.
+
+    Maps to: IncorporationGetStateOptions
+
+    \b
+    Endpoint: GET /developer/v1/incorporation/states
+    """
+    client = RampClient(ctx.obj["env"])
+    response = client.get(f"{_INCORPORATION_BASE}/states")
+    _render_get(response, ctx.obj["format"], ctx.obj["config_format"])
+
+
+@incorporation_group.group(
+    "industries", help="Search incorporation industry classifications"
+)
+def industries_group() -> None:
+    pass
+
+
+@industries_group.command("search")
+@click.option(
+    "--q",
+    "query",
+    required=True,
+    help="Free-text industry search query (e.g. 'saas restaurant')",
+)
+@click.pass_context
+def search_industries(ctx: click.Context, query: str) -> None:
+    """Search NAICS industries for Ramp formation.
+
+    Maps to: IncorporationSearchIndustries
+
+    \b
+    Example:
+        ramp incorporation industries search --q "saas restaurant"
+
+    Endpoint: GET /developer/v1/incorporation/industries
+    """
+    client = RampClient(ctx.obj["env"])
+    response = client.get(f"{_INCORPORATION_BASE}/industries", params={"search": query})
+    _render_get(response, ctx.obj["format"], ctx.obj["config_format"])
+
+
+@incorporation_group.command("countries")
+@click.pass_context
+def list_countries(ctx: click.Context) -> None:
+    """List countries of residence accepted for Ramp LLC formation.
+
+    Maps to: IncorporationListCountries
+
+    \b
+    Endpoint: GET /developer/v1/incorporation/countries
+    """
+    client = RampClient(ctx.obj["env"])
+    response = client.get(f"{_INCORPORATION_BASE}/countries")
+    _render_get(response, ctx.obj["format"], ctx.obj["config_format"])
+
+
+@incorporation_group.group("applicant", help="Manage incorporation applicant records")
+def applicant_group() -> None:
+    pass
+
+
+@applicant_group.command("create")
+@click.option(
+    "--country-of-residence",
+    "country_of_residence",
+    required=False,
+    default=None,
+    help="ISO 3166-1 alpha-2 country code returned by `ramp incorporation countries` (e.g. 'US')",
+)
+@click.option(
+    "--json",
+    "json_body",
+    required=False,
+    default=None,
+    help="Full applicant body as raw JSON (overrides individual flags)",
+)
+@click.pass_context
+def create_applicant(
+    ctx: click.Context,
+    country_of_residence: str | None,
+    json_body: str | None,
+) -> None:
+    """Create an incorporation applicant record for the authenticated business.
+
+    Maps to: IncorporationCreateApplicant
+
+    \b
+    Example:
+        ramp incorporation applicant create --country-of-residence US
+
+    Endpoint: POST /developer/v1/incorporation/applicant
+    """
+    if json_body:
+        body: dict[str, Any] = _parse_json_body(json_body)
+    else:
+        body = {}
+        if country_of_residence:
+            body["country_of_residence"] = country_of_residence
+
+    # Same SSN-rejection posture as `submit`: even though applicant-create
+    # doesn't request SSN fields, defense-in-depth rejects any caller JSON
+    # that smuggles SSN-like keys or values (P1 Codex thread on #247).
+    _reject_ssn_in_json(body)
+
+    client = RampClient(ctx.obj["env"])
+    response = client.post(
+        f"{_INCORPORATION_BASE}/applicant", json.dumps(body).encode()
+    )
+    _render_get(response, ctx.obj["format"], ctx.obj["config_format"])
+
+
+@applicant_group.command("get")
+@click.pass_context
+def get_applicant(ctx: click.Context) -> None:
+    """Retrieve the incorporation applicant record for the authenticated business.
+
+    Maps to: IncorporationGetApplicant
+
+    \b
+    Endpoint: GET /developer/v1/incorporation/applicant
+    """
+    client = RampClient(ctx.obj["env"])
+    response = client.get(f"{_INCORPORATION_BASE}/applicant")
+    _render_get(response, ctx.obj["format"], ctx.obj["config_format"])
+
+
+# Ramp-facing formation_submission_status values that carry pre-EIN early-access
+# meaning. Core maps provider statuses before returning this field.
+# Statuses with no pre-EIN meaning (NOT_SUBMITTED, PENDING_REVIEW) are absent
+# on purpose.
+_PRE_EIN_STATUS_NOTES: dict[str, dict[str, Any]] = {
+    "SUBMITTED": {
+        "access": "LIMITED",
+        "ein": "pending",
+        "summary": (
+            "Formation filed with the state; EIN not yet issued. The business "
+            "has limited access now and auto-promotes to full access when Ramp "
+            "receives the EIN."
+        ),
+        "unblocks_full_access": "EIN issued (formation_submission_status APPROVED)",
+    },
+    "APPROVED": {
+        "access": "FULL_PENDING_KYB",
+        "ein": "issued",
+        "summary": (
+            "EIN issued. Business-entity verification runs now; access promotes "
+            "to full once it passes."
+        ),
+        "unblocks_full_access": "business-entity KYB approved",
+    },
+    "REJECTED": {
+        "access": "AT_RISK",
+        "ein": "not issued",
+        "summary": (
+            "Formation was rejected. Review the rejection reason and re-file; "
+            "limited access may be revoked if no EIN is obtained."
+        ),
+        "unblocks_full_access": "resolve rejection, re-file formation, and obtain an EIN",
+    },
+}
+
+
+def _pre_ein_status_note(status: str | None) -> dict[str, Any] | None:
+    """Return the pre-EIN annotation for a formation_submission_status value.
+
+    Pure lookup; returns None for a missing status or one with no pre-EIN
+    meaning, so callers can attach the note conditionally.
+    """
+    if not status:
+        return None
+    return _PRE_EIN_STATUS_NOTES.get(status.upper())
+
+
+def _render_status(
+    response: bytes,
+    format_flag: str | None,
+    config_format: str,
+) -> None:
+    """Render company status, annotating the pre-EIN lifecycle when present."""
+    try:
+        data: Any = json.loads(response)
+    except (json.JSONDecodeError, ValueError):
+        data = {"raw": response.decode("utf-8", errors="replace")}
+
+    if isinstance(data, dict):
+        status = data.get("formation_submission_status")
+        note = _pre_ein_status_note(status if isinstance(status, str) else None)
+        if note is not None:
+            data = {**data, "pre_ein": note}
+
+    if resolve_format(format_flag, config_format) == "json":
+        print_agent_json(data, pagination={"has_more": False, "next": None})
+    else:
+        print_json(data)
+
+
+@incorporation_group.command("status")
+@click.pass_context
+def get_company_status(ctx: click.Context) -> None:
+    """Get the current Ramp formation status for this business.
+
+    Maps to: IncorporationGetCompanyStatus
+
+    Checks status live from Ramp. If the formation is APPROVED but Ramp's
+    local state hasn't been backfilled yet, the server triggers the
+    IncorporationBackfillWorkflow inline so the FA blockers stay consistent.
+
+    For pre-EIN early access, the output is annotated with a ``pre_ein`` block
+    explaining the access the business has at the reported submission status and
+    what unblocks full access (e.g. SUBMITTED → limited access, EIN pending).
+
+    \b
+    Endpoint: GET /developer/v1/incorporation/company-status
+    """
+    client = RampClient(ctx.obj["env"])
+    response = client.get(_INCORPORATION_STATUS_PATH)
+    _render_status(response, ctx.obj["format"], ctx.obj["config_format"])
+
+
+@incorporation_group.command("documents")
+@click.pass_context
+def get_documents(ctx: click.Context) -> None:
+    """List formation documents (articles of incorporation, EIN letter, etc.).
+
+    Maps to: IncorporationGetDocuments
+
+    \b
+    Endpoint: GET /developer/v1/incorporation/documents
+    """
+    client = RampClient(ctx.obj["env"])
+    response = client.get(f"{_INCORPORATION_BASE}/documents")
+    _render_get(response, ctx.obj["format"], ctx.obj["config_format"])

@@ -158,6 +158,7 @@ CATEGORY_DISPLAY_FIELDS: dict[str, list[str]] = {
         "merchant_category",
         "spend_allocation_name",
         "reason_or_justification",
+        "decline_reason",
         "transaction_uuid",
     ],
     "bills": [

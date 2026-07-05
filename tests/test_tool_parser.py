@@ -121,9 +121,36 @@ class TestActivateCard:
         assert required[0].type is ParamType.STRING
 
 
+class TestHeaderParams:
+    def test_required_idempotency_header_is_parsed(self, tool_map: dict[str, ToolDef]):
+        tool = tool_map["post_banking_drawdown_requests_resource"]
+        param = _find_param(tool, "X-Idempotency-Key")
+
+        assert param is not None
+        assert param.location == "header"
+        assert param.flag == "idempotency_key"
+        assert param.required is True
+        assert param.type is ParamType.STRING
+
+    def test_optional_idempotency_header_is_parsed(self, tool_map: dict[str, ToolDef]):
+        tool = tool_map["post_application_document_resource"]
+        param = _find_param(tool, "X-Idempotency-Key")
+
+        assert param is not None
+        assert param.location == "header"
+        assert param.flag == "idempotency_key"
+        assert param.required is False
+
+
 class TestGetTransactions:
     def test_exists(self, tool_map: dict[str, ToolDef]):
         assert "get-transactions" in tool_map
+
+    def test_transaction_info_includes_decline_reason(self):
+        spec = json.loads(AGENT_TOOL_SPEC.read_text())
+        transaction_info = spec["components"]["schemas"]["TransactionInfo"]
+
+        assert "decline_reason" in transaction_info["properties"]
 
     def test_has_enum_params(self, tool_map: dict[str, ToolDef]):
         param = _find_param(tool_map["get-transactions"], "state")
@@ -179,6 +206,27 @@ class TestEnrollBusinessInAgentCards:
         assert tool_map["enroll-business-in-agent-cards"].alias == "enroll"
 
 
+class TestAgentAccountNumbers:
+    def test_exists(self, tool_map: dict[str, ToolDef]):
+        assert "get_agent_account_numbers_list_resource" in tool_map
+
+    def test_alias_and_category(self, tool_map: dict[str, ToolDef]):
+        tool = tool_map["get_agent_account_numbers_list_resource"]
+        assert tool.alias == "account-numbers"
+        assert tool.category == "treasury"
+
+    def test_scopes(self, tool_map: dict[str, ToolDef]):
+        tool = tool_map["get_agent_account_numbers_list_resource"]
+        assert tool.required_scopes == ["agent_account_numbers:read"]
+
+    def test_query_params(self, tool_map: dict[str, ToolDef]):
+        tool = tool_map["get_agent_account_numbers_list_resource"]
+        assert [(p.name, p.type, p.required) for p in tool.params] == [
+            ("page_size", ParamType.INT, False),
+            ("start", ParamType.STRING, False),
+        ]
+
+
 # ── Param type classification ──
 
 
@@ -191,6 +239,10 @@ class TestParamTypes:
     def test_flags_match_names(self, tools: list[ToolDef]):
         for tool in tools:
             for param in tool.params:
+                if param.location == "header":
+                    assert "-" not in param.flag
+                    assert param.flag == param.flag.lower()
+                    continue
                 assert param.flag == param.name, (
                     f"{tool.name}.{param.name}: flag '{param.flag}' != name"
                 )

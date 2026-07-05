@@ -20,6 +20,7 @@ from ramp_cli.version_check import (
     get_update_info,
     get_update_warning,
     parse_version,
+    suppress_next_update_notice,
 )
 
 
@@ -141,3 +142,16 @@ class TestEmitUpdateNotice:
         emit_update_notice(agent_mode=False)
         captured = capsys.readouterr()
         assert captured.err == ""
+
+    @patch("ramp_cli.version_check.__version__", "0.1.3")
+    def test_suppress_next_notice_only_suppresses_once(self, cache_file: Path, capsys):
+        _write_cache("0.2.0")
+
+        suppress_next_update_notice()
+        emit_update_notice(agent_mode=True)
+        first = capsys.readouterr()
+        assert first.err == ""
+
+        emit_update_notice(agent_mode=True)
+        second = capsys.readouterr()
+        assert json.loads(second.err)["update_available"]["latest"] == "0.2.0"

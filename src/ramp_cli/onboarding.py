@@ -45,7 +45,7 @@ CATEGORY_SAMPLES: dict[str, list[str]] = {
         "ramp accounting categories  (tracking categories & GL codes)",
     ],
     "travel": [
-        "ramp travel search  (search flights & hotels)",
+        "ramp travel search-flight  (search flights)",
     ],
     "receipts": [
         "ramp receipts upload <TRANSACTION_ID> --file_path receipt.pdf",
@@ -96,7 +96,7 @@ CATEGORY_TIPS: dict[str, str] = {
         "project, or custom dimensions."
     ),
     "travel": (
-        "Tip: Combine travel search with --agent to build automated booking workflows."
+        "Tip: Combine flight search with --agent to build automated booking workflows."
     ),
     "receipts": (
         "Tip: Upload receipts right after a transaction to keep compliance green."

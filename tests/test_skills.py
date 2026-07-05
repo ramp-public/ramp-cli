@@ -7,9 +7,11 @@ import re
 
 from click.testing import CliRunner
 
+from ramp_cli.commands.applications import APPLICATION_EXAMPLE
 from ramp_cli.main import (
     _SINGLE_TOOL_RESOURCE_CATEGORIES,
     CATEGORY_ALIAS_GROUPS,
+    CATEGORY_LEGACY_GROUPS,
     CATEGORY_REMAP,
     cli,
 )
@@ -26,9 +28,10 @@ from ramp_cli.tools.parser import parse_spec
 
 class TestSkillDiscovery:
     def test_skill_names_discovers_all(self):
-        """All 14 skills should be discovered from the skills/ directory."""
+        """All 16 skills should be discovered from the skills/ directory."""
         names = skill_names()
-        assert len(names) == 14
+        assert len(names) == 16
+        assert "get-started" in names
         assert "agentic-purchase" in names
         assert "card-management" in names
         assert "book-flight" in names
@@ -40,9 +43,16 @@ class TestSkillDiscovery:
         assert "submit-reimbursement" in names
         assert "transaction-cleanup" in names
         assert "apply-to-ramp" in names
+        assert "incorporate-with-ramp" in names
         assert "vendor-document-upload" in names
         assert "payment-lookup" in names
         assert "spend-analysis" in names
+
+    def test_readme_lists_all_skills(self):
+        """The public skill index should mention every bundled skill."""
+        readme = (SKILLS_DIR / "README.md").read_text()
+        for name in skill_names():
+            assert f"`{name}`" in readme
 
     def test_skill_names_empty_dir(self, tmp_path, monkeypatch):
         """Returns empty list when skills dir has no skill subdirectories."""
@@ -57,11 +67,13 @@ class TestSkillsList:
         assert result.exit_code == 0
 
         data = json.loads(result.output)
-        assert len(data["data"]) == 14
+        assert len(data["data"]) == 16
         names = {s["name"] for s in data["data"]}
+        assert "get-started" in names
         assert "browser-automation" in names
         assert "card-management" in names
         assert "agentic-purchase" in names
+        assert "incorporate-with-ramp" in names
         assert "book-flight" in names
         assert "manage-procurement" in names
         assert "manage-bills" in names
@@ -71,7 +83,7 @@ class TestSkillsList:
         runner = CliRunner()
         result = runner.invoke(cli, ["--human", "skills", "list"])
         assert result.exit_code == 0
-        assert "14 Skills" in result.output
+        assert "16 Skills" in result.output
         assert "browser-automation" in result.output
         assert "manage-procurement" in result.output
         assert "manage-bills" in result.output
@@ -120,14 +132,14 @@ class TestSkillsInstall:
         assert "Browser Automation" in dest.read_text()
 
     def test_install_all(self, tmp_path):
-        """--all installs all 14 skills."""
+        """--all installs all 16 skills."""
         runner = CliRunner()
         result = runner.invoke(
             cli, ["skills", "install", "--all", "--target", str(tmp_path)]
         )
         assert result.exit_code == 0
         installed = [d.name for d in tmp_path.iterdir() if d.is_dir()]
-        assert len(installed) == 14
+        assert len(installed) == 16
 
     def test_install_overwrites(self, tmp_path):
         """Installing twice succeeds and returns 'updated' on second run."""
@@ -198,6 +210,315 @@ class TestSkillsBundled:
             skill_file = SKILLS_DIR / name / "SKILL.md"
             assert skill_file.is_file(), f"{name}/SKILL.md missing from {SKILLS_DIR}"
 
+    def test_incorporate_with_ramp_skill_country_guidance(self):
+        """Incorporation skill should not send agents through the countries lookup."""
+        content = (SKILLS_DIR / "incorporate-with-ramp" / "SKILL.md").read_text()
+        assert "ramp incorporation countries" not in content
+        assert "/developer/v1/incorporation/countries" not in content
+        assert "This launch flow is US-only" in content
+        assert "non-US founders or country fields" in content
+
+    def test_apply_to_ramp_progress_loop_prioritizes_incorporation(self):
+        """Ramp review should not stop independently actionable incorporation work."""
+        content = (SKILLS_DIR / "apply-to-ramp" / "SKILL.md").read_text()
+        progress_section = self._extract_section(content, "Run The Progress Loop")
+
+        assert progress_section.index(
+            "COMPLETE_INCORPORATION"
+        ) < progress_section.index("actor=RAMP")
+        assert "WAIT_FOR_RAMP" in progress_section
+        assert "Do not wait for Ramp approval" in progress_section
+        assert "Do not start incorporation formation yet" in progress_section
+        assert "ramp applications get --env production --agent" in progress_section
+        assert "business.incorporation" in progress_section
+        assert "REVIEW_AND_SUBMIT" in progress_section
+        assert "date_of_incorporation" in progress_section
+        assert "present in the live" in progress_section
+        assert "Progress may omit a validation issue" in progress_section
+        assert "do not treat missing progress validation" in progress_section
+        assert "Do not hand off an applicant-owned browser step" in progress_section
+        assert "Ramp-owned actions as stop conditions only after" in progress_section
+        assert (
+            "Do not use `WAIT_FOR_RAMP` alone as an incorporation signal"
+            in progress_section
+        )
+        assert "person explicitly asked to file an LLC" in progress_section
+        assert "needs_incorporation=true" in progress_section
+        assert "formed entity/EIN" in progress_section
+        assert "ramp skills show incorporate-with-ramp" in progress_section
+        assert "same Ramp CLI binary and version" in progress_section
+        assert "stale skill snapshots" in progress_section
+
+    def test_apply_to_ramp_unformed_entity_fields_before_doola(self):
+        """FA may require provisional incorporation fields before Doola filing."""
+        content = (SKILLS_DIR / "apply-to-ramp" / "SKILL.md").read_text()
+        section = self._extract_section(content, "Unformed Entity Incorporation Fields")
+        normalized_section = " ".join(section.split())
+
+        assert "needs_incorporation=true" in section
+        assert "intended/provisional filing facts" in section
+        assert "business type and state" in section
+        assert "leave EIN empty/null" in section
+        assert (
+            "do not skip this step because Doola formation has not been submitted"
+            in section
+        )
+        assert "after the person submits FA" in section
+        assert "date_of_incorporation" in section
+        assert "intended filing date" in normalized_section
+        assert "whenever the current" in section
+        assert "application/edit schema exposes it" in section
+        assert "Ramp backfills that after approval" in normalized_section
+        assert "filing state" in content
+
+    def test_apply_to_ramp_minimizes_browser_touchpoints(self):
+        """Agents should batch API-writable work before sending users to Ramp."""
+        content = (SKILLS_DIR / "apply-to-ramp" / "SKILL.md").read_text()
+        section = self._extract_section(content, "Minimize Browser Touchpoints")
+        normalized_section = " ".join(section.split())
+
+        assert "accepting the invite email" in section
+        assert "phone verification, when progress returns it" in section
+        assert "SSN entry" in section
+        assert "Onfido identity verification" in section
+        assert "During application data collection" in section
+        assert "Everything else should be completed through the CLI" in section
+        assert "all visible non-sensitive missing facts" in section
+        assert "API-writable/non-sensitive application field" in section
+        assert "only remaining applicant-owned actions are SSN entry" in section
+        assert "SSN entry and optionally phone verification" in normalized_section
+        assert "business.incorporation" in section
+        assert "domain-mismatch explanation" in section
+        assert "residential address" in section
+        assert "ownership percentage" in section
+        assert "one browser session" in section
+        assert (
+            "Final review and submission is also applicant-only" in normalized_section
+        )
+        assert "--wait_for_phone_verification" in section
+        assert "--wait_for_identity_verification" in section
+
+    def test_apply_to_ramp_progress_loop_mentions_wait_flags(self):
+        """Progress guidance should use built-in waits for applicant handoffs."""
+        content = (SKILLS_DIR / "apply-to-ramp" / "SKILL.md").read_text()
+        section = self._extract_section(content, "Run The Progress Loop")
+
+        assert "--wait_for_phone_verification" in section
+        assert "--wait_for_identity_verification" in section
+        assert "--wait_for_action <action_or_key>" in section
+        assert "Do not use wait flags with `--dry_run`" in section
+
+    def test_apply_to_ramp_batches_non_sensitive_questions(self):
+        """The question guidance should ask for writable fields up front."""
+        content = (SKILLS_DIR / "apply-to-ramp" / "SKILL.md").read_text()
+        section = self._extract_section(content, "Ask Only For The Next Missing Facts")
+        normalized_section = " ".join(section.split())
+
+        assert "all current agent-owned required actions" in normalized_section
+        assert "does not have to bounce between Ramp and chat" in normalized_section
+        assert "residential address" in section
+        assert "Ramp currently supports LLC formation" in normalized_section
+        assert "which valid filing state should we use" in normalized_section
+
+    def test_apply_to_ramp_owners_and_control_guidance(self):
+        """Agents should capture controller ownership when the officer is an owner."""
+        content = (SKILLS_DIR / "apply-to-ramp" / "SKILL.md").read_text()
+        section = self._extract_section(content, "Owners And Control")
+        normalized_section = " ".join(section.split())
+
+        assert "controlling officer who is also a" in section
+        assert "beneficial owner" in section
+        assert "`controlling_officer.is_beneficial_owner: true`" in section
+        assert "`controlling_officer.ownership_percentage`" in section
+        assert "whole number from 25 to 100" in section
+        assert "owns less than 25%" in section
+        assert "do not mark them as a beneficial owner" in normalized_section
+        assert "Do not duplicate the same person in `beneficial_owners`" in section
+        assert "normalize owner/controller emails" in section
+        assert "case-insensitively" in section
+        assert (
+            "`beneficial_owners[*].email` matches `controlling_officer.email`"
+            in section
+        )
+        assert "merge" in section
+        assert "remove that matching entry from `beneficial_owners`" in section
+        assert "never retry by appending the same beneficial owner again" in section
+        assert '"beneficial_owners": []' in section
+        assert "include each owner's `ownership_percentage`" in section
+        assert "`ownership_acknowledgement`" in section
+        assert "25%+ beneficial owners" in section
+
+    def test_incorporate_with_ramp_allows_direct_filing_after_fa_submission(self):
+        """The filing skill should support direct LLC filing after FA submission."""
+        content = (SKILLS_DIR / "incorporate-with-ramp" / "SKILL.md").read_text()
+        normalized = " ".join(content.split())
+
+        assert "Once the financing application has been submitted" in normalized
+        assert "IN_REVIEW" in normalized
+        assert "WAIT_FOR_RAMP" in normalized
+        assert "do not wait for FA approval" in normalized
+        assert "Do not start formation while the application is only" in normalized
+        assert "ready_for_submission=true" in normalized
+        assert "direct filing path" in normalized
+        assert "file an LLC" in normalized
+        assert "Do not report `WAIT_FOR_RAMP` as a stop condition" in content
+        assert "absence of an explicit `COMPLETE_INCORPORATION` action" in normalized
+        assert "must still check formation status" in content
+        assert "--wait_for_action REVIEW_AND_SUBMIT" in content
+        assert "--wait_for_action COMPLETE_INCORPORATION" in content
+
+    def test_incorporate_with_ramp_uses_lean_submit_payload(self):
+        """Formation submit should reuse FA owner/controller data."""
+        content = (SKILLS_DIR / "incorporate-with-ramp" / "SKILL.md").read_text()
+        workflow_section = self._extract_section(content, "Workflow")
+        normalized = " ".join(content.split())
+        normalized_workflow = " ".join(workflow_section.split())
+
+        assert "reuses owner, controller, and identity data" in content
+        assert "do not ask for `members`, `responsible_party`" in content
+        assert "`RAMP_INCORPORATION_*_SSN_LAST_4`" in content
+        assert "Use the lean formation payload" in workflow_section
+        assert (
+            "Core derives that data from the submitted financing application"
+            in normalized_workflow
+        )
+        assert '"addresses"' in workflow_section
+        assert '"members":' not in workflow_section
+        assert '"responsible_party":' not in workflow_section
+        assert "Stale guidance asks for `members`, `responsible_party`" in content
+        assert "Lean submit returns a validation error" in content
+        assert "pre_ein.access = LIMITED" in normalized
+        assert "`RP_IDENTITY`" in workflow_section
+        assert "do not re-collect or re-submit" in normalized_workflow
+        assert "FA-sourced identity fields" in workflow_section
+
+    def test_incorporate_with_ramp_requires_same_context_applicant_preflight(self):
+        """Formation submit must be preceded by same-context applicant create/get."""
+        content = (SKILLS_DIR / "incorporate-with-ramp" / "SKILL.md").read_text()
+        section = self._extract_section(content, "Workflow")
+
+        assert "Use the same CLI binary" in content
+        assert "same CLI binary, `--env`, OAuth token, and shell session" in section
+        assert "ramp incorporation applicant create --agent" in section
+        assert "ramp incorporation applicant get --agent" in section
+        assert "This is a required pre-submit gate" in section
+        assert "Same-context preflight" in section
+        assert 'applications get --env "$ENV" --agent | python3' in section
+        assert "Do not paste or summarize the full `applications get` output" in section
+
+    def test_incorporate_with_ramp_missing_applicant_recovery(self):
+        """The skill should recover missing-applicant errors before retrying submit."""
+        content = (SKILLS_DIR / "incorporate-with-ramp" / "SKILL.md").read_text()
+        gotchas = self._extract_section(content, "Gotchas")
+
+        assert "No incorporation applicant exists for this business" in gotchas
+        assert "Do not retry submit first" in gotchas
+        assert "applicant create --env <env> --country-of-residence US" in gotchas
+        assert "applicant get --env <env>" in gotchas
+        assert "same terminal/auth context" in gotchas
+        assert "No incorporation formation exists" in gotchas
+        assert "generic auth-token hint" in gotchas
+        assert "ramp auth status" in gotchas
+        assert "incorporation:read" in gotchas
+        assert "incorporation:write" in gotchas
+        assert "Do not hardcode `customer_id` or `doolaCustomerId`" in gotchas
+        assert "BusinessIncorporationLink.doola_customer_id" in gotchas
+        assert "SSN entry still required" in gotchas
+        assert "do not run `ramp incorporation submit`" in gotchas
+
+    def _extract_section(self, content: str, heading: str) -> str:
+        """Return text from `## heading` up to (but not including) the next `## ` heading."""
+        start = content.find(f"## {heading}")
+        assert start != -1, f"Section '## {heading}' not found in SKILL.md"
+        end = content.find("\n## ", start + 1)
+        return content[start:end] if end != -1 else content[start:]
+
+    def test_apply_to_ramp_skill_ssn_browser_handoff_guidance(self):
+        """apply-to-ramp skill must instruct the agent to use deep_link_url for SSN."""
+        content = (SKILLS_DIR / "apply-to-ramp" / "SKILL.md").read_text()
+        ssn_section = self._extract_section(content, "SSN — Browser Handoff Only")
+        normalized_ssn_section = " ".join(ssn_section.split())
+
+        # Must never ask for SSN in chat.
+        assert "Never ask for or accept SSN" in ssn_section
+        assert "CLI prompts" in ssn_section
+        assert "env vars" in ssn_section
+        assert "Ramp browser form link" in ssn_section
+        # Must use non-null language, not just 'includes'.
+        assert "non-null" in ssn_section
+        assert "deep_link_url" in ssn_section
+        # Must use lowercase section_key values as seen in the API.
+        assert "controlling_officer" in ssn_section
+        assert "beneficial_owners" in ssn_section
+        assert "non-sensitive missing fields" in normalized_ssn_section
+        assert "collect and PATCH" in ssn_section
+        assert (
+            "only other remaining applicant-owned action is phone"
+            in normalized_ssn_section
+        )
+        assert "address" in ssn_section
+        assert "ownership" in ssn_section
+        # ALL_CAPS section keys must not appear in SSN prose (they're not real API values).
+        assert "CONTROLLING_OFFICER" not in ssn_section
+        assert "BENEFICIAL_OWNERS" not in ssn_section
+        # Must reference both KYC follow-up reason enum values (these ARE upper-case in API).
+        assert "KYC_SSN_VERIFICATION" in ssn_section
+        assert "KYC_SSN_FULL_9_VERIFICATION" in ssn_section
+        # Must instruct re-fetching after browser step.
+        assert "re-fetch" in ssn_section
+        # Must warn against inventing a link.
+        assert (
+            "Never invent" in ssn_section
+            or "never invent" in ssn_section
+            or "only" in ssn_section
+        )
+        # Must include pre-deploy fallback (null deep_link_url) guidance.
+        assert "null" in ssn_section
+        # Must include cross-skill disambiguation note.
+        assert (
+            "incorporate-with-ramp" in ssn_section
+            or "RAMP_INCORPORATION" in ssn_section
+        )
+
+    def test_apply_to_ramp_skill_ssn_safety_boundary(self):
+        """apply-to-ramp safety boundaries must explicitly call out SSN in-chat collection."""
+        content = (SKILLS_DIR / "apply-to-ramp" / "SKILL.md").read_text()
+        safety_section = self._extract_section(content, "Safety Boundaries")
+
+        # The explicit SSN bullet must be present within the Safety Boundaries section.
+        assert "Never collect SSN" in safety_section
+        # The bullet must reference the deep_link_url handoff.
+        assert "deep_link_url" in safety_section
+
+    def test_apply_to_ramp_example_ssn_last_4_is_null(self):
+        """APPLICATION_EXAMPLE must not model SSN collection (both fields must be null)."""
+        bo = APPLICATION_EXAMPLE["beneficial_owners"][0]
+        assert bo["ssn_last_4"] is None, "beneficial_owner ssn_last_4 must be null"
+        co = APPLICATION_EXAMPLE["controlling_officer"]
+        assert co["ssn_last_4"] is None, "controlling_officer ssn_last_4 must be null"
+
+    def test_apply_to_ramp_example_includes_ownership_percentages(self):
+        """APPLICATION_EXAMPLE should model controller-owner percentages."""
+        co = APPLICATION_EXAMPLE["controlling_officer"]
+        assert co["is_beneficial_owner"] is True
+        assert co["ownership_percentage"] == 60
+
+        bo = APPLICATION_EXAMPLE["beneficial_owners"][0]
+        assert bo["ownership_percentage"] == 40
+
+    def test_agent_tool_spec_example_ssn_last_4_is_null(self):
+        """ApiApplicationResource example in agent-tool.json must also null ssn_last_4."""
+        spec = json.loads(AGENT_TOOL_SPEC.read_text())
+        example = spec["components"]["schemas"]["ApiApplicationResource"]["example"]
+        for bo in example.get("beneficial_owners", []):
+            assert bo.get("ssn_last_4") is None, (
+                "agent-tool.json ApiApplicationResource example beneficial_owner ssn_last_4 must be null"
+            )
+        co = example.get("controlling_officer", {})
+        assert co.get("ssn_last_4") is None, (
+            "agent-tool.json ApiApplicationResource example controlling_officer ssn_last_4 must be null"
+        )
+
 
 # ── Tool reference validation ────────────────────────────────────────────────
 
@@ -217,6 +538,15 @@ HAND_WRITTEN_COMMANDS: dict[str, set[str] | None] = {
     "config": {"show", "set", "unset", "path"},
     "env": {"sandbox", "production"},
     "feedback": None,
+    "incorporation": {
+        "states",
+        "industries",
+        "countries",
+        "applicant",
+        "submit",
+        "status",
+        "documents",
+    },
     "skills": {"list", "show", "install"},
     "tools": {"refresh", "schema"},
 }
@@ -278,6 +608,12 @@ def _build_valid_commands() -> set[tuple[str, str]]:
         if t.category in CATEGORY_ALIAS_GROUPS:
             valid.add((t.category, t.alias or t.name))
 
+    # Hidden legacy groups remain invokable for backwards compatibility even
+    # after the public resource group is remapped.
+    for t in tools:
+        if t.category in CATEGORY_LEGACY_GROUPS:
+            valid.add((t.category, t.alias or t.name))
+
     return valid | SKILL_COMMAND_REFERENCES
 
 
@@ -311,6 +647,25 @@ def _build_tool_param_index() -> dict[tuple[str, str], set[str]]:
         if t.category in CATEGORY_ALIAS_GROUPS:
             key = (t.category, t.alias or t.name)
             index.setdefault(key, set()).update(p.name for p in t.params)
+
+    # Hidden legacy groups are not shown in help, but command references using
+    # the old resource path should still validate.
+    for t in tools:
+        if t.category in CATEGORY_LEGACY_GROUPS:
+            key = (t.category, t.alias or t.name)
+            index.setdefault(key, set()).update(p.name for p in t.params)
+
+    # applications progress has CLI-only wait flags layered on top of the
+    # generated OpenAPI command.
+    index.setdefault(("applications", "progress"), set()).update(
+        {
+            "wait_for_action",
+            "wait_for_phone_verification",
+            "wait_for_identity_verification",
+            "wait_interval",
+            "wait_timeout",
+        }
+    )
 
     return index
 

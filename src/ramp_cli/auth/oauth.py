@@ -6,6 +6,7 @@ import base64
 import hashlib
 import html as html_mod
 import json
+import os
 import secrets
 import socket
 import subprocess
@@ -40,6 +41,11 @@ from ramp_cli.tools.registry import _resolve_spec_path
 _SCOPE_SPEC_CACHE_FRESH_SECONDS = 3600
 _OAUTH_CALLBACK_TIMEOUT_SECONDS = 900
 _AUTH_SETUP_BROWSER_DELAY_SECONDS = 1.0
+_AGENT_CLIENT_HINT_SENTINELS = (
+    ("CODEX_SANDBOX", "codex"),
+    ("CLAUDECODE", "claude_code"),
+    ("OPENCODE", "opencode"),
+)
 
 
 @dataclass
@@ -412,7 +418,21 @@ def _build_auth_url(
         "code_challenge": challenge,
         "code_challenge_method": "S256",
     }
+    agent_client = _agent_client_presentation_hint()
+    if agent_client:
+        params["agent_client_hint"] = agent_client
     return append_query_params(auth_url(env), params)
+
+
+def _agent_client_presentation_hint() -> str | None:
+    return next(
+        (
+            hint
+            for env_var, hint in _AGENT_CLIENT_HINT_SENTINELS
+            if os.environ.get(env_var)
+        ),
+        None,
+    )
 
 
 def _exchange_code(

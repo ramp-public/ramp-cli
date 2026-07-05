@@ -19,6 +19,7 @@ from ramp_cli.tools.parser import ToolDef, parse_spec
 # resource group.  Used by main.py for command routing and by
 # getting_started.py so the onboarding guide shows invokable names.
 CATEGORY_REMAP: dict[str, str] = {
+    "ai-token-spend": "ai-spend",
     "cards": "funds",
     "agent_cards": "funds",
 }
@@ -29,6 +30,10 @@ CATEGORY_REMAP: dict[str, str] = {
 # and also gain an intuitive alias group (e.g. ``cards list``).  This is a
 # non-breaking alias — no existing command path is removed or renamed.
 CATEGORY_ALIAS_GROUPS: frozenset[str] = frozenset({"cards"})
+
+# Spec categories that keep a hidden legacy resource path after being remapped.
+# These stay invokable for existing automation without showing up in root help.
+CATEGORY_LEGACY_GROUPS: frozenset[str] = frozenset({"ai-token-spend"})
 
 
 def _resolve_generated_spec_path(definition: GeneratedToolSpec, env: str):

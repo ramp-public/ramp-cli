@@ -138,6 +138,16 @@ def load_component_schema(spec_path: Path, schema_name: str) -> dict[str, Any]:
         spec = jsonref.replace_refs(json.load(f), proxies=False)
 
     schemas = spec.get("components", {}).get("schemas", {})
+    if "+" in schema_name:
+        return _flatten_object_schema(
+            {
+                "allOf": [
+                    {"$ref": f"#/components/schemas/{name}"}
+                    for name in schema_name.split("+")
+                ]
+            },
+            schemas,
+        )
     try:
         return schemas[schema_name]
     except KeyError as exc:
@@ -246,7 +256,7 @@ def _parse_endpoint(
     request_content_type, request_schema = _request_schema(method_def)
     request_ref = request_schema.get("$ref", "") if request_schema else ""
     if request_ref:
-        schema_name = request_ref.split("/")[-1]
+        schema_name = _request_schema_name(request_schema)
         schema_def = schemas.get(schema_name, {})
         body_location = (
             "form" if request_content_type == "multipart/form-data" else "body"
@@ -274,6 +284,7 @@ def _parse_endpoint(
         )
 
     if request_schema:
+        schema_name = _request_schema_name(request_schema)
         body_location = (
             "form" if request_content_type == "multipart/form-data" else "body"
         )
@@ -288,7 +299,7 @@ def _parse_endpoint(
             alias=method_def.get("x-alias", ""),
             params=_sort_params([*operation_params, *body_params]),
             required_scopes=_extract_scopes(method_def),
-            request_schema_name="",
+            request_schema_name=schema_name,
             response_schema_name=response_ref.split("/")[-1] if response_ref else "",
             json_schema=_parse_input_json_schema(
                 request_schema,
@@ -322,6 +333,17 @@ def _request_schema(method_def: dict) -> tuple[str, dict]:
         if isinstance(schema, dict):
             return content_type, schema
     return "application/json", {}
+
+
+def _request_schema_name(request_schema: dict) -> str:
+    if "$ref" in request_schema:
+        return request_schema["$ref"].split("/")[-1]
+    refs = [
+        sub_schema["$ref"].split("/")[-1]
+        for sub_schema in request_schema.get("allOf", [])
+        if isinstance(sub_schema, dict) and "$ref" in sub_schema
+    ]
+    return "+".join(refs)
 
 
 def _response_ref(method_def: dict) -> str:
@@ -361,6 +383,7 @@ def _parse_params(
     schema_def: dict, schemas: dict, *, location: str = "body"
 ) -> list[ToolParam]:
     """Convert schema properties into a sorted list of ToolParams (required first)."""
+    schema_def = _flatten_object_schema(schema_def, schemas)
     required_names = set(schema_def.get("required", []))
     params: list[ToolParam] = []
 
@@ -373,21 +396,71 @@ def _parse_params(
     return _sort_params(params)
 
 
+def _flatten_object_schema(
+    schema_def: dict,
+    schemas: dict,
+    seen_refs: frozenset[str] = frozenset(),
+) -> dict:
+    """Merge top-level allOf object fragments for CLI flag generation."""
+    if not isinstance(schema_def, dict):
+        return {}
+
+    if "$ref" in schema_def:
+        ref_name = schema_def["$ref"].split("/")[-1]
+        if ref_name in seen_refs:
+            return {}
+        resolved = _flatten_object_schema(
+            schemas.get(ref_name, {}),
+            schemas,
+            seen_refs | frozenset({ref_name}),
+        )
+        return {**resolved, **{k: v for k, v in schema_def.items() if k != "$ref"}}
+
+    if "allOf" not in schema_def:
+        return schema_def
+
+    merged = {k: v for k, v in schema_def.items() if k != "allOf"}
+    properties: dict[str, Any] = dict(merged.get("properties", {}))
+    required: list[str] = list(merged.get("required", []))
+
+    for sub_schema in schema_def.get("allOf", []):
+        flattened = _flatten_object_schema(sub_schema, schemas, seen_refs)
+        properties.update(flattened.get("properties", {}))
+        for name in flattened.get("required", []):
+            if name not in required:
+                required.append(name)
+
+    merged["properties"] = properties
+    if required:
+        merged["required"] = required
+    return merged
+
+
 def _parse_operation_params(parameters: list[dict], schemas: dict) -> list[ToolParam]:
-    """Convert OpenAPI path and query parameters into ToolParams."""
+    """Convert OpenAPI path, query, and header parameters into ToolParams."""
     params: list[ToolParam] = []
     for p in parameters:
         location = p.get("in")
-        if location not in {"path", "query"}:
+        if location not in {"path", "query", "header"}:
             continue
         name = p["name"]
         schema = p.get("schema", {})
         param = _classify_property(name, schema, schemas)
+        param.flag = _param_flag_name(name, location)
         param.required = p.get("required", False)
         param.location = location
         param.description = p.get("description", "") or param.description
         params.append(param)
     return _sort_params(params)
+
+
+def _param_flag_name(name: str, location: str) -> str:
+    if location != "header":
+        return name
+    flag = name.lower()
+    if flag.startswith("x-"):
+        flag = flag[2:]
+    return flag.replace("-", "_")
 
 
 def _sort_params(params: list[ToolParam]) -> list[ToolParam]:

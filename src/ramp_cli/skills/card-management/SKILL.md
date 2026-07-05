@@ -1,52 +1,68 @@
 ---
 name: card-management
 description: |-
-  List a user's cards and count or filter them by state (e.g. how many are active),
-  then activate or lock/unlock a card from the terminal.
-  Use when: 'list my cards', 'how many cards', 'how many active cards', 'count active cards',
-  'which cards are active', 'show my cards', 'card status', 'activate my card',
-  'lock my card', 'unlock my card', 'is my card active'.
-  Do NOT use for: listing funds/budgets or spend allocations (use `ramp funds list`),
-  agent card payments (use agentic-purchase), or transaction history (use spend-analysis).
+  Inspect a user's card/fund status, then activate or lock/unlock a card from
+  the terminal. Use for card status, card lock questions, physical card
+  activation, and card lock/unlock actions.
 ---
+
+# Card Management
 
 ## Non-Negotiables
 
-- To list cards, use `ramp cards list` — NOT `ramp funds list` (that lists funds/budgets, not cards).
-- The API has no server-side state filter. To count or filter by state, list all cards, then filter on `card_state` client-side.
-- Pass `--agent` for machine-readable JSON output whenever you need to count or filter programmatically.
-- `card_state` is a free-form string from the API with no fixed enum in the spec; active cards report a `card_state` that equals `active` case-insensitively (e.g. `ACTIVE`). Always compare case-insensitively and report exactly what the API returns; do not invent states.
-- A card's lifecycle state (`card_state`) is distinct from its `activation_status` (whether the physical card has been activated). A card can be active while still `not_activated` for physical use.
+- To inspect card/fund status, use `ramp funds list`. The current generated
+  spec no longer exposes `ramp cards list`.
+- Use `--state ACTIVE` when the user asks for active cards/funds.
+- Use `--include_lock_info` when the user asks why a card or fund is locked.
+- Use `--include_members` when the user asks who has access to a fund/card.
+- Pass `--agent` for machine-readable JSON output whenever you need to count
+  or inspect returned fields programmatically.
+- Report the fields returned by the API. Do not invent card lifecycle states.
 
 ## Workflow
 
-### Step 1: List the cards
+### Step 1: Inspect card/fund status
 
 ```bash
-ramp cards list --rationale "list the user's cards" --agent
+ramp funds list --funds_to_retrieve MY_FUNDS --rationale "inspect the user's card and fund status" --agent
 ```
 
-In `--agent` mode the response is wrapped in the standard envelope: the cards live in the nested array at `.data[0].cards[]` (not one card per `.data[]`). Each card object includes `display_name`, `last_four`, `card_state`, `activation_status`, `card_type`, `is_physical`, and `id`.
+In `--agent` mode the response is wrapped in the standard envelope. Fund/card
+records live in the nested array at `.data[0].funds[]`.
 
-Admins and managers can target another employee's cards by passing that user's UUID — run `ramp cards list --help` to confirm the option is available in your synced spec.
+Admins and managers can target another employee's funds/cards by passing that
+user's UUID. Resolve the UUID first, then pass it through `--user_uuids`.
+
+```bash
+ramp users org-chart --rationale "find the employee's user UUID" --agent
+ramp funds list --user_uuids '["USER_UUID"]' --include_lock_info --rationale "inspect this employee's card and fund status" --agent
+```
 
 ### Step 2: Count or filter by state
 
-Count active cards directly with `jq`. The cards are at `.data[0].cards[]`, and `card_state` casing is compared case-insensitively so it works regardless of how the API capitalizes it:
+Count active card/fund contexts:
 
 ```bash
-ramp cards list --rationale "count active cards" --agent | jq '[.data[0].cards[] | select((.card_state // "" | ascii_downcase) == "active")] | length'
+ramp funds list --funds_to_retrieve MY_FUNDS --state ACTIVE --rationale "count active card and fund contexts" --agent | jq '.data[0].funds | length'
 ```
 
-List just the active card names:
+List active card/fund context names:
 
 ```bash
-ramp cards list --rationale "list active cards" --agent | jq -r '.data[0].cards[] | select((.card_state // "" | ascii_downcase) == "active") | .display_name'
+ramp funds list --funds_to_retrieve MY_FUNDS --state ACTIVE --rationale "list active card and fund contexts" --agent | jq -r '.data[0].funds[] | .name'
 ```
 
-In a human terminal, `ramp cards list` shows `card_state` and `activation_status` as columns, so you can count active cards by eye.
+### Step 3: Inspect lock or access details
 
-### Step 3 (optional): Activate or lock a card
+When debugging lock questions, add lock info and inspect the `lock` and
+`member_locks` fields. When debugging access questions, add members and inspect
+the `members` field.
+
+```bash
+ramp funds list --funds_to_retrieve MY_FUNDS --include_lock_info --rationale "inspect fund and card lock details" --agent
+```
+
+### Step 4: Activate or lock a card
 
 Activate a physical card by its last four digits:
 
@@ -54,44 +70,45 @@ Activate a physical card by its last four digits:
 ramp cards activate --last_four 1234 --rationale "activate the user's new physical card" --agent
 ```
 
-Lock or unlock a card by its id (the `id` field from `cards list`) — the id is a required positional argument:
+Lock or unlock a card by its id. The id is a required positional argument:
 
 ```bash
 ramp cards lock 7f3c0d2a-9b1e-4a55-8c21-0e9d6b2f4a10 --action lock --rationale "user lost their card" --agent
 ramp cards lock 7f3c0d2a-9b1e-4a55-8c21-0e9d6b2f4a10 --action unlock --rationale "user found their card" --agent
 ```
 
-The same tools are also available under `funds` (`ramp funds list-cards`, `ramp funds activate`, `ramp funds lock-or-unlock-card`) — `cards <alias>` is a convenience alias for the same endpoints.
+The same write tools are also available under `funds` using their full command
+names, for example `ramp funds activate` and `ramp funds lock-or-unlock-card`.
 
-## Fields Available (from `cards list`)
+## Fields To Inspect
 
-| Field | Description |
+| Field | Meaning |
 |---|---|
-| `display_name` | Card name |
-| `last_four` | Last four digits |
-| `card_state` | Lifecycle state; equals `active` (case-insensitive, e.g. `ACTIVE`) when the card is active |
-| `activation_status` | Whether the physical card has been activated |
-| `card_type` | Virtual or physical card type |
-| `is_physical` | Whether the card is a physical card |
-| `is_locked` | Whether the card is currently locked |
-| `id` | Card UUID |
+| `id` | Fund/card context UUID |
+| `name` | Display name |
+| `state` | Current fund/card context state when returned |
+| `lock` | Fund-level lock information when `--include_lock_info` is set |
+| `member_locks` | Member-specific lock information when returned |
+| `members` | Users with access when `--include_members` is set |
+| `allocation_url` | Ramp web deep link when returned |
 
 ## Example Session
 
 ```
-User: How many active cards do I have?
+User: Why can't I use my card?
 
-Agent: > ramp cards list --rationale "count active cards" --agent | jq '[.data[0].cards[] | select((.card_state // "" | ascii_downcase) == "active")] | length'
-3
+Agent: > ramp funds list --funds_to_retrieve MY_FUNDS --include_lock_info --rationale "inspect the user's card and fund lock status" --agent
 
-You have 3 active cards.
+Agent: Your card/fund context is locked because the API returned a lock entry
+requiring missing policy items.
 ```
 
 ## Gotchas
 
 | Issue | Fix |
 |---|---|
-| `ramp funds list` returns funds/budgets, not cards | Use `ramp cards list` to list cards |
-| No `--state`/`--active` flag exists | List all cards and filter on `card_state` client-side |
-| `card_state` casing varies | Compare case-insensitively (`ascii_downcase` in jq) |
+| `ramp cards list` is not available in the current spec | Use `ramp funds list` for card/fund status |
+| Need only active cards/funds | Add `--state ACTIVE` |
+| Need card lock details | Add `--include_lock_info` |
+| Need card access/member details | Add `--include_members` |
 | Something broken? | `ramp feedback "message"` to report CLI/API bugs |

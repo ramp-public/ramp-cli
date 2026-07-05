@@ -15,6 +15,7 @@ Search, inspect, and review vendor bills — submitted, draft, and pending appro
 
 ## Non-Negotiables
 
+- **Pass `--rationale` on every command** — it is a required field on these agent-tools (a non-empty string, max 1024 chars). With `--json`, supply it as a `"rationale"` key in the body. Omitting it returns `HTTP 422 (DEVELOPER_INVALID_SCHEMA)`, in both agent and human modes.
 - **Deep links**: If the response contains a `bill_url` field, always include it when presenting bill details — it lets the user click through to the Ramp web app. If the field is absent, direct the user to the Ramp bills page instead. Use the URL matching the active CLI environment: `https://app.ramp.com/bills` for production or `https://demo.ramp.com/bills` for sandbox. Run `ramp env` to check the current environment if unsure.
 - Bill amounts are in **cents**. Divide by 100 for display (e.g., `350000` → `$3,500.00`).
 - Bill IDs are UUIDs. Always confirm the correct bill before acting on it.
@@ -30,16 +31,16 @@ Start by searching or listing bills to locate the ones the user needs.
 
 ```bash
 # Search by vendor name, invoice number, or payment ID
-ramp bills search --query "Acme Corp" --agent
+ramp bills search --query "Acme Corp" --agent --rationale "Search bills for the user"
 
 # List all bills (no query required)
-ramp bills list --agent --limit 20
+ramp bills list --agent --limit 20 --rationale "List bills for the user"
 
 # Paid bills are included by default; pass --no-include_paid to exclude them
-ramp bills search --query "UPS" --agent
+ramp bills search --query "UPS" --agent --rationale "Search bills for the user"
 
 # Paginate through results
-ramp bills search --query "Acme" --page_cursor "{cursor_from_previous_response}" --agent
+ramp bills search --query "Acme" --page_cursor "{cursor_from_previous_response}" --agent --rationale "Search bills for the user"
 ```
 
 If the response includes a `bill_url` field on each bill, present it alongside the bill summary.
@@ -50,10 +51,10 @@ Once you have a bill ID, pull comprehensive details:
 
 ```bash
 # Full bill details (submitted bills only)
-ramp bills get --bill_id "{bill_id}" --agent
+ramp bills get --bill_id "{bill_id}" --agent --rationale "Review bill details"
 
 # Draft bill details (not yet submitted)
-ramp bills draft --bill_id "{bill_id}" --agent
+ramp bills draft --bill_id "{bill_id}" --agent --rationale "Draft the bill"
 ```
 
 The `get` response includes: amount, currency, vendor info, approval status, payment status, due date, invoice number, line items, accounting field codings, and more. Use this as your primary tool for investigating a bill — it covers status, amount breakdowns, and metadata in a single call.
@@ -64,17 +65,17 @@ If the response includes a `bill_url` field, it is a direct link to the bill in 
 
 ```bash
 # Get invoice file attachments
-ramp bills attachments --bill_id "{bill_id}" --agent
+ramp bills attachments --bill_id "{bill_id}" --agent --rationale "Fetch bill attachments"
 ```
 
 ### Step 4: Pending approvals
 
 ```bash
 # Bills waiting for the current user's approval
-ramp bills pending --agent --limit 20
+ramp bills pending --agent --limit 20 --rationale "Review bills pending approval"
 
 # Paginate through pending bills
-ramp bills pending --page_cursor "{cursor}" --agent
+ramp bills pending --page_cursor "{cursor}" --agent --rationale "Review bills pending approval"
 ```
 
 ## How to Present Results
@@ -172,7 +173,7 @@ Common handoff scenarios:
 User: What bills do we have from Acme?
 
 Agent: Let me search for Acme bills.
-> ramp bills search --query "Acme" --agent
+> ramp bills search --query "Acme" --agent --rationale "Search bills for the user"
 
 Found 2 bills from Acme Corp:
   $3,500.00  INV-2024-001  Approved   Due 2026-04-15  → <bill_url>

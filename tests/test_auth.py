@@ -8,6 +8,7 @@ from contextlib import nullcontext
 from urllib.parse import parse_qs, urlparse
 
 import click
+import httpx
 import pytest
 from click.testing import CliRunner
 
@@ -25,6 +26,11 @@ from ramp_cli.commands import auth as auth_command_module
 from ramp_cli.errors import RefreshFailedError
 from ramp_cli.main import BoxHelpFormatter, cli, main
 from ramp_cli.onboarding import record_first_login
+
+
+def _clear_agent_client_env(monkeypatch):
+    for key in ("CLAUDECODE", "OPENCODE", "CODEX_SANDBOX", "RAMP_CLIENT_NAME"):
+        monkeypatch.delenv(key, raising=False)
 
 
 def test_pkce_verifier_length():
@@ -56,6 +62,88 @@ def test_auth_url_uses_explicit_authorization_level():
     )
 
     assert parse_qs(urlparse(url).query)["auth_level"] == ["business"]
+
+
+def test_auth_url_includes_allowlisted_agent_client_hint(monkeypatch):
+    _clear_agent_client_env(monkeypatch)
+    monkeypatch.setenv("CLAUDECODE", "1")
+
+    url = oauth_module._build_auth_url(
+        "sandbox",
+        "http://localhost:19817/callback",
+        "state",
+        "challenge",
+        "applications:read",
+        auth_level="business",
+    )
+    query = parse_qs(urlparse(url).query)
+
+    assert query["agent_client_hint"] == ["claude_code"]
+    assert query["client_id"] == [oauth_module.client_id("sandbox")]
+    assert query["redirect_uri"] == ["http://localhost:19817/callback"]
+    assert query["scope"] == ["applications:read"]
+
+
+def test_auth_url_includes_codex_agent_client_hint(monkeypatch):
+    _clear_agent_client_env(monkeypatch)
+    monkeypatch.setenv("CODEX_SANDBOX", "1")
+
+    url = oauth_module._build_auth_url(
+        "sandbox",
+        "http://localhost:19817/callback",
+        "state",
+        "challenge",
+        "applications:read",
+    )
+
+    assert parse_qs(urlparse(url).query)["agent_client_hint"] == ["codex"]
+
+
+def test_auth_url_codex_hint_wins_when_opencode_is_also_present(monkeypatch):
+    _clear_agent_client_env(monkeypatch)
+    monkeypatch.setenv("OPENCODE", "1")
+    monkeypatch.setenv("CODEX_SANDBOX", "1")
+
+    url = oauth_module._build_auth_url(
+        "sandbox",
+        "http://localhost:19817/callback",
+        "state",
+        "challenge",
+        "applications:read",
+    )
+
+    assert parse_qs(urlparse(url).query)["agent_client_hint"] == ["codex"]
+
+
+def test_auth_url_includes_opencode_agent_client_hint(monkeypatch):
+    _clear_agent_client_env(monkeypatch)
+    monkeypatch.setenv("OPENCODE", "1")
+
+    url = oauth_module._build_auth_url(
+        "sandbox",
+        "http://localhost:19817/callback",
+        "state",
+        "challenge",
+        "applications:read",
+    )
+
+    assert parse_qs(urlparse(url).query)["agent_client_hint"] == ["opencode"]
+
+
+def test_auth_url_omits_unknown_or_untrusted_agent_client_hint(monkeypatch):
+    _clear_agent_client_env(monkeypatch)
+    monkeypatch.setenv("RAMP_CLIENT_NAME", "claude_code")
+    monkeypatch.setenv("CODEX_REVIEW", "1")
+
+    url = oauth_module._build_auth_url(
+        "sandbox",
+        "http://localhost:19817/callback",
+        "state",
+        "challenge",
+        "applications:read",
+    )
+
+    assert "agent_client_hint" not in parse_qs(urlparse(url).query)
 
 
 def test_token_save_and_load(isolated_config):
@@ -641,9 +729,11 @@ class TestResolveScopes:
             lambda: "",
         )
 
-        scopes = oauth_module._resolve_scopes("production")
+        scopes = oauth_module._resolve_scopes("production").split()
         # Bundled spec has standard scopes
         assert "business:read" in scopes
+        assert "incorporation:read" in scopes
+        assert "incorporation:write" in scopes
 
     def test_explicit_login_scopes_override_discovery(self, monkeypatch):
         monkeypatch.setattr(
@@ -920,7 +1010,7 @@ class TestEnvironmentAuthPreflight:
 
 
 class TestOAuthLoginFailures:
-    """The two failure-paths in oauth.login() raise click.ClickException so
+    """OAuth login failures raise click.ClickException so
     main() renders them as `Error: <message>` instead of leaking
     `Error: RuntimeError: internal error`."""
 
@@ -944,3 +1034,48 @@ class TestOAuthLoginFailures:
         with pytest.raises(click.ClickException) as exc_info:
             oauth_module.login("sandbox", oauth_module.LoginOptions(no_browser=True))
         assert "timed out" in str(exc_info.value).lower()
+
+    def test_token_exchange_failure_renders_clean_error(
+        self, isolated_config, monkeypatch
+    ):
+        monkeypatch.setattr(auth_command_module, "fetch_spec", lambda env: None)
+
+        def fake_login(env: str, opts: oauth_module.LoginOptions) -> TokenResponse:
+            raise OAuthTokenError(
+                "token_request_failed",
+                "The provided authorization grant or refresh token is invalid.",
+            )
+
+        monkeypatch.setattr(auth_command_module, "do_login", fake_login)
+
+        result = CliRunner().invoke(
+            cli,
+            ["--human", "--env", "sandbox", "auth", "login"],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 1
+        assert "token_request_failed" in result.output
+        assert "authorization grant or refresh token is invalid" in result.output
+        assert "internal error" not in result.output
+
+    def test_token_transport_failure_renders_clean_error(
+        self, isolated_config, monkeypatch
+    ):
+        monkeypatch.setattr(auth_command_module, "fetch_spec", lambda env: None)
+
+        def fake_login(env: str, opts: oauth_module.LoginOptions) -> TokenResponse:
+            raise httpx.ConnectError("connection failed")
+
+        monkeypatch.setattr(auth_command_module, "do_login", fake_login)
+
+        result = CliRunner().invoke(
+            cli,
+            ["--human", "--env", "sandbox", "auth", "login"],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 1
+        assert "Token request failed" in result.output
+        assert "connection failed" in result.output
+        assert "internal error" not in result.output

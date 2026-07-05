@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import sys
 
 import click
 import httpx
+import pytest
 from click.testing import CliRunner
 
 from ramp_cli.auth import store
@@ -14,9 +16,11 @@ from ramp_cli.commands.applications import (
     APPLICATION_CREATED_MESSAGE,
     APPLICATION_EXAMPLE,
     _merge_all_of,
+    _render_handoff_result,
 )
 from ramp_cli.config.constants import application_signup_token, base_url
-from ramp_cli.main import cli
+from ramp_cli.main import cli, main
+from ramp_cli.version_check import _write_cache, emit_update_notice
 
 # ── Fake OpenAPI spec for schema unit tests ──
 
@@ -254,6 +258,42 @@ def test_applications_create__uses_dev_console_token(monkeypatch):
 
     assert result.exit_code == 0
     assert captured_token["access_token"] == application_signup_token("sandbox")
+
+
+def test_applications_create__access_token_env_overrides_dev_console_token(monkeypatch):
+
+    captured_token: dict[str, object] = {}
+
+    original_init = __import__(
+        "ramp_cli.client.api", fromlist=["RampClient"]
+    ).RampClient.__init__
+
+    def spy_init(self, env, access_token=None):
+        captured_token["access_token"] = access_token
+        original_init(self, env, access_token=access_token)
+
+    monkeypatch.setenv("RAMP_ACCESS_TOKEN", "dev-deploy-token")
+    monkeypatch.setattr("ramp_cli.client.api.RampClient.__init__", spy_init)
+    monkeypatch.setattr(
+        "ramp_cli.client.api.RampClient.post",
+        lambda self, path, json_body: b'{"ok":true}',
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "--env",
+            "sandbox",
+            "applications",
+            "create",
+            "--json",
+            '{"applicant":{"email":"test@example.com"}}',
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured_token["access_token"] == "dev-deploy-token"
 
 
 def test_applications_create__dry_run_prints_request_without_sending(monkeypatch):
@@ -515,8 +555,144 @@ def test_applications_create__wait_for_auth_timeout_returns_fallback(
     assert data["fallback_command"] == (
         "ramp --env sandbox auth login --auth-level business "
         "--scope applications:read --scope applications:write "
-        "--scope bank_accounts:read"
+        "--scope bank_accounts:read "
+        "--scope incorporation:read --scope incorporation:write"
     )
+
+
+def test_applications_create__wait_for_auth_interrupt_returns_invite_link(
+    monkeypatch,
+):
+    class InterruptedCallback(_FakePkceCallback):
+        def wait_for_code(self, timeout: int, *, timeout_message: str) -> str:
+            raise KeyboardInterrupt
+
+    callback = InterruptedCallback()
+
+    monkeypatch.setattr(
+        "ramp_cli.client.api.RampClient.post",
+        lambda self, path, json_body: json.dumps(
+            {"invite_link": "https://app.ramp.com/invite/test-token"}
+        ).encode(),
+    )
+    monkeypatch.setattr(
+        "ramp_cli.commands.applications.start_pkce_callback", lambda: callback
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--agent",
+            "--env",
+            "sandbox",
+            "applications",
+            "create",
+            "--json",
+            '{"applicant":{"email":"jane@example.com"}}',
+            "--wait_for_auth",
+        ],
+    )
+
+    emit_update_notice(agent_mode=True)
+
+    assert result.exit_code == 130
+    assert callback.shutdown_called is True
+    payload = json.loads(result.output)
+    data = payload["data"][0]
+    assert data["authenticated"] is False
+    assert data["interrupted"] is True
+    assert data["auth_error"] == "Interrupted by user"
+    assert data["invite_link"] == "https://app.ramp.com/invite/test-token"
+    assert data["fallback_command"].startswith("ramp --env sandbox auth login")
+
+
+def test_applications_create__main_interrupt_exits_130_with_invite_link(
+    monkeypatch, capsys
+):
+    class InterruptedCallback(_FakePkceCallback):
+        def wait_for_code(self, timeout: int, *, timeout_message: str) -> str:
+            raise KeyboardInterrupt
+
+    callback = InterruptedCallback()
+
+    monkeypatch.setattr("ramp_cli.main.check_for_update", lambda: None)
+    _write_cache("999.0.0")
+    monkeypatch.setattr(
+        "ramp_cli.client.api.RampClient.post",
+        lambda self, path, json_body: json.dumps(
+            {"invite_link": "https://app.ramp.com/invite/test-token"}
+        ).encode(),
+    )
+    monkeypatch.setattr(
+        "ramp_cli.commands.applications.start_pkce_callback", lambda: callback
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "ramp",
+            "--agent",
+            "--env",
+            "sandbox",
+            "applications",
+            "create",
+            "--json",
+            '{"applicant":{"email":"jane@example.com"}}',
+            "--wait_for_auth",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    data = payload["data"][0]
+    assert exc_info.value.code == 130
+    assert callback.shutdown_called is True
+    assert "update_available" not in payload
+    assert captured.err == ""
+    assert data["interrupted"] is True
+    assert data["invite_link"] == "https://app.ramp.com/invite/test-token"
+
+
+def test_applications_create__interrupted_handoff_falls_back_to_stderr_on_broken_pipe(
+    monkeypatch, capsys
+):
+    redirected_stdout = False
+
+    def raise_broken_pipe(*args, **kwargs):
+        raise BrokenPipeError
+
+    def redirect_stdout_to_devnull():
+        nonlocal redirected_stdout
+        redirected_stdout = True
+
+    monkeypatch.setattr(
+        "ramp_cli.commands.applications.print_agent_json", raise_broken_pipe
+    )
+    monkeypatch.setattr(
+        "ramp_cli.commands.applications._redirect_stdout_to_devnull",
+        redirect_stdout_to_devnull,
+    )
+
+    _render_handoff_result(
+        "sandbox",
+        False,
+        "Interrupted by user",
+        "json",
+        "table",
+        invite_link="https://app.ramp.com/invite/test-token",
+        interrupted=True,
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    payload = json.loads(captured.err)
+    data = payload["data"][0]
+    assert data["interrupted"] is True
+    assert data["invite_link"] == "https://app.ramp.com/invite/test-token"
+    assert redirected_stdout is True
 
 
 def test_applications_create__wait_for_auth_exchange_error_returns_fallback(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from typing import Any
 
@@ -22,6 +23,7 @@ from ramp_cli.client.api import RampClient
 from ramp_cli.config.constants import api_url, application_signup_token
 from ramp_cli.output.formatter import print_agent_json, print_json, resolve_format
 from ramp_cli.tools.commands import GeneratedToolGroup
+from ramp_cli.version_check import suppress_next_update_notice
 
 _DEVELOPER_API_SPEC_URL = "https://docs.ramp.com/openapi/developer-api.json"
 
@@ -36,6 +38,14 @@ _APPLICATION_AUTH_FALLBACK_SCOPES = (
     "applications:read",
     "applications:write",
     "bank_accounts:read",
+    "incorporation:read",
+    "incorporation:write",
+)
+_APPLICATION_INVITE_LINK_KEYS = (
+    "invite_link",
+    "invite_url",
+    "application_url",
+    "signup_url",
 )
 
 APPLICATION_EXAMPLE: dict[str, Any] = {
@@ -59,7 +69,8 @@ APPLICATION_EXAMPLE: dict[str, Any] = {
             "first_name": "John",
             "last_name": "Smith",
             "phone": "+14155550125",
-            "ssn_last_4": "5678",
+            "ownership_percentage": 40,
+            "ssn_last_4": None,
             "title": "Co-Founder",
         }
     ],
@@ -97,8 +108,9 @@ APPLICATION_EXAMPLE: dict[str, Any] = {
         "first_name": "Jane",
         "is_beneficial_owner": True,
         "last_name": "Doe",
+        "ownership_percentage": 60,
         "phone": "+14155550124",
-        "ssn_last_4": "1234",
+        "ssn_last_4": None,
         "title": "Owner",
     },
     "financial_details": {
@@ -148,18 +160,47 @@ def _manual_auth_fallback_command(env: str) -> str:
     return f"ramp --env {env} auth login --auth-level business {scope_flags}"
 
 
+def _agent_handoff_envelope(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": "1.0",
+        "data": [payload],
+        "pagination": {"has_more": False, "next": None},
+    }
+
+
+def _write_agent_handoff_result(payload: dict[str, Any], stream: Any) -> None:
+    json.dump(_agent_handoff_envelope(payload), stream, indent=2, default=str)
+    stream.write("\n")
+    stream.flush()
+
+
+def _redirect_stdout_to_devnull() -> None:
+    try:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _render_handoff_result(
     env: str,
     authenticated: bool,
     auth_error: str | None,
     format_flag: str | None,
     config_format: str,
+    *,
+    invite_link: str | None = None,
+    interrupted: bool = False,
 ) -> None:
     fmt = resolve_format(format_flag, config_format)
     fallback_command = None if authenticated else _manual_auth_fallback_command(env)
     message = APPLICATION_CREATED_MESSAGE
     if authenticated:
         message += " Ramp credentials were saved for this environment."
+    elif interrupted:
+        message += " CLI authentication was interrupted."
+        if invite_link:
+            message += " Use the invite link to continue the application."
+        message += " Use the fallback command if credentials are still needed."
     else:
         message += " CLI authentication was not completed; use the fallback command."
 
@@ -169,22 +210,71 @@ def _render_handoff_result(
         "authenticated": authenticated,
         "fallback_command": fallback_command,
     }
+    if invite_link:
+        payload["invite_link"] = invite_link
+    if interrupted:
+        payload["interrupted"] = True
     if auth_error:
         payload["auth_error"] = auth_error
 
     if fmt == "json":
-        print_agent_json(payload, pagination={"has_more": False, "next": None})
+        try:
+            print_agent_json(payload, pagination={"has_more": False, "next": None})
+        except BrokenPipeError:
+            if not interrupted:
+                raise
+            _write_agent_handoff_result(payload, sys.stderr)
+            _redirect_stdout_to_devnull()
         return
 
-    click.echo(APPLICATION_CREATED_MESSAGE)
+    err = interrupted
+    click.echo(APPLICATION_CREATED_MESSAGE, err=err)
+    if invite_link:
+        click.echo(f"Invite link: {invite_link}", err=err)
     if authenticated:
-        click.echo("Ramp credentials were saved for this environment.")
+        click.echo("Ramp credentials were saved for this environment.", err=err)
         return
 
     if auth_error:
         click.echo(f"CLI authentication was not completed: {auth_error}", err=True)
     click.echo("Manual scoped auth fallback:", err=True)
     click.echo(f"  {fallback_command}", err=True)
+
+
+def _application_create_response_payload(response: bytes) -> dict[str, Any] | None:
+    if not response.strip():
+        return None
+
+    try:
+        payload = json.loads(response)
+    except json.JSONDecodeError:
+        return None
+
+    return payload if isinstance(payload, dict) else None
+
+
+def _extract_application_invite_link(response: bytes) -> str | None:
+    payload = _application_create_response_payload(response)
+    if not payload:
+        return None
+
+    for key in _APPLICATION_INVITE_LINK_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+
+    nested = payload.get("data")
+    if isinstance(nested, dict):
+        for key in _APPLICATION_INVITE_LINK_KEYS:
+            value = nested.get(key)
+            if isinstance(value, str) and value:
+                return value
+
+    return None
+
+
+def _application_create_access_token(env: str) -> str:
+    return os.environ.get("RAMP_ACCESS_TOKEN") or application_signup_token(env)
 
 
 def _render_dry_run(
@@ -325,6 +415,7 @@ def create_application(
     env = ctx.obj["env"]
     body = _parse_json_body(json_body)
     callback = None
+    invite_link = None
 
     if dry_run and wait_for_auth:
         raise click.UsageError("--wait_for_auth cannot be used with --dry_run")
@@ -338,8 +429,9 @@ def create_application(
             _render_dry_run(env, body, ctx.obj["format"], ctx.obj["config_format"])
             return
 
-        client = RampClient(env, access_token=application_signup_token(env))
-        client.post(_APPLICATIONS_API_PATH, json.dumps(body).encode())
+        client = RampClient(env, access_token=_application_create_access_token(env))
+        response = client.post(_APPLICATIONS_API_PATH, json.dumps(body).encode())
+        invite_link = _extract_application_invite_link(response)
         if not callback:
             _render_success_message(ctx.obj["format"], ctx.obj["config_format"])
             return
@@ -360,6 +452,24 @@ def create_application(
             token_resp = exchange_pkce_callback_code(env, callback, code)
             _save_token_response(env, token_resp)
             authenticated = True
+        except KeyboardInterrupt:
+            suppress_next_update_notice()
+            _render_handoff_result(
+                env,
+                False,
+                "Interrupted by user",
+                ctx.obj["format"],
+                ctx.obj["config_format"],
+                invite_link=invite_link,
+                interrupted=True,
+            )
+            if callback:
+                try:
+                    callback.shutdown()
+                except KeyboardInterrupt:
+                    pass
+                callback = None
+            sys.exit(130)
         except (click.ClickException, OAuthTokenError, httpx.HTTPError, OSError) as exc:
             auth_error = str(exc)
 
@@ -369,6 +479,7 @@ def create_application(
             auth_error,
             ctx.obj["format"],
             ctx.obj["config_format"],
+            invite_link=invite_link,
         )
     finally:
         if callback:

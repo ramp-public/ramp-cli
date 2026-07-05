@@ -39,6 +39,7 @@ from ramp_cli.specs.sync import maybe_sync
 from ramp_cli.tools.commands import build_tool_command, resolve_tool_command_names
 from ramp_cli.tools.registry import (
     CATEGORY_ALIAS_GROUPS,
+    CATEGORY_LEGACY_GROUPS,
     CATEGORY_REMAP,
     get_tool,
     list_categories,
@@ -80,8 +81,9 @@ class Resource(StrEnum):
 
 _RESOURCE_HELP: dict[str, str] = {
     "accounting": "Manage tracking categories and GL codes for expense classification",
+    "ai-spend": "Inspect AI token spend, provider connections, and reporting filters",
     "bills": "Review, approve, and manage vendor bills and invoices",
-    "cards": "List your cards, activate a card, and lock or unlock a card",
+    "cards": "Activate a card, and lock or unlock a card",
     "funds": "Manage funds (budgets/cards), activate cards, and make agent card payments",
     "general": "Post comments, explain declines, answer policy questions, and search help center",
     "purchase_orders": "Search and view purchase order details",
@@ -91,12 +93,15 @@ _RESOURCE_HELP: dict[str, str] = {
     "tasks": "Review tasks and items requiring your attention",
     "transactions": "Search, review, and manage card transaction data and metadata",
     "travel": "Search and book flights, hotels, and manage trip itineraries",
-    "treasury": "Query treasury account balances, transfers, and investment positions",
+    "treasury": "Query treasury accounts and request funds",
     "users": "Look up user details, org charts, and search the company directory",
     "vendors": "Upload and manage vendor documents and track bulk upload progress",
 }
 
-_SINGLE_TOOL_RESOURCE_CATEGORIES = frozenset({"tasks"})
+_SINGLE_TOOL_RESOURCE_CATEGORIES = frozenset({"tasks", "treasury"})
+_LEGACY_TOOL_ALIASES: dict[tuple[str, str], tuple[str, ...]] = {
+    ("travel", "search-flights"): ("search",),
+}
 
 VALID_FORMATS = frozenset({m.value for m in OutputMode})
 
@@ -259,6 +264,8 @@ class ToolGroup(click.Group):
             visible_names.add(cmd_name)
             if tool.alias and cmd_name != tool.name:
                 legacy_candidates[tool.name] = tool
+            for legacy_name in _LEGACY_TOOL_ALIASES.get((name, tool.name), ()):
+                legacy_candidates[legacy_name] = tool
 
         group._legacy_tools = {  # type: ignore[attr-defined]
             tool_name: tool
@@ -312,6 +319,13 @@ class RampGroup(click.Group):
                 cmd_name, tools, _RESOURCE_HELP.get(cmd_name, fallback)
             )
 
+        if legacy_tools := self._legacy_category_tools(ctx, cmd_name):
+            aliases = ", ".join(sorted(t.alias or t.name for t in legacy_tools))
+            fallback = f"{cmd_name.replace('_', ' ').title()} - {aliases}"
+            return ToolGroup.build(
+                cmd_name, legacy_tools, _RESOURCE_HELP.get(cmd_name, fallback)
+            )
+
         if tool_def := get_tool(cmd_name, env=self._resolve_env(ctx)):
             # Developer API operation IDs are internal implementation details.
             # Legacy agent-tool endpoint names remain available at the root.
@@ -360,6 +374,16 @@ class RampGroup(click.Group):
             ctx._ramp_synced = True  # type: ignore[attr-defined]
         return self._split_category_map(list_categories(env))
 
+    def _legacy_category_tools(self, ctx: click.Context, cmd_name: str) -> list:
+        if cmd_name not in CATEGORY_LEGACY_GROUPS:
+            return []
+
+        env = self._resolve_env(ctx)
+        if not getattr(ctx, "_ramp_synced", False):
+            maybe_sync(env)
+            ctx._ramp_synced = True  # type: ignore[attr-defined]
+        return list_categories(env).get(cmd_name, [])
+
     @staticmethod
     def _split_category_map(cats: dict[str, list]) -> tuple[dict[str, list], list]:
         merged: dict[str, list] = {}
@@ -369,7 +393,11 @@ class RampGroup(click.Group):
         multi: dict[str, list] = {}
         singletons: list = []
         for cat, tools in merged.items():
-            if len(tools) > 1 or cat in _SINGLE_TOOL_RESOURCE_CATEGORIES:
+            if (
+                len(tools) > 1
+                or cat in _SINGLE_TOOL_RESOURCE_CATEGORIES
+                or cat in _RESOURCE_HELP
+            ):
                 multi[cat] = tools
             else:
                 singletons.extend(tools)
@@ -380,10 +408,8 @@ class RampGroup(click.Group):
         # ``ramp cards <alias>`` and the original ``ramp funds <name>``.
         #
         # These groups always stay grouped — even when scope filtering leaves
-        # only a single visible tool (e.g. a read-only ``limits:read`` token
-        # sees ``list-cards`` but not the ``cards:write`` activate/lock tools).
-        # This keeps ``ramp cards list`` invokable instead of folding the lone
-        # tool into ``general``.
+        # only a single visible tool. This keeps alias resource commands
+        # invokable instead of folding the lone tool into ``general``.
         for cat in CATEGORY_ALIAS_GROUPS:
             alias_tools = cats.get(cat)
             if alias_tools:
@@ -406,6 +432,8 @@ class RampGroup(click.Group):
         resource_tools = self._split_category_map(all_categories)[0].get(
             resource_name, []
         )
+        if not resource_tools and resource_name in CATEGORY_LEGACY_GROUPS:
+            resource_tools = all_categories.get(resource_name, [])
         if not resource_tools:
             return []
 

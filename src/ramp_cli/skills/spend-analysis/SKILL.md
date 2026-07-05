@@ -12,6 +12,7 @@ description: |-
 
 ## Non-Negotiables
 
+- **Pass `--rationale` on every command** — it is a required field on these agent-tools (a non-empty string, max 1024 chars). With `--json`, supply it as a `"rationale"` key in the body. Omitting it returns `HTTP 422 (DEVELOPER_INVALID_SCHEMA)`, in both agent and human modes.
 - Always query both **transactions** and **bills** for complete vendor spend. Card charges and bill payments are separate resources — there is no unified spend endpoint.
 - Pass `--agent` for machine-readable JSON output on all commands.
 - Handle amount format differences: transactions use strings (`"$1,048.25"`, `"-$259.49"`), bills use numbers (`15000`), PO amounts use numbers. Reimbursement amounts are in dollars.
@@ -33,7 +34,7 @@ ramp transactions list \
   --to_date <YYYY-MM-DD> \
   --include_count \
   --page_size 200 \
-  --agent
+  --agent --rationale "List the user's transactions"
 ```
 
 If `next_page_cursor` is not null, paginate:
@@ -46,7 +47,7 @@ ramp transactions list \
   --to_date <YYYY-MM-DD> \
   --page_size 200 \
   --next_page_cursor "<cursor>" \
-  --agent
+  --agent --rationale "List the user's transactions"
 ```
 
 **For broad analysis (all vendors):** Omit `--reason_memo_merchant_or_user_name_text_search` to pull all transactions, then group client-side.
@@ -56,13 +57,13 @@ ramp transactions list \
 For a specific vendor:
 
 ```bash
-ramp bills search --query "<vendor>" --include_paid --limit 50 --agent
+ramp bills search --query "<vendor>" --include_paid --limit 50 --agent --rationale "Search bills for the user"
 ```
 
 For broad analysis (all vendors):
 
 ```bash
-ramp bills list --include_paid --limit 50 --agent
+ramp bills list --include_paid --limit 50 --agent --rationale "List bills for the user"
 ```
 
 Repeat either with `--page_cursor` if `next_page_cursor` is not null.
@@ -93,6 +94,7 @@ Fetch all pages first, then aggregate. The loop continues until `next_page_curso
 ramp transactions list \
   --transactions_to_retrieve all_transactions_across_entire_business \
   --from_date 2026-01-01 --page_size 200 --include_count --agent \
+  --rationale "List the user's transactions" \
   > /tmp/txns_page1.json
 
 # Page 2+ (repeat until next_page_cursor is null)
@@ -100,6 +102,7 @@ ramp transactions list \
   --transactions_to_retrieve all_transactions_across_entire_business \
   --from_date 2026-01-01 --page_size 200 --include_count --agent \
   --next_page_cursor "<cursor from previous page>" \
+  --rationale "List the user's transactions" \
   > /tmp/txns_page2.json
 ```
 
@@ -176,13 +179,13 @@ For SaaS reviews or inference spend monitoring, run vendors in parallel:
 ```bash
 # Run these concurrently
 ramp transactions list --transactions_to_retrieve all_transactions_across_entire_business \
-  --reason_memo_merchant_or_user_name_text_search "Figma" --from_date 2026-01-01 --include_count --agent
+  --reason_memo_merchant_or_user_name_text_search "Figma" --from_date 2026-01-01 --include_count --agent --rationale "List the user's transactions"
 
 ramp transactions list --transactions_to_retrieve all_transactions_across_entire_business \
-  --reason_memo_merchant_or_user_name_text_search "Anthropic" --from_date 2026-01-01 --include_count --agent
+  --reason_memo_merchant_or_user_name_text_search "Anthropic" --from_date 2026-01-01 --include_count --agent --rationale "List the user's transactions"
 
 ramp transactions list --transactions_to_retrieve all_transactions_across_entire_business \
-  --reason_memo_merchant_or_user_name_text_search "OpenAI" --from_date 2026-01-01 --include_count --agent
+  --reason_memo_merchant_or_user_name_text_search "OpenAI" --from_date 2026-01-01 --include_count --agent --rationale "List the user's transactions"
 ```
 
 **Tip:** For vendors with known name variants, run multiple searches and deduplicate by `transaction_uuid`:
@@ -209,8 +212,8 @@ User: How much have we spent on Figma this year?
 Agent: Let me pull both card transactions and bills.
 > ramp transactions list --transactions_to_retrieve all_transactions_across_entire_business \
 >   --reason_memo_merchant_or_user_name_text_search "Figma" \
->   --from_date 2026-01-01 --include_count --agent
-> ramp bills search --query "Figma" --include_paid --limit 50 --agent
+>   --from_date 2026-01-01 --include_count --agent --rationale "List the user's transactions"
+> ramp bills search --query "Figma" --include_paid --limit 50 --agent --rationale "Search bills for the user"
 
 Figma spend YTD (2026-01-01 to today):
 
@@ -230,7 +233,7 @@ User: Give me a full SaaS vendor breakdown
 
 Agent: Pulling all transactions and grouping by merchant...
 > ramp transactions list --transactions_to_retrieve all_transactions_across_entire_business \
->   --from_date 2026-01-01 --page_size 200 --include_count --agent
+>   --from_date 2026-01-01 --page_size 200 --include_count --agent --rationale "List the user's transactions"
 
 SaaS Vendor Spend YTD:
 
