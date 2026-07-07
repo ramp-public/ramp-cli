@@ -367,15 +367,15 @@ class TestSkillsBundled:
         assert "--wait_for_action REVIEW_AND_SUBMIT" in content
         assert "--wait_for_action COMPLETE_INCORPORATION" in content
 
-    def test_incorporate_with_ramp_uses_lean_submit_payload(self):
-        """Formation submit should reuse FA owner/controller data."""
+    def test_incorporate_with_ramp_selects_formation_payload_from_ownership(self):
+        """Formation submit should use members only for the no-owner fallback."""
         content = (SKILLS_DIR / "incorporate-with-ramp" / "SKILL.md").read_text()
         workflow_section = self._extract_section(content, "Workflow")
         normalized = " ".join(content.split())
         normalized_workflow = " ".join(workflow_section.split())
 
         assert "reuses owner, controller, and identity data" in content
-        assert "do not ask for `members`, `responsible_party`" in content
+        assert "Do not ask for `responsible_party`" in content
         assert "`RAMP_INCORPORATION_*_SSN_LAST_4`" in content
         assert "Use the lean formation payload" in workflow_section
         assert (
@@ -383,14 +383,45 @@ class TestSkillsBundled:
             in normalized_workflow
         )
         assert '"addresses"' in workflow_section
-        assert '"members":' not in workflow_section
+        assert '"members":' in workflow_section
         assert '"responsible_party":' not in workflow_section
-        assert "Stale guidance asks for `members`, `responsible_party`" in content
-        assert "Lean submit returns a validation error" in content
+        assert "Stale guidance always asks for `members`" in content
         assert "pre_ein.access = LIMITED" in normalized
         assert "`RP_IDENTITY`" in workflow_section
         assert "do not re-collect or re-submit" in normalized_workflow
         assert "FA-sourced identity fields" in workflow_section
+        assert "`controlling_officer.is_beneficial_owner` is true" in workflow_section
+        assert "`beneficial_owners` is non-empty" in workflow_section
+        assert "The application read response does not expose that acknowledgement" in (
+            normalized_workflow
+        )
+        assert '"is_natural_person": false' in workflow_section
+        assert '"is_natural_person": true' not in workflow_section
+        assert "sum of `ownership_percent`" in normalized_workflow
+        assert "must equal exactly 100" in normalized_workflow
+        for field in (
+            "legal_first_name",
+            "legal_last_name",
+            "is_natural_person",
+            "address",
+            "ownership_percent",
+            "contact_full_name",
+            "nationality",
+            "ssn_last_4",
+        ):
+            assert f"`{field}`" in workflow_section
+
+    def test_apply_to_ramp_marks_valid_no_25_percent_owner_shape(self):
+        """No-owner applications must carry the explicit acknowledgement."""
+        content = (SKILLS_DIR / "apply-to-ramp" / "SKILL.md").read_text()
+        section = self._extract_section(content, "Owners And Control")
+
+        assert "`beneficial_owners: []`" in section
+        assert "`controlling_officer.is_beneficial_owner: false`" in section
+        assert (
+            "`ownership_acknowledgement: CONFIRM_NO_INDIVIDUAL_OWNS_25_PCT`" in section
+        )
+        assert "separately collect the LLC members" in " ".join(section.split())
 
     def test_incorporate_with_ramp_requires_same_context_applicant_preflight(self):
         """Formation submit must be preceded by same-context applicant create/get."""

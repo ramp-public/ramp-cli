@@ -88,10 +88,13 @@ Ramp application form returned by application progress, not in
 `ramp incorporation submit`, chat, CLI prompts, env vars, or `--json`.
 
 The current formation submit path reuses owner, controller, and identity data
-already collected on the Ramp financing application. When the application has
-that data, do not ask for `members`, `responsible_party`, or
+already collected on the Ramp financing application when it identifies at least
+one owner. Do not ask for `responsible_party` or
 `RAMP_INCORPORATION_*_SSN_LAST_4` environment variables and do not resend
-beneficial-owner or controlling-officer payloads during formation filing.
+beneficial-owner or controlling-officer payloads during formation filing. The
+only exception is the explicit member fallback for a valid no-25%-owner
+application described below; it sends non-sensitive `members` but still omits
+`ssn_last_4`.
 
 Before filing the LLC, complete every API-writable/non-sensitive application
 field first. When the only remaining applicant-owned actions are SSN entry and
@@ -180,10 +183,20 @@ Collect from the user:
 Do not ask the user to repeat owner, member, responsible-party, controller, or
 SSN facts that are already on the Ramp application. In the normal submitted-FA
 path, Core sources owner/controller data from the application and the formation
-payload only needs filing facts plus addresses. If a future API response
-explicitly rejects the lean payload as missing owner/controller data, stop and
-report the exact validation error instead of re-collecting SSN or resubmitting
-the financing-application owner payload.
+payload only needs filing facts plus addresses.
+
+Before choosing the formation payload, inspect the submitted application:
+
+- If `controlling_officer.is_beneficial_owner` is true or
+  `beneficial_owners` is non-empty, use the lean payload. Do not send `members`.
+- If the controlling officer is not a beneficial owner and `beneficial_owners`
+  is empty, collect and send the explicit `members` fallback in Step 6. Because
+  formation starts only after financing-application submission, Core has already
+  validated the required no-individual-owns-25% acknowledgement. The application
+  read response does not expose that acknowledgement, so do not branch on it.
+- For any other empty-owner shape, return to `apply-to-ramp` and complete or
+  correct the ownership section. Do not infer that no individual owns 25% or
+  discover the fallback by repeatedly submitting the lean payload.
 
 Do NOT collect SSN last-4 in the model context or CLI — SSN entry must happen in
 the Ramp form.
@@ -264,10 +277,11 @@ name unless it is explicitly needed for the user-facing confirmation.
 
 ### 6. Submit the formation
 
-Use the lean formation payload when the Ramp application already contains the
-owner, controller, and identity information. `members` and `responsible_party`
-are intentionally omitted; Core derives that data from the submitted financing
-application. Do not set `RAMP_INCORPORATION_*_SSN_LAST_4` env vars.
+Use the lean formation payload when the submitted Ramp application identifies
+one or more owners through the controlling officer or `beneficial_owners`.
+`members` and `responsible_party` are intentionally omitted; Core derives that
+data from the submitted financing application. Do not set
+`RAMP_INCORPORATION_*_SSN_LAST_4` env vars.
 
 ```bash
 ramp incorporation submit --json '{
@@ -293,6 +307,43 @@ ramp incorporation submit --json '{
     }
   ]
 }' --agent
+```
+
+For the valid no-25%-owner shape identified in Step 2, add a non-empty
+`members` list to that same payload. Collect these formation-specific member
+facts even though the individuals are not 25%+ beneficial owners:
+
+- `legal_first_name` and `legal_last_name`
+- `is_natural_person`
+- residential `address` (`line1`, optional `line2`, `city`, `state`,
+  `postal_code`, and `country`)
+- `ownership_percent`
+- `contact_full_name`
+- optional `nationality`
+
+Every member must include all required fields above, and the sum of
+`ownership_percent` across the list must equal exactly 100. Do not include the
+optional `ssn_last_4`; SSN remains browser-only and the CLI rejects SSN fields.
+Do not add `responsible_party` or copy the controlling officer into `members`
+unless the user confirms that person is actually an LLC member.
+
+```json
+"members": [
+  {
+    "legal_first_name": "<entity_legal_name_first_part>",
+    "legal_last_name": "<entity_legal_name_remainder>",
+    "is_natural_person": false,
+    "address": {
+      "line1": "<residential_street>",
+      "city": "<city>",
+      "state": "<state>",
+      "postal_code": "<zip>",
+      "country": "US"
+    },
+    "ownership_percent": 100,
+    "contact_full_name": "<contact_full_name>"
+  }
+]
 ```
 
 On success:
@@ -441,8 +492,8 @@ If `ramp incorporation status` returns `REJECTED` with `reason: NAME_CONFLICT`:
 | `ramp incorporation status` returns 404 `No incorporation formation exists` plus a generic auth-token hint | If `ramp auth status` confirms the current business-scoped OAuth session and `incorporation:read` / `incorporation:write`, treat this as the first-submission path and continue with applicant create/get. If auth is not clean, re-authenticate first. |
 | Applicant `get` returns a customer id but submit still says no applicant | Treat this as a backend link or wrong-business-auth issue, not a formation payload issue. Do not hardcode `customer_id` or `doolaCustomerId` into the public formation JSON; Core injects the provider id from `BusinessIncorporationLink.doola_customer_id`. Escalate with application id, business id, masked applicant email, provider customer id, CLI path/version, and `--env`. |
 | Multiple `ramp` binaries are installed | Use one explicit CLI path for every command in the applicant create/get + submit sequence; do not mix Homebrew and editable/uv-installed binaries. |
-| Stale guidance asks for `members`, `responsible_party`, or `RAMP_INCORPORATION_*_SSN_LAST_4` | Use the lean submit payload after submitted FA data is present; do not resend owner/controller data or collect SSN env vars |
-| Lean submit returns a validation error for owner/controller fields | Stop and report the exact API error, application status, `needs_incorporation`, and formation status; this is a product/API mismatch unless product confirms a fallback payload is required |
+| Stale guidance always asks for `members`, `responsible_party`, or `RAMP_INCORPORATION_*_SSN_LAST_4` | Use the lean submit payload when submitted FA data identifies an owner. Use `members` only for the confirmed no-25%-owner fallback; never send `responsible_party` or collect SSN env vars |
+| No-25%-owner application needs formation members | After FA submission, confirm the controller is not a beneficial owner and `beneficial_owners` is empty; send a non-empty `members` list whose ownership totals 100 instead of retrying the lean payload |
 | Formation company addresses | Send exactly two entries: `{"provider": "ramp", "address_type": "registered_agent"}` plus a `{"provider": "user", "address_type": "mailing", ...}` customer mailing address; Core maps them to the provider shape |
 | Country codes | Use `US` for mailing address country. Core defaults omitted country fields to `US` and rejects non-US values for now |
 | Formation takes days | Poll `ramp incorporation status` every few hours; do not re-submit while PENDING_REVIEW or SUBMITTED |

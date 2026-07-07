@@ -456,6 +456,15 @@ list the actual beneficial owners separately. Only send
 `ownership_acknowledgement` after the person explicitly confirms that all
 25%+ beneficial owners have been captured.
 
+When no individual owns 25% or more, require that explicit confirmation before
+writing an empty owner list. Set `beneficial_owners: []`,
+`controlling_officer.is_beneficial_owner: false`, and
+`ownership_acknowledgement: CONFIRM_NO_INDIVIDUAL_OWNS_25_PCT`. Do not use that
+acknowledgement merely because no owner was entered yet. This ownership shape is
+valid for the financing application, but `incorporate-with-ramp` will separately
+collect the LLC members required for formation after the application is
+submitted.
+
 If the applicant's business email domain does not match the business website
 domain, surface that mismatch plainly before writing it, and ask for a brief
 reason (for example, a personal email or a parent-company domain). Do not block
