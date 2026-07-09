@@ -28,9 +28,9 @@ from ramp_cli.tools.parser import parse_spec
 
 class TestSkillDiscovery:
     def test_skill_names_discovers_all(self):
-        """All 16 skills should be discovered from the skills/ directory."""
+        """All 17 skills should be discovered from the skills/ directory."""
         names = skill_names()
-        assert len(names) == 16
+        assert len(names) == 17
         assert "get-started" in names
         assert "agentic-purchase" in names
         assert "card-management" in names
@@ -47,6 +47,7 @@ class TestSkillDiscovery:
         assert "vendor-document-upload" in names
         assert "payment-lookup" in names
         assert "spend-analysis" in names
+        assert "submit-procurement-request" in names
 
     def test_readme_lists_all_skills(self):
         """The public skill index should mention every bundled skill."""
@@ -67,7 +68,7 @@ class TestSkillsList:
         assert result.exit_code == 0
 
         data = json.loads(result.output)
-        assert len(data["data"]) == 16
+        assert len(data["data"]) == 17
         names = {s["name"] for s in data["data"]}
         assert "get-started" in names
         assert "browser-automation" in names
@@ -78,12 +79,13 @@ class TestSkillsList:
         assert "manage-procurement" in names
         assert "manage-bills" in names
         assert "vendor-document-upload" in names
+        assert "submit-procurement-request" in names
 
     def test_list_skills_human(self):
         runner = CliRunner()
         result = runner.invoke(cli, ["--human", "skills", "list"])
         assert result.exit_code == 0
-        assert "16 Skills" in result.output
+        assert "17 Skills" in result.output
         assert "browser-automation" in result.output
         assert "manage-procurement" in result.output
         assert "manage-bills" in result.output
@@ -132,14 +134,14 @@ class TestSkillsInstall:
         assert "Browser Automation" in dest.read_text()
 
     def test_install_all(self, tmp_path):
-        """--all installs all 16 skills."""
+        """--all installs all 17 skills."""
         runner = CliRunner()
         result = runner.invoke(
             cli, ["skills", "install", "--all", "--target", str(tmp_path)]
         )
         assert result.exit_code == 0
         installed = [d.name for d in tmp_path.iterdir() if d.is_dir()]
-        assert len(installed) == 16
+        assert len(installed) == 17
 
     def test_install_overwrites(self, tmp_path):
         """Installing twice succeeds and returns 'updated' on second run."""
@@ -548,6 +550,19 @@ class TestSkillsBundled:
         co = example.get("controlling_officer", {})
         assert co.get("ssn_last_4") is None, (
             "agent-tool.json ApiApplicationResource example controlling_officer ssn_last_4 must be null"
+        )
+
+    def test_submit_procurement_distinguishes_visible_and_priority_fields(self):
+        content = get_skill_content("submit-procurement-request")
+
+        assert (
+            "`draft_state.fields` as the current visibility-based write allowlist"
+            in content
+        )
+        assert "`fields_to_answer` as the prioritized subset" in content
+        assert (
+            "already-answered visible fields may still be intentionally updated"
+            in content
         )
 
 

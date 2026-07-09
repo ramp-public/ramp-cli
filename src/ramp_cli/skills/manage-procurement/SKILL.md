@@ -1,17 +1,24 @@
 ---
 name: manage-procurement
 description: |-
-  Search, inspect, summarize, and safely review procurement requests and
+  Search, inspect, track, and safely approve submitted procurement requests and
   purchase orders. Use when: 'find a PO', 'show procurement request details',
-  'purchase order status', 'what procurement requests need approval', 'approve
-  this PO request'. Do NOT use for: bill payment, card transaction cleanup,
-  reimbursements, or vendor document upload.
+  'purchase order status', 'what procurement requests need approval', or
+  'approve this PO request'. Do NOT use to create, continue, edit, review before
+  submission, or submit a draft request (use submit-procurement-request), or for
+  a cross-product approval queue (use approval-dashboard).
 ---
 
 # Manage Procurement
 
 Use this skill for purchase order lookup, unified procurement request lookup,
-pending procurement approvals, and safe request approval or rejection.
+status tracking after submission, pending procurement approvals, and safe
+request approval or rejection.
+
+For a new or existing draft that the user wants to fill, review before
+submission, or submit, use `submit-procurement-request`. For an approval queue
+that spans requests, bills, reimbursements, or transactions, use
+`approval-dashboard`.
 
 Do not use it for bill approval/payment, card transaction cleanup,
 reimbursements, vendor document upload, accounting recoding, or contract edits.

@@ -83,9 +83,11 @@ _RESOURCE_HELP: dict[str, str] = {
     "accounting": "Manage tracking categories and GL codes for expense classification",
     "ai-spend": "Inspect AI token spend, provider connections, and reporting filters",
     "bills": "Review, approve, and manage vendor bills and invoices",
+    "business": "Look up business metadata such as departments",
     "cards": "Activate a card, and lock or unlock a card",
     "funds": "Manage funds (budgets/cards), activate cards, and make agent card payments",
     "general": "Post comments, explain declines, answer policy questions, and search help center",
+    "procurement_requests": "Create and submit procurement requests",
     "purchase_orders": "Search and view purchase order details",
     "receipts": "Upload and attach receipts to transactions and reimbursements",
     "reimbursements": "Submit, review, and manage out-of-pocket expense reimbursements",
@@ -98,7 +100,7 @@ _RESOURCE_HELP: dict[str, str] = {
     "vendors": "Upload and manage vendor documents and track bulk upload progress",
 }
 
-_SINGLE_TOOL_RESOURCE_CATEGORIES = frozenset({"tasks", "treasury"})
+_SINGLE_TOOL_RESOURCE_CATEGORIES = frozenset({"business", "tasks", "treasury"})
 _LEGACY_TOOL_ALIASES: dict[tuple[str, str], tuple[str, ...]] = {
     ("travel", "search-flights"): ("search",),
 }

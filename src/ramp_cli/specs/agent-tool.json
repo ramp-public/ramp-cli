@@ -496,6 +496,52 @@
         ]
       }
     },
+    "/developer/v1/agent-tools/departments": {
+      "post": {
+        "description": "Returns the departments available in the user's business, which can be\nused as inputs to workflows that require department references.",
+        "operationId": "post_agent_tool_api___list_departments",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ListDepartmentsRequestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListDepartmentsOutput"
+                }
+              }
+            },
+            "description": "Success"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "departments:read"
+            ]
+          }
+        ],
+        "summary": "List all departments in the company",
+        "tags": [
+          "Agent Tool",
+          "business"
+        ],
+        "x-alias": "departments",
+        "x-gated-by": "developer_api_procurement_request_agent_tools_enabled",
+        "x-platforms": [
+          "cli",
+          "mcp"
+        ]
+      }
+    },
     "/developer/v1/agent-tools/duplicate-reimbursement": {
       "post": {
         "operationId": "post_agent_tool_api___duplicate_reimbursement",
@@ -2909,7 +2955,7 @@
             ]
           }
         ],
-        "summary": "Retrieve the user's traveler profile information including name, email, phone, date of birth, gender, known traveler number (KTN/TSA), redress number, and loyalty programs",
+        "summary": "Retrieve traveler profile information, optionally targeting another traveler for delegated flight booking",
         "tags": [
           "Agent Tool",
           "travel"
@@ -3829,6 +3875,52 @@
         ]
       }
     },
+    "/developer/v1/agent-tools/merchant-categories": {
+      "post": {
+        "description": "Returns category IDs and names.",
+        "operationId": "post_agent_tool_api___list_sk_categories",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ListSkCategoriesRequestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListSkCategoriesResult"
+                }
+              }
+            },
+            "description": "Success"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "merchants:read"
+            ]
+          }
+        ],
+        "summary": "List all available spend categories",
+        "tags": [
+          "Agent Tool",
+          "merchant"
+        ],
+        "x-alias": "categories",
+        "x-gated-by": "developer_api_procurement_request_agent_tools_enabled",
+        "x-platforms": [
+          "cli",
+          "mcp"
+        ]
+      }
+    },
     "/developer/v1/agent-tools/pay-with-x402": {
       "post": {
         "description": "Fill the inputs from the merchant's 402 payment challenge. Returns the\npartially-signed Solana transaction to put in the x402 PaymentPayload that\nsettles the request.",
@@ -3914,6 +4006,289 @@
           "communication"
         ],
         "x-alias": "comment",
+        "x-platforms": [
+          "cli",
+          "mcp"
+        ]
+      }
+    },
+    "/developer/v1/agent-tools/procurement-draft": {
+      "delete": {
+        "operationId": "delete_agent_tool_api___delete_procurement_draft",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeleteProcurementDraftRequestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeletedProcurementDraft"
+                }
+              }
+            },
+            "description": "Success"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "spend_requests:write"
+            ]
+          }
+        ],
+        "summary": "Delete an abandoned procurement draft owned by the acting user",
+        "tags": [
+          "Agent Tool",
+          "procurement_requests"
+        ],
+        "x-alias": "delete",
+        "x-gated-by": "developer_api_procurement_request_agent_tools_enabled",
+        "x-platforms": [
+          "cli",
+          "mcp"
+        ]
+      },
+      "get": {
+        "operationId": "get_agent_tool_api___get_procurement_draft",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "rationale",
+            "required": true,
+            "schema": {
+              "description": "Briefly explain why you are calling this tool: what goal or workflow it serves and what you intend to do with the result.",
+              "maxLength": 1024,
+              "minLength": 1,
+              "title": "Rationale",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "spend_request_uuid",
+            "required": true,
+            "schema": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/UUIDStrRequestBody"
+                }
+              ],
+              "description": "Draft spend request UUID returned by draft_procurement_request."
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcurementDraftState"
+                }
+              }
+            },
+            "description": "Success"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "spend_requests:write"
+            ]
+          }
+        ],
+        "summary": "Refresh and canonically revalidate a procurement draft's visible form state",
+        "tags": [
+          "Agent Tool",
+          "procurement_requests"
+        ],
+        "x-alias": "get",
+        "x-gated-by": "developer_api_procurement_request_agent_tools_enabled",
+        "x-platforms": [
+          "cli",
+          "mcp"
+        ]
+      },
+      "post": {
+        "operationId": "post_agent_tool_api___draft_procurement_request",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DraftProcurementRequestRequestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcurementDraftState"
+                }
+              }
+            },
+            "description": "Success"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "spend_requests:write"
+            ]
+          }
+        ],
+        "summary": "Create or update a procurement draft and return the current visible form state",
+        "tags": [
+          "Agent Tool",
+          "procurement_requests"
+        ],
+        "x-alias": "draft",
+        "x-gated-by": "developer_api_procurement_request_agent_tools_enabled",
+        "x-platforms": [
+          "cli",
+          "mcp"
+        ]
+      }
+    },
+    "/developer/v1/agent-tools/procurement-spend-intents": {
+      "post": {
+        "operationId": "post_agent_tool_api___list_procurement_spend_intents",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ListProcurementSpendIntentsRequestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListProcurementSpendIntentsResult"
+                }
+              }
+            },
+            "description": "Success"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "spend_requests:read"
+            ]
+          }
+        ],
+        "summary": "List published procurement spend programs the agent can draft against",
+        "tags": [
+          "Agent Tool",
+          "procurement_requests"
+        ],
+        "x-alias": "spend-intents",
+        "x-gated-by": "developer_api_procurement_request_agent_tools_enabled",
+        "x-platforms": [
+          "cli",
+          "mcp"
+        ]
+      }
+    },
+    "/developer/v1/agent-tools/procurement-submit": {
+      "post": {
+        "operationId": "post_agent_tool_api___submit_procurement_request",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubmitProcurementRequestRequestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcurementSubmittedRequest"
+                }
+              }
+            },
+            "description": "Success"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "spend_requests:write"
+            ]
+          }
+        ],
+        "summary": "Submit a procurement draft after explicit user confirmation",
+        "tags": [
+          "Agent Tool",
+          "procurement_requests"
+        ],
+        "x-alias": "submit",
+        "x-gated-by": "developer_api_procurement_request_agent_tools_enabled",
+        "x-platforms": [
+          "cli",
+          "mcp"
+        ]
+      }
+    },
+    "/developer/v1/agent-tools/procurement-upload-file": {
+      "post": {
+        "operationId": "post_agent_tool_api___upload_procurement_file",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/ApiProcurementRequestUploadFileInputRequestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcurementUploadedFileResultJsonMode"
+                }
+              }
+            },
+            "description": "Uploaded procurement request file"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "spend_requests:write"
+            ]
+          }
+        ],
+        "summary": "Upload a file for a visible procurement request draft file field",
+        "tags": [
+          "Agent Tool",
+          "procurement_requests"
+        ],
+        "x-alias": "upload-file",
+        "x-gated-by": "developer_api_procurement_request_agent_tools_enabled",
         "x-platforms": [
           "cli",
           "mcp"
@@ -4277,6 +4652,52 @@
         ]
       }
     },
+    "/developer/v1/agent-tools/search-merchants": {
+      "post": {
+        "description": "Returns matching merchant IDs, UUIDs, names, categories, and domains.",
+        "operationId": "post_agent_tool_api___search_merchants",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchMerchantsRequestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchMerchantsResult"
+                }
+              }
+            },
+            "description": "Success"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "merchants:read"
+            ]
+          }
+        ],
+        "summary": "Search for merchants by name",
+        "tags": [
+          "Agent Tool",
+          "merchant"
+        ],
+        "x-alias": "search",
+        "x-gated-by": "developer_api_procurement_request_agent_tools_enabled",
+        "x-platforms": [
+          "cli",
+          "mcp"
+        ]
+      }
+    },
     "/developer/v1/agent-tools/search-purchase-orders": {
       "post": {
         "operationId": "post_agent_tool_api___search_purchase_orders",
@@ -4546,7 +4967,7 @@
     },
     "/developer/v1/agent-tools/submit-flight-booking": {
       "post": {
-        "description": "Two-step flow: call without ``confirm`` for a summary (itinerary, price,\nin-policy status, required approvals) without booking, then call with\n``confirm=true`` and the previewed ``expected_total_amount`` to book once\nthe traveler approves that summary.\n\n``flight_offer_uuid`` is the literal ``id`` from search: the outbound flight\nfor one-way, the return flight for round trips (it carries both legs), or a\nfare option's id to book that fare. For a delegated booking, pass the\n``traveler_user_id`` from search. For changes or cancellations, use the web app.\n\nIf the chosen flight is out of policy, you MUST collect an ``oop_reason`` from\nthe traveler and pass it here.\n\nFor self-booking only, before previewing or confirming a booking, call\nGetTravelerProfile. If ``has_profile`` is false, collect first_name,\nlast_name, email, phone_number, date_of_birth, and id_gender, then call\nUpdateTravelerProfile first. Do not use this preflight for delegated\nbookings with ``traveler_user_id``; these profile tools operate on the\ncurrent runtime user, so rely on the booking flow's existing\ntraveler-profile check instead.",
+        "description": "Two-step flow: call without ``confirm`` for a summary (itinerary, price,\nin-policy status, required approvals) without booking, then call with\n``confirm=true`` and the previewed ``expected_total_amount`` to book once\nthe traveler approves that summary.\n\n``flight_offer_uuid`` is the literal ``id`` from search: the outbound flight\nfor one-way, the return flight for round trips (it carries both legs), or a\nfare option's id to book that fare. For a delegated booking, pass the\n``traveler_user_id`` from user search through GetTravelerProfile,\nUpdateTravelerProfile if needed, SearchFlights, and SubmitFlightBooking. For\nchanges or cancellations, use the web app.\n\nIf the chosen flight is out of policy, you MUST collect an ``oop_reason`` from\nthe traveler and pass it here.\n\nBefore previewing or confirming a booking, call GetTravelerProfile for the\ntraveler being booked. For self-booking, omit ``traveler_user_id``. For\ndelegated booking, pass the resolved ``traveler_user_id``. If ``has_profile``\nis false, collect first_name, last_name, email, phone_number, date_of_birth,\nand id_gender, then call UpdateTravelerProfile with the same traveler target\nbefore booking.",
         "operationId": "post_agent_tool_api___submit_flight_booking",
         "requestBody": {
           "content": {
@@ -4842,7 +5263,7 @@
             ]
           }
         ],
-        "summary": "Update the user's traveler profile information including name, email, phone, date of birth, gender, and loyalty programs",
+        "summary": "Update traveler profile information, optionally targeting another traveler for delegated flight booking",
         "tags": [
           "Agent Tool",
           "travel"
@@ -5681,6 +6102,15 @@
     },
     {
       "name": "x402"
+    },
+    {
+      "name": "business"
+    },
+    {
+      "name": "merchant"
+    },
+    {
+      "name": "procurement_requests"
     }
   ],
   "openapi": "3.0.2",
@@ -6040,6 +6470,97 @@
         ],
         "type": "object"
       },
+      "AgentAddressFieldAnswerRequestBody": {
+        "properties": {
+          "address1": {
+            "description": "Street address line 1.",
+            "title": "Address1",
+            "type": "string"
+          },
+          "address2": {
+            "default": null,
+            "description": "Street address line 2.",
+            "nullable": true,
+            "title": "Address2",
+            "type": "string"
+          },
+          "answer_type": {
+            "description": "Must be address.",
+            "enum": [
+              "address"
+            ],
+            "title": "Answer Type",
+            "type": "string"
+          },
+          "city": {
+            "description": "City.",
+            "title": "City",
+            "type": "string"
+          },
+          "country": {
+            "description": "ISO 3166-1 alpha-2 country code, such as US.",
+            "title": "Country",
+            "type": "string"
+          },
+          "field_id": {
+            "description": "Visible custom-form field ID returned by draft state.",
+            "title": "Field Id",
+            "type": "string"
+          },
+          "postal_code": {
+            "default": null,
+            "description": "Postal or ZIP code.",
+            "nullable": true,
+            "title": "Postal Code",
+            "type": "string"
+          },
+          "state": {
+            "default": null,
+            "description": "State or province.",
+            "nullable": true,
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "address1",
+          "answer_type",
+          "city",
+          "country",
+          "field_id"
+        ],
+        "title": "AgentAddressFieldAnswer",
+        "type": "object"
+      },
+      "AgentBooleanFieldAnswerRequestBody": {
+        "properties": {
+          "answer_type": {
+            "description": "Must be boolean.",
+            "enum": [
+              "boolean"
+            ],
+            "title": "Answer Type",
+            "type": "string"
+          },
+          "field_id": {
+            "description": "Visible custom-form field ID returned by draft state.",
+            "title": "Field Id",
+            "type": "string"
+          },
+          "value": {
+            "description": "Boolean answer for this field.",
+            "title": "Value",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "answer_type",
+          "field_id",
+          "value"
+        ],
+        "title": "AgentBooleanFieldAnswer",
+        "type": "object"
+      },
       "AgentCardFundInfo": {
         "properties": {
           "allowed_categories": {
@@ -6118,6 +6639,361 @@
         "title": "AgentCardFundsList",
         "type": "object"
       },
+      "AgentContactFieldAnswerRequestBody": {
+        "properties": {
+          "answer_type": {
+            "description": "Must be contact.",
+            "enum": [
+              "contact"
+            ],
+            "title": "Answer Type",
+            "type": "string"
+          },
+          "email": {
+            "description": "Contact email address.",
+            "title": "Email",
+            "type": "string"
+          },
+          "field_id": {
+            "description": "Visible custom-form field ID returned by draft state.",
+            "title": "Field Id",
+            "type": "string"
+          },
+          "first_name": {
+            "default": null,
+            "description": "Optional first name.",
+            "nullable": true,
+            "title": "First Name",
+            "type": "string"
+          },
+          "last_name": {
+            "default": null,
+            "description": "Optional last name.",
+            "nullable": true,
+            "title": "Last Name",
+            "type": "string"
+          },
+          "phone_number": {
+            "default": null,
+            "description": "Optional phone number.",
+            "nullable": true,
+            "title": "Phone Number",
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer_type",
+          "email",
+          "field_id"
+        ],
+        "title": "AgentContactFieldAnswer",
+        "type": "object"
+      },
+      "AgentCurrentFile": {
+        "properties": {
+          "displayed_filename": {
+            "title": "Displayed Filename",
+            "type": "string"
+          },
+          "document_category": {
+            "title": "Document Category",
+            "type": "string"
+          },
+          "file_uuid": {
+            "title": "File Uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "displayed_filename",
+          "document_category",
+          "file_uuid"
+        ],
+        "title": "AgentCurrentFile",
+        "type": "object"
+      },
+      "AgentDateFieldAnswerRequestBody": {
+        "properties": {
+          "answer_type": {
+            "description": "Must be date. Value must be a YYYY-MM-DD string.",
+            "enum": [
+              "date"
+            ],
+            "title": "Answer Type",
+            "type": "string"
+          },
+          "field_id": {
+            "description": "Visible custom-form field ID returned by draft state.",
+            "title": "Field Id",
+            "type": "string"
+          },
+          "value": {
+            "description": "String answer for this field.",
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer_type",
+          "field_id",
+          "value"
+        ],
+        "title": "AgentDateFieldAnswer",
+        "type": "object"
+      },
+      "AgentDepartmentFieldAnswerRequestBody": {
+        "properties": {
+          "answer_type": {
+            "description": "Must be department.",
+            "enum": [
+              "department"
+            ],
+            "title": "Answer Type",
+            "type": "string"
+          },
+          "department_uuid": {
+            "description": "Existing Ramp department UUID.",
+            "format": "uuid",
+            "title": "Department Uuid",
+            "type": "string"
+          },
+          "field_id": {
+            "description": "Visible custom-form field ID returned by draft state.",
+            "title": "Field Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer_type",
+          "department_uuid",
+          "field_id"
+        ],
+        "title": "AgentDepartmentFieldAnswer",
+        "type": "object"
+      },
+      "AgentDraftField": {
+        "properties": {
+          "answer_template": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "title": "Answer Template",
+            "type": "object"
+          },
+          "answered": {
+            "title": "Answered",
+            "type": "boolean"
+          },
+          "choices": {
+            "items": {
+              "$ref": "#/components/schemas/AgentFieldChoice"
+            },
+            "title": "Choices",
+            "type": "array"
+          },
+          "current_files": {
+            "default": null,
+            "items": {
+              "$ref": "#/components/schemas/AgentCurrentFile"
+            },
+            "nullable": true,
+            "title": "Current Files",
+            "type": "array"
+          },
+          "current_value_display_string": {
+            "nullable": true,
+            "title": "Current Value Display String",
+            "type": "string"
+          },
+          "field_id": {
+            "title": "Field Id",
+            "type": "string"
+          },
+          "field_type": {
+            "title": "Field Type",
+            "type": "string"
+          },
+          "label": {
+            "nullable": true,
+            "title": "Label",
+            "type": "string"
+          },
+          "lookup": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/AgentFieldLookup"
+              }
+            ],
+            "default": null,
+            "nullable": true
+          },
+          "required": {
+            "title": "Required",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "answer_template",
+          "answered",
+          "current_value_display_string",
+          "field_id",
+          "field_type",
+          "label",
+          "required"
+        ],
+        "title": "AgentDraftField",
+        "type": "object"
+      },
+      "AgentEmailFieldAnswerRequestBody": {
+        "properties": {
+          "answer_type": {
+            "description": "Must be email.",
+            "enum": [
+              "email"
+            ],
+            "title": "Answer Type",
+            "type": "string"
+          },
+          "field_id": {
+            "description": "Visible custom-form field ID returned by draft state.",
+            "title": "Field Id",
+            "type": "string"
+          },
+          "value": {
+            "description": "String answer for this field.",
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer_type",
+          "field_id",
+          "value"
+        ],
+        "title": "AgentEmailFieldAnswer",
+        "type": "object"
+      },
+      "AgentFieldChoice": {
+        "properties": {
+          "label": {
+            "nullable": true,
+            "title": "Label",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "label",
+          "value"
+        ],
+        "title": "AgentFieldChoice",
+        "type": "object"
+      },
+      "AgentFieldLookup": {
+        "properties": {
+          "category": {
+            "title": "Category",
+            "type": "string"
+          },
+          "example_args": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "title": "Example Args",
+            "type": "object"
+          },
+          "purpose": {
+            "title": "Purpose",
+            "type": "string"
+          },
+          "result_path": {
+            "title": "Result Path",
+            "type": "string"
+          },
+          "tool": {
+            "title": "Tool",
+            "type": "string"
+          }
+        },
+        "required": [
+          "category",
+          "example_args",
+          "purpose",
+          "result_path",
+          "tool"
+        ],
+        "title": "AgentFieldLookup",
+        "type": "object"
+      },
+      "AgentFileUploadFieldAnswerJsonMode": {
+        "properties": {
+          "answer_type": {
+            "description": "Must be file_upload.",
+            "enum": [
+              "file_upload"
+            ],
+            "title": "Answer Type",
+            "type": "string"
+          },
+          "field_id": {
+            "description": "Visible custom-form field ID returned by draft state.",
+            "title": "Field Id",
+            "type": "string"
+          },
+          "file_uuids": {
+            "description": "Form file UUIDs returned by the upload-file tool.",
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "File Uuids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "answer_type",
+          "field_id",
+          "file_uuids"
+        ],
+        "title": "AgentFileUploadFieldAnswer",
+        "type": "object"
+      },
+      "AgentFileUploadFieldAnswerRequestBody": {
+        "properties": {
+          "answer_type": {
+            "description": "Must be file_upload.",
+            "enum": [
+              "file_upload"
+            ],
+            "title": "Answer Type",
+            "type": "string"
+          },
+          "field_id": {
+            "description": "Visible custom-form field ID returned by draft state.",
+            "title": "Field Id",
+            "type": "string"
+          },
+          "file_uuids": {
+            "description": "Form file UUIDs returned by the upload-file tool.",
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "File Uuids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "answer_type",
+          "field_id",
+          "file_uuids"
+        ],
+        "title": "AgentFileUploadFieldAnswer",
+        "type": "object"
+      },
       "AgentKeyDetail": {
         "description": "Agent key information when the caller is authenticated via an agent key.",
         "properties": {
@@ -6138,6 +7014,239 @@
           "id"
         ],
         "title": "AgentKeyDetail",
+        "type": "object"
+      },
+      "AgentLinkFieldAnswerRequestBody": {
+        "properties": {
+          "answer_type": {
+            "description": "Must be link.",
+            "enum": [
+              "link"
+            ],
+            "title": "Answer Type",
+            "type": "string"
+          },
+          "field_id": {
+            "description": "Visible custom-form field ID returned by draft state.",
+            "title": "Field Id",
+            "type": "string"
+          },
+          "value": {
+            "description": "String answer for this field.",
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer_type",
+          "field_id",
+          "value"
+        ],
+        "title": "AgentLinkFieldAnswer",
+        "type": "object"
+      },
+      "AgentMerchantCategoryFieldAnswerRequestBody": {
+        "properties": {
+          "answer_type": {
+            "description": "Must be merchant_category.",
+            "enum": [
+              "merchant_category"
+            ],
+            "title": "Answer Type",
+            "type": "string"
+          },
+          "category_ids": {
+            "description": "Existing merchant category integer IDs returned by merchant categories.",
+            "items": {
+              "type": "integer"
+            },
+            "title": "Category Ids",
+            "type": "array"
+          },
+          "field_id": {
+            "description": "Visible custom-form field ID returned by draft state.",
+            "title": "Field Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer_type",
+          "category_ids",
+          "field_id"
+        ],
+        "title": "AgentMerchantCategoryFieldAnswer",
+        "type": "object"
+      },
+      "AgentMerchantFieldAnswerRequestBody": {
+        "properties": {
+          "answer_type": {
+            "description": "Must be merchant.",
+            "enum": [
+              "merchant"
+            ],
+            "title": "Answer Type",
+            "type": "string"
+          },
+          "field_id": {
+            "description": "Visible custom-form field ID returned by draft state.",
+            "title": "Field Id",
+            "type": "string"
+          },
+          "merchant_uuids": {
+            "description": "Existing Ramp merchant UUIDs returned by merchant search.",
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Merchant Uuids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "answer_type",
+          "field_id",
+          "merchant_uuids"
+        ],
+        "title": "AgentMerchantFieldAnswer",
+        "type": "object"
+      },
+      "AgentMonetaryAmountFieldAnswerRequestBody": {
+        "properties": {
+          "amount": {
+            "description": "Finite amount in currency units. String values are preferred.",
+            "oneOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "title": "Amount"
+          },
+          "answer_type": {
+            "description": "Must be monetary_amount.",
+            "enum": [
+              "monetary_amount"
+            ],
+            "title": "Answer Type",
+            "type": "string"
+          },
+          "currency": {
+            "description": "ISO 4217 currency code, such as USD.",
+            "title": "Currency",
+            "type": "string"
+          },
+          "field_id": {
+            "description": "Visible custom-form field ID returned by draft state.",
+            "title": "Field Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "amount",
+          "answer_type",
+          "currency",
+          "field_id"
+        ],
+        "title": "AgentMonetaryAmountFieldAnswer",
+        "type": "object"
+      },
+      "AgentMultiSelectFieldAnswerRequestBody": {
+        "properties": {
+          "answer_type": {
+            "description": "Must be multi_select.",
+            "enum": [
+              "multi_select"
+            ],
+            "title": "Answer Type",
+            "type": "string"
+          },
+          "field_id": {
+            "description": "Visible custom-form field ID returned by draft state.",
+            "title": "Field Id",
+            "type": "string"
+          },
+          "values": {
+            "description": "Selected choice values. Use choices[].value from the latest draft response.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Values",
+            "type": "array"
+          }
+        },
+        "required": [
+          "answer_type",
+          "field_id",
+          "values"
+        ],
+        "title": "AgentMultiSelectFieldAnswer",
+        "type": "object"
+      },
+      "AgentNumberFieldAnswerRequestBody": {
+        "properties": {
+          "answer_type": {
+            "description": "Must be number.",
+            "enum": [
+              "number"
+            ],
+            "title": "Answer Type",
+            "type": "string"
+          },
+          "field_id": {
+            "description": "Visible custom-form field ID returned by draft state.",
+            "title": "Field Id",
+            "type": "string"
+          },
+          "value": {
+            "description": "Finite numeric answer for this field.",
+            "oneOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "title": "Value"
+          }
+        },
+        "required": [
+          "answer_type",
+          "field_id",
+          "value"
+        ],
+        "title": "AgentNumberFieldAnswer",
+        "type": "object"
+      },
+      "AgentParagraphFieldAnswerRequestBody": {
+        "properties": {
+          "answer_type": {
+            "description": "Must be paragraph.",
+            "enum": [
+              "paragraph"
+            ],
+            "title": "Answer Type",
+            "type": "string"
+          },
+          "field_id": {
+            "description": "Visible custom-form field ID returned by draft state.",
+            "title": "Field Id",
+            "type": "string"
+          },
+          "value": {
+            "description": "String answer for this field.",
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer_type",
+          "field_id",
+          "value"
+        ],
+        "title": "AgentParagraphFieldAnswer",
         "type": "object"
       },
       "AgentReportSummary": {
@@ -6178,6 +7287,102 @@
           "status"
         ],
         "title": "AgentReportSummary",
+        "type": "object"
+      },
+      "AgentSingleSelectFieldAnswerRequestBody": {
+        "properties": {
+          "answer_type": {
+            "description": "Must be single_select. Use choices[].value exactly.",
+            "enum": [
+              "single_select"
+            ],
+            "title": "Answer Type",
+            "type": "string"
+          },
+          "field_id": {
+            "description": "Visible custom-form field ID returned by draft state.",
+            "title": "Field Id",
+            "type": "string"
+          },
+          "value": {
+            "description": "String answer for this field.",
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer_type",
+          "field_id",
+          "value"
+        ],
+        "title": "AgentSingleSelectFieldAnswer",
+        "type": "object"
+      },
+      "AgentTextFieldAnswerRequestBody": {
+        "properties": {
+          "answer_type": {
+            "description": "Must be text.",
+            "enum": [
+              "text"
+            ],
+            "title": "Answer Type",
+            "type": "string"
+          },
+          "field_id": {
+            "description": "Visible custom-form field ID returned by draft state.",
+            "title": "Field Id",
+            "type": "string"
+          },
+          "value": {
+            "description": "String answer for this field.",
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer_type",
+          "field_id",
+          "value"
+        ],
+        "title": "AgentTextFieldAnswer",
+        "type": "object"
+      },
+      "AgentVendorFieldAnswerRequestBody": {
+        "properties": {
+          "answer_type": {
+            "description": "Must be vendor.",
+            "enum": [
+              "vendor"
+            ],
+            "title": "Answer Type",
+            "type": "string"
+          },
+          "field_id": {
+            "description": "Visible custom-form field ID returned by draft state.",
+            "title": "Field Id",
+            "type": "string"
+          },
+          "new_vendor_name": {
+            "default": null,
+            "description": "Name for a vendor that does not exist yet. Prefer payee_uuid when vendor search finds the vendor.",
+            "nullable": true,
+            "title": "New Vendor Name",
+            "type": "string"
+          },
+          "payee_uuid": {
+            "default": null,
+            "description": "Existing vendor UUID returned by vendor search.",
+            "format": "uuid",
+            "nullable": true,
+            "title": "Payee Uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer_type",
+          "field_id"
+        ],
+        "title": "AgentVendorFieldAnswer",
         "type": "object"
       },
       "AggregatedCostResponseSchema": {
@@ -11402,6 +12607,44 @@
         },
         "type": "object"
       },
+      "ApiProcurementRequestUploadFileInputRequestBody": {
+        "example": {
+          "field_id": "vendor_contract",
+          "rationale": "Upload the vendor quote requested by the visible form field.",
+          "spend_request_uuid": "30ffb5d0-3021-4438-8253-25819d480237"
+        },
+        "properties": {
+          "field_id": {
+            "description": "Visible custom-form file field ID returned by procurement_requests draft.",
+            "title": "Field Id",
+            "type": "string"
+          },
+          "file": {
+            "$ref": "#/components/schemas/UploadedFileRequestBody"
+          },
+          "rationale": {
+            "description": "Why this file upload is needed for the procurement request.",
+            "title": "Rationale",
+            "type": "string"
+          },
+          "spend_request_uuid": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/UUIDStrRequestBody"
+              }
+            ],
+            "description": "Draft spend request UUID returned by procurement_requests draft."
+          }
+        },
+        "required": [
+          "field_id",
+          "file",
+          "rationale",
+          "spend_request_uuid"
+        ],
+        "title": "ApiProcurementRequestUploadFileInput",
+        "type": "object"
+      },
       "ApprovalChainAssignedEntity": {
         "properties": {
           "assigned_user_full_name": {
@@ -14329,6 +15572,203 @@
         "title": "CurrencyAmount",
         "type": "object"
       },
+      "CurrencyRequestBody": {
+        "description": "We attempted to dynamically create this class from the ISO4217Currency and CryptoCurrency enums.\nHowever, mypy was not able to infer the type of the Currency enum; so we manually added the currencies to the enum.",
+        "enum": [
+          "AED",
+          "AFN",
+          "ALL",
+          "AMD",
+          "ANG",
+          "AOA",
+          "ARS",
+          "AUD",
+          "AWG",
+          "AZN",
+          "BAM",
+          "BBD",
+          "BDT",
+          "BGN",
+          "BHD",
+          "BIF",
+          "BMD",
+          "BND",
+          "BOB",
+          "BOV",
+          "BRL",
+          "BSD",
+          "BTN",
+          "BWP",
+          "BYN",
+          "BZD",
+          "CAD",
+          "CDF",
+          "CHE",
+          "CHF",
+          "CHW",
+          "CLF",
+          "CLP",
+          "CNH",
+          "CNY",
+          "COP",
+          "COU",
+          "CRC",
+          "CUC",
+          "CUP",
+          "CVE",
+          "CZK",
+          "DJF",
+          "DKK",
+          "DOP",
+          "DZD",
+          "EGP",
+          "ERN",
+          "ETB",
+          "EUR",
+          "EURC",
+          "FJD",
+          "FKP",
+          "GBP",
+          "GEL",
+          "GHS",
+          "GIP",
+          "GMD",
+          "GNF",
+          "GTQ",
+          "GYD",
+          "HKD",
+          "HNL",
+          "HRK",
+          "HTG",
+          "HUF",
+          "IDR",
+          "ILS",
+          "INR",
+          "IQD",
+          "IRR",
+          "ISK",
+          "JMD",
+          "JOD",
+          "JPY",
+          "KES",
+          "KGS",
+          "KHR",
+          "KMF",
+          "KPW",
+          "KRW",
+          "KWD",
+          "KYD",
+          "KZT",
+          "LAK",
+          "LBP",
+          "LKR",
+          "LRD",
+          "LSL",
+          "LYD",
+          "MAD",
+          "MDL",
+          "MGA",
+          "MKD",
+          "MMK",
+          "MNT",
+          "MOP",
+          "MRU",
+          "MUR",
+          "MVR",
+          "MWK",
+          "MXN",
+          "MXV",
+          "MYR",
+          "MZN",
+          "NAD",
+          "NGN",
+          "NIO",
+          "NOK",
+          "NPR",
+          "NZD",
+          "OMR",
+          "OPEN_USD",
+          "PAB",
+          "PEN",
+          "PGK",
+          "PHP",
+          "PKR",
+          "PLN",
+          "PYG",
+          "QAR",
+          "RON",
+          "RSD",
+          "RUB",
+          "RWF",
+          "SAR",
+          "SBD",
+          "SCR",
+          "SDG",
+          "SEK",
+          "SGD",
+          "SHP",
+          "SLE",
+          "SLL",
+          "SOS",
+          "SRD",
+          "SSP",
+          "STN",
+          "SVC",
+          "SYP",
+          "SZL",
+          "THB",
+          "TJS",
+          "TMT",
+          "TND",
+          "TOP",
+          "TRY",
+          "TTD",
+          "TWD",
+          "TZS",
+          "UAH",
+          "UGX",
+          "USD",
+          "USDB",
+          "USDC",
+          "USDT",
+          "USN",
+          "UYI",
+          "UYU",
+          "UYW",
+          "UZS",
+          "VED",
+          "VES",
+          "VND",
+          "VUV",
+          "WST",
+          "XAD",
+          "XAF",
+          "XAG",
+          "XAU",
+          "XBA",
+          "XBB",
+          "XBC",
+          "XBD",
+          "XCD",
+          "XCG",
+          "XDR",
+          "XOF",
+          "XPD",
+          "XPF",
+          "XPT",
+          "XSU",
+          "XTS",
+          "XUA",
+          "XXX",
+          "YER",
+          "ZAR",
+          "ZMW",
+          "ZWG",
+          "ZWL"
+        ],
+        "title": "Currency",
+        "type": "string"
+      },
       "CustomRecordFieldState": {
         "properties": {
           "column_id": {
@@ -14618,6 +16058,57 @@
         "title": "DeclineExplanation",
         "type": "object"
       },
+      "DeleteProcurementDraftRequestBody": {
+        "description": "Delete an abandoned procurement draft owned by the acting user.",
+        "properties": {
+          "rationale": {
+            "description": "Briefly explain why you are calling this tool: what goal or workflow it serves and what you intend to do with the result.",
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Rationale",
+            "type": "string"
+          },
+          "spend_request_uuid": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/UUIDStrRequestBody"
+              }
+            ],
+            "description": "Draft spend request UUID returned by draft_procurement_request."
+          }
+        },
+        "required": [
+          "rationale",
+          "spend_request_uuid"
+        ],
+        "title": "DeleteProcurementDraft",
+        "type": "object"
+      },
+      "DeletedProcurementDraft": {
+        "properties": {
+          "external_agent_messages": {
+            "items": {
+              "type": "string"
+            },
+            "title": "External Agent Messages",
+            "type": "array"
+          },
+          "spend_request_uuid": {
+            "title": "Spend Request Uuid",
+            "type": "string"
+          },
+          "web_path": {
+            "title": "Web Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "spend_request_uuid",
+          "web_path"
+        ],
+        "title": "DeletedProcurementDraft",
+        "type": "object"
+      },
       "DepartmentDetails": {
         "description": "Department information with name and UUID.",
         "properties": {
@@ -14637,6 +16128,25 @@
           "uuid"
         ],
         "title": "DepartmentDetails",
+        "type": "object"
+      },
+      "DepartmentInfo": {
+        "description": "Information about a department.",
+        "properties": {
+          "department_id": {
+            "title": "Department Id",
+            "type": "string"
+          },
+          "department_name": {
+            "title": "Department Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "department_id",
+          "department_name"
+        ],
+        "title": "DepartmentInfo",
         "type": "object"
       },
       "DetailLineItemSummary": {
@@ -14956,6 +16466,167 @@
           "version"
         ],
         "title": "DraftBillDetails",
+        "type": "object"
+      },
+      "DraftProcurementRequestRequestBody": {
+        "description": "Create or update a procurement draft and return the current visible form state.",
+        "properties": {
+          "answers": {
+            "description": "Flat typed custom-form answers. Use only field IDs in the current draft_state.fields visibility-based write allowlist. draft_state.fields_to_answer is the prioritized subset of missing required fields and fields with errors; visible optional or already-answered fields may also be updated. Copy the field's answer_template and fill the placeholder values.",
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "address": "#/components/schemas/AgentAddressFieldAnswerRequestBody",
+                  "boolean": "#/components/schemas/AgentBooleanFieldAnswerRequestBody",
+                  "contact": "#/components/schemas/AgentContactFieldAnswerRequestBody",
+                  "date": "#/components/schemas/AgentDateFieldAnswerRequestBody",
+                  "department": "#/components/schemas/AgentDepartmentFieldAnswerRequestBody",
+                  "email": "#/components/schemas/AgentEmailFieldAnswerRequestBody",
+                  "file_upload": "#/components/schemas/AgentFileUploadFieldAnswerRequestBody",
+                  "link": "#/components/schemas/AgentLinkFieldAnswerRequestBody",
+                  "merchant": "#/components/schemas/AgentMerchantFieldAnswerRequestBody",
+                  "merchant_category": "#/components/schemas/AgentMerchantCategoryFieldAnswerRequestBody",
+                  "monetary_amount": "#/components/schemas/AgentMonetaryAmountFieldAnswerRequestBody",
+                  "multi_select": "#/components/schemas/AgentMultiSelectFieldAnswerRequestBody",
+                  "number": "#/components/schemas/AgentNumberFieldAnswerRequestBody",
+                  "paragraph": "#/components/schemas/AgentParagraphFieldAnswerRequestBody",
+                  "single_select": "#/components/schemas/AgentSingleSelectFieldAnswerRequestBody",
+                  "text": "#/components/schemas/AgentTextFieldAnswerRequestBody",
+                  "vendor": "#/components/schemas/AgentVendorFieldAnswerRequestBody"
+                },
+                "propertyName": "answer_type"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/AgentAddressFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentBooleanFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentContactFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentDateFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentDepartmentFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentEmailFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentFileUploadFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentLinkFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentMerchantCategoryFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentMerchantFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentMonetaryAmountFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentMultiSelectFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentNumberFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentParagraphFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentSingleSelectFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentTextFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentVendorFieldAnswerRequestBody"
+                }
+              ]
+            },
+            "title": "Answers",
+            "type": "array"
+          },
+          "clear_field_ids": {
+            "description": "Visible custom-form field IDs to clear. Do not also provide an answer for the same field.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Clear Field Ids",
+            "type": "array"
+          },
+          "currency": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CurrencyRequestBody"
+              }
+            ],
+            "default": null,
+            "description": "ISO 4217 currency code, e.g. USD.",
+            "nullable": true
+          },
+          "internal_memo": {
+            "default": null,
+            "description": "Common shortcut for the internal memo.",
+            "nullable": true,
+            "title": "Internal Memo",
+            "type": "string"
+          },
+          "line_items": {
+            "default": null,
+            "description": "Complete desired line item list. When provided, it fully replaces the draft's current line items; when omitted, line items are untouched. Use string money values such as amount='90000.00'.",
+            "items": {
+              "$ref": "#/components/schemas/ProcurementLineItemDataRequestBody"
+            },
+            "nullable": true,
+            "title": "Line Items",
+            "type": "array"
+          },
+          "rationale": {
+            "description": "Briefly explain why you are calling this tool: what goal or workflow it serves and what you intend to do with the result.",
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Rationale",
+            "type": "string"
+          },
+          "request_name": {
+            "default": null,
+            "description": "Common shortcut for the procurement request name.",
+            "nullable": true,
+            "title": "Request Name",
+            "type": "string"
+          },
+          "spend_intent_uuid": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/UUIDStrRequestBody"
+              }
+            ],
+            "default": null,
+            "description": "Spend intent UUID returned by spend-intents. Required when creating a new draft; omit when continuing an existing draft.",
+            "nullable": true
+          },
+          "spend_request_uuid": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/UUIDStrRequestBody"
+              }
+            ],
+            "default": null,
+            "description": "Draft spend request UUID returned by this tool.",
+            "nullable": true
+          }
+        },
+        "required": [
+          "rationale"
+        ],
+        "title": "DraftProcurementRequest",
         "type": "object"
       },
       "DraftReimbursementState": {
@@ -18748,13 +20419,20 @@
         "type": "object"
       },
       "GetTravelerProfileRequestBody": {
-        "description": "Retrieve the user's traveler profile information including name, email, phone, date of birth, gender, known traveler number (KTN/TSA), redress number, and loyalty programs.",
+        "description": "Retrieve traveler profile information including name, email, phone, date of birth, gender, known traveler number (KTN/TSA), redress number, and loyalty programs. Defaults to the acting user's profile. For delegated flight booking, pass traveler_user_id from user search to retrieve that traveler's profile using the same authorization path as SubmitFlightBooking.",
         "properties": {
           "rationale": {
             "description": "Briefly explain why you are calling this tool: what goal or workflow it serves and what you intend to do with the result.",
             "maxLength": 1024,
             "minLength": 1,
             "title": "Rationale",
+            "type": "string"
+          },
+          "traveler_user_id": {
+            "default": null,
+            "description": "Traveler UUID when reading another user's profile for delegated flight booking. Resolve names with list-users, set this only when the user explicitly asks to book for another person, and pass the same value through search and submit-flight-booking. Omit for self-booking.",
+            "nullable": true,
+            "title": "Traveler User Id",
             "type": "string"
           }
         },
@@ -20092,6 +21770,7 @@
         "title": "IssueOneOffFundsResult",
         "type": "object"
       },
+      "JsonValue": {},
       "LimitIncreaseRequestBody": {
         "description": "Increase the spending limit on a fund (spend allocation) or card.\n\nREQUIRED MULTI-STEP PROTOCOL \u2014 do NOT call this tool until both conditions are met:\n1. The user has clearly stated whether the increase should be TEMPORARY or PERMANENT.\n   - If they haven't specified, ask: \"Would you like this to be a temporary increase\n     (resets at the end of the current period) or a permanent increase?\"\n   - Do NOT guess or default to either option.\n2. Once the user confirms, set increase_type to \"temporary\" or \"permanent\" AND\n   set user_confirmed_increase_type to True.\n\nA temporary increase resets at the next interval boundary (e.g., end of month).\nA permanent increase persists indefinitely.\nIf the user does not specify a fund or card, ask them to specify one.\n\nUse this when a user wants to:\n- Temporarily increase their fund limit for the current period (e.g., \"I need more budget this month\")\n- Permanently increase their fund or card limit\n- Increase their card limit (e.g., \"increase my card ending in 1234 to $200\")\n- Request a higher spending limit",
         "properties": {
@@ -20295,6 +21974,14 @@
         "title": "LineItemSummary",
         "type": "object"
       },
+      "LineItemTypeRequestBody": {
+        "enum": [
+          "EXPENSE",
+          "ITEM"
+        ],
+        "title": "LineItemType",
+        "type": "string"
+      },
       "ListBillsRequestBody": {
         "description": "List and filter bills with optional search, pagination, and status filters.\n\nReturns bills for the current user's business. When called with no parameters,\nreturns the most recent bills. Supports optional text search across vendor name,\ninvoice number, and payment ID.",
         "properties": {
@@ -20389,6 +22076,160 @@
           "rationale"
         ],
         "title": "ListBusinessAccounts",
+        "type": "object"
+      },
+      "ListDepartmentsOutput": {
+        "description": "Response containing list of departments.",
+        "properties": {
+          "departments": {
+            "items": {
+              "$ref": "#/components/schemas/DepartmentInfo"
+            },
+            "title": "Departments",
+            "type": "array"
+          },
+          "external_agent_messages": {
+            "items": {
+              "type": "string"
+            },
+            "title": "External Agent Messages",
+            "type": "array"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "total_count": {
+            "title": "Total Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "departments",
+          "message",
+          "total_count"
+        ],
+        "title": "ListDepartmentsOutput",
+        "type": "object"
+      },
+      "ListDepartmentsRequestBody": {
+        "description": "List all departments in the company.\n\nReturns the departments available in the user's business, which can be\nused as inputs to workflows that require department references.",
+        "properties": {
+          "name_filter": {
+            "default": null,
+            "description": "Optional filter to search departments by name (case-insensitive partial match).",
+            "nullable": true,
+            "title": "Name Filter",
+            "type": "string"
+          },
+          "rationale": {
+            "description": "Briefly explain why you are calling this tool: what goal or workflow it serves and what you intend to do with the result.",
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Rationale",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rationale"
+        ],
+        "title": "ListDepartments",
+        "type": "object"
+      },
+      "ListProcurementSpendIntentsRequestBody": {
+        "description": "List published procurement spend programs the agent can draft against.",
+        "properties": {
+          "page_size": {
+            "default": 50,
+            "description": "Maximum spend programs to return.",
+            "maximum": 100,
+            "minimum": 1,
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "query": {
+            "default": null,
+            "description": "Optional text filter for spend program name or description.",
+            "nullable": true,
+            "title": "Query",
+            "type": "string"
+          },
+          "rationale": {
+            "description": "Briefly explain why you are calling this tool: what goal or workflow it serves and what you intend to do with the result.",
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Rationale",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rationale"
+        ],
+        "title": "ListProcurementSpendIntents",
+        "type": "object"
+      },
+      "ListProcurementSpendIntentsResult": {
+        "properties": {
+          "external_agent_messages": {
+            "items": {
+              "type": "string"
+            },
+            "title": "External Agent Messages",
+            "type": "array"
+          },
+          "spend_intents": {
+            "items": {
+              "$ref": "#/components/schemas/ProcurementSpendIntentSummary"
+            },
+            "title": "Spend Intents",
+            "type": "array"
+          }
+        },
+        "required": [
+          "spend_intents"
+        ],
+        "title": "ListProcurementSpendIntentsResult",
+        "type": "object"
+      },
+      "ListSkCategoriesRequestBody": {
+        "description": "List all available spend categories. Returns category IDs and names.",
+        "properties": {
+          "rationale": {
+            "description": "Briefly explain why you are calling this tool: what goal or workflow it serves and what you intend to do with the result.",
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Rationale",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rationale"
+        ],
+        "title": "ListSkCategories",
+        "type": "object"
+      },
+      "ListSkCategoriesResult": {
+        "properties": {
+          "categories": {
+            "description": "All available spend categories",
+            "items": {
+              "$ref": "#/components/schemas/SkCategoryItem"
+            },
+            "title": "Categories",
+            "type": "array"
+          },
+          "external_agent_messages": {
+            "items": {
+              "type": "string"
+            },
+            "title": "External Agent Messages",
+            "type": "array"
+          }
+        },
+        "required": [
+          "categories"
+        ],
+        "title": "ListSkCategoriesResult",
         "type": "object"
       },
       "ListTreasuryAccountsOutput": {
@@ -21354,6 +23195,53 @@
         "title": "MerchantRestrictionUpdateStatus",
         "type": "string"
       },
+      "MerchantResult": {
+        "properties": {
+          "category": {
+            "default": null,
+            "description": "Expense category",
+            "nullable": true,
+            "title": "Category",
+            "type": "string"
+          },
+          "domain": {
+            "default": null,
+            "description": "Merchant website domain",
+            "nullable": true,
+            "title": "Domain",
+            "type": "string"
+          },
+          "id": {
+            "description": "Merchant integer ID for use in merchant-aware policies and tools",
+            "title": "Id",
+            "type": "integer"
+          },
+          "logo_url": {
+            "default": null,
+            "description": "Merchant logo URL",
+            "nullable": true,
+            "title": "Logo Url",
+            "type": "string"
+          },
+          "name": {
+            "description": "Merchant display name",
+            "title": "Name",
+            "type": "string"
+          },
+          "uuid": {
+            "description": "Merchant UUID for use with downstream tools",
+            "title": "Uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "uuid"
+        ],
+        "title": "MerchantResult",
+        "type": "object"
+      },
       "MissingAccountingItem": {
         "properties": {
           "category_id": {
@@ -22224,6 +24112,445 @@
           "rationale"
         ],
         "title": "PostComment",
+        "type": "object"
+      },
+      "ProcurementDraftState": {
+        "properties": {
+          "draft": {
+            "$ref": "#/components/schemas/ProcurementDraftSummary"
+          },
+          "draft_state": {
+            "$ref": "#/components/schemas/ProcurementDraftStateDetails"
+          },
+          "external_agent_messages": {
+            "items": {
+              "type": "string"
+            },
+            "title": "External Agent Messages",
+            "type": "array"
+          }
+        },
+        "required": [
+          "draft",
+          "draft_state"
+        ],
+        "title": "ProcurementDraftState",
+        "type": "object"
+      },
+      "ProcurementDraftStateDetails": {
+        "properties": {
+          "fields": {
+            "items": {
+              "$ref": "#/components/schemas/AgentDraftField"
+            },
+            "title": "Fields",
+            "type": "array"
+          },
+          "fields_to_answer": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Fields To Answer",
+            "type": "array"
+          },
+          "status": {
+            "enum": [
+              "has_validation_errors",
+              "needs_input",
+              "ready_to_submit"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "validation_errors": {
+            "items": {
+              "$ref": "#/components/schemas/ProcurementValidationIssue"
+            },
+            "title": "Validation Errors",
+            "type": "array"
+          }
+        },
+        "required": [
+          "fields",
+          "fields_to_answer",
+          "status",
+          "validation_errors"
+        ],
+        "title": "ProcurementDraftStateDetails",
+        "type": "object"
+      },
+      "ProcurementDraftSummary": {
+        "properties": {
+          "currency": {
+            "nullable": true,
+            "title": "Currency",
+            "type": "string"
+          },
+          "internal_memo": {
+            "nullable": true,
+            "title": "Internal Memo",
+            "type": "string"
+          },
+          "line_items": {
+            "items": {
+              "$ref": "#/components/schemas/ProcurementLineItemSummary"
+            },
+            "title": "Line Items",
+            "type": "array"
+          },
+          "request_name": {
+            "nullable": true,
+            "title": "Request Name",
+            "type": "string"
+          },
+          "spend_intent_uuid": {
+            "nullable": true,
+            "title": "Spend Intent Uuid",
+            "type": "string"
+          },
+          "spend_request_uuid": {
+            "title": "Spend Request Uuid",
+            "type": "string"
+          },
+          "unified_request_uuid": {
+            "nullable": true,
+            "title": "Unified Request Uuid",
+            "type": "string"
+          },
+          "web_path": {
+            "title": "Web Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "currency",
+          "internal_memo",
+          "line_items",
+          "request_name",
+          "spend_intent_uuid",
+          "spend_request_uuid",
+          "unified_request_uuid",
+          "web_path"
+        ],
+        "title": "ProcurementDraftSummary",
+        "type": "object"
+      },
+      "ProcurementLineItemDataRequestBody": {
+        "description": "Agent input that preserves omitted fields for partial line-item updates.",
+        "properties": {
+          "amount": {
+            "default": null,
+            "description": "Total line amount. If this is the only amount field provided, the service normalizes it to unit_price=amount and quantity=1.",
+            "nullable": true,
+            "oneOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "title": "Amount"
+          },
+          "description": {
+            "default": null,
+            "nullable": true,
+            "title": "Description",
+            "type": "string"
+          },
+          "due_date": {
+            "format": "date",
+            "nullable": true,
+            "title": "Due Date",
+            "type": "string"
+          },
+          "end_date": {
+            "format": "date",
+            "nullable": true,
+            "title": "End Date",
+            "type": "string"
+          },
+          "line_item_type": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/LineItemTypeRequestBody"
+              }
+            ],
+            "default": null,
+            "description": "Line item type. New lines default to EXPENSE when omitted; existing lines preserve their current type.",
+            "nullable": true
+          },
+          "quantity": {
+            "default": null,
+            "description": "Quantity for an itemized line. String values are preferred. For simple amount-only lines, the service uses 1.",
+            "nullable": true,
+            "oneOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "title": "Quantity"
+          },
+          "start_date": {
+            "format": "date",
+            "nullable": true,
+            "title": "Start Date",
+            "type": "string"
+          },
+          "unit_price": {
+            "default": null,
+            "description": "Unit price for an itemized line. String values are preferred. For simple requests, use amount instead.",
+            "nullable": true,
+            "oneOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "title": "Unit Price"
+          },
+          "uuid": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/UUIDStrRequestBody"
+              }
+            ],
+            "default": null,
+            "nullable": true
+          }
+        },
+        "title": "ProcurementLineItemData",
+        "type": "object"
+      },
+      "ProcurementLineItemSummary": {
+        "properties": {
+          "amount": {
+            "nullable": true,
+            "title": "Amount",
+            "type": "number"
+          },
+          "description": {
+            "nullable": true,
+            "title": "Description",
+            "type": "string"
+          },
+          "due_date": {
+            "format": "date",
+            "nullable": true,
+            "title": "Due Date",
+            "type": "string"
+          },
+          "end_date": {
+            "format": "date",
+            "nullable": true,
+            "title": "End Date",
+            "type": "string"
+          },
+          "line_item_type": {
+            "nullable": true,
+            "title": "Line Item Type",
+            "type": "string"
+          },
+          "quantity": {
+            "nullable": true,
+            "title": "Quantity",
+            "type": "number"
+          },
+          "start_date": {
+            "format": "date",
+            "nullable": true,
+            "title": "Start Date",
+            "type": "string"
+          },
+          "unit_price": {
+            "nullable": true,
+            "title": "Unit Price",
+            "type": "number"
+          },
+          "uuid": {
+            "nullable": true,
+            "title": "Uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "amount",
+          "description",
+          "due_date",
+          "end_date",
+          "line_item_type",
+          "quantity",
+          "start_date",
+          "unit_price",
+          "uuid"
+        ],
+        "title": "ProcurementLineItemSummary",
+        "type": "object"
+      },
+      "ProcurementSpendIntentSummary": {
+        "properties": {
+          "description": {
+            "nullable": true,
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "outcome_type": {
+            "title": "Outcome Type",
+            "type": "string"
+          },
+          "spend_intent_uuid": {
+            "title": "Spend Intent Uuid",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "description",
+          "name",
+          "outcome_type",
+          "spend_intent_uuid",
+          "status"
+        ],
+        "title": "ProcurementSpendIntentSummary",
+        "type": "object"
+      },
+      "ProcurementSubmittedRequest": {
+        "properties": {
+          "external_agent_messages": {
+            "items": {
+              "type": "string"
+            },
+            "title": "External Agent Messages",
+            "type": "array"
+          },
+          "request_status": {
+            "title": "Request Status",
+            "type": "string"
+          },
+          "spend_request_uuid": {
+            "title": "Spend Request Uuid",
+            "type": "string"
+          },
+          "submitted_at": {
+            "nullable": true,
+            "title": "Submitted At",
+            "type": "string"
+          },
+          "unified_request_uuid": {
+            "nullable": true,
+            "title": "Unified Request Uuid",
+            "type": "string"
+          },
+          "web_path": {
+            "title": "Web Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_status",
+          "spend_request_uuid",
+          "submitted_at",
+          "unified_request_uuid",
+          "web_path"
+        ],
+        "title": "ProcurementSubmittedRequest",
+        "type": "object"
+      },
+      "ProcurementUploadedFileResultJsonMode": {
+        "properties": {
+          "answer": {
+            "$ref": "#/components/schemas/AgentFileUploadFieldAnswerJsonMode"
+          },
+          "content_type": {
+            "nullable": true,
+            "title": "Content Type",
+            "type": "string"
+          },
+          "displayed_filename": {
+            "nullable": true,
+            "title": "Displayed Filename",
+            "type": "string"
+          },
+          "document_category": {
+            "title": "Document Category",
+            "type": "string"
+          },
+          "field_id": {
+            "title": "Field Id",
+            "type": "string"
+          },
+          "file_uuid": {
+            "title": "File Uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer",
+          "content_type",
+          "displayed_filename",
+          "document_category",
+          "field_id",
+          "file_uuid"
+        ],
+        "title": "ProcurementUploadedFileResult",
+        "type": "object"
+      },
+      "ProcurementValidationIssue": {
+        "properties": {
+          "example": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/JsonValue"
+              }
+            ],
+            "default": null,
+            "nullable": true
+          },
+          "expected": {
+            "default": null,
+            "nullable": true,
+            "title": "Expected",
+            "type": "string"
+          },
+          "field_id": {
+            "default": null,
+            "nullable": true,
+            "title": "Field Id",
+            "type": "string"
+          },
+          "label": {
+            "default": null,
+            "nullable": true,
+            "title": "Label",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "path": {
+            "default": null,
+            "nullable": true,
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "title": "ProcurementValidationIssue",
         "type": "object"
       },
       "ProvideNoReceiptReasonRequestBody": {
@@ -24967,6 +27294,68 @@
         "title": "SearchHelpCenterSnippets",
         "type": "object"
       },
+      "SearchMerchantsRequestBody": {
+        "description": "Search for merchants by name. Returns matching merchant IDs, UUIDs, names, categories, and domains.",
+        "properties": {
+          "limit": {
+            "default": 10,
+            "description": "Maximum number of results to return",
+            "maximum": 20,
+            "minimum": 1,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "query": {
+            "description": "Merchant name to search for (partial match, case-insensitive)",
+            "minLength": 2,
+            "title": "Query",
+            "type": "string"
+          },
+          "rationale": {
+            "description": "Briefly explain why you are calling this tool: what goal or workflow it serves and what you intend to do with the result.",
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Rationale",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query",
+          "rationale"
+        ],
+        "title": "SearchMerchants",
+        "type": "object"
+      },
+      "SearchMerchantsResult": {
+        "properties": {
+          "external_agent_messages": {
+            "items": {
+              "type": "string"
+            },
+            "title": "External Agent Messages",
+            "type": "array"
+          },
+          "merchants": {
+            "description": "List of merchants matching the search query",
+            "items": {
+              "$ref": "#/components/schemas/MerchantResult"
+            },
+            "title": "Merchants",
+            "type": "array"
+          },
+          "query": {
+            "description": "The search query that was used",
+            "title": "Query",
+            "type": "string"
+          }
+        },
+        "required": [
+          "merchants",
+          "query"
+        ],
+        "title": "SearchMerchantsResult",
+        "type": "object"
+      },
       "SearchPurchaseOrdersRequestBody": {
         "description": "Search for purchase orders using structured purchase order filters.",
         "properties": {
@@ -25578,6 +27967,26 @@
         "title": "SimplifiedUserDetailResponse",
         "type": "object"
       },
+      "SkCategoryItem": {
+        "properties": {
+          "id": {
+            "description": "Category integer ID for use in category-aware policies and tools",
+            "title": "Id",
+            "type": "integer"
+          },
+          "name": {
+            "description": "Category display name",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "SkCategoryItem",
+        "type": "object"
+      },
       "SortByRequestBody": {
         "enum": [
           "merchant",
@@ -25929,7 +28338,7 @@
         "type": "object"
       },
       "SubmitFlightBookingRequestBody": {
-        "description": "Book a selected flight offer.\n\nTwo-step flow: call without ``confirm`` for a summary (itinerary, price,\nin-policy status, required approvals) without booking, then call with\n``confirm=true`` and the previewed ``expected_total_amount`` to book once\nthe traveler approves that summary.\n\n``flight_offer_uuid`` is the literal ``id`` from search: the outbound flight\nfor one-way, the return flight for round trips (it carries both legs), or a\nfare option's id to book that fare. For a delegated booking, pass the\n``traveler_user_id`` from search. For changes or cancellations, use the web app.\n\nIf the chosen flight is out of policy, you MUST collect an ``oop_reason`` from\nthe traveler and pass it here.\n\nFor self-booking only, before previewing or confirming a booking, call\nGetTravelerProfile. If ``has_profile`` is false, collect first_name,\nlast_name, email, phone_number, date_of_birth, and id_gender, then call\nUpdateTravelerProfile first. Do not use this preflight for delegated\nbookings with ``traveler_user_id``; these profile tools operate on the\ncurrent runtime user, so rely on the booking flow's existing\ntraveler-profile check instead.",
+        "description": "Book a selected flight offer.\n\nTwo-step flow: call without ``confirm`` for a summary (itinerary, price,\nin-policy status, required approvals) without booking, then call with\n``confirm=true`` and the previewed ``expected_total_amount`` to book once\nthe traveler approves that summary.\n\n``flight_offer_uuid`` is the literal ``id`` from search: the outbound flight\nfor one-way, the return flight for round trips (it carries both legs), or a\nfare option's id to book that fare. For a delegated booking, pass the\n``traveler_user_id`` from user search through GetTravelerProfile,\nUpdateTravelerProfile if needed, SearchFlights, and SubmitFlightBooking. For\nchanges or cancellations, use the web app.\n\nIf the chosen flight is out of policy, you MUST collect an ``oop_reason`` from\nthe traveler and pass it here.\n\nBefore previewing or confirming a booking, call GetTravelerProfile for the\ntraveler being booked. For self-booking, omit ``traveler_user_id``. For\ndelegated booking, pass the resolved ``traveler_user_id``. If ``has_profile``\nis false, collect first_name, last_name, email, phone_number, date_of_birth,\nand id_gender, then call UpdateTravelerProfile with the same traveler target\nbefore booking.",
         "properties": {
           "confirm": {
             "default": false,
@@ -26004,6 +28413,38 @@
           "rationale"
         ],
         "title": "SubmitFlightBooking",
+        "type": "object"
+      },
+      "SubmitProcurementRequestRequestBody": {
+        "description": "Submit a procurement draft after explicit user confirmation.",
+        "properties": {
+          "confirmed": {
+            "description": "Must be true only after explicit user confirmation.",
+            "title": "Confirmed",
+            "type": "boolean"
+          },
+          "rationale": {
+            "description": "Briefly explain why you are calling this tool: what goal or workflow it serves and what you intend to do with the result.",
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Rationale",
+            "type": "string"
+          },
+          "spend_request_uuid": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/UUIDStrRequestBody"
+              }
+            ],
+            "description": "Draft spend request UUID returned by draft."
+          }
+        },
+        "required": [
+          "confirmed",
+          "rationale",
+          "spend_request_uuid"
+        ],
+        "title": "SubmitProcurementRequest",
         "type": "object"
       },
       "SubmitReimbursementRequestBody": {
@@ -28945,7 +31386,7 @@
         "type": "object"
       },
       "UpdateTravelerProfileRequestBody": {
-        "description": "Update the user's traveler profile information including name, email, phone, date of birth, gender, and loyalty programs.",
+        "description": "Update traveler profile information including name, email, phone, date of birth, gender, and loyalty programs. Defaults to the acting user's profile. For delegated flight booking, pass traveler_user_id from user search to update that traveler's profile using the same authorization path as SubmitFlightBooking.",
         "properties": {
           "date_of_birth": {
             "default": null,
@@ -29047,6 +31488,13 @@
             "description": "Redress number from the DHS Traveler Redress Inquiry Program (DHS TRIP). Must be a 7-digit number.",
             "nullable": true,
             "title": "Redress Number",
+            "type": "string"
+          },
+          "traveler_user_id": {
+            "default": null,
+            "description": "Traveler UUID when updating another user's profile for delegated flight booking. Resolve names with list-users, set this only when the user explicitly asks to book for another person, and pass the same value through profile preflight, search, and submit-flight-booking. Omit for self-booking.",
+            "nullable": true,
+            "title": "Traveler User Id",
             "type": "string"
           }
         },

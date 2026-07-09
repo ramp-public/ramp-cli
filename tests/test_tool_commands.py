@@ -61,6 +61,26 @@ class TestRegistry:
     def test_get_tool_not_found(self):
         assert get_tool("nonexistent-tool") is None
 
+    def test_shared_procurement_path_operations_have_unique_registry_entries(
+        self, monkeypatch
+    ):
+        _use_bundled_spec(monkeypatch)
+
+        operations = {
+            name: get_tool(name, env="production")
+            for name in (
+                "delete-procurement-draft",
+                "get-procurement-draft",
+                "post-procurement-draft",
+            )
+        }
+
+        assert {name: tool.http_method for name, tool in operations.items()} == {
+            "delete-procurement-draft": "delete",
+            "get-procurement-draft": "get",
+            "post-procurement-draft": "post",
+        }
+
     def test_env_switch_reloads_spec(self, tmp_path, monkeypatch):
         """Registry auto-reloads when a different env is requested."""
 
@@ -653,6 +673,74 @@ class TestBuildToolCommand:
             None,
         )
         assert json.loads(result.output)["data"] == [{}]
+
+    def test_non_dry_run_procurement_get_json_keeps_get_transport(
+        self, monkeypatch, isolated_config
+    ):
+        """Dry-run skips JSON schema sync, so exercise the real non-dry-run path."""
+        _use_bundled_spec(monkeypatch)
+        monkeypatch.setattr(
+            "ramp_cli.tools.commands.maybe_sync", lambda env, force=False: None
+        )
+        client = MagicMock()
+        client.get.return_value = b"{}"
+        monkeypatch.setattr("ramp_cli.tools.commands.RampClient", lambda env: client)
+        request_body = {
+            "rationale": "Refresh the draft before continuing",
+            "spend_request_uuid": "00000000-0000-4000-8000-000000000001",
+        }
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--agent",
+                "procurement_requests",
+                "get",
+                "--json",
+                json.dumps(request_body),
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        client.get.assert_called_once_with(
+            "/developer/v1/agent-tools/procurement-draft", request_body
+        )
+        client.post.assert_not_called()
+        client.delete.assert_not_called()
+
+    def test_non_dry_run_procurement_delete_json_keeps_delete_transport(
+        self, monkeypatch, isolated_config
+    ):
+        """Dry-run skips JSON schema sync, so exercise the real non-dry-run path."""
+        _use_bundled_spec(monkeypatch)
+        monkeypatch.setattr(
+            "ramp_cli.tools.commands.maybe_sync", lambda env, force=False: None
+        )
+        client = MagicMock()
+        client.delete.return_value = b"{}"
+        monkeypatch.setattr("ramp_cli.tools.commands.RampClient", lambda env: client)
+        request_body = {
+            "rationale": "Delete the abandoned draft",
+            "spend_request_uuid": "00000000-0000-4000-8000-000000000001",
+        }
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--agent",
+                "procurement_requests",
+                "delete",
+                "--json",
+                json.dumps(request_body),
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        path, payload = client.delete.call_args.args
+        assert path == "/developer/v1/agent-tools/procurement-draft"
+        assert json.loads(payload) == request_body
+        client.get.assert_not_called()
+        client.post.assert_not_called()
 
     def test_has_param_options(self):
         cmd = build_tool_command(self._simple_tool())
@@ -1702,6 +1790,151 @@ class TestCLIIntegration:
             "/developer/v1/agent-tools/search-unified-requests"
         )
 
+    def test_procurement_draft_generated_group_builds_schema_payload(self, monkeypatch):
+        _use_bundled_spec(monkeypatch)
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "--agent",
+                "--env",
+                "sandbox",
+                "procurement_requests",
+                "draft",
+                "--json",
+                json.dumps(
+                    {
+                        "spend_intent_uuid": "spend-intent-uuid",
+                        "rationale": "Populate procurement request draft",
+                        "request_name": "Laptop request",
+                        "currency": "USD",
+                        "line_items": [
+                            {
+                                "description": "Laptop",
+                                "amount": "2000.00",
+                            }
+                        ],
+                        "answers": [
+                            {
+                                "answer_type": "text",
+                                "field_id": "business_justification",
+                                "value": "Need laptops",
+                            },
+                            {
+                                "answer_type": "file_upload",
+                                "field_id": "quote_upload",
+                                "file_uuids": ["file-uuid"],
+                            },
+                        ],
+                    }
+                ),
+                "--dry_run",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        body = payload["data"][0]["body"]
+        assert payload["data"][0]["url"].endswith(
+            "/developer/v1/agent-tools/procurement-draft"
+        )
+        assert body == {
+            "spend_intent_uuid": "spend-intent-uuid",
+            "rationale": "Populate procurement request draft",
+            "request_name": "Laptop request",
+            "currency": "USD",
+            "line_items": [
+                {
+                    "description": "Laptop",
+                    "amount": "2000.00",
+                }
+            ],
+            "answers": [
+                {
+                    "answer_type": "text",
+                    "field_id": "business_justification",
+                    "value": "Need laptops",
+                },
+                {
+                    "answer_type": "file_upload",
+                    "field_id": "quote_upload",
+                    "file_uuids": ["file-uuid"],
+                },
+            ],
+        }
+
+    def test_procurement_upload_file_generated_group_builds_multipart_payload(
+        self, tmp_path, monkeypatch
+    ):
+        _use_bundled_spec(monkeypatch)
+        upload = tmp_path / "quote.pdf"
+        upload.write_text("quote")
+        runner = CliRunner()
+
+        result = runner.invoke(
+            cli,
+            [
+                "--agent",
+                "--env",
+                "sandbox",
+                "procurement_requests",
+                "upload-file",
+                "quote_upload",
+                "spend-request-uuid",
+                "--file",
+                str(upload),
+                "--rationale",
+                "Attach quote",
+                "--dry_run",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        body = payload["data"][0]["body"]
+        assert payload["data"][0]["url"].endswith(
+            "/developer/v1/agent-tools/procurement-upload-file"
+        )
+        assert body == {
+            "spend_request_uuid": "spend-request-uuid",
+            "field_id": "quote_upload",
+            "rationale": "Attach quote",
+            "file": str(upload),
+        }
+
+    def test_procurement_submit_generated_group_builds_confirmed_payload(
+        self, monkeypatch
+    ):
+        _use_bundled_spec(monkeypatch)
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "--agent",
+                "--env",
+                "sandbox",
+                "procurement_requests",
+                "submit",
+                "spend-request-uuid",
+                "--confirmed",
+                "--rationale",
+                "Submit confirmed procurement request",
+                "--dry_run",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        body = payload["data"][0]["body"]
+        assert payload["data"][0]["url"].endswith(
+            "/developer/v1/agent-tools/procurement-submit"
+        )
+        assert body == {
+            "spend_request_uuid": "spend-request-uuid",
+            "confirmed": True,
+            "rationale": "Submit confirmed procurement request",
+        }
+
     def test_travel_search_keeps_legacy_alias(self, monkeypatch):
         _use_bundled_spec(monkeypatch)
         runner = CliRunner()
@@ -1728,6 +1961,45 @@ class TestCLIIntegration:
             assert payload["data"][0]["url"].endswith(
                 "/developer/v1/agent-tools/search-flights"
             )
+
+    def test_travel_profile_tools_accept_traveler_user_id(self, monkeypatch):
+        _use_bundled_spec(monkeypatch)
+        runner = CliRunner()
+
+        profile_result = runner.invoke(
+            cli,
+            [
+                "travel",
+                "profile",
+                "--traveler_user_id",
+                "traveler-uuid",
+                "--dry_run",
+                "--rationale",
+                "test",
+            ],
+        )
+        assert profile_result.exit_code == 0, profile_result.output
+        profile_body = json.loads(profile_result.output)["data"][0]["body"]
+        assert profile_body["traveler_user_id"] == "traveler-uuid"
+
+        update_result = runner.invoke(
+            cli,
+            [
+                "travel",
+                "profile-update",
+                "--traveler_user_id",
+                "traveler-uuid",
+                "--first_name",
+                "Taylor",
+                "--dry_run",
+                "--rationale",
+                "test",
+            ],
+        )
+        assert update_result.exit_code == 0, update_result.output
+        update_body = json.loads(update_result.output)["data"][0]["body"]
+        assert update_body["traveler_user_id"] == "traveler-uuid"
+        assert update_body["first_name"] == "Taylor"
 
     def test_flat_tool_access_still_works(self):
         runner = CliRunner()

@@ -102,10 +102,17 @@ def _extract_category(tags: list[str]) -> str:
     return tags[-1] if tags else ""
 
 
-def _operation_name(path: str, method_def: dict) -> str:
+def _operation_name(
+    path: str,
+    method: str,
+    method_def: dict,
+    *,
+    shared_path: bool = False,
+) -> str:
     """Return a stable internal name while preserving legacy tool identities."""
     if path.startswith(_AGENT_TOOLS_PREFIX):
-        return path.rsplit("/", 1)[-1]
+        endpoint_name = path.rsplit("/", 1)[-1]
+        return f"{method}-{endpoint_name}" if shared_path else endpoint_name
     return method_def.get("operationId") or path.rsplit("/", 1)[-1]
 
 
@@ -172,22 +179,35 @@ def parse_spec_dict(
         if path_prefix is not None and not path.startswith(path_prefix):
             continue
         path_params = path_def.get("parameters", [])
-        for method, method_def in path_def.items():
-            # Skip OpenAPI extension keys like "x-source-details"
-            if method.startswith("x-") or method not in _HTTP_METHODS:
-                continue
-            if not isinstance(method_def, dict) or not _supports_cli(method_def):
-                continue
+        operations = [
+            (method, method_def)
+            for method, method_def in path_def.items()
+            if method in _HTTP_METHODS
+            and isinstance(method_def, dict)
+            and _supports_cli(method_def)
+            and (not require_alias or method_def.get("x-alias"))
+        ]
+        for method, method_def in operations:
             alias = method_def.get("x-alias")
-            if require_alias and not alias:
-                continue
+            # x-alias remains the public command name. Qualifying only the internal
+            # name prevents registry collisions when methods share an API path.
+            operation_name = (
+                alias
+                if alias_as_name and alias
+                else _operation_name(
+                    path,
+                    method,
+                    method_def,
+                    shared_path=len(operations) > 1,
+                )
+            )
             tool = _parse_endpoint(
                 path,
                 method,
                 method_def,
                 schemas,
                 path_params=path_params,
-                name=alias if alias_as_name else None,
+                name=operation_name,
                 category=category or None,
                 source=source,
             )
@@ -248,7 +268,7 @@ def _parse_endpoint(
     source: str = "agent-tools",
 ) -> ToolDef | None:
     summary = method_def.get("summary", "")
-    tool_name = name or _operation_name(path, method_def)
+    tool_name = name or _operation_name(path, method, method_def)
     response_ref = _response_ref(method_def)
     all_parameters = [*(path_params or []), *method_def.get("parameters", [])]
     operation_params = _parse_operation_params(all_parameters, schemas)

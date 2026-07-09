@@ -23,10 +23,11 @@ plain travel language ("Let me pull up the fare and check it before booking…")
 - ✅ Resolve cities to airports; search one-way and round-trip; show offers.
 - ✅ Round-trip: fetch the matching **return** flights for the outbound the user picks (Step 5).
 - ✅ **Book the ticket** — preview, confirm only on an explicit yes, then verify (Step 6).
-  Booking books for **you** (the logged-in user) and spends **real money**.
+  Booking spends **real money**; it defaults to the logged-in user unless the user explicitly
+  asks to book for another traveler.
 - ✅ Compare cabins/fares — **only when asked** (see "Comparing cabins or fares").
 - ✅ Read or update the traveler's profile, and read trips and bookings (see "Supporting tools").
-- ❌ Booking for someone else. If asked, say you can only book for the signed-in user.
+- ✅ Book for another traveler when explicitly asked and authorized (see "Delegated booking").
 - ❌ Cancellations, changes, refunds, seat selection, loyalty, hotels, cars, multi-city —
   those happen in the Ramp web app.
 
@@ -60,6 +61,37 @@ plain travel language ("Let me pull up the fare and check it before booking…")
 
 - **Use `ramp travel search-flight`** for flight searches. Check `ramp travel --help` if the
   alias is unavailable before continuing.
+
+## Delegated booking
+
+Only set `traveler_user_id` when the user explicitly asks to book for another person. Otherwise
+omit it everywhere and book for the logged-in user.
+
+When the user asks to book for someone else:
+
+1. Resolve that traveler before profile preflight or search:
+
+```bash
+ramp users list --name_search "Taylor Smith" --page_size 5 \
+  --rationale "resolve the traveler for the Toronto→SFO trip" --output json
+```
+
+Use the returned traveler user UUID as `traveler_user_id`. If more than one user could match,
+ask the requester to pick the exact traveler before continuing.
+
+2. Preserve the same `traveler_user_id` across the whole delegated flow: profile preflight,
+   `profile-update` if needed, every `search-flight` call (initial search, resume pages, and
+   round-trip return search), both `travel book` preview and confirm calls, and booking
+   verification/retries. Do not switch traveler ids mid-flow.
+
+3. If traveler lookup fails or a target-aware call returns an authorization/empty-access result,
+   respond in plain travel-helper language. Do not mention `traveler_user_id`, flags, command
+   names, command counts, or CLI mechanics. Say you couldn't find/access that traveler and ask
+   whether to continue for the requester or search again with a Ramp email/exact profile name.
+   Example: *"I couldn't find a traveler named Emmy Song in this Ramp directory. If you want to
+   book for yourself, I can continue using your own traveler profile. Otherwise, send me the
+   traveler's Ramp email or exact profile name and I'll search again."* Do not silently fall back
+   to self-booking.
 
 ## Step 1 — gather trip details
 
@@ -99,8 +131,8 @@ YYZ/YTZ). For one specific airport, search `--location_type airport` and pass it
 
 ## Step 3 — search flights
 
-Add `--return_date` only for round-trips. No `--cabin_class`/`--limit`/`--sort_key` unless
-the user named a cabin, count, or order.
+Add `--return_date` only for round-trips. Add `--traveler_user_id` only for delegated bookings.
+No `--cabin_class`/`--limit`/`--sort_key` unless the user named a cabin, count, or order.
 
 ```bash
 ramp travel search-flight --output json \
@@ -161,8 +193,9 @@ pick."* If vague ("the morning one") and more than one fits, confirm the exact f
 
 The return step is a **second flight-search call** — same command, with the chosen outbound's
 `id` as `--outbound_offer_id` plus the Step 3 `job_id` as `--search_job_id` (carries outbound
-context for return-policy). Don't pass `--departure`/`--arrival`/dates again — mixing them
-with `--outbound_offer_id` is rejected.
+context for return-policy). For delegated bookings, also pass the same `--traveler_user_id`.
+Don't pass `--departure`/`--arrival`/dates again — mixing them with `--outbound_offer_id` is
+rejected.
 
 ```bash
 ramp travel search-flight --output json \
@@ -196,6 +229,10 @@ If `has_profile` is `false`, collect the required traveler details in one messag
 the profile before continuing. Use the tool to save the details the traveler gives you; do not
 send them to the Ramp web app for this.
 
+For delegated bookings, pass the same `traveler_user_id` from the user lookup flow to
+`travel profile` and, if needed, `travel profile-update`. For self-booking, omit
+`traveler_user_id`.
+
 ```bash
 ramp travel profile-update --output json \
   --first_name "Taylor" \
@@ -207,8 +244,9 @@ ramp travel profile-update --output json \
 ```
 
 Only continue when the update succeeds. Confirm the profile-update result reports success, or
-re-run `travel profile` to verify the traveler now has a profile before moving on. If the update
-fails, correct the missing details and retry instead of continuing to booking.
+re-run `travel profile` to verify the traveler now has a profile before moving on. For delegated
+bookings, re-run it with the same `traveler_user_id`. If the update fails, correct the missing
+details and retry instead of continuing to booking.
 
 Once the profile exists, continue to the normal preview, confirmation, and verification flow.
 
@@ -221,6 +259,7 @@ Behind it is **`flight_offer_uuid`**, so a `--json` body uses key `flight_offer_
 ### Phase 1 — preview (always first)
 
 Run `book` **without `--confirm`** — that returns the preview and books nothing.
+For delegated bookings, pass the same `--traveler_user_id` used for profile preflight/search.
 
 ```bash
 ramp travel book "<flight_offer_uuid>" --output json \
@@ -253,6 +292,7 @@ Add `--confirm` and pass the preview's total as `--expected_total_amount` (rejec
 booking if the fare moved instead of quietly charging more). Use the preview's `total_amount`
 **exactly as a string with the currency symbol**, **single-quoted** (`'$288.80'`) — double
 quotes let the shell eat `$2`, sending `88.80` and triggering a false price-change rejection.
+For delegated bookings, pass the same `--traveler_user_id` used in the preview.
 
 ```bash
 ramp travel book "<flight_offer_uuid>" --confirm \
@@ -281,6 +321,9 @@ ramp travel bookings --include_flights --output json \
   --rationale "verify the Toronto→SFO Jul 1 booking reached a terminal status"
 ```
 
+For delegated bookings, pass the same `--traveler_user_id` when verifying and on every retry;
+otherwise `travel bookings` checks the requester's bookings.
+
 Find the flight you just booked by matching what `travel bookings` returns — departure/arrival
 airports, `flight_number`, and departure time. If several match (e.g. earlier pending/failed
 attempts on the same route/date), pick the most recent by **`booked_at`** — that's the one you
@@ -291,7 +334,8 @@ match on that.) Report its `status`. Most read for themselves (`CONFIRMED`, `PEN
 - **`PROCESSING`** is **not final** — wait and re-run `travel bookings` until it settles;
   don't report it as booked yet.
 - **`FAILED`** — show `error_message` exactly. If it points to missing traveler details, use
-  `travel profile` and `travel profile-update` to complete the profile before retrying.
+  `travel profile` and `travel profile-update` with the same traveler target to complete the
+  profile before retrying.
 
 ## Comparing cabins or fares (only when asked)
 

@@ -9,6 +9,7 @@ from ramp_cli.tools.parser import (
     ParamType,
     ToolDef,
     ToolParam,
+    _parse_endpoint,
     extract_all_scopes,
     parse_spec,
     parse_spec_dict,
@@ -340,8 +341,45 @@ class TestAlias:
         for tool in tools:
             assert isinstance(tool.alias, str), f"{tool.name}: alias is not a string"
 
+    def test_shared_agent_tool_path_uses_method_qualified_internal_names(self):
+        spec = {
+            "paths": {
+                "/developer/v1/agent-tools/procurement-draft": {
+                    method: {
+                        "summary": f"{method.title()} draft",
+                        "x-alias": alias,
+                    }
+                    for method, alias in (
+                        ("delete", "delete"),
+                        ("get", "get"),
+                        ("post", "draft"),
+                    )
+                }
+            }
+        }
+
+        tools = parse_spec_dict(spec, synthesize_cli_tools=False)
+
+        assert {(tool.name, tool.alias, tool.http_method) for tool in tools} == {
+            ("delete-procurement-draft", "delete", "delete"),
+            ("get-procurement-draft", "get", "get"),
+            ("post-procurement-draft", "draft", "post"),
+        }
+
 
 class TestJsonSchema:
+    def test_procurement_answers_describe_visible_field_write_allowlist(self):
+        spec = json.loads(AGENT_TOOL_SPEC.read_text())
+        answers = spec["components"]["schemas"]["DraftProcurementRequestRequestBody"][
+            "properties"
+        ]["answers"]
+
+        assert (
+            "draft_state.fields visibility-based write allowlist"
+            in answers["description"]
+        )
+        assert "fields_to_answer is the prioritized subset" in answers["description"]
+
     def test_unified_request_search_schema_has_nested_filters(
         self, tool_map: dict[str, ToolDef]
     ):
@@ -401,6 +439,17 @@ class TestJsonSchema:
 
 
 class TestEdgeCases:
+    def test_parse_endpoint_derives_name_when_not_supplied(self):
+        tool = _parse_endpoint(
+            "/developer/v1/agent-tools/get-status",
+            "get",
+            {"summary": "Get status"},
+            {},
+        )
+
+        assert tool is not None
+        assert tool.name == "get-status"
+
     def test_empty_spec(self):
         assert parse_spec_dict({}) == []
 
