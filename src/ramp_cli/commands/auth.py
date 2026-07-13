@@ -13,6 +13,11 @@ from ramp_cli.auth.environment import (
     environment_auth_required_message,
     missing_required_environment_auth,
 )
+from ramp_cli.auth.memberships import (
+    fetch_business_memberships,
+    fetch_token_info,
+    summarize_memberships,
+)
 from ramp_cli.auth.oauth import LoginOptions, OAuthTokenError
 from ramp_cli.auth.oauth import login as do_login
 from ramp_cli.config import settings
@@ -229,6 +234,65 @@ def status(ctx: click.Context) -> None:
                 )
             else:
                 click.echo(f"  Scopes: {len(scopes)} granted", err=True)
+                click.echo(
+                    "  Tip: ramp auth businesses — list memberships when you "
+                    "belong to multiple businesses",
+                    err=True,
+                )
+
+
+@auth_group.command("businesses")
+@click.pass_context
+def businesses(ctx: click.Context) -> None:
+    """List Ramp businesses your account can access in this environment."""
+
+    env = ctx.obj["env"]
+    fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
+
+    if not _is_authenticated(settings.load(), env):
+        raise click.ClickException(
+            f"Not authenticated for {env_label(env)}. Run: ramp auth login"
+        )
+
+    token_info = fetch_token_info(env)
+    active_business_id = str(token_info.get("business_id") or "")
+    memberships = summarize_memberships(
+        fetch_business_memberships(env), active_business_id
+    )
+
+    if not memberships:
+        raise click.ClickException(
+            "Could not load business memberships. Ensure your token includes "
+            "users:read and try: ramp users me --agent"
+        )
+
+    if fmt == "json":
+        print_agent_json(
+            {
+                "environment": env,
+                "active_business_id": active_business_id or None,
+                "membership_count": len(memberships),
+                "memberships": memberships,
+                "switch_hint": (
+                    "Re-run ramp auth login and select the target business in "
+                    "the OAuth UI to switch the active session."
+                ),
+            },
+            pagination=None,
+        )
+        return
+
+    click.echo(f"Business memberships for {env_label(env)}:")
+    for row in memberships:
+        marker = " (active session)" if row["is_active_session"] else ""
+        click.echo(
+            f"  • {row['name'] or row['email']} — {row['business_id']}{marker}"
+        )
+    if len(memberships) > 1:
+        click.echo(
+            "\n  To switch businesses, run ramp auth login and select the "
+            "target business in the OAuth UI."
+        )
 
 
 @auth_group.command()
