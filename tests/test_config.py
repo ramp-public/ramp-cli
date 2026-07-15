@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 
 from click.testing import CliRunner
 
 from ramp_cli.config import settings
 from ramp_cli.config.constants import ENV_PRODUCTION, ENV_SANDBOX, environment_usage
 from ramp_cli.main import cli
+from ramp_cli.platform_utils import is_git_bash_windows
 
 
 def test_load_missing_file(isolated_config):
@@ -71,6 +74,66 @@ def test_config_file_permissions(isolated_config):
     path = settings.config_path()
     mode = path.stat().st_mode & 0o777
     assert mode == 0o600
+
+
+def test_loose_permission_warning_emitted_on_posix(isolated_config, capsys):
+    cfg = settings.Config()
+    cfg.environment = "sandbox"
+    settings.save(cfg)
+    settings.config_path().chmod(0o644)
+
+    settings.load()
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert "0644" in err
+
+
+def test_loose_permission_warning_skipped_on_windows(
+    isolated_config, monkeypatch, capsys
+):
+    """Windows synthesizes modes like 0o666, so the POSIX check must not run."""
+    cfg = settings.Config()
+    cfg.environment = "sandbox"
+    settings.save(cfg)
+    settings.config_path().chmod(0o644)
+
+    class WindowsLikeOS:
+        name = "nt"
+
+        def __getattr__(self, attr):
+            return getattr(os, attr)
+
+    monkeypatch.setattr(settings, "os", WindowsLikeOS())
+    loaded = settings.load()
+    assert loaded.environment == "sandbox"
+    assert "WARNING" not in capsys.readouterr().err
+
+
+def test_config_dir_normalizes_git_bash_xdg_config_home(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("MSYSTEM", "MINGW64")
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/c/Users/alice/.config")
+
+    assert (
+        str(settings.config_dir()).replace("\\", "/") == "C:/Users/alice/.config/ramp"
+    )
+
+
+def test_config_dir_keeps_msys_python_xdg_config_home_posix(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "msys")
+    monkeypatch.setenv("MSYSTEM", "MINGW64")
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/c/Users/alice/.config")
+
+    assert str(settings.config_dir()) == "/c/Users/alice/.config/ramp"
+
+
+def test_config_dir_does_not_claim_cygwin_path_support(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "cygwin")
+    monkeypatch.setenv("MSYSTEM", "MINGW64")
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/c/Users/alice/.config")
+
+    assert is_git_bash_windows() is False
+    assert str(settings.config_dir()) == "/c/Users/alice/.config/ramp"
 
 
 class TestConfigAgentMode:

@@ -2,8 +2,10 @@
 
 import io
 import os
+import sys
 from unittest.mock import MagicMock
 
+from ramp_cli.output import style
 from ramp_cli.output.paginator import ToolPaginator, _LineCounter
 from ramp_cli.output.style import ESC
 from ramp_cli.tools.commands import (
@@ -207,6 +209,21 @@ class TestPaginatorPageCaching:
         paginator._next_page()
         assert not fetch_called
 
+    def test_static_fallback_shows_next_page_hint(self, monkeypatch):
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+        buf = io.StringIO()
+        paginator = ToolPaginator(
+            title="Test",
+            headers=["id"],
+            initial_rows=[{"id": "1"}],
+            next_cursor="next-cursor",
+            fetch_next_page=lambda c: ([], None),
+            file=buf,
+        )
+
+        assert paginator.run() is None
+        assert "More results are available" in buf.getvalue()
+
 
 class TestPaginatorRerender:
     """Re-renders should move cursor up and clear, not append new tables."""
@@ -294,3 +311,36 @@ class TestPaginatorRerender:
         assert counter.line_count == 3
         counter.write("\n")
         assert counter.line_count == 4
+
+
+class TestRawInputFallback:
+    """On native Windows Python (Git Bash/ConPTY) isatty() can be True while
+    termios/tty are None — the paginator must fall back to a static table
+    instead of crashing in _read_key."""
+
+    def test_falls_back_to_static_table_when_termios_unavailable(self, monkeypatch):
+        monkeypatch.setattr(style, "termios", None)
+        monkeypatch.setattr(style, "tty", None)
+
+        fake_stdin = MagicMock()
+        fake_stdin.isatty.return_value = True
+        monkeypatch.setattr(sys, "stdin", fake_stdin)
+
+        read_key = MagicMock(side_effect=AssertionError("must not read raw keys"))
+        monkeypatch.setattr("ramp_cli.output.paginator._read_key", read_key)
+
+        buf = io.StringIO()
+        result = ToolPaginator(
+            title="Transactions",
+            headers=["id"],
+            initial_rows=[{"id": "txn-1"}, {"id": "txn-2"}],
+            next_cursor=None,
+            fetch_next_page=lambda c: ([], None),
+            file=buf,
+        ).run()
+
+        assert result is None
+        read_key.assert_not_called()
+        output = buf.getvalue()
+        assert "txn-1" in output
+        assert "txn-2" in output

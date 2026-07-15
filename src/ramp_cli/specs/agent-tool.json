@@ -8953,6 +8953,15 @@
         "title": "AnalystExecutionMode",
         "type": "string"
       },
+      "AnalystExecutionModeRequestBody": {
+        "enum": [
+          "jit_clickhouse_federated",
+          "jit_clickhouse_materialized",
+          "prebuilt_artifact"
+        ],
+        "title": "AnalystExecutionMode",
+        "type": "string"
+      },
       "AnalystMetricMetadata": {
         "properties": {
           "caveats": {
@@ -16553,6 +16562,96 @@
             "title": "Answers",
             "type": "array"
           },
+          "change_request_answers": {
+            "description": "Typed answers for the independent change-request form. Use only field IDs in change_request_state.fields; do not put these answers in answers.",
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "address": "#/components/schemas/AgentAddressFieldAnswerRequestBody",
+                  "boolean": "#/components/schemas/AgentBooleanFieldAnswerRequestBody",
+                  "contact": "#/components/schemas/AgentContactFieldAnswerRequestBody",
+                  "date": "#/components/schemas/AgentDateFieldAnswerRequestBody",
+                  "department": "#/components/schemas/AgentDepartmentFieldAnswerRequestBody",
+                  "email": "#/components/schemas/AgentEmailFieldAnswerRequestBody",
+                  "file_upload": "#/components/schemas/AgentFileUploadFieldAnswerRequestBody",
+                  "link": "#/components/schemas/AgentLinkFieldAnswerRequestBody",
+                  "merchant": "#/components/schemas/AgentMerchantFieldAnswerRequestBody",
+                  "merchant_category": "#/components/schemas/AgentMerchantCategoryFieldAnswerRequestBody",
+                  "monetary_amount": "#/components/schemas/AgentMonetaryAmountFieldAnswerRequestBody",
+                  "multi_select": "#/components/schemas/AgentMultiSelectFieldAnswerRequestBody",
+                  "number": "#/components/schemas/AgentNumberFieldAnswerRequestBody",
+                  "paragraph": "#/components/schemas/AgentParagraphFieldAnswerRequestBody",
+                  "single_select": "#/components/schemas/AgentSingleSelectFieldAnswerRequestBody",
+                  "text": "#/components/schemas/AgentTextFieldAnswerRequestBody",
+                  "vendor": "#/components/schemas/AgentVendorFieldAnswerRequestBody"
+                },
+                "propertyName": "answer_type"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/AgentAddressFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentBooleanFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentContactFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentDateFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentDepartmentFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentEmailFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentFileUploadFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentLinkFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentMerchantCategoryFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentMerchantFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentMonetaryAmountFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentMultiSelectFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentNumberFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentParagraphFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentSingleSelectFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentTextFieldAnswerRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentVendorFieldAnswerRequestBody"
+                }
+              ]
+            },
+            "title": "Change Request Answers",
+            "type": "array"
+          },
+          "clear_change_request_field_ids": {
+            "description": "Visible change-request form field IDs to clear. Do not also provide a change_request_answers entry for the same field.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Clear Change Request Field Ids",
+            "type": "array"
+          },
           "clear_field_ids": {
             "description": "Visible custom-form field IDs to clear. Do not also provide an answer for the same field.",
             "items": {
@@ -16571,6 +16670,16 @@
             "description": "ISO 4217 currency code, e.g. USD.",
             "nullable": true
           },
+          "existing_spend_request_uuid": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/UUIDStrRequestBody"
+              }
+            ],
+            "default": null,
+            "description": "The original approved purchase-order request's spend_request_uuid from unified request details; not the unified request_uuid or purchase_order_id. Provide this when requesting a change to that purchase order. Mutually exclusive with spend_intent_uuid.",
+            "nullable": true
+          },
           "internal_memo": {
             "default": null,
             "description": "Common shortcut for the internal memo.",
@@ -16580,7 +16689,7 @@
           },
           "line_items": {
             "default": null,
-            "description": "Complete desired line item list. When provided, it fully replaces the draft's current line items; when omitted, line items are untouched. Use string money values such as amount='90000.00'.",
+            "description": "Complete desired line item list. When provided, it replaces the draft's current lines; omit it to leave the lines unchanged. For an existing line, include its UUID and edit only the values that should change. Use string money values such as amount='90000.00'.",
             "items": {
               "$ref": "#/components/schemas/ProcurementLineItemDataRequestBody"
             },
@@ -16609,7 +16718,7 @@
               }
             ],
             "default": null,
-            "description": "Spend intent UUID returned by spend-intents. Required when creating a new draft; omit when continuing an existing draft.",
+            "description": "Spend intent UUID returned by spend-intents. Provide this when starting a new procurement request. Mutually exclusive with existing_spend_request_uuid.",
             "nullable": true
           },
           "spend_request_uuid": {
@@ -16619,7 +16728,7 @@
               }
             ],
             "default": null,
-            "description": "Draft spend request UUID returned by this tool.",
+            "description": "Draft spend request UUID returned by this tool. Provide this to continue editing a draft.",
             "nullable": true
           }
         },
@@ -23735,6 +23844,32 @@
         "title": "OrgChartUserInfo",
         "type": "object"
       },
+      "OriginalProcurementRequest": {
+        "description": "Approved purchase-order request being changed.",
+        "properties": {
+          "purchase_order_number": {
+            "nullable": true,
+            "title": "Purchase Order Number",
+            "type": "string"
+          },
+          "spend_request_uuid": {
+            "title": "Spend Request Uuid",
+            "type": "string"
+          },
+          "unified_request_uuid": {
+            "nullable": true,
+            "title": "Unified Request Uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "purchase_order_number",
+          "spend_request_uuid",
+          "unified_request_uuid"
+        ],
+        "title": "OriginalProcurementRequest",
+        "type": "object"
+      },
       "PaginatedResponseAgentAccountNumberResponse": {
         "example": {
           "data": [
@@ -24114,8 +24249,456 @@
         "title": "PostComment",
         "type": "object"
       },
+      "ProcurementChangeRequestAccountingFieldDiff": {
+        "properties": {
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          },
+          "field": {
+            "title": "Field",
+            "type": "string"
+          },
+          "field_type": {
+            "default": "ACCOUNTING_FIELD",
+            "enum": [
+              "ACCOUNTING_FIELD"
+            ],
+            "title": "Field Type",
+            "type": "string"
+          },
+          "is_custom_field": {
+            "default": false,
+            "title": "Is Custom Field",
+            "type": "boolean"
+          },
+          "new_value": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ProcurementChangeRequestAccountingFieldValues"
+              }
+            ],
+            "nullable": true
+          },
+          "old_value": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ProcurementChangeRequestAccountingFieldValues"
+              }
+            ],
+            "nullable": true
+          }
+        },
+        "required": [
+          "display_name",
+          "field",
+          "field_type",
+          "is_custom_field",
+          "new_value",
+          "old_value"
+        ],
+        "title": "ProcurementChangeRequestAccountingFieldDiff",
+        "type": "object"
+      },
+      "ProcurementChangeRequestAccountingFieldValues": {
+        "description": "Structured values for header accounting field diffs.",
+        "properties": {
+          "tracking_categories": {
+            "default": null,
+            "items": {
+              "$ref": "#/components/schemas/ProcurementChangeRequestAccountingTrackingCategoryValue"
+            },
+            "nullable": true,
+            "title": "Tracking Categories",
+            "type": "array"
+          }
+        },
+        "title": "ProcurementChangeRequestAccountingFieldValues",
+        "type": "object"
+      },
+      "ProcurementChangeRequestAccountingTrackingCategoryValue": {
+        "properties": {
+          "tracking_category_id": {
+            "title": "Tracking Category Id",
+            "type": "integer"
+          },
+          "tracking_category_name": {
+            "title": "Tracking Category Name",
+            "type": "string"
+          },
+          "tracking_category_option_name": {
+            "title": "Tracking Category Option Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tracking_category_id",
+          "tracking_category_name",
+          "tracking_category_option_name"
+        ],
+        "title": "ProcurementChangeRequestAccountingTrackingCategoryValue",
+        "type": "object"
+      },
+      "ProcurementChangeRequestFieldsDiff": {
+        "properties": {
+          "fields": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/ProcurementChangeRequestAccountingFieldDiff"
+                },
+                {
+                  "$ref": "#/components/schemas/ProcurementChangeRequestFilesFieldDiff"
+                },
+                {
+                  "$ref": "#/components/schemas/ProcurementChangeRequestLegacyFieldDiff"
+                },
+                {
+                  "$ref": "#/components/schemas/ProcurementChangeRequestLineItemFieldDiff"
+                },
+                {
+                  "$ref": "#/components/schemas/ProcurementChangeRequestLinkFieldDiff"
+                },
+                {
+                  "$ref": "#/components/schemas/ProcurementChangeRequestTextFieldDiff"
+                }
+              ]
+            },
+            "title": "Fields",
+            "type": "array"
+          }
+        },
+        "required": [
+          "fields"
+        ],
+        "title": "ProcurementChangeRequestFieldsDiff",
+        "type": "object"
+      },
+      "ProcurementChangeRequestFileFieldResponse": {
+        "properties": {
+          "original_filename": {
+            "title": "Original Filename",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "original_filename",
+          "url"
+        ],
+        "title": "ProcurementChangeRequestFileFieldResponse",
+        "type": "object"
+      },
+      "ProcurementChangeRequestFilesFieldDiff": {
+        "properties": {
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          },
+          "field": {
+            "title": "Field",
+            "type": "string"
+          },
+          "field_type": {
+            "default": "FILE",
+            "enum": [
+              "FILE"
+            ],
+            "title": "Field Type",
+            "type": "string"
+          },
+          "is_custom_field": {
+            "default": false,
+            "title": "Is Custom Field",
+            "type": "boolean"
+          },
+          "new_value": {
+            "items": {
+              "$ref": "#/components/schemas/ProcurementChangeRequestFileFieldResponse"
+            },
+            "nullable": true,
+            "title": "New Value",
+            "type": "array"
+          },
+          "old_value": {
+            "items": {
+              "$ref": "#/components/schemas/ProcurementChangeRequestFileFieldResponse"
+            },
+            "nullable": true,
+            "title": "Old Value",
+            "type": "array"
+          }
+        },
+        "required": [
+          "display_name",
+          "field",
+          "field_type",
+          "is_custom_field",
+          "new_value",
+          "old_value"
+        ],
+        "title": "ProcurementChangeRequestFilesFieldDiff",
+        "type": "object"
+      },
+      "ProcurementChangeRequestLegacyFieldDiff": {
+        "description": "Deprecated pre-field_type string diff; the only variant without field_type.",
+        "properties": {
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          },
+          "field": {
+            "title": "Field",
+            "type": "string"
+          },
+          "is_custom_field": {
+            "default": false,
+            "title": "Is Custom Field",
+            "type": "boolean"
+          },
+          "new_value": {
+            "nullable": true,
+            "title": "New Value",
+            "type": "string"
+          },
+          "old_value": {
+            "nullable": true,
+            "title": "Old Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "display_name",
+          "field",
+          "is_custom_field",
+          "new_value",
+          "old_value"
+        ],
+        "title": "ProcurementChangeRequestLegacyFieldDiff",
+        "type": "object"
+      },
+      "ProcurementChangeRequestLineItemFieldDiff": {
+        "properties": {
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          },
+          "field": {
+            "title": "Field",
+            "type": "string"
+          },
+          "field_type": {
+            "default": "LINE_ITEM",
+            "enum": [
+              "LINE_ITEM"
+            ],
+            "title": "Field Type",
+            "type": "string"
+          },
+          "is_custom_field": {
+            "default": false,
+            "title": "Is Custom Field",
+            "type": "boolean"
+          },
+          "new_value": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ProcurementChangeRequestLineItemValues"
+              }
+            ],
+            "nullable": true
+          },
+          "old_value": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ProcurementChangeRequestLineItemValues"
+              }
+            ],
+            "nullable": true
+          }
+        },
+        "required": [
+          "display_name",
+          "field",
+          "field_type",
+          "is_custom_field",
+          "new_value",
+          "old_value"
+        ],
+        "title": "ProcurementChangeRequestLineItemFieldDiff",
+        "type": "object"
+      },
+      "ProcurementChangeRequestLineItemValues": {
+        "description": "Structured values for a line item, used in line item diffs.",
+        "properties": {
+          "amount": {
+            "default": null,
+            "nullable": true,
+            "title": "Amount",
+            "type": "string"
+          },
+          "custom_field_values": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": null,
+            "nullable": true,
+            "title": "Custom Field Values",
+            "type": "object"
+          },
+          "description": {
+            "default": null,
+            "nullable": true,
+            "title": "Description",
+            "type": "string"
+          },
+          "due_date": {
+            "default": null,
+            "nullable": true,
+            "title": "Due Date",
+            "type": "string"
+          },
+          "end_date": {
+            "default": null,
+            "nullable": true,
+            "title": "End Date",
+            "type": "string"
+          },
+          "quantity": {
+            "default": null,
+            "nullable": true,
+            "title": "Quantity",
+            "type": "string"
+          },
+          "rate": {
+            "default": null,
+            "nullable": true,
+            "title": "Rate",
+            "type": "string"
+          },
+          "start_date": {
+            "default": null,
+            "nullable": true,
+            "title": "Start Date",
+            "type": "string"
+          },
+          "tracking_categories": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": null,
+            "nullable": true,
+            "title": "Tracking Categories",
+            "type": "object"
+          }
+        },
+        "title": "ProcurementChangeRequestLineItemValues",
+        "type": "object"
+      },
+      "ProcurementChangeRequestLinkFieldDiff": {
+        "properties": {
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          },
+          "field": {
+            "title": "Field",
+            "type": "string"
+          },
+          "field_type": {
+            "default": "LINK",
+            "enum": [
+              "LINK"
+            ],
+            "title": "Field Type",
+            "type": "string"
+          },
+          "is_custom_field": {
+            "default": false,
+            "title": "Is Custom Field",
+            "type": "boolean"
+          },
+          "new_value": {
+            "nullable": true,
+            "title": "New Value",
+            "type": "string"
+          },
+          "old_value": {
+            "nullable": true,
+            "title": "Old Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "display_name",
+          "field",
+          "field_type",
+          "is_custom_field",
+          "new_value",
+          "old_value"
+        ],
+        "title": "ProcurementChangeRequestLinkFieldDiff",
+        "type": "object"
+      },
+      "ProcurementChangeRequestTextFieldDiff": {
+        "properties": {
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          },
+          "field": {
+            "title": "Field",
+            "type": "string"
+          },
+          "field_type": {
+            "default": "TEXT",
+            "enum": [
+              "TEXT"
+            ],
+            "title": "Field Type",
+            "type": "string"
+          },
+          "is_custom_field": {
+            "default": false,
+            "title": "Is Custom Field",
+            "type": "boolean"
+          },
+          "new_value": {
+            "nullable": true,
+            "title": "New Value",
+            "type": "string"
+          },
+          "old_value": {
+            "nullable": true,
+            "title": "Old Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "display_name",
+          "field",
+          "field_type",
+          "is_custom_field",
+          "new_value",
+          "old_value"
+        ],
+        "title": "ProcurementChangeRequestTextFieldDiff",
+        "type": "object"
+      },
       "ProcurementDraftState": {
         "properties": {
+          "change_request_state": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ProcurementDraftStateDetails"
+              }
+            ],
+            "default": null,
+            "nullable": true
+          },
           "draft": {
             "$ref": "#/components/schemas/ProcurementDraftSummary"
           },
@@ -24181,6 +24764,16 @@
       },
       "ProcurementDraftSummary": {
         "properties": {
+          "change_request_diff": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ProcurementChangeRequestFieldsDiff"
+              }
+            ],
+            "default": null,
+            "description": "Changes from the original purchase order. Each line item includes only the values that changed; a line item with no new value was removed.",
+            "nullable": true
+          },
           "currency": {
             "nullable": true,
             "title": "Currency",
@@ -24197,6 +24790,15 @@
             },
             "title": "Line Items",
             "type": "array"
+          },
+          "original_request": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/OriginalProcurementRequest"
+              }
+            ],
+            "default": null,
+            "nullable": true
           },
           "request_name": {
             "nullable": true,
@@ -24236,7 +24838,7 @@
         "type": "object"
       },
       "ProcurementLineItemDataRequestBody": {
-        "description": "Agent input that preserves omitted fields for partial line-item updates.",
+        "description": "Editable fields for a purchase order line item.",
         "properties": {
           "amount": {
             "default": null,
@@ -24428,12 +25030,31 @@
       },
       "ProcurementSubmittedRequest": {
         "properties": {
+          "change_request_diff": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ProcurementChangeRequestFieldsDiff"
+              }
+            ],
+            "default": null,
+            "description": "Changes from the original purchase order. Each line item includes only the values that changed; a line item with no new value was removed.",
+            "nullable": true
+          },
           "external_agent_messages": {
             "items": {
               "type": "string"
             },
             "title": "External Agent Messages",
             "type": "array"
+          },
+          "original_request": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/OriginalProcurementRequest"
+              }
+            ],
+            "default": null,
+            "nullable": true
           },
           "request_status": {
             "title": "Request Status",
@@ -29955,6 +30576,16 @@
             "default": null,
             "nullable": true
           },
+          "change_request_diff": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ProcurementChangeRequestFieldsDiff"
+              }
+            ],
+            "default": null,
+            "description": "Changes from the original purchase order. Each line item includes only the values that changed; a line item with no new value was removed.",
+            "nullable": true
+          },
           "comments": {
             "items": {
               "$ref": "#/components/schemas/CommentInfo"
@@ -29968,6 +30599,15 @@
             },
             "title": "External Agent Messages",
             "type": "array"
+          },
+          "original_request": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/OriginalProcurementRequest"
+              }
+            ],
+            "default": null,
+            "nullable": true
           },
           "purchase_order_id": {
             "default": null,
@@ -32055,15 +32695,6 @@
         ],
         "title": "X402PaymentSigned",
         "type": "object"
-      },
-      "AnalystExecutionModeRequestBody": {
-        "enum": [
-          "jit_clickhouse_federated",
-          "jit_clickhouse_materialized",
-          "prebuilt_artifact"
-        ],
-        "title": "AnalystExecutionMode",
-        "type": "string"
       }
     },
     "securitySchemes": {

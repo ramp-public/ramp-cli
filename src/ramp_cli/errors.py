@@ -19,6 +19,12 @@ _ERROR_CODE_HINTS: dict[str, str] = {
         "The request body failed validation.  Run `ramp <resource> <command> --help`\n"
         "  to check required parameters and accepted values."
     ),
+    # Request-body validation failure on an agent-tool (DEVELOPER_INVALID_SCHEMA).
+    "DEVELOPER_7001": (
+        "The request body failed validation — a required field is missing or invalid.\n"
+        "  Run `ramp <resource> <command> --help` to check required parameters and\n"
+        "  accepted values.\n"
+    ),
     # Auth token not found.
     "DEVELOPER_7002": (
         "No valid auth token was found for this request.\n"
@@ -31,7 +37,8 @@ _ERROR_CODE_HINTS: dict[str, str] = {
     # Insufficient OAuth scope.
     "DEVELOPER_7100": (
         "Your token is missing the OAuth scope required by this endpoint.\n"
-        "  Run `ramp auth login` to re-authorize with the necessary permissions."
+        "  Refresh the tool definitions with `ramp tools refresh`, then run\n"
+        "  `ramp auth login` to re-authorize with the necessary permissions."
     ),
     # Tool not found on the server — spec may be outdated.
     "DEVELOPER_7127": (
@@ -50,7 +57,9 @@ class RampCLIError(Exception):
 
 
 class ApiError(RampCLIError):
-    def __init__(self, status_code: int, body: str) -> None:
+    def __init__(
+        self, status_code: int, body: str, *, contextual_hint: str | None = None
+    ) -> None:
         self.status_code = status_code
         self.body = body.strip()
 
@@ -97,8 +106,10 @@ class ApiError(RampCLIError):
             detail = self.body[:500]
             error_code = None
 
+        self.error_code = error_code
+
         # Append actionable hints for known error codes
-        hint = _ERROR_CODE_HINTS.get(error_code or "")
+        hint = contextual_hint or _ERROR_CODE_HINTS.get(error_code or "")
         if hint:
             detail += f"\n\n  {hint}"
 

@@ -140,39 +140,6 @@ def append_query_params(url: str, params: dict[str, str]) -> str:
     )
 
 
-# Scopes needed by existing DevAPI resource commands. These are merged with
-# scopes extracted from the agent-tool spec at login time in oauth.py.
-DEVAPI_SCOPES = [
-    "applications:read",
-    "applications:write",
-    "business:read",
-    "cashbacks:read",
-    "departments:read",
-    "departments:write",
-    "entities:read",
-    "incorporation:read",
-    "incorporation:write",
-    "item_receipts:read",
-    "limits:write",
-    "locations:read",
-    "locations:write",
-    "merchants:read",
-    "purchase_orders:read",
-    "purchase_orders:write",
-    "receipts:read",
-    "reimbursements:read",
-    "reimbursements:write",
-    "spend_programs:read",
-    "spend_programs:write",
-    "statements:read",
-    "transfers:read",
-    "users:read",
-    "users:write",
-    "vendors:read",
-    "vendors:write",
-]
-
-
 def base_url(env: str) -> str:
     override = os.environ.get("RAMP_API_URL")
     if override:

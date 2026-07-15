@@ -325,6 +325,7 @@ def _save_token_response(env: str, token_resp: TokenResponse) -> None:
         refresh_token_expires_in=token_resp.refresh_token_expires_in,
         granted_scopes=token_resp.scope,
         agent_key_uuid=token_resp.agent_key_uuid,
+        clear_granted_scopes=not bool(token_resp.scope),
     )
 
 

@@ -13,6 +13,8 @@ from ramp_cli.skills import (
     get_skill_content,
     install_skill,
     list_skills,
+    previously_removed_skills,
+    record_synced_skills,
     skill_names,
 )
 
@@ -103,9 +105,11 @@ def skills_install(
             )
 
     available = skill_names()
+    removed: list[str] = []
 
     if install_all:
-        names = available
+        removed = previously_removed_skills(target)
+        names = [n for n in available if n not in removed]
     else:
         assert name is not None  # guaranteed by the early check above
         if name not in available:
@@ -121,4 +125,14 @@ def skills_install(
             f"  {status.capitalize()} {skill_name_val} → {target / skill_name_val}/"
         )
 
+    if install_all:
+        # Only after all copies succeeded — a partial failure must not mark
+        # never-copied skills as user-deleted.
+        record_synced_skills(target)
+
     click.echo(f"\n  {len(names)} skill(s) installed to {target}")
+    if removed:
+        click.echo(
+            f"  Skipped previously removed: {', '.join(removed)} "
+            "(restore: ramp skills install <name>)"
+        )

@@ -7,6 +7,7 @@ import httpx
 import pytest
 from click.testing import CliRunner
 
+from ramp_cli.auth import store
 from ramp_cli.main import cli
 from ramp_cli.specs import AGENT_TOOL_SPEC
 from ramp_cli.tools.parser import ToolDef, parse_spec
@@ -59,6 +60,31 @@ COLLIDING_TOOLS = [
     ),
 ]
 
+FUND_COLLIDING_TOOLS = [
+    ToolDef(
+        name="get-agent-card-funds",
+        alias="list",
+        description="List agent card funds",
+        summary="List agent card funds",
+        path="/developer/v1/agent-tools/get-agent-card-funds",
+        http_method="POST",
+        category="agent_cards",
+        required_scopes=["cards:read_agentic"],
+        request_schema_name="GetAgentCardFunds",
+    ),
+    ToolDef(
+        name="get-funds",
+        alias="list",
+        description="List funds",
+        summary="List funds",
+        path="/developer/v1/agent-tools/get-funds",
+        http_method="POST",
+        category="funds",
+        required_scopes=["limits:read"],
+        request_schema_name="GetFunds",
+    ),
+]
+
 
 class TestToolsRefresh:
     @patch("ramp_cli.commands.tools.reload")
@@ -100,16 +126,10 @@ class TestToolsRefresh:
         assert "Failed to fetch spec" in result.output
 
 
-FAKE_CATEGORIES = {
-    "funds": [FAKE_TOOLS[0]],
-    "transactions": [FAKE_TOOLS[1]],
-}
-
-
 class TestToolsList:
     @patch(
-        "ramp_cli.commands.tools.list_categories",
-        return_value=FAKE_CATEGORIES,
+        "ramp_cli.commands.tools.list_tool_defs",
+        return_value=FAKE_TOOLS,
     )
     @patch("ramp_cli.commands.tools.maybe_sync")
     @patch("ramp_cli.main.maybe_sync")
@@ -120,8 +140,8 @@ class TestToolsList:
         assert "2 tools" in result.output
 
     @patch(
-        "ramp_cli.commands.tools.list_categories",
-        return_value=FAKE_CATEGORIES,
+        "ramp_cli.commands.tools.list_tool_defs",
+        return_value=FAKE_TOOLS,
     )
     @patch("ramp_cli.commands.tools.maybe_sync")
     @patch("ramp_cli.main.maybe_sync")
@@ -133,8 +153,8 @@ class TestToolsList:
         assert '"category": "funds"' in result.output
 
     @patch(
-        "ramp_cli.commands.tools.list_categories",
-        return_value=FAKE_CATEGORIES,
+        "ramp_cli.commands.tools.list_tool_defs",
+        return_value=FAKE_TOOLS,
     )
     @patch("ramp_cli.commands.tools.maybe_sync")
     @patch("ramp_cli.main.maybe_sync")
@@ -143,8 +163,8 @@ class TestToolsList:
         mock_sync.assert_called_once_with("production")
 
     @patch(
-        "ramp_cli.commands.tools.list_categories",
-        return_value={"travel": COLLIDING_TOOLS},
+        "ramp_cli.commands.tools.list_tool_defs",
+        return_value=COLLIDING_TOOLS,
     )
     @patch("ramp_cli.commands.tools.maybe_sync")
     @patch("ramp_cli.main.maybe_sync")
@@ -156,6 +176,58 @@ class TestToolsList:
         assert result.exit_code == 0
         names = {item["name"] for item in json.loads(result.output)["data"]}
         assert names == {"get-user-trips", "list-eligible-travel-funds"}
+
+    @pytest.mark.parametrize("mode", ["--human", "--agent"])
+    def test_list_includes_tools_missing_from_token_scopes(
+        self, isolated_config, monkeypatch, runner, mode
+    ):
+        tool = ToolDef(
+            name="restricted-tool",
+            description="Restricted tool",
+            summary="Restricted tool",
+            path="/developer/v1/agent-tools/restricted-tool",
+            http_method="POST",
+            category="general",
+            required_scopes=["restricted:read"],
+        )
+        store.save_tokens("production", "tok", "refresh", granted_scopes="users:read")
+        monkeypatch.setattr(
+            "ramp_cli.commands.tools.list_tool_defs", lambda env: [tool]
+        )
+        monkeypatch.setattr("ramp_cli.commands.tools.maybe_sync", lambda env: None)
+        monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
+
+        result = runner.invoke(cli, [mode, "tools", "list"])
+
+        assert result.exit_code == 0
+        assert "restricted-tool" in result.output
+
+    def test_list_matches_scope_resolved_root_alias(
+        self, isolated_config, monkeypatch, runner
+    ):
+        store.save_tokens(
+            "production",
+            "tok",
+            "refresh",
+            granted_scopes="cards:read_agentic",
+        )
+        monkeypatch.setattr(
+            "ramp_cli.commands.tools.list_tool_defs",
+            lambda env: FUND_COLLIDING_TOOLS,
+        )
+        monkeypatch.setattr("ramp_cli.commands.tools.maybe_sync", lambda env: None)
+        monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
+
+        result = runner.invoke(cli, ["--agent", "tools", "list"])
+
+        assert result.exit_code == 0
+        entries = {
+            (entry["category"], entry["name"]): entry
+            for entry in json.loads(result.output)["data"]
+        }
+        assert entries[("funds", "list")]["description"] == "List agent card funds"
+        assert entries[("funds", "get-funds")]["description"] == "List funds"
+        assert not any(category == "agent_cards" for category, _ in entries)
 
 
 class TestToolsGroup:
@@ -254,3 +326,33 @@ class TestToolsSchema:
         assert json.loads(result.output)["data"][0] == {
             "title": "ListEligibleTravelFunds"
         }
+
+    def test_schema_matches_scope_resolved_root_alias(
+        self, isolated_config, monkeypatch, runner
+    ):
+        store.save_tokens(
+            "production",
+            "tok",
+            "refresh",
+            granted_scopes="cards:read_agentic",
+        )
+        monkeypatch.setattr(
+            "ramp_cli.commands.tools.list_tool_defs",
+            lambda env: FUND_COLLIDING_TOOLS,
+        )
+        monkeypatch.setattr(
+            "ramp_cli.commands.tools.load_component_schema",
+            lambda path, name: {"title": name},
+        )
+        monkeypatch.setattr(
+            "ramp_cli.commands.tools.maybe_sync", lambda env, force=False: None
+        )
+        monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
+
+        result = runner.invoke(
+            cli,
+            ["--agent", "tools", "schema", "funds", "list"],
+        )
+
+        assert result.exit_code == 0
+        assert json.loads(result.output)["data"][0] == {"title": "GetAgentCardFunds"}

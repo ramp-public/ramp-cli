@@ -5,14 +5,15 @@ from __future__ import annotations
 import click
 import httpx
 
+from ramp_cli.auth.store import get_known_granted_scopes
 from ramp_cli.config.constants import environment_cache_key
 from ramp_cli.output.formatter import print_agent_json, print_json, resolve_format
 from ramp_cli.output.help import BoxHelpFormatter
 from ramp_cli.specs import AGENT_TOOL_DEFINITION
 from ramp_cli.specs.sync import fetch_spec, maybe_sync
-from ramp_cli.tools.commands import resolve_tool_command_names
+from ramp_cli.tools.commands import resolve_cli_tool_groups, resolve_tool_command_names
 from ramp_cli.tools.parser import load_component_schema
-from ramp_cli.tools.registry import list_categories, list_tool_defs, reload
+from ramp_cli.tools.registry import list_tool_defs, reload
 
 
 @click.group("tools", help="Manage agent-tool specifications")
@@ -52,7 +53,8 @@ def tools_list(ctx: click.Context) -> None:
     # Opportunistically sync before listing so the user sees the latest tools.
     maybe_sync(env)
 
-    categories = list_categories(env)
+    categories = resolve_cli_tool_groups(list_tool_defs(env))
+    granted_scopes = get_known_granted_scopes(env)
 
     if fmt == "json":
         print_agent_json(
@@ -63,7 +65,9 @@ def tools_list(ctx: click.Context) -> None:
                     "description": tool.description,
                 }
                 for cat, tools in sorted(categories.items())
-                for name, tool in resolve_tool_command_names(cat, tools)
+                for name, tool in resolve_tool_command_names(
+                    cat, tools, granted_scopes=granted_scopes
+                )
             ],
             pagination=None,
         )
@@ -76,7 +80,9 @@ def tools_list(ctx: click.Context) -> None:
         for cat, tools in sorted(categories.items()):
             dl_rows = [
                 (name, tool.description or "")
-                for name, tool in resolve_tool_command_names(cat, tools)
+                for name, tool in resolve_tool_command_names(
+                    cat, tools, granted_scopes=granted_scopes
+                )
             ]
             total += len(dl_rows)
             with formatter.section(cat.replace("_", " ").title()):
@@ -96,10 +102,13 @@ def tools_schema(ctx: click.Context, category: str, tool_name: str) -> None:
     env: str = ctx.obj["env"]
     maybe_sync(env, force=True)
 
-    category_tools = [
-        candidate for candidate in list_tool_defs(env) if candidate.category == category
-    ]
-    named_tools = resolve_tool_command_names(category, category_tools)
+    categories = resolve_cli_tool_groups(list_tool_defs(env))
+    category_tools = categories.get(category, [])
+    named_tools = resolve_tool_command_names(
+        category,
+        category_tools,
+        granted_scopes=get_known_granted_scopes(env),
+    )
     tool = next(
         (candidate for name, candidate in named_tools if name == tool_name),
         None,

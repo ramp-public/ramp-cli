@@ -4,17 +4,14 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import tomllib
 
 from click.testing import CliRunner
 
 from ramp_cli.commands.applications import APPLICATION_EXAMPLE
-from ramp_cli.main import (
-    _SINGLE_TOOL_RESOURCE_CATEGORIES,
-    CATEGORY_ALIAS_GROUPS,
-    CATEGORY_LEGACY_GROUPS,
-    CATEGORY_REMAP,
-    cli,
-)
+from ramp_cli.config import settings
+from ramp_cli.main import cli
 from ramp_cli.skills import (
     SKILLS_DIR,
     detect_agent_dir,
@@ -23,14 +20,17 @@ from ramp_cli.skills import (
     skill_names,
 )
 from ramp_cli.specs import AGENT_TOOL_SPEC
+from ramp_cli.tools.commands import resolve_cli_tool_groups, resolve_tool_command_names
 from ramp_cli.tools.parser import parse_spec
+from ramp_cli.tools.registry import CATEGORY_LEGACY_GROUPS
 
 
 class TestSkillDiscovery:
     def test_skill_names_discovers_all(self):
-        """All 17 skills should be discovered from the skills/ directory."""
+        """All 18 skills should be discovered from the skills/ directory."""
         names = skill_names()
-        assert len(names) == 17
+        assert len(names) == 18
+        assert "x402-pay" in names
         assert "get-started" in names
         assert "agentic-purchase" in names
         assert "card-management" in names
@@ -68,7 +68,7 @@ class TestSkillsList:
         assert result.exit_code == 0
 
         data = json.loads(result.output)
-        assert len(data["data"]) == 17
+        assert len(data["data"]) == 18
         names = {s["name"] for s in data["data"]}
         assert "get-started" in names
         assert "browser-automation" in names
@@ -85,7 +85,7 @@ class TestSkillsList:
         runner = CliRunner()
         result = runner.invoke(cli, ["--human", "skills", "list"])
         assert result.exit_code == 0
-        assert "17 Skills" in result.output
+        assert "18 Skills" in result.output
         assert "browser-automation" in result.output
         assert "manage-procurement" in result.output
         assert "manage-bills" in result.output
@@ -134,14 +134,15 @@ class TestSkillsInstall:
         assert "Browser Automation" in dest.read_text()
 
     def test_install_all(self, tmp_path):
-        """--all installs all 17 skills."""
+        """--all installs all 18 skills."""
+        target = tmp_path / "skills"
         runner = CliRunner()
         result = runner.invoke(
-            cli, ["skills", "install", "--all", "--target", str(tmp_path)]
+            cli, ["skills", "install", "--all", "--target", str(target)]
         )
         assert result.exit_code == 0
-        installed = [d.name for d in tmp_path.iterdir() if d.is_dir()]
-        assert len(installed) == 17
+        installed = [d.name for d in target.iterdir() if d.is_dir()]
+        assert len(installed) == 18
 
     def test_install_overwrites(self, tmp_path):
         """Installing twice succeeds and returns 'updated' on second run."""
@@ -180,6 +181,112 @@ class TestSkillsInstall:
         result = runner.invoke(cli, ["skills", "install"])
         assert result.exit_code != 0
         assert "Provide a skill name or use --all" in result.output
+
+
+class TestSkillsSync:
+    """Deletion tracking: skills removed by the user stay removed on re-sync."""
+
+    def _install_all(self, target):
+        runner = CliRunner()
+        result = runner.invoke(
+            cli, ["skills", "install", "--all", "--target", str(target)]
+        )
+        assert result.exit_code == 0
+        return result
+
+    def test_deleted_skill_not_reinstalled(self, tmp_path):
+        target = tmp_path / "skills"
+        assert "18 skill(s) installed" in self._install_all(target).output
+
+        shutil.rmtree(target / "browser-automation")
+        result = self._install_all(target)
+        assert "17 skill(s) installed" in result.output
+        assert "Skipped previously removed: browser-automation" in result.output
+        assert "restore: ramp skills install <name>" in result.output
+        assert not (target / "browser-automation").exists()
+        # Deletion persists across further syncs.
+        assert "Skipped previously removed" in self._install_all(target).output
+
+    def test_seed_from_existing_dir(self, tmp_path):
+        """First sync with no state adopts skills already on disk."""
+        target = tmp_path / "skills"
+        install_skill("browser-automation", target)
+        result = self._install_all(target)
+        assert "Skipped" not in result.output
+        assert "Updated browser-automation" in result.output
+
+        # A skill deleted after seeding stays deleted.
+        shutil.rmtree(target / "get-started")
+        assert "Skipped previously removed: get-started" in (
+            self._install_all(target).output
+        )
+
+    def test_explicit_install_restores_deleted_skill(self, tmp_path):
+        target = tmp_path / "skills"
+        self._install_all(target)
+        shutil.rmtree(target / "browser-automation")
+        self._install_all(target)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["skills", "install", "browser-automation", "--target", str(target)],
+        )
+        assert result.exit_code == 0
+        assert (target / "browser-automation" / "SKILL.md").is_file()
+
+        # And it is synced again afterwards.
+        result = self._install_all(target)
+        assert "Skipped" not in result.output
+        assert "18 skill(s) installed" in result.output
+
+    def test_known_skills_persisted_per_target_and_pruned(self, tmp_path):
+        target = tmp_path / "skills"
+        state = settings.config_dir() / "skills.toml"
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(f'[known]\n"{target.resolve()}" = "some-retired-skill"\n')
+
+        self._install_all(target)
+        known = tomllib.loads(state.read_text())["known"][str(target.resolve())]
+        assert set(known.split()) == set(skill_names())
+
+    def test_targets_track_deletions_independently(self, tmp_path):
+        """Syncing one target must not mark skills deleted in another (fresh) target."""
+        target_a = tmp_path / "a"
+        target_b = tmp_path / "b"
+        self._install_all(target_a)
+        shutil.rmtree(target_a / "browser-automation")
+
+        result = self._install_all(target_b)
+        assert "18 skill(s) installed" in result.output
+        assert "Skipped" not in result.output
+        # And target A's deletion still holds.
+        assert "Skipped previously removed: browser-automation" in (
+            self._install_all(target_a).output
+        )
+
+    def test_partial_failure_does_not_record_state(self, tmp_path, monkeypatch):
+        """Skills never copied due to a mid-install failure must not be
+        treated as user-deleted on the next run."""
+        target = tmp_path / "skills"
+        real_install = install_skill
+
+        def failing_install(name, target_dir):
+            if name > "get-started":
+                raise OSError("disk full")
+            return real_install(name, target_dir)
+
+        monkeypatch.setattr("ramp_cli.commands.skills.install_skill", failing_install)
+        runner = CliRunner()
+        result = runner.invoke(
+            cli, ["skills", "install", "--all", "--target", str(target)]
+        )
+        assert result.exit_code != 0
+        monkeypatch.undo()
+
+        result = self._install_all(target)
+        assert "18 skill(s) installed" in result.output
+        assert "Skipped" not in result.output
 
 
 class TestDetectAgentDir:
@@ -622,37 +729,13 @@ GLOBAL_FLAGS = {
 
 
 def _build_valid_commands() -> set[tuple[str, str]]:
-    """Build the set of valid (cli_group, alias) pairs.
-
-    Mirrors the category remapping and singleton→general folding
-    from ``RampCLI._split_categories`` in ``main.py``.
-    """
+    """Build the set of valid (cli_group, alias) pairs."""
     tools = parse_spec(AGENT_TOOL_SPEC)
-
-    # Group by CLI-visible category after remapping.
-    merged: dict[str, list] = {}
-    for t in tools:
-        cli_cat = (
-            CATEGORY_REMAP.get(t.category, t.category) if t.category else "general"
-        )
-        merged.setdefault(cli_cat, []).append(t)
-
-    valid: set[tuple[str, str]] = set()
-    for cat, cat_tools in merged.items():
-        if len(cat_tools) > 1 or cat in _SINGLE_TOOL_RESOURCE_CATEGORIES:
-            for t in cat_tools:
-                valid.add((cat, t.alias or t.name))
-        else:
-            # Singletons fold into "general"
-            for t in cat_tools:
-                alias = t.alias or t.name
-                valid.add(("general", alias))
-
-    # Additive alias groups (e.g. cards): the tool's short alias is also
-    # reachable under its original spec category as its own group.
-    for t in tools:
-        if t.category in CATEGORY_ALIAS_GROUPS:
-            valid.add((t.category, t.alias or t.name))
+    valid = {
+        (category, name)
+        for category, category_tools in resolve_cli_tool_groups(tools).items()
+        for name, _tool in resolve_tool_command_names(category, category_tools)
+    }
 
     # Hidden legacy groups remain invokable for backwards compatibility even
     # after the public resource group is remapped.
@@ -667,32 +750,12 @@ def _build_tool_param_index() -> dict[tuple[str, str], set[str]]:
     """Map (cli_group, alias) → set of valid parameter names."""
     tools = parse_spec(AGENT_TOOL_SPEC)
 
-    merged: dict[str, list] = {}
-    for t in tools:
-        cli_cat = (
-            CATEGORY_REMAP.get(t.category, t.category) if t.category else "general"
-        )
-        merged.setdefault(cli_cat, []).append(t)
-
     index: dict[tuple[str, str], set[str]] = {}
-    for cat, cat_tools in merged.items():
-        if len(cat_tools) > 1 or cat in _SINGLE_TOOL_RESOURCE_CATEGORIES:
-            for t in cat_tools:
-                key = (cat, t.alias or t.name)
-                # Merge params when multiple tools share (category, alias).
-                index.setdefault(key, set()).update(p.name for p in t.params)
-        else:
-            for t in cat_tools:
-                alias = t.alias or t.name
-                key = ("general", alias)
-                index.setdefault(key, set()).update(p.name for p in t.params)
-
-    # Additive alias groups (e.g. cards): index the tool's params under its
-    # own spec-category group as well.
-    for t in tools:
-        if t.category in CATEGORY_ALIAS_GROUPS:
-            key = (t.category, t.alias or t.name)
-            index.setdefault(key, set()).update(p.name for p in t.params)
+    for category, category_tools in resolve_cli_tool_groups(tools).items():
+        for name, tool in resolve_tool_command_names(category, category_tools):
+            index.setdefault((category, name), set()).update(
+                param.name for param in tool.params
+            )
 
     # Hidden legacy groups are not shown in help, but command references using
     # the old resource path should still validate.

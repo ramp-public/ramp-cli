@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 
@@ -91,6 +92,7 @@ def save_tokens(
     issued_at: int | None = None,
     granted_scopes: str | None = None,
     agent_key_uuid: str | None = None,
+    clear_granted_scopes: bool = False,
 ) -> None:
     state = _build_token_state(
         access_token,
@@ -108,9 +110,11 @@ def save_tokens(
     ec.access_token_expires_in = state.access_token_expires_in
     ec.refresh_token_issued_at = state.refresh_token_issued_at
     ec.refresh_token_expires_in = state.refresh_token_expires_in
-    # Only overwrite scopes when explicitly provided (non-None, non-empty).
-    # Token refresh responses often omit scope — preserve prior stored scopes.
-    if granted_scopes:
+    # Token refresh responses often omit scope, so preserve grants by default.
+    # Credential replacement callers explicitly clear them when scope is unknown.
+    if clear_granted_scopes:
+        ec.granted_scopes = ""
+    elif granted_scopes:
         ec.granted_scopes = granted_scopes
     # agent_key_uuid contract:
     #   - refresh callers omit it (None) → preserve stored value
@@ -148,6 +152,14 @@ def get_granted_scopes(env: str) -> set[str]:
     if not ec.granted_scopes:
         return set()
     return set(ec.granted_scopes.split())
+
+
+def get_known_granted_scopes(env: str) -> set[str] | None:
+    """Return grants only when they are known to match the active credential."""
+    if os.environ.get("RAMP_ACCESS_TOKEN"):
+        return None
+    scopes = get_granted_scopes(env)
+    return scopes or None
 
 
 def has_tokens(env: str) -> bool:

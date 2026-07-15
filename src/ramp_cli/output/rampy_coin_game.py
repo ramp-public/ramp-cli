@@ -24,7 +24,7 @@ from ramp_cli.animations.rampy import (
     _blinking,
     _render_eye,
 )
-from ramp_cli.output.lifecycle import Lifecycle
+from ramp_cli.output.lifecycle import Lifecycle, raw_terminal_supported
 from ramp_cli.output.style import (
     _WIDTH_MAX,
     _WIDTH_MIN,
@@ -290,6 +290,11 @@ MIN_GAME_LINES = 20  # Minimum terminal height for the coin game
 
 def show_coin_game(file=None) -> None:
     """Run the Rampy Coin Chase game."""
+    if not raw_terminal_supported():
+        raise click.ClickException(
+            "The coin game needs a POSIX terminal and is not supported on Windows."
+        )
+
     file = file or sys.stdout
     use_color = _color_supported(file)
 

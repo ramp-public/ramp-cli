@@ -21,7 +21,8 @@ that spans requests, bills, reimbursements, or transactions, use
 `approval-dashboard`.
 
 Do not use it for bill approval/payment, card transaction cleanup,
-reimbursements, vendor document upload, accounting recoding, or contract edits.
+reimbursements, vendor document upload, accounting recoding, or drafting
+contract edits.
 
 ## Rules
 
@@ -38,6 +39,16 @@ reimbursements, vendor document upload, accounting recoding, or contract edits.
   and statuses instead of inventing links.
 - Do not approve or reject without first showing details and confirming the
   user's intent.
+- When `requests get` returns a non-null `original_request`, treat the request as
+  a change request; before approval, verify that `original_request` identifies the
+  intended original approved request and review every entry in
+  `change_request_diff` fields, including each old and new value. Stop if the
+  source or diff is absent or unexpected.
+- A `LINE_ITEM` diff includes only changed values. Overlay a present `new_value`
+  on `old_value`: a null property means unchanged; the whole `new_value` is null
+  when the line was removed. When a line item's UUID matches the original, its
+  tracking categories, custom fields, withholding rates, and external IDs
+  carried over unchanged; do not report them as changes.
 - For rejection, include the user-supplied or user-accepted reason in
   `--thoughts`.
 - PO amount fields are numeric currency units with a `currency` code. Display
@@ -100,6 +111,13 @@ reimbursements, vendor document upload, accounting recoding, or contract edits.
    `requests approve`; hand off with the identifiers and the current approval
    step from `approval_workflow.steps`.
 
+   If `original_request` is non-null, also show its original spend request
+   UUID, unified request UUID, and PO number, followed by the complete
+   `change_request_diff` fields and old/new values. Confirm that the source is the
+   original approved request the user intended to amend and that the diff
+   contains only the expected changes. Do not infer a change request from names or
+   amounts when `original_request` is null.
+
 5. Act only after the user confirms the exact request UUID:
 
    ```bash
@@ -123,6 +141,8 @@ Vendor:
 Amount:
 PO status:
 Request status:
+Change-request source:
+Change-request diff:
 Promise date:
 Linked bills:
 Linked transactions:
@@ -131,8 +151,9 @@ Unified request ID:
 ```
 
 Before approval, state that approval acts on the unified request UUID, not the
-PO ID. After action, surface returned `request_uuid`, `action`, `success`, and
-`message`.
+PO ID. For change requests, include the original approved request identifiers and
+old/new diff in the confirmation prompt. After action, surface returned
+`request_uuid`, `action`, `success`, and `message`.
 
 ## Handoff
 

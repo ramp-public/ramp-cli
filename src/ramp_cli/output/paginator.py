@@ -11,6 +11,7 @@ from ramp_cli.output.style import (
     _color_supported,
     _fg,
     _hide_cursor,
+    _raw_input_supported,
     _read_key,
     _render_button,
     _reset,
@@ -85,8 +86,16 @@ class ToolPaginator:
 
         Returns the selected row dict if Enter is pressed, or None on ESC/q.
         """
-        if not sys.stdin.isatty():
+        # Fall back to a static table when stdin is not a TTY, or when raw
+        # keypress input is unavailable (e.g. native Windows Python under
+        # Git Bash/ConPTY, where isatty() is True but termios/tty are None).
+        if not sys.stdin.isatty() or not _raw_input_supported():
             show_table_card(self._title, self._headers, self._pages[0], file=self._file)
+            if self._cursors[0]:
+                self._file.write(
+                    "\nMore results are available. Use JSON output or narrower filters "
+                    "to retrieve additional pages.\n"
+                )
             return None
 
         self._write(_hide_cursor())

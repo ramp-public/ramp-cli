@@ -7,15 +7,21 @@ provide three callbacks: render_full, render_frame, and on_input.
 
 from __future__ import annotations
 
-import fcntl
 import os
 import select
 import signal
 import sys
-import termios
 import time
-import tty
 from typing import Callable
+
+try:
+    import fcntl
+    import termios
+    import tty
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None  # type: ignore[assignment]
+    termios = None  # type: ignore[assignment]
+    tty = None  # type: ignore[assignment]
 
 from ramp_cli.output.style import (
     _alt_screen_off,
@@ -27,6 +33,11 @@ from ramp_cli.output.style import (
 
 RESIZE_DEBOUNCE_S = 0.05
 DEFAULT_FPS = 20
+
+
+def raw_terminal_supported() -> bool:
+    """Return True when the POSIX raw-terminal modules are available."""
+    return fcntl is not None and termios is not None and tty is not None
 
 
 class Lifecycle:
@@ -76,6 +87,11 @@ class Lifecycle:
 
     def start(self) -> None:
         """Block until quit. Manages alt screen, raw mode, loop, input, resize."""
+        if not raw_terminal_supported():
+            raise RuntimeError(
+                "Interactive terminal mode is not supported on this platform "
+                "(requires a POSIX terminal)."
+            )
         self._write_fd = sys.stdout.fileno()
 
         # Open /dev/tty directly — works even when Click replaces stdin

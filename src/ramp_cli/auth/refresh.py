@@ -16,6 +16,11 @@ try:
 except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None
 
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX fallback
+    msvcrt = None
+
 
 def try_refresh(env: str) -> str | None:
     """Attempt to silently refresh tokens. Returns new access token or None."""
@@ -60,15 +65,33 @@ def _refresh_lock(env: str):
     lock_path = _refresh_lock_path(env)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with lock_path.open("a+") as lock_file:
+    with lock_path.open("a+b") as lock_file:
         if fcntl is not None:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        elif msvcrt is not None:
+            _lock_with_msvcrt(lock_file)
         try:
             yield
         finally:
             if fcntl is not None:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            elif msvcrt is not None:
+                _unlock_with_msvcrt(lock_file)
 
 
 def _refresh_lock_path(env: str) -> Path:
     return settings.config_dir() / f".{env}.refresh.lock"
+
+
+def _lock_with_msvcrt(lock_file):
+    lock_file.seek(0, 2)
+    if lock_file.tell() == 0:
+        lock_file.write(b"\0")
+        lock_file.flush()
+    lock_file.seek(0)
+    msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+
+
+def _unlock_with_msvcrt(lock_file):
+    lock_file.seek(0)
+    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)

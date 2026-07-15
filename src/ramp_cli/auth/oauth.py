@@ -24,7 +24,6 @@ import httpx
 from ramp_cli.auth.constants import INVALID_GRANT
 from ramp_cli.auth.environment import extra_auth_headers
 from ramp_cli.config.constants import (
-    DEVAPI_SCOPES,
     PREFERRED_CALLBACK_PORT,
     append_query_params,
     auth_setup_url,
@@ -570,17 +569,16 @@ def _classify_token_error(status_code: int, grant_type: str, description: str) -
 def _resolve_scopes(env: str) -> str:
     """Build the OAuth scope string for login.
 
-    Uses custom scopes if configured, otherwise merges DevAPI scopes
-    with scopes extracted from the agent-tool OpenAPI spec. A freshly
-    synced env cache is authoritative for that environment; stale or
-    untracked caches are merged with the bundled spec so they cannot
-    hide scopes that the installed CLI already knows about.
+    Uses custom scopes if configured, otherwise extracts scopes from the
+    agent-tool OpenAPI spec. A freshly synced env cache is authoritative for
+    that environment; stale or untracked caches are merged with the bundled
+    spec so they cannot hide scopes that the installed CLI already knows about.
     """
     custom = configured_scopes()
     if custom:
         return custom
 
-    all_scopes = set(DEVAPI_SCOPES)
+    all_scopes: set[str] = set()
     for spec_path in _resolve_scope_spec_paths(env):
         try:
             all_scopes.update(extract_all_scopes(spec_path))

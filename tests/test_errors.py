@@ -42,4 +42,25 @@ def test_insufficient_scope_error_includes_scope_specific_hint() -> None:
     message = str(error)
     assert "Insufficient scope" in message
     assert "missing the OAuth scope" in message
+    assert "ramp tools refresh" in message
     assert "ramp auth login" in message
+    assert error.error_code == "DEVELOPER_7100"
+
+
+def test_invalid_schema_error_hints_at_missing_field() -> None:
+    error = ApiError(
+        422,
+        json.dumps(
+            {
+                "error_v2": {
+                    "error_code": "DEVELOPER_7001",
+                    "message": "There was an error.",
+                }
+            }
+        ),
+    )
+
+    message = str(error)
+    assert "API error 422" in message
+    assert "failed validation" in message
+    assert "--help" in message

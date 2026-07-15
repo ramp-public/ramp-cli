@@ -11,6 +11,8 @@ from pathlib import Path
 
 import tomli_w
 
+from ramp_cli.platform_utils import normalize_msys_path
+
 from .constants import (
     ENV_PRODUCTION,
     ENV_SANDBOX,
@@ -49,7 +51,7 @@ class Config:
 def config_dir() -> Path:
     xdg = os.environ.get("XDG_CONFIG_HOME")
     if xdg:
-        return Path(xdg) / "ramp"
+        return Path(normalize_msys_path(xdg)) / "ramp"
     return Path.home() / ".config" / "ramp"
 
 
@@ -85,17 +87,19 @@ def load() -> Config:
         )
         set_env_config(cfg, env_name, ec)
 
-    # Warn on loose permissions
-    try:
-        mode = path.stat().st_mode & 0o777
-        if mode & 0o077:
-            print(
-                f"WARNING: config file {path} has permissions {mode:04o} (should be 0600)\n"
-                f"  Fix: chmod 600 {path}",
-                file=sys.stderr,
-            )
-    except OSError:
-        pass
+    # Warn on loose permissions. Windows has no POSIX permission bits and
+    # synthesizes modes like 0o666, so the check only makes sense on POSIX.
+    if os.name != "nt":
+        try:
+            mode = path.stat().st_mode & 0o777
+            if mode & 0o077:
+                print(
+                    f"WARNING: config file {path} has permissions {mode:04o} (should be 0600)\n"
+                    f"  Fix: chmod 600 {path}",
+                    file=sys.stderr,
+                )
+        except OSError:
+            pass
 
     return cfg
 

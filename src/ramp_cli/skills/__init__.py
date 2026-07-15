@@ -7,10 +7,17 @@ works in both editable and installed (wheel) builds.
 
 from __future__ import annotations
 
+import contextlib
+import os
 import re
 import shutil
+import tempfile
+import tomllib
 from pathlib import Path
 
+import tomli_w
+
+from ramp_cli.config.settings import config_dir
 from ramp_cli.specs import SKILLS_DIR
 
 AGENT_SKILL_DIRS = [".claude/skills", ".cursor/skills", ".windsurf/skills"]
@@ -131,3 +138,65 @@ def install_skill(name: str, target_dir: Path) -> str:
             dest_file.write_text(content, encoding="utf-8")
 
     return status
+
+
+def _state_path() -> Path:
+    """Skill sync state lives in its own file, separate from config.toml, so
+    skill writes can never clobber the auth tokens stored there."""
+    return config_dir() / "skills.toml"
+
+
+def _load_known() -> dict[str, str]:
+    """Load [known]: resolved target dir → space-separated synced skill names.
+
+    Missing or malformed state degrades to empty (re-seed from disk)."""
+    try:
+        raw = tomllib.loads(_state_path().read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    known = raw.get("known")
+    if not isinstance(known, dict):
+        return {}
+    return {k: v for k, v in known.items() if isinstance(v, str)}
+
+
+def previously_removed_skills(target_dir: Path) -> list[str]:
+    """Bundled skills recorded as synced into ``target_dir`` but now missing.
+
+    These were deleted by the user and should not be reinstalled.  A target
+    with no recorded state seeds from the skills already present on disk.
+    """
+    available = skill_names()
+
+    def present(name: str) -> bool:
+        return (target_dir / name / "SKILL.md").is_file()
+
+    known = set(_load_known().get(str(target_dir.resolve()), "").split()) or {
+        n for n in available if present(n)
+    }
+    return [n for n in available if n in known and not present(n)]
+
+
+def record_synced_skills(target_dir: Path) -> None:
+    """Record all bundled skill names as synced into ``target_dir``.
+
+    Best-effort: an unwritable state file must never break installs.
+    """
+    known = _load_known()
+    known[str(target_dir.resolve())] = " ".join(skill_names())
+    path = _state_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=".skills.", suffix=".toml", dir=path.parent
+        )
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(tomli_w.dumps({"known": known}).encode())
+            os.replace(tmp_name, path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name)
+            raise
+    except OSError:
+        pass

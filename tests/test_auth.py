@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
+import time
 from contextlib import nullcontext
 from urllib.parse import parse_qs, urlparse
 
@@ -144,6 +146,33 @@ def test_auth_url_omits_unknown_or_untrusted_agent_client_hint(monkeypatch):
     )
 
     assert "agent_client_hint" not in parse_qs(urlparse(url).query)
+
+
+def test_open_browser_git_bash_uses_win32_branch_with_full_url(monkeypatch):
+    """Git Bash runs a native win32 Python, so the win32 branch must handle it.
+
+    The URL must reach the launcher intact — cmd.exe-style `start` would split
+    an unquoted authorize URL at every `&`.
+    """
+    calls = []
+
+    class FakePopen:
+        def __init__(self, args, **kwargs):
+            calls.append((args, kwargs))
+
+    url = (
+        "https://app.ramp.com/v1/authorize?response_type=code"
+        "&client_id=abc123&scope=transactions%3Aread&state=xyz"
+        "&code_challenge=ccc&code_challenge_method=S256"
+    )
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("MSYSTEM", "MINGW64")
+    monkeypatch.setattr(oauth_module.subprocess, "Popen", FakePopen)
+
+    assert oauth_module._open_browser(url) is True
+    args, _kwargs = calls[0]
+    assert args == ["rundll32", "url.dll,FileProtocolHandler", url]
+    assert "cmd.exe" not in args
 
 
 def test_token_save_and_load(isolated_config):
@@ -318,6 +347,76 @@ def test_try_refresh__uses_newly_rotated_tokens_from_other_process(
     monkeypatch.setattr(refresh_helper, "refresh_tokens", fail_refresh)
 
     assert refresh_helper.try_refresh("sandbox") == "access-new"
+
+
+def test_try_refresh__windows_lock_serializes_refresh_rotation(
+    isolated_config, monkeypatch
+):
+    store.save_tokens("sandbox", "access-old", "refresh-old")
+    original_get_tokens = store.get_tokens
+    initial_reads = 0
+    initial_reads_lock = threading.Lock()
+
+    class FakeMsvcrt:
+        LK_LOCK = 1
+        LK_UNLCK = 2
+
+        def __init__(self):
+            self._lock = threading.Lock()
+            self.lock_held = False
+
+        def locking(self, fd: int, mode: int, nbytes: int) -> None:
+            if mode == self.LK_LOCK:
+                self._lock.acquire()
+                self.lock_held = True
+            else:
+                self.lock_held = False
+                self._lock.release()
+
+    fake_msvcrt = FakeMsvcrt()
+
+    def tracked_get_tokens(env: str):
+        nonlocal initial_reads
+        if not fake_msvcrt.lock_held:
+            with initial_reads_lock:
+                initial_reads += 1
+        return original_get_tokens(env)
+
+    refresh_calls = 0
+
+    def fake_refresh_tokens(env: str, refresh_token: str) -> TokenResponse:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        assert refresh_token == "refresh-old"
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with initial_reads_lock:
+                if initial_reads >= 2:
+                    break
+            time.sleep(0.01)
+        return TokenResponse(access_token="access-new", refresh_token="refresh-new")
+
+    monkeypatch.setattr(refresh_helper, "fcntl", None)
+    monkeypatch.setattr(refresh_helper, "msvcrt", fake_msvcrt)
+    monkeypatch.setattr(store, "get_tokens", tracked_get_tokens)
+    monkeypatch.setattr(refresh_helper, "refresh_tokens", fake_refresh_tokens)
+
+    results: list[str | None] = []
+    threads = [
+        threading.Thread(
+            target=lambda: results.append(refresh_helper.try_refresh("sandbox"))
+        )
+        for _ in range(2)
+    ]
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+
+    assert results == ["access-new", "access-new"]
+    assert refresh_calls == 1
+    assert store.get_tokens("sandbox") == ("access-new", "refresh-new")
 
 
 def test_try_refresh__clears_tokens_without_replacement_refresh_token(
@@ -730,10 +829,11 @@ class TestResolveScopes:
         )
 
         scopes = oauth_module._resolve_scopes("production").split()
-        # Bundled spec has standard scopes
-        assert "business:read" in scopes
-        assert "incorporation:read" in scopes
-        assert "incorporation:write" in scopes
+        assert "applications:read" in scopes
+        assert "users:read" in scopes
+        assert "business:read" not in scopes
+        assert "incorporation:read" not in scopes
+        assert "incorporation:write" not in scopes
 
     def test_explicit_login_scopes_override_discovery(self, monkeypatch):
         monkeypatch.setattr(
@@ -908,6 +1008,24 @@ class TestPostLoginEnvHint:
         assert "Token saved" in data["data"][0]["message"]
         # JSON output should not contain the hint
         assert "ramp env" not in result.output
+
+    def test_login_token_stdin_clears_stale_granted_scopes(self, isolated_config):
+        store.save_tokens(
+            "production",
+            "old-token",
+            "refresh",
+            granted_scopes="cards:read_agentic",
+        )
+
+        result = CliRunner().invoke(
+            cli,
+            ["--agent", "auth", "login", "--token_stdin", "--env", "production"],
+            input="replacement-token\n",
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert store.get_granted_scopes("production") == set()
 
     def test_login_token_stdin_rejects_oauth_options(self, isolated_config):
         result = CliRunner().invoke(

@@ -182,6 +182,16 @@ def _alt_screen_off() -> str:
 _MAX_ESCAPE_DRAIN = 16  # max bytes to drain from an escape sequence
 
 
+def _raw_input_supported() -> bool:
+    """Return True when raw keypress reading (termios/tty) is available.
+
+    False on native Windows Python (including Git Bash), where the POSIX
+    terminal modules do not exist and interactive views must fall back to
+    static rendering.
+    """
+    return termios is not None and tty is not None and select is not None
+
+
 def _read_key() -> str:
     """Read a single keypress in raw mode.
 

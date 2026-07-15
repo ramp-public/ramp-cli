@@ -125,7 +125,13 @@ def login(
         token = sys.stdin.readline().strip()
         if not token:
             raise click.UsageError("No token provided on stdin.")
-        store.save_tokens(env, token, "", agent_key_uuid="")
+        store.save_tokens(
+            env,
+            token,
+            "",
+            agent_key_uuid="",
+            clear_granted_scopes=True,
+        )
         fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
         if fmt == "json":
             print_agent_json(
@@ -162,6 +168,7 @@ def login(
         refresh_token_expires_in=token_resp.refresh_token_expires_in,
         granted_scopes=token_resp.scope,
         agent_key_uuid=token_resp.agent_key_uuid,
+        clear_granted_scopes=not bool(token_resp.scope),
     )
 
     if not token_resp.scope:

@@ -4,6 +4,7 @@ import json
 from unittest.mock import MagicMock
 
 import click
+import pytest
 from click.testing import CliRunner
 
 from ramp_cli.auth import store
@@ -1137,6 +1138,103 @@ class TestAliasInCategoryGroup:
         help_text = group.get_help(click.Context(group))
         assert "get-funds" not in help_text
 
+    @pytest.mark.parametrize(
+        ("granted_scopes", "expected_help"),
+        [
+            ("cards:read_agentic", "Get agent card funds"),
+            ("limits:read", "Get funds"),
+            ("cards:read_agentic limits:read", "Get funds"),
+            ("", "Get funds"),
+        ],
+    )
+    def test_alias_collision_uses_known_grants_only_to_break_ties(
+        self, isolated_config, granted_scopes, expected_help
+    ):
+        remapped_tool = ToolDef(
+            name="get-agent-card-funds",
+            path="/developer/v1/agent-tools/get-agent-card-funds",
+            http_method="post",
+            summary="Get agent card funds",
+            description="Get agent card funds",
+            category="agent_cards",
+            alias="list",
+            params=[],
+            required_scopes=["cards:read_agentic"],
+        )
+        native_tool = ToolDef(
+            name="get-funds",
+            path="/developer/v1/agent-tools/get-funds",
+            http_method="post",
+            summary="Get funds",
+            description="Get funds",
+            category="funds",
+            alias="list",
+            params=[],
+            required_scopes=["limits:read"],
+        )
+        if granted_scopes:
+            store.save_tokens(
+                "production",
+                "tok",
+                "refresh",
+                granted_scopes=granted_scopes,
+            )
+
+        group = ToolGroup.build(
+            "funds",
+            [remapped_tool, native_tool],
+            "Funds",
+            env="production",
+        )
+
+        list_command = group.get_command(click.Context(group), "list")
+        assert list_command is not None
+        assert list_command.help == expected_help
+
+    def test_external_token_ignores_stale_grants_for_alias_collision(
+        self, isolated_config, monkeypatch
+    ):
+        remapped_tool = ToolDef(
+            name="get-agent-card-funds",
+            path="/developer/v1/agent-tools/get-agent-card-funds",
+            http_method="post",
+            summary="Get agent card funds",
+            description="Get agent card funds",
+            category="agent_cards",
+            alias="list",
+            params=[],
+            required_scopes=["cards:read_agentic"],
+        )
+        native_tool = ToolDef(
+            name="get-funds",
+            path="/developer/v1/agent-tools/get-funds",
+            http_method="post",
+            summary="Get funds",
+            description="Get funds",
+            category="funds",
+            alias="list",
+            params=[],
+            required_scopes=["limits:read"],
+        )
+        store.save_tokens(
+            "production",
+            "stored",
+            "refresh",
+            granted_scopes="cards:read_agentic",
+        )
+        monkeypatch.setenv("RAMP_ACCESS_TOKEN", "external")
+
+        group = ToolGroup.build(
+            "funds",
+            [remapped_tool, native_tool],
+            "Funds",
+            env="production",
+        )
+
+        list_command = group.get_command(click.Context(group), "list")
+        assert list_command is not None
+        assert list_command.help == "Get funds"
+
 
 class TestDryRun:
     """Dry run never hits the network — no mocking needed."""
@@ -1459,7 +1557,9 @@ class TestCLIIntegration:
         assert result.exit_code == 0
         assert "list" in result.output
 
-    def test_hidden_resource_reports_missing_scope(self, monkeypatch, isolated_config):
+    def test_resource_remains_visible_without_required_scope(
+        self, monkeypatch, isolated_config
+    ):
         task_tool = ToolDef(
             name="get-attention-feed",
             path="/developer/v1/agent-tools/get-attention-feed",
@@ -1474,21 +1574,17 @@ class TestCLIIntegration:
         store.save_tokens("production", "tok", "refresh", granted_scopes="users:read")
 
         monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
-        monkeypatch.setattr("ramp_cli.main.list_categories", lambda env: {})
         monkeypatch.setattr(
-            "ramp_cli.main.list_tool_defs",
-            lambda env: [task_tool],
+            "ramp_cli.main.list_categories", lambda env: {"tasks": [task_tool]}
         )
 
         runner = CliRunner()
-        result = runner.invoke(cli, ["--env", "production", "tasks", "list"])
+        result = runner.invoke(cli, ["--env", "production", "tasks", "list", "--help"])
 
-        assert result.exit_code != 0
-        assert "tasks' resource is available" in result.output
-        assert "tasks:read" in result.output
-        assert "auth status --agent" in result.output
+        assert result.exit_code == 0
+        assert "Usage: cli tasks list" in result.output
 
-    def test_hidden_singleton_category_stays_unknown_command(
+    def test_singleton_tool_remains_visible_without_required_scope(
         self, monkeypatch, isolated_config
     ):
         communication_tool = ToolDef(
@@ -1505,20 +1601,20 @@ class TestCLIIntegration:
         store.save_tokens("production", "tok", "refresh", granted_scopes="users:read")
 
         monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
-        monkeypatch.setattr("ramp_cli.main.list_categories", lambda env: {})
         monkeypatch.setattr(
-            "ramp_cli.main.list_tool_defs",
-            lambda env: [communication_tool],
+            "ramp_cli.main.list_categories",
+            lambda env: {"communication": [communication_tool]},
         )
 
         runner = CliRunner()
-        result = runner.invoke(cli, ["--env", "production", "communication"])
+        result = runner.invoke(
+            cli, ["--env", "production", "general", "comment", "--help"]
+        )
 
-        assert result.exit_code != 0
-        assert "No such command 'communication'" in result.output
-        assert "missing the required scope" not in result.output
+        assert result.exit_code == 0
+        assert "Usage: cli general comment" in result.output
 
-    def test_partially_accessible_resource_stays_unknown_command(
+    def test_partially_scoped_resource_lists_all_commands(
         self, monkeypatch, isolated_config
     ):
         accessible_tool = ToolDef(
@@ -1548,18 +1644,17 @@ class TestCLIIntegration:
         )
 
         monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
-        monkeypatch.setattr("ramp_cli.main.list_categories", lambda env: {})
         monkeypatch.setattr(
-            "ramp_cli.main.list_tool_defs",
-            lambda env: [accessible_tool, hidden_tool],
+            "ramp_cli.main.list_categories",
+            lambda env: {"requests": [accessible_tool, hidden_tool]},
         )
 
         runner = CliRunner()
-        result = runner.invoke(cli, ["--env", "production", "requests"])
+        result = runner.invoke(cli, ["--env", "production", "requests", "--help"])
 
-        assert result.exit_code != 0
-        assert "No such command 'requests'" in result.output
-        assert "missing the required scope" not in result.output
+        assert result.exit_code == 0
+        assert "review" in result.output
+        assert "approve" in result.output
 
     def test_ai_spend_group_contains_token_spend_tools(self, monkeypatch):
         _use_bundled_spec(monkeypatch)
@@ -1611,21 +1706,25 @@ class TestCLIIntegration:
         assert ai_spend_payload["url"].endswith("/get-ai-token-spend-aggregates")
         assert ai_spend_payload == legacy_payload
 
-    def test_ai_spend_missing_scope_message(self, monkeypatch, isolated_config):
+    def test_ai_spend_visible_without_required_scope(
+        self, monkeypatch, isolated_config
+    ):
         _use_bundled_spec(monkeypatch)
         store.save_tokens("production", "tok", "refresh", granted_scopes="users:read")
         monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
 
         runner = CliRunner()
-        public_result = runner.invoke(cli, ["--env", "production", "ai-spend"])
-        legacy_result = runner.invoke(cli, ["--env", "production", "ai-token-spend"])
+        public_result = runner.invoke(
+            cli, ["--env", "production", "ai-spend", "--help"]
+        )
+        legacy_result = runner.invoke(
+            cli, ["--env", "production", "ai-token-spend", "--help"]
+        )
 
-        assert public_result.exit_code != 0
-        assert "ai-spend' resource is available" in public_result.output
-        assert "ai_spend:read" in public_result.output
-        assert legacy_result.exit_code != 0
-        assert "ai-token-spend' resource is available" in legacy_result.output
-        assert "ai_spend:read" in legacy_result.output
+        assert public_result.exit_code == 0
+        assert "aggregates" in public_result.output
+        assert legacy_result.exit_code == 0
+        assert "aggregates" in legacy_result.output
 
     def test_funds_group_contains_card_tools(self, monkeypatch):
         _use_bundled_spec(monkeypatch)
@@ -1660,8 +1759,7 @@ class TestCLIIntegration:
         self, monkeypatch, isolated_config
     ):
         _use_bundled_spec(monkeypatch)
-        # A read-only `limits:read` token can still list funds, while the
-        # card-specific alias group remains unavailable without `cards:write`.
+        # Discovery remains complete even when the token only has `limits:read`.
         store.save_tokens("production", "tok", "refresh", granted_scopes="limits:read")
         monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
 
@@ -1678,9 +1776,9 @@ class TestCLIIntegration:
         assert dry.exit_code == 0, dry.output
         assert json.loads(dry.output)["data"][0]["url"].endswith("/get-funds")
 
-        cards = runner.invoke(cli, ["--env", "production", "cards"])
-        assert cards.exit_code != 0
-        assert "cards:write" in cards.output
+        cards = runner.invoke(cli, ["--env", "production", "cards", "--help"])
+        assert cards.exit_code == 0
+        assert "activate" in cards.output
 
     def test_treasury_account_numbers_invokable_with_readonly_scope(
         self, monkeypatch, isolated_config
@@ -1790,7 +1888,49 @@ class TestCLIIntegration:
             "/developer/v1/agent-tools/search-unified-requests"
         )
 
-    def test_procurement_draft_generated_group_builds_schema_payload(self, monkeypatch):
+    def test_procurement_draft_generated_group_help_shows_change_request_params(
+        self, monkeypatch
+    ):
+        _use_bundled_spec(monkeypatch)
+        runner = CliRunner()
+        help_result = runner.invoke(cli, ["procurement_requests", "draft", "--help"])
+        assert help_result.exit_code == 0, help_result.output
+        assert "--clear_change_request_field_ids" in help_result.output
+        assert "change_request_answers" in help_result.output
+
+    def test_procurement_new_draft_generated_group_builds_schema_payload(
+        self, monkeypatch
+    ):
+        _use_bundled_spec(monkeypatch)
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--agent",
+                "--env",
+                "sandbox",
+                "procurement_requests",
+                "draft",
+                "--json",
+                json.dumps(
+                    {
+                        "spend_intent_uuid": "spend-intent-uuid",
+                        "rationale": "Create a procurement request draft",
+                    }
+                ),
+                "--dry_run",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["data"][0]["body"] == {
+            "spend_intent_uuid": "spend-intent-uuid",
+            "rationale": "Create a procurement request draft",
+        }
+
+    def test_procurement_change_request_draft_generated_group_builds_schema_payload(
+        self, monkeypatch
+    ):
         _use_bundled_spec(monkeypatch)
         runner = CliRunner()
         result = runner.invoke(
@@ -1804,7 +1944,7 @@ class TestCLIIntegration:
                 "--json",
                 json.dumps(
                     {
-                        "spend_intent_uuid": "spend-intent-uuid",
+                        "existing_spend_request_uuid": "existing-spend-request-uuid",
                         "rationale": "Populate procurement request draft",
                         "request_name": "Laptop request",
                         "currency": "USD",
@@ -1826,6 +1966,13 @@ class TestCLIIntegration:
                                 "file_uuids": ["file-uuid"],
                             },
                         ],
+                        "change_request_answers": [
+                            {
+                                "answer_type": "text",
+                                "field_id": "change_reason",
+                                "value": "Increase contract value",
+                            }
+                        ],
                     }
                 ),
                 "--dry_run",
@@ -1839,7 +1986,7 @@ class TestCLIIntegration:
             "/developer/v1/agent-tools/procurement-draft"
         )
         assert body == {
-            "spend_intent_uuid": "spend-intent-uuid",
+            "existing_spend_request_uuid": "existing-spend-request-uuid",
             "rationale": "Populate procurement request draft",
             "request_name": "Laptop request",
             "currency": "USD",
@@ -1860,6 +2007,13 @@ class TestCLIIntegration:
                     "field_id": "quote_upload",
                     "file_uuids": ["file-uuid"],
                 },
+            ],
+            "change_request_answers": [
+                {
+                    "answer_type": "text",
+                    "field_id": "change_reason",
+                    "value": "Increase contract value",
+                }
             ],
         }
 

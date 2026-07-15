@@ -1,8 +1,9 @@
-"""Tests for OAuth scope persistence, tool filtering, and pre-flight checks."""
+"""Tests for OAuth scope persistence, tool discovery, and API errors."""
 
 from __future__ import annotations
 
 import json
+from unittest.mock import MagicMock
 
 import click
 from click.testing import CliRunner
@@ -10,9 +11,11 @@ from click.testing import CliRunner
 from ramp_cli.auth import oauth as oauth_module
 from ramp_cli.auth import store
 from ramp_cli.config import settings
+from ramp_cli.errors import ApiError
 from ramp_cli.main import cli
+from ramp_cli.tools import registry
+from ramp_cli.tools.commands import _scope_error_hint
 from ramp_cli.tools.parser import ToolDef
-from ramp_cli.tools.registry import _filter_by_scopes
 
 
 class TestScopePersistence:
@@ -123,9 +126,34 @@ class TestScopePersistence:
         assert store.get_granted_scopes("sandbox") == {"sandbox:scope"}
         assert store.get_granted_scopes("production") == {"prod:scope"}
 
+    def test_external_token_makes_stored_scopes_unknown(
+        self, isolated_config, monkeypatch
+    ):
+        store.save_tokens(
+            "production", "stored", "refresh", granted_scopes="cards:read_agentic"
+        )
+        monkeypatch.setenv("RAMP_ACCESS_TOKEN", "external")
 
-class TestFilterByScopes:
-    """_filter_by_scopes hides tools the token can't access."""
+        assert store.get_known_granted_scopes("production") is None
+
+    def test_replacing_token_can_clear_stored_scopes(self, isolated_config):
+        store.save_tokens(
+            "production", "old", "refresh", granted_scopes="cards:read_agentic"
+        )
+
+        store.save_tokens(
+            "production",
+            "replacement",
+            "",
+            clear_granted_scopes=True,
+        )
+
+        assert store.get_granted_scopes("production") == set()
+        assert store.get_known_granted_scopes("production") is None
+
+
+class TestScopeIndependentDiscovery:
+    """Tool discovery does not depend on locally persisted token scopes."""
 
     def _make_tool(self, name: str, scopes: list[str] | None = None) -> ToolDef:
         return ToolDef(
@@ -137,16 +165,23 @@ class TestFilterByScopes:
             required_scopes=scopes or [],
         )
 
-    def test_all_tools_shown_when_no_scopes_stored(self, isolated_config):
-        """Backwards compat: old tokens with no scope info show everything."""
+    def test_all_tools_shown_when_no_scopes_stored(self, isolated_config, monkeypatch):
         tools = [
             self._make_tool("tool-a", ["a:read"]),
             self._make_tool("tool-b", ["b:write"]),
         ]
-        result = _filter_by_scopes(tools, "production")
-        assert len(result) == 2
+        monkeypatch.setattr(registry, "list_tool_defs", lambda env: tools)
 
-    def test_filters_to_matching_scopes(self, isolated_config):
+        categories = registry.list_categories("production")
+
+        assert [tool.name for tool in categories["general"]] == [
+            "tool-a",
+            "tool-b",
+        ]
+
+    def test_tools_with_missing_scopes_remain_visible(
+        self, isolated_config, monkeypatch
+    ):
         store.save_tokens(
             "production",
             "tok",
@@ -158,59 +193,81 @@ class TestFilterByScopes:
             self._make_tool("tool-b", ["b:write"]),
             self._make_tool("tool-c", ["c:read"]),
         ]
-        result = _filter_by_scopes(tools, "production")
-        names = [t.name for t in result]
-        assert "tool-a" in names
-        assert "tool-c" in names
-        assert "tool-b" not in names
+        monkeypatch.setattr(registry, "list_tool_defs", lambda env: tools)
 
-    def test_tool_with_no_required_scopes_always_shown(self, isolated_config):
-        store.save_tokens("production", "tok", "", granted_scopes="a:read")
-        tools = [self._make_tool("no-scope-tool", [])]
-        result = _filter_by_scopes(tools, "production")
-        assert len(result) == 1
+        categories = registry.list_categories("production")
 
-    def test_tool_requiring_multiple_scopes(self, isolated_config):
-        store.save_tokens(
-            "production",
-            "tok",
-            "",
-            granted_scopes="a:read b:write",
-        )
-        tools = [
-            self._make_tool("needs-both", ["a:read", "b:write"]),
-            self._make_tool("needs-missing", ["a:read", "c:read"]),
+        assert [tool.name for tool in categories["general"]] == [
+            "tool-a",
+            "tool-b",
+            "tool-c",
         ]
-        result = _filter_by_scopes(tools, "production")
-        names = [t.name for t in result]
-        assert "needs-both" in names
-        assert "needs-missing" not in names
 
 
-class TestPreFlightScopeCheck:
-    """_execute_tool rejects calls to tools the token can't access."""
+class TestServerScopeErrors:
+    """Core authorizes tool calls and the CLI contextualizes scope errors."""
 
-    def test_missing_scope_fails_fast(self, isolated_config):
-        """Calling a tool without the required scope gives a clear error."""
+    @staticmethod
+    def _tool() -> ToolDef:
+        return ToolDef(
+            name="get-attention-feed",
+            path="/developer/v1/agent-tools/get-attention-feed",
+            http_method="post",
+            summary="Get attention feed",
+            description="Get attention feed",
+            category="tasks",
+            alias="list",
+            params=[],
+            required_scopes=["tasks:read", "users:read"],
+        )
+
+    @staticmethod
+    def _scope_error() -> ApiError:
+        return ApiError(
+            403,
+            json.dumps(
+                {
+                    "error_v2": {
+                        "error_code": "DEVELOPER_7100",
+                        "message": "Insufficient scope",
+                    }
+                }
+            ),
+        )
+
+    def test_core_scope_error_has_contextual_recovery_guidance(
+        self, isolated_config, monkeypatch
+    ):
         store.save_tokens(
-            "production",
+            "sandbox",
             "tok",
             "",
             granted_scopes="users:read",
         )
-        runner = CliRunner()
-        # get-transactions requires transactions:read
-        result = runner.invoke(
-            cli,
-            ["get-transactions", "--json", '{"filters": {}}'],
+        client = MagicMock()
+        client.post.side_effect = self._scope_error()
+        tool = self._tool()
+        monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
+        monkeypatch.setattr("ramp_cli.tools.commands.maybe_sync", lambda env: None)
+        monkeypatch.setattr(
+            "ramp_cli.main.list_categories", lambda env: {"tasks": [tool]}
         )
+        monkeypatch.setattr("ramp_cli.tools.commands.RampClient", lambda env: client)
+
+        result = CliRunner().invoke(cli, ["--env", "sandbox", "tasks", "list"])
+
         assert result.exit_code != 0
-        assert "transactions:read" in result.output
-        assert "ramp auth login" in result.output
-        assert "missing the required scope" in result.output
+        client.post.assert_called_once()
+        message = str(result.exception)
+        assert "DEVELOPER_7100" not in message
+        assert "get-attention-feed" in message
+        assert "insufficient OAuth scope" in message
+        assert "tasks:read" not in message
+        assert "users:read" not in message
+        assert "ramp --env sandbox tools refresh" in message
+        assert "ramp --env sandbox auth login" in message
 
     def test_dry_run_skips_scope_check(self, isolated_config):
-        """--dry_run should not check scopes (it never hits the network)."""
         store.save_tokens(
             "production",
             "tok",
@@ -225,33 +282,104 @@ class TestPreFlightScopeCheck:
         assert result.exit_code == 0
         assert "dry_run" in result.output
 
-    def test_matching_scope_proceeds(self, isolated_config):
-        """When scopes match, the tool attempts execution (will fail on network,
-        but should NOT fail on scope check)."""
-        store.save_tokens(
-            "production",
-            "tok",
-            "",
-            granted_scopes="transactions:read",
-        )
-        runner = CliRunner()
-        result = runner.invoke(
-            cli,
-            ["get-transactions", "--dry_run", "--json", '{"filters": {}}'],
-        )
-        # dry_run bypasses the scope check and the network
-        assert result.exit_code == 0
+    def test_unknown_grants_do_not_claim_exact_missing_scopes(self, isolated_config):
+        message = _scope_error_hint(self._tool(), "sandbox")
 
-    def test_no_stored_scopes_skips_check(self, isolated_config):
-        """Old tokens without scope info should not block tool calls."""
-        store.save_tokens("production", "tok", "", granted_scopes="")
-        runner = CliRunner()
-        result = runner.invoke(
-            cli,
-            ["get-funds", "--dry_run", "--rationale", "Testing scope preflight"],
+        assert "insufficient OAuth scope" in message
+        assert "tasks:read" not in message
+
+    def test_custom_scope_override_is_called_out(self, isolated_config, monkeypatch):
+        cfg = settings.load()
+        cfg.scopes = "users:read"
+        settings.save(cfg)
+        client = MagicMock()
+        client.post.side_effect = self._scope_error()
+        tool = self._tool()
+        monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
+        monkeypatch.setattr("ramp_cli.tools.commands.maybe_sync", lambda env: None)
+        monkeypatch.setattr(
+            "ramp_cli.main.list_categories", lambda env: {"tasks": [tool]}
         )
-        assert result.exit_code == 0
-        assert "dry_run" in result.output
+        monkeypatch.setattr("ramp_cli.tools.commands.RampClient", lambda env: client)
+
+        result = CliRunner().invoke(cli, ["--env", "sandbox", "tasks", "list"])
+
+        assert result.exit_code != 0
+        message = str(result.exception)
+        assert "top-level custom `scopes` override" in message
+        assert "cached tool definition: tasks:read" in message
+
+    def test_custom_scope_override_superset_is_not_blamed(self, isolated_config):
+        cfg = settings.load()
+        cfg.scopes = "tasks:read users:read"
+        settings.save(cfg)
+
+        message = _scope_error_hint(self._tool(), "sandbox")
+
+        assert "custom `scopes` override" not in message
+
+    def test_external_token_gets_external_token_recovery(
+        self, isolated_config, monkeypatch
+    ):
+        cfg = settings.load()
+        cfg.scopes = "users:read"
+        settings.save(cfg)
+        monkeypatch.setenv("RAMP_ACCESS_TOKEN", "external")
+
+        message = _scope_error_hint(self._tool(), "sandbox")
+
+        assert "`RAMP_ACCESS_TOKEN` has insufficient OAuth scope" in message
+        assert "overrides credentials saved by `ramp auth login`" in message
+        assert "unset RAMP_ACCESS_TOKEN" in message
+        assert "custom `scopes` override" not in message
+
+    def test_stale_cached_scope_is_not_reported_as_missing(self, isolated_config):
+        error = ApiError(
+            403,
+            json.dumps(
+                {
+                    "error_v2": {
+                        "error_code": "DEVELOPER_7100",
+                        "message": "Missing newly_required:read",
+                    }
+                }
+            ),
+            contextual_hint=_scope_error_hint(self._tool(), "sandbox"),
+        )
+
+        message = str(error)
+        assert "Missing newly_required:read" in message
+        assert "tasks:read" not in message
+
+    def test_non_scope_api_error_is_unchanged(self, isolated_config, monkeypatch):
+        error = ApiError(
+            403,
+            json.dumps(
+                {
+                    "error_v2": {
+                        "error_code": "CUSTOMER_7004",
+                        "message": "Business not authorized",
+                    }
+                }
+            ),
+        )
+        client = MagicMock()
+        client.post.side_effect = error
+        tool = self._tool()
+        monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
+        monkeypatch.setattr("ramp_cli.tools.commands.maybe_sync", lambda env: None)
+        monkeypatch.setattr(
+            "ramp_cli.main.list_categories", lambda env: {"tasks": [tool]}
+        )
+        monkeypatch.setattr("ramp_cli.tools.commands.RampClient", lambda env: client)
+
+        result = CliRunner().invoke(cli, ["--env", "sandbox", "tasks", "list"])
+
+        assert result.exit_code != 0
+        message = str(result.exception)
+        assert "Business not authorized" in message
+        assert "tools refresh" not in message
+        assert "auth login" not in message
 
 
 class TestAuthStatusScopes:
@@ -329,5 +457,6 @@ class TestResolveScopesWarning:
         output = result.output
         assert "Could not read tool definitions" in output
         assert "ramp tools refresh" in output
-        # Should still return DEVAPI_SCOPES as fallback
-        assert "business:read" in output
+        # The bundled spec still supplies scopes when the env cache fails.
+        assert "users:read" in output
+        assert "business:read" not in output

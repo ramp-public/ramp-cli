@@ -134,6 +134,16 @@ YYZ/YTZ). For one specific airport, search `--location_type airport` and pass it
 Add `--return_date` only for round-trips. Add `--traveler_user_id` only for delegated bookings.
 No `--cabin_class`/`--limit`/`--sort_key` unless the user named a cabin, count, or order.
 
+**When the traveler named a departure weekday** ("leave Sunday", "out next Friday"), also pass
+`--requested_weekday` with the lowercase day (`sunday`), if the flight-search command lists it
+(skip it on an older CLI). The server rejects the search when the departure date doesn't fall
+on that weekday, and the error names the correct nearby dates — retry with the corrected date
+from the error; never clear the error by changing the weekday. It's departure-only: for an
+**arrival** day ("be home by Sunday"), leave it off — the right flight may depart the day
+before (a red-eye) — and let the Step 4 date strings show both days. If the rejection, or phrasing like "Sunday night", leaves it ambiguous whether the
+traveler means late Sunday or a just-after-midnight Monday departure, ask them which they mean
+instead of silently moving the date.
+
 ```bash
 ramp travel search-flight --output json \
   --departure YYZ --arrival SFO \
@@ -181,9 +191,17 @@ and `fare_options` (the per-fare grid — **present only when you passed `--incl
 - **Policy** — `in_policy: true` → **✓**, `false` → **✗** + short `policy_reason` (e.g.
   *✗ (booked < 14 days out)*), `null` → **—** (not checked); never show **✗** for `null`.
 
-Above the table, show up to 3 recommended options with a couple-word reason, price, and policy
-status (*"Recommended: JetBlue — cheapest in-policy, $289 round-trip."*). If
-`search_policy_summary` has text, show it once as a short banner.
+Above the table, lead with the route and travel date, taking the weekday from the offers'
+`departure_date` strings (weekday included, e.g. "Mon, Jul 13, 2026" → **"SFO → EWR — Mon,
+Jul 13"**). The day you show must come from the API's date strings — never pair the traveler's
+words ("Sunday") with a date you computed. Judge a mismatch against the day the traveler
+actually named: a departure day against `departure_date`, an arrival day against
+`arrival_date` — a Saturday red-eye arriving Sunday **matches** "be home by Sunday". On a real
+mismatch, re-search with the corrected date instead of presenting these offers. For an
+arrival-day request, show each offer's `departure_date` **and** `arrival_date` as returned so
+the traveler sees both days. Below that, show up to 3 recommended options with a
+couple-word reason, price, and policy status (*"Recommended: JetBlue — cheapest in-policy,
+$289 round-trip."*). If `search_policy_summary` has text, show it once as a short banner.
 
 ## Step 5 — round-trip: confirm the outbound, then fetch returns
 
@@ -283,8 +301,26 @@ sometimes `available_balance`/`spending_limit`).
 Whether the booking needs sign-off comes from the preview's **`requires_approval`** /
 **`approval_steps`** — surface those plainly rather than inferring it from the fund.
 
-Then state the total in plain words and **ask for a clear yes** — *"This books LHR → JFK on
-Delta, Jul 6, for **$412 total**, paid from the Travel fund. Book it?"* Stop and wait.
+The preview returns the itinerary dates as weekday-qualified strings — **`outbound_date`**
+(e.g. "Mon, Jul 13, 2026") and, for round-trips, **`return_date`**. The read-back must quote
+them **exactly as returned, weekday included** — never re-derive the weekday or repeat one
+from earlier conversation. These are departure dates — check them against a departure day the
+traveler named; for an arrival day ("be home by Sunday"), check the chosen offer's
+`arrival_date` instead and read that day back too (a Saturday-departing red-eye arriving
+Sunday is correct). On a real mismatch, **stop and re-search (Step 3) with the corrected
+date** — don't ask for confirmation. If the preview doesn't include these fields, verify each
+ISO travel date with Python's calendar instead (use `python` if only that executable is
+available):
+
+```bash
+python3 -c 'from datetime import date; import sys; dates = map(date.fromisoformat, sys.argv[1:]); print("\n".join("{}: {} {}, {}".format(d.isoformat(), d.strftime("%A, %B"), d.day, d.year) for d in dates))' 2026-07-06 2026-07-10
+```
+
+Then state the total in plain words and **ask for a clear yes**. The confirmation prompt must
+include the preview's date string for every leg, along with the local departure time: *"This
+books LHR → JFK on Delta, departing Mon, Jul 6, 2026 at 10:00 AM, for **$412 total**, paid
+from the Travel fund. Book it?"* For a round-trip, include both outbound and return dates and
+times. Stop and wait.
 
 ### Phase 2 — confirm (only after a clear "yes")
 

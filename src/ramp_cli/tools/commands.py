@@ -7,6 +7,7 @@ flags; complex nested params require the --json escape hatch.
 
 import json
 import mimetypes
+import os
 import sys
 import threading
 import time
@@ -19,11 +20,11 @@ from uuid import uuid4
 
 import click
 
-from ramp_cli.auth.store import get_granted_scopes
 from ramp_cli.client.api import RampClient
 from ramp_cli.client.session import get_session_id
 from ramp_cli.config.constants import api_url, append_query_params
-from ramp_cli.config.settings import resolve_environment
+from ramp_cli.config.settings import configured_scopes, resolve_environment
+from ramp_cli.errors import ApiError
 from ramp_cli.onboarding import maybe_show_category_tip
 from ramp_cli.output.formatter import (
     extract_headers,
@@ -38,13 +39,40 @@ from ramp_cli.output.paginator import ToolPaginator
 from ramp_cli.output.style import show_detail_card, show_table_card
 from ramp_cli.specs.sync import maybe_sync
 from ramp_cli.tools.parser import JsonSchema, ParamType, ToolDef, ToolParam
-from ramp_cli.tools.registry import CATEGORY_REMAP, get_tool, list_tool_defs
+from ramp_cli.tools.registry import (
+    CATEGORY_ALIAS_GROUPS,
+    CATEGORY_REMAP,
+    get_tool,
+    list_tool_defs,
+)
 
 _SPINNER_CHARS = "░▒▓█▓▒"
 
 _ID_SUFFIXES = ("_id", "_uuid")
 _IDEMPOTENCY_HEADER = "X-Idempotency-Key"
 _APPLICATION_PROGRESS_PATH = "/developer/v1/applications/progress"
+
+CLI_RESOURCE_CATEGORIES = frozenset(
+    {
+        "accounting",
+        "ai-spend",
+        "bills",
+        "business",
+        "cards",
+        "funds",
+        "procurement_requests",
+        "purchase_orders",
+        "receipts",
+        "reimbursements",
+        "requests",
+        "tasks",
+        "transactions",
+        "travel",
+        "treasury",
+        "users",
+        "vendors",
+    }
+)
 
 _APPLICATION_WAIT_ACTION_ALIASES: dict[str, str] = {
     "idv": "identity_verification",
@@ -98,7 +126,9 @@ class WaitConfig:
 
 
 def resolve_tool_command_names(
-    group_name: str, tools: list[ToolDef]
+    group_name: str,
+    tools: list[ToolDef],
+    granted_scopes: set[str] | None = None,
 ) -> list[tuple[str, ToolDef]]:
     """Resolve the public command name for each tool in a CLI group."""
     alias_tools: dict[str, list[ToolDef]] = {}
@@ -113,14 +143,55 @@ def resolve_tool_command_names(
         if len(peers) == 1:
             command_name = preferred
         else:
-            native_peers = [peer for peer in peers if peer.category == group_name]
-            command_name = (
-                preferred
-                if tool.category == group_name and len(native_peers) == 1
-                else tool.name
+            authorized_peers = (
+                [
+                    peer
+                    for peer in peers
+                    if not peer.required_scopes
+                    or set(peer.required_scopes) <= granted_scopes
+                ]
+                if granted_scopes
+                else []
             )
+            native_peers = [peer for peer in peers if peer.category == group_name]
+            preferred_peer = (
+                authorized_peers[0]
+                if len(authorized_peers) == 1
+                else native_peers[0]
+                if len(native_peers) == 1
+                else None
+            )
+            command_name = preferred if tool is preferred_peer else tool.name
         resolved.append((command_name, tool))
     return resolved
+
+
+def resolve_cli_tool_groups(tools: list[ToolDef]) -> dict[str, list[ToolDef]]:
+    """Group tools under the resource names exposed by the root CLI."""
+    source_categories: dict[str, list[ToolDef]] = {}
+    for tool in tools:
+        source_categories.setdefault(tool.category or "general", []).append(tool)
+
+    merged: dict[str, list[ToolDef]] = {}
+    for category, category_tools in source_categories.items():
+        target = CATEGORY_REMAP.get(category, category)
+        merged.setdefault(target, []).extend(category_tools)
+
+    groups: dict[str, list[ToolDef]] = {}
+    general_tools: list[ToolDef] = []
+    for category, category_tools in merged.items():
+        if len(category_tools) > 1 or category in CLI_RESOURCE_CATEGORIES:
+            groups[category] = category_tools
+        else:
+            general_tools.extend(category_tools)
+
+    for category in CATEGORY_ALIAS_GROUPS:
+        if alias_tools := source_categories.get(category):
+            groups.setdefault(category, list(alias_tools))
+
+    if general_tools:
+        groups.setdefault("general", []).extend(general_tools)
+    return dict(sorted(groups.items()))
 
 
 def is_id_param(param: ToolParam) -> bool:
@@ -431,21 +502,6 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
             print_json(request.display_body())
         return
 
-    # Pre-flight scope check: fail fast with a clear message instead of
-    # sending a doomed request that returns an opaque 403.
-    if tool.required_scopes:
-        granted = get_granted_scopes(env)
-        if granted:  # only check if we have scope info persisted
-            missing = set(tool.required_scopes) - granted
-            if missing:
-                missing_str = ", ".join(sorted(missing))
-                raise click.ClickException(
-                    f"Your token is missing the required scope: {missing_str}\n\n"
-                    f"  To fix this, log in again to get a fresh token:\n\n"
-                    f"    ramp auth login\n\n"
-                    f"  This will request all the scopes needed for your tools."
-                )
-
     # Refresh cached spec in the background for the *next* invocation. Non-dry-run
     # --json bodies already forced a sync before schema validation above.
     if not synced_for_json_validation:
@@ -458,17 +514,26 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
     t0 = time.monotonic()
 
     client = RampClient(env)
-    if wait_config is None:
-        resp_bytes = _execute_prepared_request(client, request)
-        data = json.loads(resp_bytes) if resp_bytes.strip() else {}
-    else:
-        data = _execute_waiting_application_progress(
-            client,
-            request,
-            wait_config,
-            is_human=is_human,
-            started_at=t0,
-        )
+    try:
+        if wait_config is None:
+            resp_bytes = _execute_prepared_request(client, request)
+            data = json.loads(resp_bytes) if resp_bytes.strip() else {}
+        else:
+            data = _execute_waiting_application_progress(
+                client,
+                request,
+                wait_config,
+                is_human=is_human,
+                started_at=t0,
+            )
+    except ApiError as error:
+        if error.error_code != "DEVELOPER_7100":
+            raise
+        raise ApiError(
+            error.status_code,
+            error.body,
+            contextual_hint=_scope_error_hint(tool, env),
+        ) from error
 
     elapsed = time.monotonic() - t0
     if stop_spinner:
@@ -501,6 +566,41 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
                 return
 
         _render_human(data, wide=wide, category=tool.category)
+
+
+def _scope_error_hint(tool: ToolDef, env: str) -> str:
+    if os.environ.get("RAMP_ACCESS_TOKEN"):
+        return (
+            f"The `{tool.name}` command was rejected by Core because "
+            "`RAMP_ACCESS_TOKEN` has insufficient OAuth scope.\n\n"
+            "  This environment variable overrides credentials saved by "
+            "`ramp auth login`. Replace it with an appropriately scoped token, "
+            "or unset it before re-authorizing:\n\n"
+            "    unset RAMP_ACCESS_TOKEN\n"
+            f"    ramp --env {env} tools refresh\n"
+            f"    ramp --env {env} auth login"
+        )
+
+    required = set(tool.required_scopes)
+    override_guidance = ""
+    configured = set(configured_scopes().split())
+    missing_from_override = sorted(required - configured) if configured else []
+    if missing_from_override:
+        override_guidance = (
+            "\n  Your top-level custom `scopes` override omits scopes declared by "
+            "the cached tool definition: "
+            f"{', '.join(missing_from_override)}. Update or remove the override "
+            "before logging in.\n"
+        )
+
+    return (
+        f"The `{tool.name}` command was rejected by Core because the active "
+        "credential has insufficient OAuth scope.\n"
+        f"{override_guidance}\n"
+        f"  Refresh the tool definitions and re-authorize for {env}:\n\n"
+        f"    ramp --env {env} tools refresh\n"
+        f"    ramp --env {env} auth login"
+    )
 
 
 def _application_progress_wait_config(

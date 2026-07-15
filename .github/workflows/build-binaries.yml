@@ -26,6 +26,9 @@ jobs:
           - os: linux
             arch: arm64
             runner: ubuntu-22.04-arm
+          - os: windows
+            arch: amd64
+            runner: windows-2022
 
     runs-on: ${{ matrix.runner }}
 
@@ -40,9 +43,11 @@ jobs:
         uses: astral-sh/setup-uv@v4
 
       - name: Install dependencies
+        shell: bash
         run: uv sync --frozen
 
       - name: Build with Nuitka
+        shell: bash
         run: |
           uv run python -m nuitka \
             --standalone \
@@ -56,11 +61,13 @@ jobs:
             src/ramp_cli/main.py
 
       - name: Package standalone directory
+        shell: bash
         run: |
           cd build
           tar -czf "ramp-${{ matrix.os }}-${{ matrix.arch }}.tar.gz" main.dist/
 
       - name: Generate checksum
+        shell: bash
         run: |
           cd build
           if [ "${{ matrix.os }}" = "darwin" ]; then
@@ -87,7 +94,7 @@ jobs:
 
       - name: Verify expected artifacts
         run: |
-          for platform in darwin-arm64 darwin-amd64 linux-amd64 linux-arm64; do
+          for platform in darwin-arm64 darwin-amd64 linux-amd64 linux-arm64 windows-amd64; do
             test -f "ramp-${platform}.tar.gz" || { echo "Missing ramp-${platform}.tar.gz"; exit 1; }
             test -f "ramp-${platform}.tar.gz.sha256" || { echo "Missing ramp-${platform}.tar.gz.sha256"; exit 1; }
           done
@@ -106,7 +113,9 @@ jobs:
             ramp-linux-amd64.tar.gz \
             ramp-linux-amd64.tar.gz.sha256 \
             ramp-linux-arm64.tar.gz \
-            ramp-linux-arm64.tar.gz.sha256
+            ramp-linux-arm64.tar.gz.sha256 \
+            ramp-windows-amd64.tar.gz \
+            ramp-windows-amd64.tar.gz.sha256
 
   update-homebrew:
     needs: release

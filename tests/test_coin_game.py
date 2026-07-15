@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import os
 
+import pytest
 from click.testing import CliRunner
 
 from ramp_cli.animations.rampy import _render_eye
 from ramp_cli.easter_eggs.rampy import rampy_cmd
+from ramp_cli.output import lifecycle as lifecycle_module
 from ramp_cli.output.lifecycle import Lifecycle
 from ramp_cli.output.rampy_coin_game import (
     G_EYE_L,
@@ -182,3 +184,28 @@ def test_lifecycle_on_input_forwarding():
     )
     # Verify on_input is set
     assert lc._on_input is not None
+
+
+def test_lifecycle_start_raises_cleanly_without_posix_terminal(monkeypatch):
+    """On native Windows Python fcntl/termios/tty are None — start() must
+    raise a clean RuntimeError instead of an AttributeError."""
+    monkeypatch.setattr(lifecycle_module, "fcntl", None)
+    monkeypatch.setattr(lifecycle_module, "termios", None)
+    monkeypatch.setattr(lifecycle_module, "tty", None)
+
+    lc = Lifecycle(lambda t: None, lambda t: None, fps=20)
+    with pytest.raises(RuntimeError, match="not supported"):
+        lc.start()
+
+
+def test_coin_game_degrades_gracefully_without_posix_terminal(monkeypatch):
+    """The coin game must exit with a clean error, not crash, on Windows."""
+    monkeypatch.setattr(lifecycle_module, "fcntl", None)
+    monkeypatch.setattr(lifecycle_module, "termios", None)
+    monkeypatch.setattr(lifecycle_module, "tty", None)
+
+    runner = CliRunner()
+    result = runner.invoke(rampy_cmd, ["--coin-game"])
+    assert result.exit_code != 0
+    assert "not supported on Windows" in result.output
+    assert "Traceback" not in result.output

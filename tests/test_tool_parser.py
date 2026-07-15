@@ -380,6 +380,78 @@ class TestJsonSchema:
         )
         assert "fields_to_answer is the prioritized subset" in answers["description"]
 
+    def test_bundled_procurement_change_request_draft_input(self):
+        spec = json.loads(AGENT_TOOL_SPEC.read_text())
+        schemas = spec["components"]["schemas"]
+        draft_properties = schemas["DraftProcurementRequestRequestBody"]["properties"]
+
+        assert "existing_spend_request_uuid" in draft_properties
+        assert "change_request_answers" in draft_properties
+        assert "clear_change_request_field_ids" in draft_properties
+        assert "uuid" in schemas["ProcurementLineItemDataRequestBody"]["properties"]
+
+    def test_bundled_procurement_change_request_draft_state(self):
+        spec = json.loads(AGENT_TOOL_SPEC.read_text())
+        schemas = spec["components"]["schemas"]
+        draft_state = schemas["ProcurementDraftState"]["properties"]
+        assert "change_request_state" in draft_state
+
+    @pytest.mark.parametrize(
+        "response_schema_name",
+        [
+            "ProcurementDraftSummary",
+            "ProcurementSubmittedRequest",
+            "UnifiedRequestDetailsOutput",
+        ],
+    )
+    def test_bundled_procurement_change_request_response(self, response_schema_name):
+        spec = json.loads(AGENT_TOOL_SPEC.read_text())
+        response_properties = spec["components"]["schemas"][response_schema_name][
+            "properties"
+        ]
+
+        assert "original_request" in response_properties
+        assert "change_request_diff" in response_properties
+        assert response_properties["original_request"]["allOf"] == [
+            {"$ref": "#/components/schemas/OriginalProcurementRequest"}
+        ]
+
+    @pytest.mark.parametrize(
+        "diff_schema_name",
+        [
+            "ProcurementChangeRequestAccountingFieldDiff",
+            "ProcurementChangeRequestFilesFieldDiff",
+            "ProcurementChangeRequestLineItemFieldDiff",
+            "ProcurementChangeRequestLinkFieldDiff",
+            "ProcurementChangeRequestTextFieldDiff",
+        ],
+    )
+    def test_bundled_typed_change_request_field_diff_requires_discriminator(
+        self, diff_schema_name
+    ):
+        spec = json.loads(AGENT_TOOL_SPEC.read_text())
+        diff_schema = spec["components"]["schemas"][diff_schema_name]
+
+        assert "field_type" in diff_schema["required"]
+        assert "is_custom_field" in diff_schema["required"]
+
+    def test_bundled_legacy_change_request_field_diff_metadata(self):
+        spec = json.loads(AGENT_TOOL_SPEC.read_text())
+        legacy_schema = spec["components"]["schemas"][
+            "ProcurementChangeRequestLegacyFieldDiff"
+        ]
+
+        assert "is_custom_field" in legacy_schema["required"]
+        assert "field_type" not in legacy_schema["properties"]
+
+    def test_procurement_upload_returns_reusable_answer(self):
+        spec = json.loads(AGENT_TOOL_SPEC.read_text())
+        upload_result = spec["components"]["schemas"][
+            "ProcurementUploadedFileResultJsonMode"
+        ]
+
+        assert "answer" in upload_result["properties"]
+
     def test_unified_request_search_schema_has_nested_filters(
         self, tool_map: dict[str, ToolDef]
     ):

@@ -11,7 +11,7 @@ from enum import StrEnum
 import click
 
 from ramp_cli import __version__ as VERSION
-from ramp_cli.auth.store import get_granted_scopes
+from ramp_cli.auth.store import get_known_granted_scopes
 from ramp_cli.commands.applications import applications_group
 from ramp_cli.commands.auth import auth_group
 from ramp_cli.commands.config import config_group
@@ -36,14 +36,15 @@ from ramp_cli.output.help import (
     suppress_help_text,
 )
 from ramp_cli.specs.sync import maybe_sync
-from ramp_cli.tools.commands import build_tool_command, resolve_tool_command_names
+from ramp_cli.tools.commands import (
+    build_tool_command,
+    resolve_cli_tool_groups,
+    resolve_tool_command_names,
+)
 from ramp_cli.tools.registry import (
-    CATEGORY_ALIAS_GROUPS,
     CATEGORY_LEGACY_GROUPS,
-    CATEGORY_REMAP,
     get_tool,
     list_categories,
-    list_tool_defs,
 )
 from ramp_cli.version_check import check_for_update, emit_update_notice
 
@@ -100,7 +101,6 @@ _RESOURCE_HELP: dict[str, str] = {
     "vendors": "Upload and manage vendor documents and track bulk upload progress",
 }
 
-_SINGLE_TOOL_RESOURCE_CATEGORIES = frozenset({"business", "tasks", "treasury"})
 _LEGACY_TOOL_ALIASES: dict[tuple[str, str], tuple[str, ...]] = {
     ("travel", "search-flights"): ("search",),
 }
@@ -250,7 +250,9 @@ class ToolGroup(click.Group):
                 formatter.write_dl(rows)
 
     @staticmethod
-    def build(name: str, tools: list, help_text: str) -> ToolGroup:
+    def build(
+        name: str, tools: list, help_text: str, env: str | None = None
+    ) -> ToolGroup:
         @click.group(
             name=name, cls=ToolGroup, help=help_text, invoke_without_command=True
         )
@@ -261,7 +263,10 @@ class ToolGroup(click.Group):
 
         visible_names: set[str] = set()
         legacy_candidates = {}
-        for cmd_name, tool in resolve_tool_command_names(name, tools):
+        granted_scopes = get_known_granted_scopes(env) if env else None
+        for cmd_name, tool in resolve_tool_command_names(
+            name, tools, granted_scopes=granted_scopes
+        ):
             group.add_command(build_tool_command(tool), cmd_name)
             visible_names.add(cmd_name)
             if tool.alias and cmd_name != tool.name:
@@ -311,6 +316,7 @@ class RampGroup(click.Group):
                 _RESOURCE_HELP.get(
                     Resource.GENERAL, f"General ({len(singletons)} tools)"
                 ),
+                env=self._resolve_env(ctx),
             )
 
         if cmd_name in multi:
@@ -318,14 +324,20 @@ class RampGroup(click.Group):
             aliases = ", ".join(sorted(t.alias or t.name for t in tools))
             fallback = f"{cmd_name.replace('_', ' ').title()} \u2014 {aliases}"
             return ToolGroup.build(
-                cmd_name, tools, _RESOURCE_HELP.get(cmd_name, fallback)
+                cmd_name,
+                tools,
+                _RESOURCE_HELP.get(cmd_name, fallback),
+                env=self._resolve_env(ctx),
             )
 
         if legacy_tools := self._legacy_category_tools(ctx, cmd_name):
             aliases = ", ".join(sorted(t.alias or t.name for t in legacy_tools))
             fallback = f"{cmd_name.replace('_', ' ').title()} - {aliases}"
             return ToolGroup.build(
-                cmd_name, legacy_tools, _RESOURCE_HELP.get(cmd_name, fallback)
+                cmd_name,
+                legacy_tools,
+                _RESOURCE_HELP.get(cmd_name, fallback),
+                env=self._resolve_env(ctx),
             )
 
         if tool_def := get_tool(cmd_name, env=self._resolve_env(ctx)):
@@ -333,9 +345,6 @@ class RampGroup(click.Group):
             # Legacy agent-tool endpoint names remain available at the root.
             if tool_def.path.startswith("/developer/v1/agent-tools/"):
                 return build_tool_command(tool_def)
-
-        if missing_scopes := self._missing_scopes_for_resource(ctx, cmd_name):
-            return self._missing_scope_command(ctx, cmd_name, missing_scopes)
 
         return None
 
@@ -374,7 +383,12 @@ class RampGroup(click.Group):
         if not getattr(ctx, "_ramp_synced", False):
             maybe_sync(env)
             ctx._ramp_synced = True  # type: ignore[attr-defined]
-        return self._split_category_map(list_categories(env))
+        categories = list_categories(env)
+        groups = resolve_cli_tool_groups(
+            [tool for tools in categories.values() for tool in tools]
+        )
+        general = groups.pop(Resource.GENERAL, [])
+        return groups, general
 
     def _legacy_category_tools(self, ctx: click.Context, cmd_name: str) -> list:
         if cmd_name not in CATEGORY_LEGACY_GROUPS:
@@ -385,101 +399,6 @@ class RampGroup(click.Group):
             maybe_sync(env)
             ctx._ramp_synced = True  # type: ignore[attr-defined]
         return list_categories(env).get(cmd_name, [])
-
-    @staticmethod
-    def _split_category_map(cats: dict[str, list]) -> tuple[dict[str, list], list]:
-        merged: dict[str, list] = {}
-        for cat, tools in cats.items():
-            merged.setdefault(CATEGORY_REMAP.get(cat, cat), []).extend(tools)
-
-        multi: dict[str, list] = {}
-        singletons: list = []
-        for cat, tools in merged.items():
-            if (
-                len(tools) > 1
-                or cat in _SINGLE_TOOL_RESOURCE_CATEGORIES
-                or cat in _RESOURCE_HELP
-            ):
-                multi[cat] = tools
-            else:
-                singletons.extend(tools)
-
-        # Additive alias groups: surface certain spec categories (e.g.
-        # ``cards``) as their own resource group too, without removing them
-        # from their remapped home.  The same tools are reachable from both
-        # ``ramp cards <alias>`` and the original ``ramp funds <name>``.
-        #
-        # These groups always stay grouped — even when scope filtering leaves
-        # only a single visible tool. This keeps alias resource commands
-        # invokable instead of folding the lone tool into ``general``.
-        for cat in CATEGORY_ALIAS_GROUPS:
-            alias_tools = cats.get(cat)
-            if alias_tools:
-                multi.setdefault(cat, list(alias_tools))
-
-        return multi, singletons
-
-    def _missing_scopes_for_resource(
-        self, ctx: click.Context, resource_name: str
-    ) -> list[str]:
-        env = self._resolve_env(ctx)
-        granted = get_granted_scopes(env)
-        if not granted:
-            return []
-
-        all_categories: dict[str, list] = {}
-        for tool in list_tool_defs(env):
-            all_categories.setdefault(tool.category or "general", []).append(tool)
-
-        resource_tools = self._split_category_map(all_categories)[0].get(
-            resource_name, []
-        )
-        if not resource_tools and resource_name in CATEGORY_LEGACY_GROUPS:
-            resource_tools = all_categories.get(resource_name, [])
-        if not resource_tools:
-            return []
-
-        if any(
-            not tool.required_scopes or set(tool.required_scopes) <= granted
-            for tool in resource_tools
-        ):
-            return []
-
-        return sorted(
-            {
-                scope
-                for tool in resource_tools
-                for scope in tool.required_scopes
-                if scope not in granted
-            }
-        )
-
-    def _missing_scope_command(
-        self, ctx: click.Context, resource_name: str, missing_scopes: list[str]
-    ) -> click.Command:
-        env = self._resolve_env(ctx)
-        missing = ", ".join(missing_scopes)
-        scope_label = "scope" if len(missing_scopes) == 1 else "scopes"
-
-        @click.command(
-            name=resource_name,
-            context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
-            help=f"Unavailable: token missing required {scope_label}: {missing}",
-        )
-        def command() -> None:
-            raise click.ClickException(
-                f"The '{resource_name}' resource is available, but your {env} token "
-                f"is missing the required {scope_label}: {missing}\n\n"
-                "  To fix this, make sure you do not have a top-level custom "
-                "'scopes' override in your config, then log in again:\n\n"
-                f"    ramp --env {env} auth logout\n"
-                f"    ramp --env {env} tools refresh\n"
-                f"    ramp --env {env} auth login\n\n"
-                "  You can inspect stored scopes with:\n\n"
-                f"    ramp --env {env} auth status --agent\n"
-            )
-
-        return command
 
 
 # ── CLI definition ───────────────────────────────────────────────────────────
