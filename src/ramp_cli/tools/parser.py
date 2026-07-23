@@ -64,6 +64,7 @@ class JsonSchema:
     """Small schema model used to validate raw --json bodies."""
 
     properties: dict[str, JsonSchema] = field(default_factory=dict)
+    required_properties: set[str] = field(default_factory=set)
     enum_values: list[str] | None = None
     array_item: JsonSchema | None = None
     additional_properties_allowed: bool = True
@@ -534,6 +535,8 @@ def _parse_json_schema(
     for sub_schema in schema.get("allOf", []):
         _merge_json_schema(result, _parse_json_schema(sub_schema, schemas, seen_refs))
 
+    result.required_properties.update(schema.get("required", []))
+
     if "enum" in schema:
         result.enum_values = schema["enum"]
 
@@ -554,6 +557,7 @@ def _parse_json_schema(
 def _merge_json_schema(target: JsonSchema, source: JsonSchema) -> None:
     """Merge allOf fragments into a single shallow validation schema."""
     target.properties.update(source.properties)
+    target.required_properties.update(source.required_properties)
     target.additional_properties_allowed = (
         target.additional_properties_allowed and source.additional_properties_allowed
     )

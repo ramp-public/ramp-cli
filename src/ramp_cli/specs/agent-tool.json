@@ -407,6 +407,54 @@
         ]
       }
     },
+    "/developer/v1/agent-tools/create-pending-payee": {
+      "post": {
+        "description": "Call SearchVendors first with include_draft=true. Reuse a suitable existing\nvendor, including a draft vendor, instead of creating a duplicate.",
+        "operationId": "post_agent_tool_api___create_pending_payee_direct",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePendingPayeeDirectRequestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateDraftPayeeResult"
+                }
+              }
+            },
+            "description": "Success"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "vendors:read",
+              "vendors:write"
+            ]
+          }
+        ],
+        "summary": "Create a pending vendor/payee record",
+        "tags": [
+          "Agent Tool",
+          "vendors"
+        ],
+        "x-alias": "create",
+        "x-gated-by": "developer_api_pending_payee_agent_tool_enabled",
+        "x-platforms": [
+          "cli",
+          "mcp"
+        ],
+        "x-read-only": false
+      }
+    },
     "/developer/v1/agent-tools/create-reimbursement-from-receipt": {
       "post": {
         "description": "Pass `amount`, `currency_code`, `transaction_date`, and `merchant` to skip OCR.",
@@ -6007,6 +6055,147 @@
           "cli",
           "mcp"
         ]
+      }
+    },
+    "/developer/v1/agent-tools/search-hotel": {
+      "post": {
+        "description": "The first call runs static hotel search and best-rate hydration once, caches\nthe full result set, and returns the first page. Pagination reads from that\ncache via ``next_cursor`` without triggering a new provider search.\n\nBefore booking, pass the selected hotel ``id`` to ``GetHotelRates`` with the\nsame traveler and stay dates, then pass a selected current rate ``id`` from\nthat response to ``SubmitHotelBooking``.",
+        "operationId": "post_agent_tool_api___search_hotels",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchHotelsRequestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchHotelsResult"
+                }
+              }
+            },
+            "description": "Success"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "trips:read"
+            ]
+          }
+        ],
+        "summary": "Search hotels using the canonical Ramp web inventory and policy flow",
+        "tags": [
+          "Agent Tool",
+          "travel"
+        ],
+        "x-gated-by": "ramp_cli_hotel_booking",
+        "x-platforms": [
+          "cli",
+          "mcp"
+        ],
+        "x-read-only": true
+      }
+    },
+    "/developer/v1/agent-tools/get-hotel-rates": {
+      "post": {
+        "description": "Use this after the user picks a hotel from ``SearchHotels`` results and before\nbooking. The returned ``rate.id`` values are the exact IDs to pass to\n``SubmitHotelBooking``.",
+        "operationId": "post_agent_tool_api___get_hotel_rates",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GetHotelRatesRequestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GetHotelRatesResult"
+                }
+              }
+            },
+            "description": "Success"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "trips:read"
+            ]
+          }
+        ],
+        "summary": "Fetch available room-rate options for one selected hotel from SearchHotels",
+        "tags": [
+          "Agent Tool",
+          "travel"
+        ],
+        "x-alias": "hotel-rates",
+        "x-gated-by": "ramp_cli_hotel_booking",
+        "x-platforms": [
+          "cli",
+          "mcp"
+        ],
+        "x-read-only": true
+      }
+    },
+    "/developer/v1/agent-tools/submit-hotel-booking": {
+      "post": {
+        "description": "Two-step flow: call without ``confirm`` for a preview (price + policy +\napproval outlook) without creating a booking, then call again with\n``confirm=true`` and the previewed ``expected_total_amount`` after traveler\napproval.\n\nUse the exact ``hotel_id`` from ``SearchHotels`` and ``rate_id`` from\n``GetHotelRates``. If the user wants to change or cancel an existing\nreservation, direct them to the Ramp web app.\n\nIf the chosen hotel rate is out of policy, you MUST collect an ``oop_reason``\nfrom the traveler and pass it here.\n\nBefore previewing or confirming, call GetTravelerProfile. For delegated\nbooking, pass the same traveler_user_id from search into\nGetTravelerProfile and UpdateTravelerProfile. If has_profile is false,\ncollect first_name, last_name, email, phone_number, date_of_birth, and\nid_gender, then call UpdateTravelerProfile first.",
+        "operationId": "post_agent_tool_api___submit_hotel_booking",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubmitHotelBookingRequestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HotelBookingResult"
+                }
+              }
+            },
+            "description": "Success"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "trips:write"
+            ]
+          }
+        ],
+        "summary": "Book a selected hotel rate",
+        "tags": [
+          "Agent Tool",
+          "travel"
+        ],
+        "x-alias": "book-hotel",
+        "x-destructive": true,
+        "x-gated-by": "ramp_cli_hotel_booking",
+        "x-platforms": [
+          "cli",
+          "mcp"
+        ],
+        "x-read-only": false
       }
     }
   },
@@ -15251,6 +15440,89 @@
         "title": "ContractOwnerSummary",
         "type": "object"
       },
+      "CreatePendingPayeeDirectRequestBody": {
+        "description": "Create a pending vendor/payee record.\n\nCall SearchVendors first with include_draft=true. Reuse a suitable existing\nvendor, including a draft vendor, instead of creating a duplicate.",
+        "properties": {
+          "contact": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PayeeContactRequestBody"
+              }
+            ],
+            "default": null,
+            "description": "Vendor contact",
+            "nullable": true
+          },
+          "description": {
+            "default": null,
+            "description": "Vendor description",
+            "nullable": true,
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "description": "Vendor name",
+            "title": "Name",
+            "type": "string"
+          },
+          "rationale": {
+            "description": "Briefly explain why you are calling this tool: what goal or workflow it serves and what you intend to do with the result.",
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Rationale",
+            "type": "string"
+          },
+          "website": {
+            "default": null,
+            "description": "Vendor website",
+            "nullable": true,
+            "title": "Website",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "rationale"
+        ],
+        "title": "CreatePendingPayeeDirect",
+        "type": "object"
+      },
+      "CreateDraftPayeeResult": {
+        "properties": {
+          "external_agent_messages": {
+            "items": {
+              "type": "string"
+            },
+            "title": "External Agent Messages",
+            "type": "array"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "payee_contact_uuid": {
+            "nullable": true,
+            "title": "Payee Contact Uuid",
+            "type": "string"
+          },
+          "payee_uuid": {
+            "title": "Payee Uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message",
+          "name",
+          "payee_contact_uuid",
+          "payee_uuid"
+        ],
+        "title": "CreateDraftPayeeResult",
+        "type": "object"
+      },
       "CreateReimbursementFromReceiptRequestBody": {
         "description": "Create a reimbursement from an actual uploaded receipt. The receipt is identified by\nits real UUID from the conversation context or receipt-matching handoff.\n\nDo not use this tool for mileage reimbursements. Do not call this tool unless a real\nreceipt UUID is available. Never pass placeholders such as null, \"null\", \"mileage\",\nor 00000000-0000-0000-0000-000000000000.\n\nWhen you have extracted receipt details from the image, provide amount, currency_code,\ntransaction_date, and merchant directly. This creates the draft faster and more reliably\nthan OCR. At minimum, provide the amount. Omit fields you could not extract.\n\nAfter successfully creating the reimbursement:\n1. Check missing_items to see what is required\n2. For items that CAN be filled via the agent (memo, accounting categories, funds, trip, attendees):\n   - Request the missing item from the user\n   - Include the relevant suggestions (suggested_memos or suggested_codings)\n   - For funds, consult suggested_funds alongside the user's expense history and any\n     preference the user has stated. suggested_funds is ordered by policy preference\n     (most preferred first). Submitting without a fund appears as a\n     regular entry (fund_name=\"None\", fund_uuid=\"00000000-0000-0000-0000-000000000000\")\n     when policy permits it \u2014 treat it like any other choice and refer to it as \"None\"\n     to the user.\n3. For items that CANNOT be filled via the agent (mileage_locations, or if all agent-fillable items are complete):\n   - ALWAYS provide the reimbursement_link URL as a clickable link in your response\n   - Format it as markdown: [link text](reimbursement_link)\n   - Example: \"You can complete your reimbursement here: [Complete reimbursement](https://app.ramp.com:3000/s/reimbursements/xxx)\"\n\nItems are requested in this order: receipt, memo, accounting categories, funds.",
         "properties": {
@@ -21458,7 +21730,7 @@
           },
           "status": {
             "default": null,
-            "description": "Booking status. For confirmed bookings: reservation status. For pending requests: PENDING_APPROVAL, PROCESSING, or FAILED.",
+            "description": "Booking status. For confirmed bookings: reservation status. For unfulfilled requests: PENDING_APPROVAL, PROCESSING, FAILED, CANCELLED, or REJECTED.",
             "nullable": true,
             "title": "Status",
             "type": "string"
@@ -24033,6 +24305,34 @@
         ],
         "title": "PayeeAgreementOrdering",
         "type": "string"
+      },
+      "PayeeContactRequestBody": {
+        "properties": {
+          "email": {
+            "description": "Contact email address",
+            "title": "Email",
+            "type": "string"
+          },
+          "first_name": {
+            "default": null,
+            "description": "Contact first name",
+            "nullable": true,
+            "title": "First Name",
+            "type": "string"
+          },
+          "last_name": {
+            "default": null,
+            "description": "Contact last name",
+            "nullable": true,
+            "title": "Last Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "email"
+        ],
+        "title": "PayeeContact",
+        "type": "object"
       },
       "PayeeDocumentCategory": {
         "enum": [
@@ -32694,6 +32994,894 @@
           "x402_authorization_id"
         ],
         "title": "X402PaymentSigned",
+        "type": "object"
+      },
+      "GetHotelRatesRequestBody": {
+        "description": "Fetch available room-rate options for one selected hotel from SearchHotels.\n\nUse this after the user picks a hotel from ``SearchHotels`` results and before\nbooking. The returned ``rate.id`` values are the exact IDs to pass to\n``SubmitHotelBooking``.",
+        "properties": {
+          "check_in_date": {
+            "description": "Hotel check-in date in YYYY-MM-DD format",
+            "format": "date",
+            "title": "Check In Date",
+            "type": "string"
+          },
+          "check_out_date": {
+            "description": "Hotel check-out date in YYYY-MM-DD format",
+            "format": "date",
+            "title": "Check Out Date",
+            "type": "string"
+          },
+          "hotel_id": {
+            "description": "Hotel UUID from SearchHotels results.",
+            "title": "Hotel Id",
+            "type": "string"
+          },
+          "num_adults": {
+            "default": 1,
+            "minimum": 1,
+            "title": "Num Adults",
+            "type": "integer"
+          },
+          "rationale": {
+            "description": "Briefly explain why you are calling this tool: what goal or workflow it serves and what you intend to do with the result.",
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Rationale",
+            "type": "string"
+          },
+          "traveler_user_id": {
+            "default": null,
+            "description": "Traveler UUID when retrieving rates on behalf of another user.",
+            "nullable": true,
+            "title": "Traveler User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "check_in_date",
+          "check_out_date",
+          "hotel_id",
+          "rationale"
+        ],
+        "title": "GetHotelRates",
+        "type": "object"
+      },
+      "GetHotelRatesResult": {
+        "properties": {
+          "all_rates": {
+            "description": "All available room-rate groups for the selected hotel.",
+            "items": {
+              "$ref": "#/components/schemas/HotelRoomRates"
+            },
+            "title": "All Rates",
+            "type": "array"
+          },
+          "external_agent_messages": {
+            "items": {
+              "type": "string"
+            },
+            "title": "External Agent Messages",
+            "type": "array"
+          },
+          "has_corporate_rates": {
+            "description": "Whether this hotel has business-level negotiated/corporate rates.",
+            "title": "Has Corporate Rates",
+            "type": "boolean"
+          },
+          "hotel": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SelectedHotel"
+              }
+            ],
+            "description": "Summary of the selected hotel."
+          },
+          "recommended_rates": {
+            "description": "Top recommended room-rate groups for the selected hotel.",
+            "items": {
+              "$ref": "#/components/schemas/HotelRoomRates"
+            },
+            "title": "Recommended Rates",
+            "type": "array"
+          },
+          "traveler_user_id": {
+            "default": null,
+            "description": "Traveler UUID for delegated lookups; pass it to SubmitHotelBooking.",
+            "nullable": true,
+            "title": "Traveler User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "has_corporate_rates",
+          "hotel"
+        ],
+        "title": "GetHotelRatesResult",
+        "type": "object"
+      },
+      "HotelBookingResult": {
+        "description": "Result of SubmitHotelBooking: quote-time preview plus booked output.\n\n- PREVIEW (booked=False): no booking is created; booking is null.\n- BOOKED (booked=True): confirm=true created a booking request.",
+        "properties": {
+          "address": {
+            "description": "Formatted hotel address.",
+            "title": "Address",
+            "type": "string"
+          },
+          "approval_steps": {
+            "description": "Human-readable approval steps required for this booking.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Approval Steps",
+            "type": "array"
+          },
+          "booked": {
+            "description": "True when a booking request was created; False for a preview.",
+            "title": "Booked",
+            "type": "boolean"
+          },
+          "booking": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/BookingRequestResult"
+              }
+            ],
+            "default": null,
+            "description": "Created booking details. Present only when booked=True.",
+            "nullable": true
+          },
+          "check_in_date": {
+            "description": "Check-in date in YYYY-MM-DD format.",
+            "title": "Check In Date",
+            "type": "string"
+          },
+          "check_out_date": {
+            "description": "Check-out date in YYYY-MM-DD format.",
+            "title": "Check Out Date",
+            "type": "string"
+          },
+          "eligible_funds": {
+            "description": "Funds the traveler can pay with (preview only); pass a fund_uuid as spend_allocation_id to book.",
+            "items": {
+              "$ref": "#/components/schemas/SuggestedFundInfo"
+            },
+            "title": "Eligible Funds",
+            "type": "array"
+          },
+          "external_agent_messages": {
+            "items": {
+              "type": "string"
+            },
+            "title": "External Agent Messages",
+            "type": "array"
+          },
+          "hotel_name": {
+            "description": "Hotel name from the selected rate quote.",
+            "title": "Hotel Name",
+            "type": "string"
+          },
+          "in_policy": {
+            "description": "Whether the selected hotel rate is in travel policy.",
+            "title": "In Policy",
+            "type": "boolean"
+          },
+          "loyalty_programs": {
+            "description": "Saved traveler loyalty programs that match this quote and will be submitted if confirmed.",
+            "items": {
+              "$ref": "#/components/schemas/ApplicableTravelerLoyaltyProgram"
+            },
+            "title": "Loyalty Programs",
+            "type": "array"
+          },
+          "message": {
+            "description": "Next-step guidance for the caller.",
+            "title": "Message",
+            "type": "string"
+          },
+          "nightly_rate": {
+            "description": "Quoted nightly rate, including currency.",
+            "title": "Nightly Rate",
+            "type": "string"
+          },
+          "policy_violations": {
+            "description": "Human-readable travel-policy violations, if any.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Policy Violations",
+            "type": "array"
+          },
+          "requires_approval": {
+            "description": "Whether this booking requires approval before fulfillment.",
+            "title": "Requires Approval",
+            "type": "boolean"
+          },
+          "room_name": {
+            "default": null,
+            "description": "Selected room name from the rate quote.",
+            "nullable": true,
+            "title": "Room Name",
+            "type": "string"
+          },
+          "total_amount": {
+            "description": "Quoted total booking amount.",
+            "title": "Total Amount",
+            "type": "string"
+          }
+        },
+        "required": [
+          "address",
+          "booked",
+          "check_in_date",
+          "check_out_date",
+          "hotel_name",
+          "in_policy",
+          "message",
+          "nightly_rate",
+          "requires_approval",
+          "total_amount"
+        ],
+        "title": "HotelBookingResult",
+        "type": "object"
+      },
+      "HotelRateOptionV1": {
+        "properties": {
+          "all_in_nightly_amount": {
+            "description": "Tax-and-fee-inclusive amount per room per night.",
+            "title": "All In Nightly Amount",
+            "type": "string"
+          },
+          "cancellation_policy": {
+            "default": null,
+            "nullable": true,
+            "title": "Cancellation Policy",
+            "type": "string"
+          },
+          "currency": {
+            "title": "Currency",
+            "type": "string"
+          },
+          "earns_loyalty_points": {
+            "title": "Earns Loyalty Points",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "Literal hotel rate UUID to pass as SubmitHotelBooking.rate_id.",
+            "title": "Id",
+            "type": "string"
+          },
+          "in_policy": {
+            "nullable": true,
+            "title": "In Policy",
+            "type": "boolean"
+          },
+          "is_company_preferred": {
+            "title": "Is Company Preferred",
+            "type": "boolean"
+          },
+          "is_corporate_rate": {
+            "title": "Is Corporate Rate",
+            "type": "boolean"
+          },
+          "loyalty_eligible": {
+            "title": "Loyalty Eligible",
+            "type": "boolean"
+          },
+          "loyalty_program": {
+            "default": null,
+            "nullable": true,
+            "title": "Loyalty Program",
+            "type": "string"
+          },
+          "loyalty_required": {
+            "title": "Loyalty Required",
+            "type": "boolean"
+          },
+          "nightly_amount": {
+            "description": "Pre-tax base amount per room per night.",
+            "title": "Nightly Amount",
+            "type": "string"
+          },
+          "payment_type": {
+            "title": "Payment Type",
+            "type": "string"
+          },
+          "policy_violations": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Policy Violations",
+            "type": "array"
+          },
+          "refundability": {
+            "default": null,
+            "nullable": true,
+            "title": "Refundability",
+            "type": "string"
+          },
+          "room_amenities": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Room Amenities",
+            "type": "array"
+          },
+          "room_description": {
+            "default": null,
+            "nullable": true,
+            "title": "Room Description",
+            "type": "string"
+          },
+          "room_name": {
+            "title": "Room Name",
+            "type": "string"
+          },
+          "total_amount": {
+            "title": "Total Amount",
+            "type": "string"
+          }
+        },
+        "required": [
+          "all_in_nightly_amount",
+          "currency",
+          "earns_loyalty_points",
+          "id",
+          "in_policy",
+          "is_company_preferred",
+          "is_corporate_rate",
+          "loyalty_eligible",
+          "loyalty_required",
+          "nightly_amount",
+          "payment_type",
+          "room_name",
+          "total_amount"
+        ],
+        "title": "HotelRateOptionV1",
+        "type": "object"
+      },
+      "HotelRateSummarySortKeyRequestBody": {
+        "enum": [
+          "DISTANCE",
+          "LOWEST_PRICE",
+          "TIME",
+          "WEIGHTED"
+        ],
+        "title": "HotelRateSummarySortKey",
+        "type": "string"
+      },
+      "HotelRoomRates": {
+        "properties": {
+          "best_rate": {
+            "$ref": "#/components/schemas/HotelRateOptionV1"
+          },
+          "rates": {
+            "items": {
+              "$ref": "#/components/schemas/HotelRateOptionV1"
+            },
+            "title": "Rates",
+            "type": "array"
+          },
+          "room_amenities": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Room Amenities",
+            "type": "array"
+          },
+          "room_description": {
+            "default": null,
+            "nullable": true,
+            "title": "Room Description",
+            "type": "string"
+          },
+          "room_id": {
+            "title": "Room Id",
+            "type": "string"
+          },
+          "room_name": {
+            "title": "Room Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "best_rate",
+          "room_id",
+          "room_name"
+        ],
+        "title": "HotelRoomRates",
+        "type": "object"
+      },
+      "HotelSearchOfferV1": {
+        "properties": {
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "chain": {
+            "default": null,
+            "nullable": true,
+            "title": "Chain",
+            "type": "string"
+          },
+          "coworker_booking_count": {
+            "default": 0,
+            "title": "Coworker Booking Count",
+            "type": "integer"
+          },
+          "hotel_amenities": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Hotel Amenities",
+            "type": "array"
+          },
+          "id": {
+            "description": "Hotel UUID.",
+            "title": "Id",
+            "type": "string"
+          },
+          "image_url": {
+            "default": null,
+            "nullable": true,
+            "title": "Image Url",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "office_travel_mode": {
+            "default": null,
+            "nullable": true,
+            "title": "Office Travel Mode",
+            "type": "string"
+          },
+          "office_travel_time_minutes": {
+            "default": null,
+            "nullable": true,
+            "title": "Office Travel Time Minutes",
+            "type": "integer"
+          },
+          "rates": {
+            "items": {
+              "$ref": "#/components/schemas/HotelRateOptionV1"
+            },
+            "title": "Rates",
+            "type": "array"
+          },
+          "review_rating": {
+            "default": null,
+            "nullable": true,
+            "title": "Review Rating",
+            "type": "string"
+          },
+          "star_rating": {
+            "default": null,
+            "nullable": true,
+            "title": "Star Rating",
+            "type": "string"
+          }
+        },
+        "required": [
+          "address",
+          "id",
+          "name"
+        ],
+        "title": "HotelSearchOfferV1",
+        "type": "object"
+      },
+      "HotelSortDirectionRequestBody": {
+        "enum": [
+          "ASC",
+          "DESC"
+        ],
+        "title": "HotelSortDirection",
+        "type": "string"
+      },
+      "HotelSortKeyRequestBody": {
+        "enum": [
+          "DISTANCE",
+          "LOWEST_PRICE",
+          "MOST_POPULAR",
+          "STAR_RATING",
+          "WEIGHTED"
+        ],
+        "title": "HotelSortKey",
+        "type": "string"
+      },
+      "SearchHotelsFiltersV1RequestBody": {
+        "description": "Subset of web search filters supported for initial search ranking.",
+        "properties": {
+          "amenity_ids": {
+            "default": null,
+            "items": {
+              "type": "string"
+            },
+            "nullable": true,
+            "title": "Amenity Ids",
+            "type": "array"
+          },
+          "brand_ids": {
+            "default": null,
+            "items": {
+              "type": "string"
+            },
+            "nullable": true,
+            "title": "Brand Ids",
+            "type": "array"
+          },
+          "min_review_rating": {
+            "default": null,
+            "nullable": true,
+            "oneOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "title": "Min Review Rating"
+          },
+          "star_ratings": {
+            "default": null,
+            "items": {
+              "type": "string"
+            },
+            "nullable": true,
+            "title": "Star Ratings",
+            "type": "array"
+          }
+        },
+        "title": "SearchHotelsFiltersV1",
+        "type": "object"
+      },
+      "SearchHotelsRequestBody": {
+        "description": "Search hotels using the canonical Ramp web inventory and policy flow.\n\nThe first call runs static hotel search and best-rate hydration once, caches\nthe full result set, and returns the first page. Pagination reads from that\ncache via ``next_cursor`` without triggering a new provider search.\n\nBefore booking, pass the selected hotel ``id`` to ``GetHotelRates`` with the\nsame traveler and stay dates, then pass a selected current rate ``id`` from\nthat response to ``SubmitHotelBooking``.",
+        "properties": {
+          "check_in_date": {
+            "default": null,
+            "format": "date",
+            "nullable": true,
+            "title": "Check In Date",
+            "type": "string"
+          },
+          "check_out_date": {
+            "default": null,
+            "format": "date",
+            "nullable": true,
+            "title": "Check Out Date",
+            "type": "string"
+          },
+          "cursor": {
+            "default": null,
+            "description": "Opaque next_cursor from a previous SearchHotels response.",
+            "nullable": true,
+            "title": "Cursor",
+            "type": "string"
+          },
+          "filters": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SearchHotelsFiltersV1RequestBody"
+              }
+            ],
+            "default": null,
+            "description": "Optional search filters that mirror web static hotel search.",
+            "nullable": true
+          },
+          "hotel_name": {
+            "default": null,
+            "description": "Specific hotel name the user asked for (for example 'citizenM New York'). When provided, SearchHotels resolves and prioritizes that hotel in results.",
+            "nullable": true,
+            "title": "Hotel Name",
+            "type": "string"
+          },
+          "limit": {
+            "default": 10,
+            "maximum": 10,
+            "minimum": 1,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "location_query": {
+            "default": null,
+            "description": "Destination, neighborhood, address, landmark, or office location.",
+            "nullable": true,
+            "title": "Location Query",
+            "type": "string"
+          },
+          "num_adults": {
+            "default": 1,
+            "minimum": 1,
+            "title": "Num Adults",
+            "type": "integer"
+          },
+          "rationale": {
+            "description": "Briefly explain why you are calling this tool: what goal or workflow it serves and what you intend to do with the result.",
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Rationale",
+            "type": "string"
+          },
+          "sort": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SearchHotelsSortV1RequestBody"
+              }
+            ],
+            "default": null,
+            "description": "Optional sort configuration that mirrors web static hotel search.",
+            "nullable": true
+          },
+          "traveler_user_id": {
+            "default": null,
+            "description": "Traveler UUID when searching on behalf of another user.",
+            "nullable": true,
+            "title": "Traveler User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rationale"
+        ],
+        "title": "SearchHotels",
+        "type": "object"
+      },
+      "SearchHotelsResult": {
+        "properties": {
+          "external_agent_messages": {
+            "items": {
+              "type": "string"
+            },
+            "title": "External Agent Messages",
+            "type": "array"
+          },
+          "hotels": {
+            "items": {
+              "$ref": "#/components/schemas/HotelSearchOfferV1"
+            },
+            "title": "Hotels",
+            "type": "array"
+          },
+          "next_cursor": {
+            "default": null,
+            "description": "Opaque cursor to pass back as cursor for the next page.",
+            "nullable": true,
+            "title": "Next Cursor",
+            "type": "string"
+          },
+          "policy_summary": {
+            "default": null,
+            "description": "Authoritative summary of what the traveler may book for this search.",
+            "nullable": true,
+            "title": "Policy Summary",
+            "type": "string"
+          },
+          "total_count": {
+            "title": "Total Count",
+            "type": "integer"
+          },
+          "traveler_user_id": {
+            "default": null,
+            "description": "Traveler UUID for delegated searches; pass it to SubmitHotelBooking.",
+            "nullable": true,
+            "title": "Traveler User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "total_count"
+        ],
+        "title": "SearchHotelsResult",
+        "type": "object"
+      },
+      "SearchHotelsSortV1RequestBody": {
+        "description": "Sort options that mirror the web hotels search surface.",
+        "properties": {
+          "sort_direction": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/HotelSortDirectionRequestBody"
+              }
+            ],
+            "default": null,
+            "nullable": true
+          },
+          "sort_key": {
+            "default": null,
+            "nullable": true,
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/HotelRateSummarySortKeyRequestBody"
+              },
+              {
+                "$ref": "#/components/schemas/HotelSortKeyRequestBody"
+              }
+            ],
+            "title": "Sort Key"
+          }
+        },
+        "title": "SearchHotelsSortV1",
+        "type": "object"
+      },
+      "SelectedHotel": {
+        "properties": {
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "chain": {
+            "default": null,
+            "nullable": true,
+            "title": "Chain",
+            "type": "string"
+          },
+          "hotel_amenities": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Hotel Amenities",
+            "type": "array"
+          },
+          "id": {
+            "description": "Hotel UUID.",
+            "title": "Id",
+            "type": "string"
+          },
+          "image_url": {
+            "default": null,
+            "nullable": true,
+            "title": "Image Url",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "review_rating": {
+            "default": null,
+            "nullable": true,
+            "title": "Review Rating",
+            "type": "string"
+          },
+          "star_rating": {
+            "default": null,
+            "nullable": true,
+            "title": "Star Rating",
+            "type": "string"
+          }
+        },
+        "required": [
+          "address",
+          "id",
+          "name"
+        ],
+        "title": "SelectedHotel",
+        "type": "object"
+      },
+      "SubmitHotelBookingRequestBody": {
+        "description": "Book a selected hotel rate.\n\nTwo-step flow: call without ``confirm`` for a preview (price + policy +\napproval outlook) without creating a booking, then call again with\n``confirm=true`` and the previewed ``expected_total_amount`` after traveler\napproval.\n\nUse the exact ``hotel_id`` from ``SearchHotels`` and ``rate_id`` from\n``GetHotelRates``. If the user wants to change or cancel an existing\nreservation, direct them to the Ramp web app.\n\nIf the chosen hotel rate is out of policy, you MUST collect an ``oop_reason``\nfrom the traveler and pass it here.\n\nBefore previewing or confirming, call GetTravelerProfile. For delegated\nbooking, pass the same traveler_user_id from search into\nGetTravelerProfile and UpdateTravelerProfile. If has_profile is false,\ncollect first_name, last_name, email, phone_number, date_of_birth, and\nid_gender, then call UpdateTravelerProfile first.",
+        "properties": {
+          "check_in_date": {
+            "description": "Hotel check-in date in YYYY-MM-DD format",
+            "format": "date",
+            "title": "Check In Date",
+            "type": "string"
+          },
+          "check_out_date": {
+            "description": "Hotel check-out date in YYYY-MM-DD format",
+            "format": "date",
+            "title": "Check Out Date",
+            "type": "string"
+          },
+          "confirm": {
+            "default": false,
+            "description": "Set true to create the booking after preview approval.",
+            "title": "Confirm",
+            "type": "boolean"
+          },
+          "expected_total_amount": {
+            "default": null,
+            "description": "Preview total_amount. Required with confirm; booking is rejected if repriced.",
+            "nullable": true,
+            "title": "Expected Total Amount",
+            "type": "string"
+          },
+          "hotel_id": {
+            "description": "Hotel UUID from SearchHotels results.",
+            "title": "Hotel Id",
+            "type": "string"
+          },
+          "oop_reason": {
+            "default": null,
+            "description": "Justification for why this booking is out of policy; approvers see this reason. REQUIRED when the selected hotel rate is out of policy: if the user chooses an out-of-policy rate you MUST collect a reason from them and pass it here.",
+            "nullable": true,
+            "title": "Oop Reason",
+            "type": "string"
+          },
+          "rate_id": {
+            "description": "Rate UUID from GetHotelRates for the selected hotel.",
+            "title": "Rate Id",
+            "type": "string"
+          },
+          "rationale": {
+            "description": "Briefly explain why you are calling this tool: what goal or workflow it serves and what you intend to do with the result.",
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Rationale",
+            "type": "string"
+          },
+          "reason": {
+            "default": null,
+            "description": "Optional booking notes; include only if volunteered by the traveler.",
+            "nullable": true,
+            "title": "Reason",
+            "type": "string"
+          },
+          "spend_allocation_id": {
+            "default": null,
+            "description": "Fund UUID to pay with. Omit to request a new allocation.",
+            "nullable": true,
+            "title": "Spend Allocation Id",
+            "type": "string"
+          },
+          "traveler_user_id": {
+            "default": null,
+            "description": "Traveler UUID when booking for someone else.",
+            "nullable": true,
+            "title": "Traveler User Id",
+            "type": "string"
+          },
+          "trip_id": {
+            "default": null,
+            "description": "Trip UUID to attach this booking to. Omit to auto-select or create.",
+            "nullable": true,
+            "title": "Trip Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "check_in_date",
+          "check_out_date",
+          "hotel_id",
+          "rate_id",
+          "rationale"
+        ],
+        "title": "SubmitHotelBooking",
+        "type": "object"
+      },
+      "ApplicableTravelerLoyaltyProgram": {
+        "properties": {
+          "display_name": {
+            "description": "Display name of the loyalty program, such as United MileagePlus.",
+            "title": "Display Name",
+            "type": "string"
+          },
+          "logo": {
+            "default": null,
+            "description": "Logo URL for the loyalty program, when available.",
+            "nullable": true,
+            "title": "Logo",
+            "type": "string"
+          },
+          "loyalty_number": {
+            "description": "Saved loyalty number that will be submitted if confirmed.",
+            "title": "Loyalty Number",
+            "type": "string"
+          },
+          "loyalty_program_id": {
+            "description": "Booking platform loyalty program ID that will be submitted if confirmed.",
+            "title": "Loyalty Program Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "display_name",
+          "loyalty_number",
+          "loyalty_program_id"
+        ],
+        "title": "ApplicableTravelerLoyaltyProgram",
         "type": "object"
       }
     },

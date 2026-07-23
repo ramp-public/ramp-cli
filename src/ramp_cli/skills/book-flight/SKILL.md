@@ -1,6 +1,6 @@
 ---
 name: book-flight
-description: "Books flights conversationally through the ramp CLI: resolves cities to airports, searches one-way and round-trip flights, presents and compares offers, previews the fare, and tickets the booking on the traveler's explicit approval. The user describes a trip in plain language ('book a flight from Toronto to SFO') and never needs to know a CLI command. Use when someone wants to book, find, search, or compare flights, or says 'fly from X to Y'. Not for cancellations, changes, refunds, seat selection, loyalty programs, hotels, cars, or multi-city trips."
+description: "Books flights conversationally through the ramp CLI: resolves cities to airports, searches one-way and round-trip flights, presents and compares offers, previews the fare, and tickets the booking on the traveler's explicit approval. The user describes a trip in plain language ('book a flight from Toronto to SFO') and never needs to know a CLI command. Use when someone wants to book, find, search, or compare flights, says 'fly from X to Y', or asks to save supported traveler-profile details such as updating a loyalty membership already in their profile. Not for cancellations, changes, refunds, seat selection, adding new loyalty memberships or points management, hotels, cars, or multi-city trips."
 ---
 
 # Book a Flight (conversational flight search)
@@ -28,8 +28,8 @@ plain travel language ("Let me pull up the fare and check it before booking…")
 - ✅ Compare cabins/fares — **only when asked** (see "Comparing cabins or fares").
 - ✅ Read or update the traveler's profile, and read trips and bookings (see "Supporting tools").
 - ✅ Book for another traveler when explicitly asked and authorized (see "Delegated booking").
-- ❌ Cancellations, changes, refunds, seat selection, loyalty, hotels, cars, multi-city —
-  those happen in the Ramp web app.
+- ❌ Cancellations, changes, refunds, seat selection, adding new loyalty memberships or managing
+  points, hotels, cars, multi-city — those happen in the Ramp web app.
 
 ## Rules for every command
 
@@ -41,8 +41,19 @@ plain travel language ("Let me pull up the fare and check it before booking…")
   consistent across the whole flow — search, returns, preview, book, fund/spend-allocation,
   and verify. Rationales are logged, so a consistent trip reference makes a trip's commands
   easy to group and its intent easy to read later.
-- `--departure`/`--arrival` each take **one** value: an airport code (`SFO`) or a Ramp city
-  id (`search_code` from `travel locations`, Step 2). No lists.
+- If the user says to **save** or **remember** a flight preference, update the traveler profile
+  with `travel profile-update`; do not only apply it to the current search. Save supported
+  profile fields such as KTN, redress number, or a membership number for a loyalty program
+  already in the profile, then confirm the update succeeded. If the preference has no
+  traveler-profile field, explain that it cannot be saved instead of claiming it was remembered.
+- To update an airline loyalty membership, first call `travel profile` and match the exact saved
+  program. Use its returned `loyalty_program.id` as `loyalty_program_id` and send it with the
+  exact membership number as one entry in `loyalty_programs`. Never infer the id from a program
+  name or ask the traveler for that internal id. If the profile has no matching program, explain
+  that adding a new loyalty membership is not supported here and direct the traveler to the Ramp
+  web app. Do not claim the membership was updated unless `travel profile-update` succeeds.
+- `--departure`/`--arrival` each take **one** value: an exact airport IATA code (`SFO`) or a
+  `search_code` from `travel locations` (Step 2). No lists.
 
 **Don't over-specify.** These default off — add each only when the user asks:
 
@@ -104,7 +115,7 @@ Infer silently, then say back (don't ask):
 |---|---|
 | **Trip type** | round-trip if there's a return date, "back on…", or a stay length; else one-way. Ask only if truly unclear. |
 | **Relative dates** | resolve to `YYYY-MM-DD`. **Always say the date back** so mistakes surface before money moves. |
-| **Airport given** | `SFO`, `JFK`, etc. → use directly, skip Step 2. |
+| **Exact airport IATA code given** | `SFO`, `JFK`, etc. → use directly, skip Step 2. City/metro wording such as `NYC` still goes through Step 2. |
 | **Cabin** | none (leave `--cabin_class` off). |
 
 Say assumptions in one line as you go — *"Searching JFK → SFO, Mon Jul 6, round-trip…"*.
@@ -117,17 +128,24 @@ cutoff). Never re-ask what they told you.
 
 ## Step 2 — resolve a place to a `--departure`/`--arrival` value
 
-- **Airport code** (`SFO`, `JFK`) → use directly, skip this step.
-- **City/vague place** ("New York", "the Bay Area") → look it up first:
+- **Exact airport IATA code** (`SFO`, `JFK`) → use directly, skip this step.
+- **Everything else** ("New York", `NYC`, "the Bay Area", "Boston Logan") → call
+  `travel locations` with the user's exact location wording. Preserve city and metro intent;
+  for a city or metro such as `NYC`, request `--location_type city`. For a specifically named
+  airport without its IATA code, request `--location_type airport`.
 
 ```bash
 ramp travel locations --query "New York" --location_type city --limit 5 \
   --rationale "resolve New York to a metro id for the user's trip" --output json
 ```
 
-For a **city**, the metro id is its **`search_code`** (a UUID; `iata_code` is empty). Pass
-that one `search_code` to search the whole metro (New York covers JFK/LGA/EWR; Toronto covers
-YYZ/YTZ). For one specific airport, search `--location_type airport` and pass its `iata_code`.
+Pass the selected result's **`search_code` unchanged** to `--departure` or `--arrival`, whether
+the result is a city or an airport. A city result searches all supported airports in that metro
+(New York covers JFK/LGA/EWR; Toronto covers YYZ/YTZ), so do not replace it with one airport.
+If a city lookup returns no city result, retry the lookup or clarify the location with the user;
+when multiple airport or geographic choices remain, present them and wait for the user to choose
+instead of silently selecting one airport. If `search-flight` rejects a location, clarify it or
+resolve it again with `travel locations` before retrying.
 
 ## Step 3 — search flights
 
@@ -433,7 +451,8 @@ Four supporting tools; use when relevant, not on every booking.
   check whether `has_profile` is true.
 - **`travel profile-update`** — saves missing traveler details before booking when
   `travel profile` returns `has_profile: false`, or when a failed booking points to missing
-  traveler details.
+  traveler details. Also use it whenever the user explicitly asks to save or remember a
+  supported flight preference in their traveler profile.
 - **`travel list`** — the traveler's trips (`--status completed|ongoing|upcoming`,
   `--cursor`). Each has `id`, `trip_name`, dates, locations. Use to find a trip `id` for
   `--trip_id` on `book`.

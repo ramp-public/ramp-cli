@@ -789,6 +789,35 @@ class TestBuildToolCommand:
         assert "Complex" in cmd.help
         assert "--json" in cmd.help
 
+    def test_complex_param_help_points_to_resolved_schema_command(self):
+        tool = ToolDef(
+            name="create-widget",
+            path="/developer/v1/agent-tools/create-widget",
+            http_method="post",
+            summary="Create widget",
+            description="Create widget",
+            category="widgets",
+            alias="create",
+            params=[
+                ToolParam(
+                    name="destinations",
+                    flag="destinations",
+                    description="Destinations",
+                    type=ParamType.ARRAY,
+                    is_complex=True,
+                )
+            ],
+        )
+
+        cmd = build_tool_command(
+            tool,
+            group_name="travel",
+            command_name="create-widget",
+        )
+        json_option = next(param for param in cmd.params if param.name == "json_body")
+
+        assert "ramp tools schema travel create-widget" in json_option.help
+
 
 class TestPositionalIdParams:
     """ID params (*_id, *_uuid, bare id) should be positional arguments."""
@@ -944,7 +973,14 @@ class TestPositionalIdParams:
         runner = CliRunner()
         result = runner.invoke(
             cli,
-            ["get-bill-details", "--json", '{"bill_id": "abc-123"}', "--dry_run"],
+            [
+                "get-bill-details",
+                "--rationale",
+                "test",
+                "--json",
+                '{"bill_id": "abc-123"}',
+                "--dry_run",
+            ],
         )
         assert result.exit_code == 0
         assert "dry_run" in result.output
@@ -959,6 +995,8 @@ class TestPositionalIdParams:
             [
                 "get-bill-details",
                 "ignored-id",
+                "--rationale",
+                "test",
                 "--json",
                 '{"bill_id": "from-json"}',
                 "--dry_run",
@@ -967,6 +1005,32 @@ class TestPositionalIdParams:
         assert result.exit_code == 0
         body = json.loads(result.output)["data"][0]["body"]
         assert body["bill_id"] == "from-json"
+
+
+class TestRequiredNonBodyParams:
+    def test_json_cannot_bypass_required_query_param(self):
+        result = CliRunner().invoke(
+            cli,
+            ["get-investment-account-balance", "--dry_run", "--json", "{}"],
+        )
+
+        assert result.exit_code == 2
+        assert "Missing required flags: --rationale" in result.output
+
+    def test_json_can_supply_required_query_param(self):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "get-investment-account-balance",
+                "--dry_run",
+                "--json",
+                '{"rationale":"test"}',
+            ],
+        )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)["data"][0]
+        assert payload["url"].endswith("?rationale=test")
 
 
 class TestDisplayName:
@@ -1261,14 +1325,21 @@ class TestDryRun:
         runner = CliRunner()
         result = runner.invoke(
             cli,
-            ["get-funds", "--dry_run", "--json", '{"funds_to_retrieve": "ALL_FUNDS"}'],
+            [
+                "get-funds",
+                "--dry_run",
+                "--rationale",
+                "test",
+                "--json",
+                '{"funds_to_retrieve": "ALL_FUNDS"}',
+            ],
         )
         assert result.exit_code == 0
         assert "ALL_FUNDS" in result.output
 
     def test_idempotency_header_defaults_from_session(self, monkeypatch):
         monkeypatch.setattr("ramp_cli.tools.commands.get_session_id", lambda: "sid-123")
-        nonces = iter(["nonce-a", "nonce-b"])
+        nonces = iter(["nonce-a", "nonce-b", "nonce-c"])
         monkeypatch.setattr("ramp_cli.tools.commands.uuid4", lambda: next(nonces))
         tool = ToolDef(
             name="request-funds",
@@ -1316,9 +1387,19 @@ class TestDryRun:
             ["thing-1", "--amount", "12.34", "--dry_run"],
             obj=_ctx_obj(),
         )
+        json_input = runner.invoke(
+            command,
+            [
+                "--dry_run",
+                "--json",
+                '{"thing_id":"thing-1","amount":"12.34"}',
+            ],
+            obj=_ctx_obj(),
+        )
 
         assert first.exit_code == 0, first.output
         assert second.exit_code == 0, second.output
+        assert json_input.exit_code == 0, json_input.output
         first_payload = json.loads(first.output)["data"][0]
         second_payload = json.loads(second.output)["data"][0]
         first_key = first_payload["headers"]["X-Idempotency-Key"]
@@ -1862,6 +1943,8 @@ class TestCLIIntegration:
                 "requests",
                 "search",
                 "--dry_run",
+                "--rationale",
+                "test",
                 "--json",
                 '{"filters":{"search":"Paola"},"limit":10}',
             ],
@@ -1878,6 +1961,8 @@ class TestCLIIntegration:
                 "requests",
                 "search-unified-requests",
                 "--dry_run",
+                "--rationale",
+                "test",
                 "--json",
                 '{"filters":{"search":"Paola"},"limit":10}',
             ],
@@ -2116,6 +2201,117 @@ class TestCLIIntegration:
                 "/developer/v1/agent-tools/search-flights"
             )
 
+    def test_hotel_search_and_booking_commands(self, monkeypatch):
+        _use_bundled_spec(monkeypatch)
+        runner = CliRunner()
+
+        help_result = runner.invoke(cli, ["travel", "--help"])
+        assert help_result.exit_code == 0, help_result.output
+        assert "search-hotel" in help_result.output
+        assert "search-hotels" not in help_result.output
+        assert "hotel-rates" in help_result.output
+        assert "book-hotel" in help_result.output
+
+        booking_help = runner.invoke(cli, ["travel", "book-hotel", "--help"])
+        assert booking_help.exit_code == 0, booking_help.output
+        assert "--simulate" not in booking_help.output
+
+        search_result = runner.invoke(
+            cli,
+            [
+                "travel",
+                "search-hotel",
+                "--check_in_date",
+                "2026-08-10",
+                "--check_out_date",
+                "2026-08-13",
+                "--location_query",
+                "Chicago office",
+                "--cursor",
+                "opaque-cursor",
+                "--traveler_user_id",
+                "traveler-uuid",
+                "--rationale",
+                "Search hotels for the traveler",
+                "--dry_run",
+            ],
+        )
+        assert search_result.exit_code == 0, search_result.output
+        search_request = json.loads(search_result.output)["data"][0]
+        assert search_request["url"].endswith("/developer/v1/agent-tools/search-hotel")
+        assert search_request["body"]["cursor"] == "opaque-cursor"
+        assert search_request["body"]["traveler_user_id"] == "traveler-uuid"
+
+        rates_result = runner.invoke(
+            cli,
+            [
+                "travel",
+                "hotel-rates",
+                "literal-hotel-id",
+                "--check_in_date",
+                "2026-08-10",
+                "--check_out_date",
+                "2026-08-13",
+                "--traveler_user_id",
+                "traveler-uuid",
+                "--rationale",
+                "Fetch rates for the selected hotel",
+                "--dry_run",
+            ],
+        )
+        assert rates_result.exit_code == 0, rates_result.output
+        rates_request = json.loads(rates_result.output)["data"][0]
+        assert rates_request["url"].endswith(
+            "/developer/v1/agent-tools/get-hotel-rates"
+        )
+        assert rates_request["body"] == {
+            "hotel_id": "literal-hotel-id",
+            "check_in_date": "2026-08-10",
+            "check_out_date": "2026-08-13",
+            "traveler_user_id": "traveler-uuid",
+            "rationale": "Fetch rates for the selected hotel",
+        }
+
+        booking_result = runner.invoke(
+            cli,
+            [
+                "travel",
+                "book-hotel",
+                "literal-hotel-uuid",
+                "literal-rate-uuid",
+                "--check_in_date",
+                "2026-08-10",
+                "--check_out_date",
+                "2026-08-13",
+                "--confirm",
+                "--expected_total_amount",
+                "$812.34",
+                "--reason",
+                "Closest hotel to the event",
+                "--oop_reason",
+                "Only property near the event venue",
+                "--rationale",
+                "Book the approved hotel rate",
+                "--dry_run",
+            ],
+        )
+        assert booking_result.exit_code == 0, booking_result.output
+        booking_request = json.loads(booking_result.output)["data"][0]
+        assert booking_request["url"].endswith(
+            "/developer/v1/agent-tools/submit-hotel-booking"
+        )
+        assert booking_request["body"] == {
+            "hotel_id": "literal-hotel-uuid",
+            "rate_id": "literal-rate-uuid",
+            "check_in_date": "2026-08-10",
+            "check_out_date": "2026-08-13",
+            "confirm": True,
+            "expected_total_amount": "$812.34",
+            "reason": "Closest hotel to the event",
+            "oop_reason": "Only property near the event venue",
+            "rationale": "Book the approved hotel rate",
+        }
+
     def test_travel_profile_tools_accept_traveler_user_id(self, monkeypatch):
         _use_bundled_spec(monkeypatch)
         runner = CliRunner()
@@ -2175,6 +2371,8 @@ class TestCLIIntegration:
                 "funds",
                 "list",
                 "--dry_run",
+                "--rationale",
+                "test",
                 "--json",
                 '{"funds_to_retrieve": null}',
             ],
@@ -2192,6 +2390,8 @@ class TestCLIIntegration:
                 "requests",
                 "search",
                 "--dry_run",
+                "--rationale",
+                "test",
                 "--json",
                 '{"query":"Paola"}',
             ],
@@ -2209,6 +2409,8 @@ class TestCLIIntegration:
                 "requests",
                 "search",
                 "--dry_run",
+                "--rationale",
+                "test",
                 "--json",
                 '{"filters":{"foo":"bar"}}',
             ],
@@ -2251,6 +2453,85 @@ class TestCLIIntegration:
         assert result.exit_code == 2
         assert "unknown JSON field 'unknown'" in result.output
 
+    def test_json_rejects_missing_nested_required_field_with_precise_path(self):
+        tool = ToolDef(
+            name="nested-schema-test",
+            path="/developer/v1/agent-tools/nested-schema-test",
+            http_method="post",
+            summary="Nested schema test",
+            description="Nested schema test",
+            params=[
+                ToolParam(
+                    name="rationale",
+                    flag="rationale",
+                    description="Rationale",
+                    type=ParamType.STRING,
+                    required=True,
+                ),
+                ToolParam(
+                    name="destinations",
+                    flag="destinations",
+                    description="Destinations",
+                    type=ParamType.ARRAY,
+                    is_complex=True,
+                ),
+            ],
+            json_schema=JsonSchema(
+                properties={
+                    "rationale": JsonSchema(),
+                    "destinations": JsonSchema(
+                        array_item=JsonSchema(
+                            properties={"location": JsonSchema()},
+                            required_properties={"location"},
+                        )
+                    ),
+                },
+                required_properties={"destinations", "rationale"},
+            ),
+        )
+        group = click.Group("test")
+        group.add_command(build_tool_command(tool), tool.name)
+
+        result = CliRunner().invoke(
+            group,
+            [
+                tool.name,
+                "--dry_run",
+                "--rationale",
+                "test",
+                "--json",
+                '{"destinations":[{"city":"Chicago"}]}',
+            ],
+            obj={
+                "env": "sandbox",
+                "format": "json",
+                "config_format": "json",
+                "quiet": False,
+                "no_input": True,
+                "wide": False,
+                "agent_mode": True,
+            },
+        )
+
+        assert result.exit_code == 2
+        assert "missing required JSON field 'destinations[0].location'" in result.output
+
+        result = CliRunner().invoke(
+            group,
+            [
+                tool.name,
+                "--dry_run",
+                "--rationale",
+                "test",
+                "--json",
+                "{}",
+            ],
+            obj=_ctx_obj(),
+        )
+
+        assert result.exit_code == 2
+        assert "missing required JSON field 'destinations'" in result.output
+
     def test_json_rejects_invalid_enum_value(self, monkeypatch):
         _use_bundled_spec(monkeypatch)
         runner = CliRunner()
@@ -2260,6 +2541,8 @@ class TestCLIIntegration:
                 "requests",
                 "search",
                 "--dry_run",
+                "--rationale",
+                "test",
                 "--json",
                 '{"filters":{"request_statuses":["SUBMITTED"]}}',
             ],
@@ -2278,6 +2561,8 @@ class TestCLIIntegration:
                 "requests",
                 "search",
                 "--dry_run",
+                "--rationale",
+                "test",
                 "--json",
                 '{"filters":{"request_statuses":[1]}}',
             ],
@@ -2294,6 +2579,8 @@ class TestCLIIntegration:
                 "purchase_orders",
                 "search",
                 "--dry_run",
+                "--rationale",
+                "test",
                 "--json",
                 '{"filters":{"spend_request_statuses":["PENDING"]}}',
             ],
@@ -2308,6 +2595,8 @@ class TestCLIIntegration:
                 "purchase_orders",
                 "search",
                 "--dry_run",
+                "--rationale",
+                "test",
                 "--json",
                 '{"filters":{"spend_request_statuses":["SUBMITTED"]}}',
             ],
@@ -2388,7 +2677,14 @@ class TestCLIIntegration:
         runner = CliRunner()
         result = runner.invoke(
             cli,
-            ["get-funds", "--dry_run", "--json", '{"funds_to_retrieve":"ALL_FUNDS"}'],
+            [
+                "get-funds",
+                "--dry_run",
+                "--rationale",
+                "test",
+                "--json",
+                '{"funds_to_retrieve":"ALL_FUNDS"}',
+            ],
         )
 
         assert result.exit_code == 0

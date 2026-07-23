@@ -10,6 +10,7 @@
 | `agentic-purchase` | End-to-end agent card purchasing via browser checkout |
 | `apply-to-ramp` | Start a new or continue an existing Ramp financing application |
 | `book-flight` | Search, compare, and book one-way or round-trip flights conversationally |
+| `book-hotel` | Search, compare, preview, and book hotel rooms conversationally |
 | `card-management` | Inspect card/fund status, count active contexts, and activate or lock cards |
 | `approval-dashboard` | Review and approve pending transactions, bills, reimbursements, and requests |
 | `browser-automation` | Automate Google Chrome for web tasks — navigate, fill forms, extract content |

@@ -10,6 +10,7 @@ from click.testing import CliRunner
 from ramp_cli.auth import store
 from ramp_cli.main import cli
 from ramp_cli.specs import AGENT_TOOL_SPEC
+from ramp_cli.tools.availability import AvailabilitySnapshot, ToolAvailability
 from ramp_cli.tools.parser import ToolDef, parse_spec
 
 
@@ -228,6 +229,90 @@ class TestToolsList:
         assert entries[("funds", "list")]["description"] == "List agent card funds"
         assert entries[("funds", "get-funds")]["description"] == "List funds"
         assert not any(category == "agent_cards" for category, _ in entries)
+
+
+class TestToolsListAvailability:
+    """`tools list` decorates output with effective availability when known."""
+
+    AVAILABILITY_TOOLS = [
+        ToolDef(
+            name="get-funds",
+            description="List funds",
+            summary="List funds",
+            path="/developer/v1/agent-tools/get-funds",
+            http_method="POST",
+            category="funds",
+        ),
+        ToolDef(
+            name="get-transactions",
+            description="List transactions",
+            summary="List transactions",
+            path="/developer/v1/agent-tools/get-transactions",
+            http_method="POST",
+            category="transactions",
+        ),
+    ]
+
+    @staticmethod
+    def _snapshot():
+        return AvailabilitySnapshot(
+            content_hash="sha256:abc",
+            entries={
+                ("get-funds", "POST"): ToolAvailability(available=True),
+                ("get-transactions", "POST"): ToolAvailability(
+                    available=False,
+                    unavailable_reasons=("missing_scopes",),
+                    missing_scopes=("transactions:read",),
+                ),
+            },
+        )
+
+    def _setup(self, monkeypatch, snapshot):
+        monkeypatch.setattr(
+            "ramp_cli.commands.tools.list_tool_defs",
+            lambda env: self.AVAILABILITY_TOOLS,
+        )
+        monkeypatch.setattr("ramp_cli.commands.tools.maybe_sync", lambda env: None)
+        monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
+        monkeypatch.setattr(
+            "ramp_cli.commands.tools.fetch_availability", lambda env: snapshot
+        )
+
+    def test_json_includes_availability_fields(self, monkeypatch, runner):
+        self._setup(monkeypatch, self._snapshot())
+
+        result = runner.invoke(cli, ["--agent", "tools", "list"])
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["availability"] == {"content_hash": "sha256:abc"}
+        records = {record["name"]: record for record in payload["data"]}
+        assert records["get-funds"]["available"] is True
+        assert records["get-funds"]["unavailable_reasons"] is None
+        assert records["get-transactions"]["available"] is False
+        assert records["get-transactions"]["unavailable_reasons"] == ["missing_scopes"]
+        assert records["get-transactions"]["missing_scopes"] == ["transactions:read"]
+
+    def test_json_without_availability_matches_current_shape(self, monkeypatch, runner):
+        self._setup(monkeypatch, None)
+
+        result = runner.invoke(cli, ["--agent", "tools", "list"])
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert "availability" not in payload
+        for record in payload["data"]:
+            assert set(record) == {"name", "category", "description"}
+
+    def test_human_annotates_unavailable_tools(self, monkeypatch, runner):
+        self._setup(monkeypatch, self._snapshot())
+
+        result = runner.invoke(cli, ["--human", "tools", "list"])
+
+        assert result.exit_code == 0
+        # The box formatter may wrap the annotation, so assert on whole tokens.
+        assert "[unavailable:" in result.output
+        assert "transactions:read]" in result.output
 
 
 class TestToolsGroup:

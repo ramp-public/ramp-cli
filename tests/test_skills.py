@@ -27,14 +27,15 @@ from ramp_cli.tools.registry import CATEGORY_LEGACY_GROUPS
 
 class TestSkillDiscovery:
     def test_skill_names_discovers_all(self):
-        """All 18 skills should be discovered from the skills/ directory."""
+        """All 19 skills should be discovered from the skills/ directory."""
         names = skill_names()
-        assert len(names) == 18
+        assert len(names) == 19
         assert "x402-pay" in names
         assert "get-started" in names
         assert "agentic-purchase" in names
         assert "card-management" in names
         assert "book-flight" in names
+        assert "book-hotel" in names
         assert "browser-automation" in names
         assert "approval-dashboard" in names
         assert "manage-procurement" in names
@@ -68,7 +69,7 @@ class TestSkillsList:
         assert result.exit_code == 0
 
         data = json.loads(result.output)
-        assert len(data["data"]) == 18
+        assert len(data["data"]) == 19
         names = {s["name"] for s in data["data"]}
         assert "get-started" in names
         assert "browser-automation" in names
@@ -76,6 +77,7 @@ class TestSkillsList:
         assert "agentic-purchase" in names
         assert "incorporate-with-ramp" in names
         assert "book-flight" in names
+        assert "book-hotel" in names
         assert "manage-procurement" in names
         assert "manage-bills" in names
         assert "vendor-document-upload" in names
@@ -85,7 +87,7 @@ class TestSkillsList:
         runner = CliRunner()
         result = runner.invoke(cli, ["--human", "skills", "list"])
         assert result.exit_code == 0
-        assert "18 Skills" in result.output
+        assert "19 Skills" in result.output
         assert "browser-automation" in result.output
         assert "manage-procurement" in result.output
         assert "manage-bills" in result.output
@@ -134,7 +136,7 @@ class TestSkillsInstall:
         assert "Browser Automation" in dest.read_text()
 
     def test_install_all(self, tmp_path):
-        """--all installs all 18 skills."""
+        """--all installs all 19 skills."""
         target = tmp_path / "skills"
         runner = CliRunner()
         result = runner.invoke(
@@ -142,7 +144,7 @@ class TestSkillsInstall:
         )
         assert result.exit_code == 0
         installed = [d.name for d in target.iterdir() if d.is_dir()]
-        assert len(installed) == 18
+        assert len(installed) == 19
 
     def test_install_overwrites(self, tmp_path):
         """Installing twice succeeds and returns 'updated' on second run."""
@@ -196,11 +198,11 @@ class TestSkillsSync:
 
     def test_deleted_skill_not_reinstalled(self, tmp_path):
         target = tmp_path / "skills"
-        assert "18 skill(s) installed" in self._install_all(target).output
+        assert "19 skill(s) installed" in self._install_all(target).output
 
         shutil.rmtree(target / "browser-automation")
         result = self._install_all(target)
-        assert "17 skill(s) installed" in result.output
+        assert "18 skill(s) installed" in result.output
         assert "Skipped previously removed: browser-automation" in result.output
         assert "restore: ramp skills install <name>" in result.output
         assert not (target / "browser-automation").exists()
@@ -238,17 +240,17 @@ class TestSkillsSync:
         # And it is synced again afterwards.
         result = self._install_all(target)
         assert "Skipped" not in result.output
-        assert "18 skill(s) installed" in result.output
+        assert "19 skill(s) installed" in result.output
 
-    def test_known_skills_persisted_per_target_and_pruned(self, tmp_path):
+    def test_legacy_known_state_migrates_to_receipts(self, tmp_path):
         target = tmp_path / "skills"
         state = settings.config_dir() / "skills.toml"
         state.parent.mkdir(parents=True, exist_ok=True)
         state.write_text(f'[known]\n"{target.resolve()}" = "some-retired-skill"\n')
 
         self._install_all(target)
-        known = tomllib.loads(state.read_text())["known"][str(target.resolve())]
-        assert set(known.split()) == set(skill_names())
+        entry = tomllib.loads(state.read_text())["targets"][str(target.resolve())]
+        assert set(entry["skills"]) == set(skill_names()) | {"some-retired-skill"}
 
     def test_targets_track_deletions_independently(self, tmp_path):
         """Syncing one target must not mark skills deleted in another (fresh) target."""
@@ -258,16 +260,17 @@ class TestSkillsSync:
         shutil.rmtree(target_a / "browser-automation")
 
         result = self._install_all(target_b)
-        assert "18 skill(s) installed" in result.output
+        assert "19 skill(s) installed" in result.output
         assert "Skipped" not in result.output
         # And target A's deletion still holds.
         assert "Skipped previously removed: browser-automation" in (
             self._install_all(target_a).output
         )
 
-    def test_partial_failure_does_not_record_state(self, tmp_path, monkeypatch):
-        """Skills never copied due to a mid-install failure must not be
-        treated as user-deleted on the next run."""
+    def test_partial_failure_records_each_successful_install(
+        self, tmp_path, monkeypatch
+    ):
+        """A mid-install failure leaves exact receipts for completed copies only."""
         target = tmp_path / "skills"
         real_install = install_skill
 
@@ -282,11 +285,281 @@ class TestSkillsSync:
             cli, ["skills", "install", "--all", "--target", str(target)]
         )
         assert result.exit_code != 0
-        monkeypatch.undo()
+        completed = {name for name in skill_names() if name <= "get-started"}
+        state = tomllib.loads((settings.config_dir() / "skills.toml").read_text())
+        entry = state["targets"][str(target.resolve())]
+        assert set(entry["skills"]) == completed
+        assert {path.name for path in target.iterdir()} == completed
+        monkeypatch.setattr("ramp_cli.commands.skills.install_skill", real_install)
 
         result = self._install_all(target)
-        assert "18 skill(s) installed" in result.output
+        assert "19 skill(s) installed" in result.output
         assert "Skipped" not in result.output
+
+    def test_receipt_write_failure_rolls_back_new_directory(
+        self, tmp_path, monkeypatch
+    ):
+        target = tmp_path / "skills"
+
+        def failing_receipt(target_dir, installed_name):
+            raise OSError("read-only config")
+
+        monkeypatch.setattr("ramp_cli.commands.skills.record_receipt", failing_receipt)
+        result = CliRunner().invoke(
+            cli,
+            ["skills", "install", "browser-automation", "--target", str(target)],
+        )
+
+        assert result.exit_code != 0
+        assert "install was rolled back" in result.output
+        assert not (target / "browser-automation").exists()
+        assert not (settings.config_dir() / "skills.toml").exists()
+
+
+class TestSkillsUninstall:
+    def test_uninstall_all_removes_only_managed_skills(self, tmp_path):
+        target = tmp_path / "skills"
+        user_skill = target / "my-skill" / "SKILL.md"
+        user_skill.parent.mkdir(parents=True)
+        user_skill.write_text("user-authored")
+        runner = CliRunner()
+        assert (
+            runner.invoke(
+                cli, ["skills", "install", "--all", "--target", str(target)]
+            ).exit_code
+            == 0
+        )
+
+        result = runner.invoke(
+            cli,
+            ["skills", "uninstall", "--all", "--target", str(target), "--yes"],
+        )
+
+        assert result.exit_code == 0
+        assert "19 skill(s) uninstalled" in result.output
+        assert user_skill.read_text() == "user-authored"
+        assert not (target / "browser-automation").exists()
+
+    def test_uninstall_single_explicit_install(self, tmp_path):
+        target = tmp_path / "skills"
+        runner = CliRunner()
+        assert (
+            runner.invoke(
+                cli,
+                ["skills", "install", "browser-automation", "--target", str(target)],
+            ).exit_code
+            == 0
+        )
+
+        result = runner.invoke(
+            cli,
+            [
+                "skills",
+                "uninstall",
+                "browser-automation",
+                "--target",
+                str(target),
+                "--yes",
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert "1 skill(s) uninstalled" in result.output
+        assert not (target / "browser-automation").exists()
+
+    def test_uninstall_does_not_remove_untracked_same_name(self, tmp_path):
+        target = tmp_path / "skills"
+        skill = target / "browser-automation" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("user-authored")
+
+        result = CliRunner().invoke(
+            cli,
+            ["skills", "uninstall", "browser-automation", "--target", str(target)],
+        )
+
+        assert result.exit_code != 0
+        assert "No installation receipt" in result.output
+        assert skill.read_text() == "user-authored"
+
+    def test_uninstall_never_touches_prefixed_user_directory(self, tmp_path):
+        """ramp-<name> is a provenance hint, not proof of ownership: only the
+        directory recorded in the receipt may be deleted."""
+        target = tmp_path / "skills"
+        runner = CliRunner()
+        assert (
+            runner.invoke(
+                cli,
+                ["skills", "install", "browser-automation", "--target", str(target)],
+            ).exit_code
+            == 0
+        )
+        user_fork = target / "ramp-browser-automation" / "SKILL.md"
+        user_fork.parent.mkdir(parents=True)
+        user_fork.write_text("user fork")
+
+        result = runner.invoke(
+            cli,
+            [
+                "skills",
+                "uninstall",
+                "browser-automation",
+                "--target",
+                str(target),
+                "--yes",
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert "1 skill(s) uninstalled" in result.output
+        assert not (target / "browser-automation").exists()
+        assert user_fork.read_text() == "user fork"
+
+    def test_uninstalled_skill_not_resurrected_by_install_all(self, tmp_path):
+        target = tmp_path / "skills"
+        runner = CliRunner()
+        assert (
+            runner.invoke(
+                cli, ["skills", "install", "--all", "--target", str(target)]
+            ).exit_code
+            == 0
+        )
+        assert (
+            runner.invoke(
+                cli,
+                [
+                    "skills",
+                    "uninstall",
+                    "browser-automation",
+                    "--target",
+                    str(target),
+                    "--yes",
+                ],
+            ).exit_code
+            == 0
+        )
+
+        result = runner.invoke(
+            cli, ["skills", "install", "--all", "--target", str(target)]
+        )
+        assert "Skipped previously removed: browser-automation" in result.output
+        assert not (target / "browser-automation").exists()
+
+        # An explicit named install restores it and clears the record.
+        assert (
+            runner.invoke(
+                cli,
+                ["skills", "install", "browser-automation", "--target", str(target)],
+            ).exit_code
+            == 0
+        )
+        assert (target / "browser-automation" / "SKILL.md").is_file()
+        result = runner.invoke(
+            cli, ["skills", "install", "--all", "--target", str(target)]
+        )
+        assert "Skipped" not in result.output
+
+    def test_uninstall_of_manually_deleted_skill_keeps_protection(self, tmp_path):
+        target = tmp_path / "skills"
+        runner = CliRunner()
+        assert (
+            runner.invoke(
+                cli, ["skills", "install", "--all", "--target", str(target)]
+            ).exit_code
+            == 0
+        )
+        shutil.rmtree(target / "browser-automation")
+
+        result = runner.invoke(
+            cli,
+            [
+                "skills",
+                "uninstall",
+                "browser-automation",
+                "--target",
+                str(target),
+                "--yes",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "0 skill(s) uninstalled" in result.output
+
+        result = runner.invoke(
+            cli, ["skills", "install", "--all", "--target", str(target)]
+        )
+        assert "Skipped previously removed: browser-automation" in result.output
+        assert not (target / "browser-automation").exists()
+
+    def test_legacy_receipt_matching_bundle_is_removed(self, tmp_path):
+        """Legacy [known] ownership is enough to remove the exact directory."""
+        target = tmp_path / "skills"
+        runner = CliRunner()
+        assert (
+            runner.invoke(
+                cli,
+                ["skills", "install", "browser-automation", "--target", str(target)],
+            ).exit_code
+            == 0
+        )
+        state = settings.config_dir() / "skills.toml"
+        state.write_text(f'[known]\n"{target.resolve()}" = "browser-automation"\n')
+
+        result = runner.invoke(
+            cli,
+            [
+                "skills",
+                "uninstall",
+                "browser-automation",
+                "--target",
+                str(target),
+                "--yes",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "1 skill(s) uninstalled" in result.output
+        assert not (target / "browser-automation").exists()
+
+    def test_confirmation_discloses_all_files_and_defaults_to_cancel(self, tmp_path):
+        target = tmp_path / "skills"
+        skill = target / "browser-automation"
+        nested_file = skill / "scripts" / "custom.sh"
+        nested_file.parent.mkdir(parents=True)
+        nested_file.write_text("user-authored")
+        runner = CliRunner()
+        assert (
+            runner.invoke(
+                cli,
+                ["skills", "install", "browser-automation", "--target", str(target)],
+            ).exit_code
+            == 0
+        )
+
+        args = [
+            "skills",
+            "uninstall",
+            "browser-automation",
+            "--target",
+            str(target),
+        ]
+        cancelled = runner.invoke(cli, args, input="\n")
+
+        assert cancelled.exit_code != 0
+        assert f"{skill}/" in cancelled.output
+        assert "SKILL.md" in cancelled.output
+        assert "scripts/custom.sh" in cancelled.output
+        assert "Confirming will delete them too" in cancelled.output
+        assert "Continue? [y/N]" in cancelled.output
+        assert nested_file.read_text() == "user-authored"
+
+        confirmed = runner.invoke(cli, args, input="y\n")
+        assert confirmed.exit_code == 0
+        assert "1 skill(s) uninstalled" in confirmed.output
+        assert not skill.exists()
+
+    def test_uninstall_requires_name_or_all(self):
+        result = CliRunner().invoke(cli, ["skills", "uninstall"])
+        assert result.exit_code != 0
+        assert "Provide a skill name or use --all" in result.output
 
 
 class TestDetectAgentDir:
@@ -326,6 +599,20 @@ class TestSkillsBundled:
         assert "/developer/v1/incorporation/countries" not in content
         assert "This launch flow is US-only" in content
         assert "non-US founders or country fields" in content
+
+    def test_book_flight_saves_supported_preferences_to_traveler_profile(self):
+        content = (SKILLS_DIR / "book-flight" / "SKILL.md").read_text()
+
+        assert "save** or **remember** a flight preference" in content
+        assert "update the traveler profile" in content
+        assert "travel profile-update" in content
+        assert "do not only apply it to the current search" in content
+        assert "adding new loyalty memberships or points management" in content
+        assert "exact membership number" in content
+        assert "`loyalty_program_id`" in content
+        assert "`loyalty_program.id`" in content
+        assert "ask the traveler for that internal id" in content
+        assert "adding a new loyalty membership is not supported" in content
 
     def test_apply_to_ramp_progress_loop_prioritizes_incorporation(self):
         """Ramp review should not stop independently actionable incorporation work."""
@@ -565,6 +852,134 @@ class TestSkillsBundled:
         assert "BusinessIncorporationLink.doola_customer_id" in gotchas
         assert "SSN entry still required" in gotchas
         assert "do not run `ramp incorporation submit`" in gotchas
+
+    def test_book_hotel_initial_comparison_table_contract(self):
+        content = (SKILLS_DIR / "book-hotel" / "SKILL.md").read_text()
+        section = self._extract_section(content, "Present the hotel comparison")
+        expected_header = (
+            "| # | Hotel | Rating | Chain | Nightly (pre-tax) | All-in total | Policy | "
+            "Loyalty program | Notes |"
+        )
+
+        assert expected_header in section
+        assert section.count("| # |") == 1
+        assert "use only `star_rating`" in section
+        assert "Never show\n  `review_rating` values" in section
+        assert "`Default Chain` as `-`" in section
+        assert "show `loyalty_program` when present; otherwise show `-`" in section
+        assert "Omit an optional column completely" in section
+        assert "before taxes and fees" in section
+        assert "full-stay total including\n  taxes and fees" in section
+        assert "`policy_summary`" in section
+        assert "If `rates=[]`" in section
+        assert "reverse-engineer it from displayed prices" in section
+        assert "Do not show a second room/rate table" in section
+        assert (
+            "Do not show `room_name`,\n  `refundability`, or `cancellation_policy` yet"
+            in section
+        )
+
+        selected_section = self._extract_section(
+            content, "Fetch and present selected-hotel rates"
+        )
+        assert 'ramp travel hotel-rates "<selected_hotel_id>"' in selected_section
+        assert "every returned `all_rates[].rates[]` option" in selected_section
+        assert "`nightly_amount`" in selected_section
+        assert "`all_in_nightly_amount`" in selected_section
+        assert "`total_amount`" in selected_section
+        assert "`refundability`" in selected_section
+        assert "`cancellation_policy`" in selected_section
+        assert "| Cancellation |" in selected_section
+        assert "| # | Room | Rate |" not in selected_section
+        assert "`earns_loyalty_points`" in selected_section
+        assert "include the separate `currency` once" in selected_section
+        assert "appears in `recommended_rates`" in selected_section
+        assert "lowest-total option within that room group" in selected_section
+        assert "display-number-to-literal-rate-`id` map" in selected_section
+
+    def test_book_hotel_uses_search_rates_preview_confirm_sequence(self):
+        content = (SKILLS_DIR / "book-hotel" / "SKILL.md").read_text()
+
+        search = content.index("ramp travel search-hotel --output json")
+        rates = content.index('ramp travel hotel-rates "<selected_hotel_id>"')
+        preview = content.index(
+            'ramp travel book-hotel "<selected_hotel_id>" "<selected_rate_id>" --output json'
+        )
+        confirm = content.index(
+            'ramp travel book-hotel "<selected_hotel_id>" "<selected_rate_id>" --confirm'
+        )
+
+        assert search < rates < preview < confirm
+        assert "Do not preview or book the search result's summary rate" in content
+        assert "These rates are current options, not quotes" in content
+        assert "`reason` is a separate optional general booking\nnote" in content
+        assert "`--oop_reason` on confirmation" in content
+        assert "repeat the preview\nwith its literal `fund_uuid`" in content
+        assert (
+            "Never add or change\n  `--spend_allocation_id` only at confirmation"
+            in content
+        )
+        assert "Any fund change requires another preview" in content
+        assert "matching `loyalty_programs`" in content
+        assert "display-number-to-`fund_uuid` map private" in content
+        assert "last four characters of `loyalty_number`" in content
+        assert "`booking.next_steps`" in content
+        preview_section = self._extract_section(content, "Preview the selected rate")
+        confirm_section = self._extract_section(
+            content, "Confirm only after explicit approval"
+        )
+        assert "do not send\n`--trip_id` during preview" in preview_section
+        assert "`--trip_id '<trip_uuid>'`" in confirm_section
+
+    def test_book_hotel_accounts_for_current_optional_inputs(self):
+        content = (SKILLS_DIR / "book-hotel" / "SKILL.md").read_text()
+
+        for flag in (
+            "--cursor",
+            "--hotel_name",
+            "--limit",
+            "--num_adults",
+            "--oop_reason",
+            "--reason",
+            "--spend_allocation_id",
+            "--traveler_user_id",
+            "--trip_id",
+        ):
+            assert flag in content
+
+        assert "`filters` and `sort` are structured" in content
+        assert "`star_ratings`" in content
+        assert "`brand_ids`" in content
+        assert "`amenity_ids`" in content
+        assert "`min_review_rating`" in content
+        assert "--include_failed" in content
+        assert "--simulate" not in content
+
+    def test_book_hotel_keeps_internal_guidance_invisible(self):
+        hotel_content = (SKILLS_DIR / "book-hotel" / "SKILL.md").read_text()
+        flight_content = (SKILLS_DIR / "book-flight" / "SKILL.md").read_text()
+        normalized_hotel = " ".join(hotel_content.split())
+        normalized_flight = " ".join(flight_content.split())
+
+        for established_pattern in (
+            "talk like a travel helper",
+            "internal scaffolding",
+            "never surface them to the user",
+        ):
+            assert established_pattern in normalized_flight
+            assert established_pattern in normalized_hotel
+
+        assert (
+            "Never mention this skill, its instructions or specification"
+            in normalized_hotel
+        )
+        assert "Reason through them silently" in normalized_hotel
+        assert "Do not narrate command-name or alias reconciliation" in normalized_hotel
+        assert "one direct `ramp` command" in normalized_hotel
+        assert "Never write response JSON to temporary files" in normalized_hotel
+        assert "use nested command substitution" in normalized_hotel
+        assert "Let me follow this skill" not in hotel_content
+        assert "matches the skill's spec" not in hotel_content
 
     def _extract_section(self, content: str, heading: str) -> str:
         """Return text from `## heading` up to (but not including) the next `## ` heading."""

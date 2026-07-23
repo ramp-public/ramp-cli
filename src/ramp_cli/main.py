@@ -19,6 +19,7 @@ from ramp_cli.commands.env import env_cmd
 from ramp_cli.commands.feedback import feedback_cmd
 from ramp_cli.commands.getting_started import getting_started_cmd
 from ramp_cli.commands.incorporation import incorporation_group
+from ramp_cli.commands.router import router_group
 from ramp_cli.commands.skills import skills_group
 from ramp_cli.commands.tools import tools_group
 from ramp_cli.commands.update import update_cmd
@@ -267,7 +268,10 @@ class ToolGroup(click.Group):
         for cmd_name, tool in resolve_tool_command_names(
             name, tools, granted_scopes=granted_scopes
         ):
-            group.add_command(build_tool_command(tool), cmd_name)
+            group.add_command(
+                build_tool_command(tool, group_name=name, command_name=cmd_name),
+                cmd_name,
+            )
             visible_names.add(cmd_name)
             if tool.alias and cmd_name != tool.name:
                 legacy_candidates[tool.name] = tool
@@ -527,6 +531,7 @@ for _cmd in (
     invoice_cmd,
     nyc_cmd,
     rampy_cmd,
+    router_group,
     skills_group,
     tools_group,
     update_cmd,

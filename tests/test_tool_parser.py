@@ -186,6 +186,158 @@ class TestSearchBills:
         assert "bills:read" in tool_map["search-bills"].required_scopes
 
 
+class TestHotelBookingTools:
+    def test_aliases_and_scopes(self, tool_map: dict[str, ToolDef]):
+        search = tool_map["search-hotel"]
+        rates = tool_map["get-hotel-rates"]
+        submit = tool_map["submit-hotel-booking"]
+
+        assert search.alias == ""
+        assert rates.alias == "hotel-rates"
+        assert submit.alias == "book-hotel"
+        assert search.category == rates.category == submit.category == "travel"
+        assert search.required_scopes == rates.required_scopes == ["trips:read"]
+        assert submit.required_scopes == ["trips:write"]
+
+    def test_search_parameters(self, tool_map: dict[str, ToolDef]):
+        search = tool_map["search-hotel"]
+        required = [param.name for param in search.params if param.required]
+
+        assert required == ["rationale"]
+        assert _find_param(search, "check_in_date").default is None
+        assert _find_param(search, "check_out_date").default is None
+        assert _find_param(search, "location_query").default is None
+        assert _find_param(search, "cursor").type is ParamType.STRING
+        assert _find_param(search, "hotel_name").type is ParamType.STRING
+        assert _find_param(search, "traveler_user_id").type is ParamType.STRING
+        assert _find_param(search, "filters").is_complex
+        assert _find_param(search, "sort").is_complex
+
+    def test_submit_parameters(self, tool_map: dict[str, ToolDef]):
+        submit = tool_map["submit-hotel-booking"]
+        required = [param.name for param in submit.params if param.required]
+
+        assert required == [
+            "check_in_date",
+            "check_out_date",
+            "hotel_id",
+            "rate_id",
+            "rationale",
+        ]
+        assert _find_param(submit, "confirm").type is ParamType.BOOL
+        assert _find_param(submit, "expected_total_amount").type is ParamType.STRING
+        assert _find_param(submit, "oop_reason").type is ParamType.STRING
+        assert _find_param(submit, "reason").type is ParamType.STRING
+        assert all(param.name != "simulate" for param in submit.params)
+
+    def test_hotel_rates_parameters(self, tool_map: dict[str, ToolDef]):
+        rates = tool_map["get-hotel-rates"]
+        required = [param.name for param in rates.params if param.required]
+
+        assert required == [
+            "check_in_date",
+            "check_out_date",
+            "hotel_id",
+            "rationale",
+        ]
+        assert _find_param(rates, "traveler_user_id").type is ParamType.STRING
+
+        spec = json.loads(AGENT_TOOL_SPEC.read_text())
+        result = spec["components"]["schemas"]["GetHotelRatesResult"]["properties"]
+        room = spec["components"]["schemas"]["HotelRoomRates"]["properties"]
+        rate = spec["components"]["schemas"]["HotelRateOptionV1"]["properties"]
+        assert {"all_rates", "hotel", "recommended_rates"} <= result.keys()
+        assert {
+            "best_rate",
+            "rates",
+            "room_amenities",
+            "room_description",
+            "room_id",
+            "room_name",
+        } <= room.keys()
+        assert {
+            "all_in_nightly_amount",
+            "cancellation_policy",
+            "currency",
+            "earns_loyalty_points",
+            "is_corporate_rate",
+            "loyalty_eligible",
+            "loyalty_required",
+            "nightly_amount",
+            "payment_type",
+            "policy_violations",
+            "refundability",
+            "total_amount",
+        } <= rate.keys()
+
+    def test_search_contract_returns_best_rate_with_metadata(self):
+        spec = json.loads(AGENT_TOOL_SPEC.read_text())
+        operation = spec["paths"]["/developer/v1/agent-tools/search-hotel"]["post"]
+        request = spec["components"]["schemas"]["SearchHotelsRequestBody"]
+        hotel = spec["components"]["schemas"]["HotelSearchOfferV1"]["properties"]
+        rate = spec["components"]["schemas"]["HotelRateOptionV1"]["properties"]
+
+        assert "first call runs static hotel search" in operation["description"]
+        assert "x-alias" not in operation
+        assert "Pagination reads from that" in request["description"]
+        for description in (operation["description"], request["description"]):
+            assert "Before booking" in description
+            assert "GetHotelRates" in description
+            assert "selected current rate" in description
+        assert {
+            "coworker_booking_count",
+            "hotel_amenities",
+            "office_travel_mode",
+            "office_travel_time_minutes",
+            "rates",
+        } <= hotel.keys()
+        assert {
+            "cancellation_policy",
+            "earns_loyalty_points",
+            "is_company_preferred",
+            "is_corporate_rate",
+            "loyalty_eligible",
+            "loyalty_required",
+            "nightly_amount",
+            "policy_violations",
+            "refundability",
+            "room_amenities",
+            "total_amount",
+        } <= rate.keys()
+
+    def test_submit_contract_returns_preview_and_booking_details(self):
+        spec = json.loads(AGENT_TOOL_SPEC.read_text())
+        result = spec["components"]["schemas"]["HotelBookingResult"]
+
+        assert {
+            "address",
+            "approval_steps",
+            "booked",
+            "booking",
+            "check_in_date",
+            "check_out_date",
+            "hotel_name",
+            "in_policy",
+            "nightly_rate",
+            "policy_violations",
+            "requires_approval",
+            "room_name",
+            "total_amount",
+        } <= result["properties"].keys()
+        assert {"eligible_funds", "loyalty_programs"} <= result["properties"].keys()
+
+        fund = spec["components"]["schemas"]["SuggestedFundInfo"]["properties"]
+        loyalty = spec["components"]["schemas"]["ApplicableTravelerLoyaltyProgram"][
+            "properties"
+        ]
+        assert {"available_balance", "fund_name", "fund_uuid", "spending_limit"} <= (
+            fund.keys()
+        )
+        assert {"display_name", "logo", "loyalty_number", "loyalty_program_id"} <= (
+            loyalty.keys()
+        )
+
+
 class TestListBills:
     def test_exists(self, tool_map: dict[str, ToolDef]):
         assert "list-bills" in tool_map
@@ -511,6 +663,56 @@ class TestJsonSchema:
 
 
 class TestEdgeCases:
+    def test_nested_required_properties_are_preserved(self):
+        spec = {
+            "paths": {
+                "/developer/v1/agent-tools/create-widget": {
+                    "post": {
+                        "x-platforms": ["cli"],
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "$ref": "#/components/schemas/CreateWidget"
+                                    }
+                                }
+                            }
+                        },
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "CreateWidget": {
+                        "type": "object",
+                        "properties": {
+                            "destinations": {
+                                "type": "array",
+                                "items": {"$ref": "#/components/schemas/Destination"},
+                            }
+                        },
+                    },
+                    "Destination": {
+                        "type": "object",
+                        "required": ["location"],
+                        "properties": {
+                            "location": {"$ref": "#/components/schemas/Location"}
+                        },
+                    },
+                    "Location": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                }
+            },
+        }
+
+        tool = parse_spec_dict(spec)[0]
+        destination = tool.json_schema.properties["destinations"].array_item
+
+        assert destination is not None
+        assert destination.required_properties == {"location"}
+
     def test_parse_endpoint_derives_name_when_not_supplied(self):
         tool = _parse_endpoint(
             "/developer/v1/agent-tools/get-status",

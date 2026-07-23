@@ -183,7 +183,7 @@ examples:
 
 ```bash
 # Vendor
-ramp vendors search --search_term "<vendor name>" --limit 10 --rationale "Find the vendor UUID for the procurement request" --agent
+ramp vendors search --search_term "<vendor name>" --include_draft --limit 10 --rationale "Find an existing or pending vendor before creating one for the procurement request" --agent
 
 # Department
 ramp business departments --name_filter "<department name>" --rationale "Find the department UUID for the procurement request" --agent
@@ -196,6 +196,22 @@ ramp merchant categories --rationale "List merchant category IDs for the procure
 ```
 
 Use IDs returned by the lookup; never derive them from display labels.
+
+For a vendor field, always run the vendor search above before considering a new
+vendor. When an existing approved or pending vendor is a plausible match, put its
+`id` in the answer's `payee_uuid` field. Do not create a vendor when the search returns
+a plausible match; ask the user to disambiguate materially different matches.
+
+Only when the search returns no plausible match should you consider creating a
+pending vendor. Confirm the legal vendor name with the user first, then create it:
+
+```bash
+ramp vendors create --name "<legal vendor name>" --rationale "Create a pending vendor after confirming no existing vendor matches" --agent
+```
+
+Use the returned `payee_uuid` in the visible vendor field's answer. Do not retry
+creation if the tool reports an existing approved vendor; use the UUID from that
+response instead.
 
 Custom-form answers are typed objects. Copy the visible field's
 `answer_template` and replace its placeholders. Representative shapes:

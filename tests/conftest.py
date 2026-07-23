@@ -13,6 +13,7 @@ def isolated_config(
 ):
     """Redirect config to a temp directory so tests don't touch real config."""
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("RAMP_NO_TOOL_AVAILABILITY", "1")
     if "tests/private" not in str(request.node.path):
         monkeypatch.setattr("ramp_cli.config.settings.default_environment", lambda: "")
     yield tmp_path

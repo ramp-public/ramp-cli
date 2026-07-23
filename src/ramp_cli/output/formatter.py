@@ -97,13 +97,17 @@ def print_json(data: Any) -> None:
     sys.stdout.write("\n")
 
 
-def print_agent_json(data: Any, pagination: dict | None = None) -> None:
+def print_agent_json(
+    data: Any, pagination: dict | None = None, availability: dict | None = None
+) -> None:
     envelope: dict[str, Any] = {"schema_version": "1.0"}
     if isinstance(data, list):
         envelope["data"] = data
     else:
         envelope["data"] = [data]
     envelope["pagination"] = pagination if pagination is not None else None
+    if availability is not None:
+        envelope["availability"] = availability
     json.dump(envelope, sys.stdout, indent=2, default=str)
     sys.stdout.write("\n")
 

@@ -38,6 +38,7 @@ from ramp_cli.output.formatter import (
 from ramp_cli.output.paginator import ToolPaginator
 from ramp_cli.output.style import show_detail_card, show_table_card
 from ramp_cli.specs.sync import maybe_sync
+from ramp_cli.tools.availability import fetch_availability
 from ramp_cli.tools.parser import JsonSchema, ParamType, ToolDef, ToolParam
 from ramp_cli.tools.registry import (
     CATEGORY_ALIAS_GROUPS,
@@ -216,7 +217,12 @@ def _build_argument(param: ToolParam) -> click.Argument:
     )
 
 
-def build_tool_command(tool: ToolDef) -> click.Command:
+def build_tool_command(
+    tool: ToolDef,
+    *,
+    group_name: str | None = None,
+    command_name: str | None = None,
+) -> click.Command:
     """Convert a ToolDef into a Click command."""
     params: list[click.Parameter] = []
 
@@ -237,7 +243,7 @@ def build_tool_command(tool: ToolDef) -> click.Command:
             click.Option(
                 ["--json", "json_body"],
                 default=None,
-                help=_json_option_help(tool),
+                help=_json_option_help(tool, group_name, command_name),
             )
         )
     params.append(
@@ -313,16 +319,34 @@ class GeneratedToolGroup(click.Group):
 
         for command_name, tool in self._generated_commands(ctx):
             if cmd_name == command_name:
-                return build_tool_command(tool)
+                return build_tool_command(
+                    tool,
+                    group_name=self.tool_category,
+                    command_name=command_name,
+                )
         return None
 
 
-def _json_option_help(tool: ToolDef) -> str:
+def _json_option_help(
+    tool: ToolDef,
+    group_name: str | None = None,
+    command_name: str | None = None,
+) -> str:
     """Describe when raw JSON is useful for this operation."""
     complex_fields = [param.name for param in tool.params if param.is_complex]
     if not complex_fields:
         return "Raw JSON input (validated against the tool schema)"
-    return f"Raw JSON input; required for complex fields: {', '.join(complex_fields)}"
+    group_name = group_name or CATEGORY_REMAP.get(tool.category, tool.category)
+    command_name = command_name or tool.alias or tool.name
+    schema_hint = (
+        f" Run 'ramp tools schema {group_name} {command_name}' for the full structure."
+        if group_name
+        else ""
+    )
+    return (
+        f"Raw JSON input; required for complex fields: {', '.join(complex_fields)}."
+        f"{schema_hint}"
+    )
 
 
 def _build_option(param: ToolParam) -> click.Option:
@@ -446,11 +470,21 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
             raw_values = json.loads(json_body_raw)
         except json.JSONDecodeError as e:
             raise click.BadParameter(f"invalid JSON: {e}", param_hint="'--json'")
+        if not isinstance(raw_values, dict):
+            raise click.BadParameter(
+                "JSON body must be an object", param_hint="'--json'"
+            )
         if not dry_run:
             tool = _sync_tool_for_json_validation(env, tool)
             synced_for_json_validation = True
-        raw_values = _validate_json_body(tool, raw_values)
         values = _build_body(tool, kwargs, allow_missing=True)
+        validation_values = {
+            name: value
+            for name, value in values.items()
+            if tool.json_schema is None or name in tool.json_schema.properties
+        }
+        validation_values.update(raw_values)
+        _validate_json_body(tool, validation_values)
         body = {
             param.name: values[param.name]
             for param in tool.params
@@ -466,7 +500,7 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
                     continue
                 value = _validate_file_path(value, param.flag)
             values[param.name] = value
-        _validate_required_path_params(tool, values)
+        _validate_required_non_body_params(tool, values)
     else:
         values = _build_body(tool, kwargs)
         body = {
@@ -527,13 +561,18 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
                 started_at=t0,
             )
     except ApiError as error:
-        if error.error_code != "DEVELOPER_7100":
-            raise
-        raise ApiError(
-            error.status_code,
-            error.body,
-            contextual_hint=_scope_error_hint(tool, env),
-        ) from error
+        if error.error_code == "DEVELOPER_7100":
+            raise ApiError(
+                error.status_code,
+                error.body,
+                contextual_hint=_scope_error_hint(tool, env),
+            ) from error
+        hint = _availability_error_hint(tool, env, error)
+        if hint:
+            raise ApiError(
+                error.status_code, error.body, contextual_hint=hint
+            ) from error
+        raise
 
     elapsed = time.monotonic() - t0
     if stop_spinner:
@@ -566,6 +605,19 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
                 return
 
         _render_human(data, wide=wide, category=tool.category)
+
+
+def _availability_error_hint(tool: ToolDef, env: str, error: ApiError) -> str | None:
+    """Explain a rejected tool call using the effective-availability endpoint."""
+    if not 400 <= error.status_code < 500:
+        return None
+    snapshot = fetch_availability(env)
+    entry = snapshot.lookup(tool) if snapshot else None
+    if entry is None or entry.available:
+        return None
+    return (
+        f"This tool is currently unavailable for your credentials: {entry.describe()}."
+    )
 
 
 def _scope_error_hint(tool: ToolDef, env: str) -> str:
@@ -920,15 +972,15 @@ def _has_auto_default(param: ToolParam) -> bool:
     )
 
 
-def _validate_required_path_params(
+def _validate_required_non_body_params(
     tool: ToolDef,
     values: dict[str, Any],
 ) -> None:
     missing: list[str] = []
     for param in tool.params:
-        if not param.required or param.location != "path":
+        if not param.required or param.location not in {"path", "query", "header"}:
             continue
-        if values.get(param.name) is not None:
+        if values.get(param.name) is not None or _has_auto_default(param):
             continue
         if is_id_param(param):
             missing.append(param.flag.upper())
@@ -967,7 +1019,11 @@ def _validate_json_body(tool: ToolDef, body: Any) -> dict[str, Any]:
         raise click.BadParameter("JSON body must be an object", param_hint="'--json'")
 
     if tool.json_schema is not None:
-        _validate_json_object(tool.json_schema, body)
+        _validate_json_object(
+            tool.json_schema,
+            body,
+            validate_required=tool.http_method != "patch",
+        )
 
     return body
 
@@ -979,8 +1035,19 @@ def _sync_tool_for_json_validation(env: str, tool: ToolDef) -> ToolDef:
 
 
 def _validate_json_object(
-    schema: JsonSchema, body: dict[str, Any], path: tuple[str, ...] = ()
+    schema: JsonSchema,
+    body: dict[str, Any],
+    path: tuple[str, ...] = (),
+    *,
+    validate_required: bool = True,
 ) -> None:
+    if validate_required:
+        for key in sorted(schema.required_properties - body.keys()):
+            raise click.BadParameter(
+                f"missing required JSON field '{'.'.join(path + (key,))}'",
+                param_hint="'--json'",
+            )
+
     if schema.properties and not schema.additional_properties_allowed:
         allowed = set(schema.properties)
         for key in body:

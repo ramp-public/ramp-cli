@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import time
-
 import pytest
 
 from ramp_cli.client import session
@@ -32,7 +30,7 @@ def test_returns_stable_id():
     ids=["just-under", "exact-boundary", "well-past"],
 )
 def test_rotation_at_timeout_boundary(monkeypatch, offset, should_rotate):
-    t = time.monotonic()
+    t = 1_000.0
     monkeypatch.setattr("ramp_cli.client.session.time.monotonic", lambda: t)
     sid1 = session.get_session_id()
 

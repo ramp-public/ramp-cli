@@ -11,6 +11,7 @@ from ramp_cli.output.formatter import print_agent_json, print_json, resolve_form
 from ramp_cli.output.help import BoxHelpFormatter
 from ramp_cli.specs import AGENT_TOOL_DEFINITION
 from ramp_cli.specs.sync import fetch_spec, maybe_sync
+from ramp_cli.tools.availability import fetch_availability
 from ramp_cli.tools.commands import resolve_cli_tool_groups, resolve_tool_command_names
 from ramp_cli.tools.parser import load_component_schema
 from ramp_cli.tools.registry import list_tool_defs, reload
@@ -55,23 +56,49 @@ def tools_list(ctx: click.Context) -> None:
 
     categories = resolve_cli_tool_groups(list_tool_defs(env))
     granted_scopes = get_known_granted_scopes(env)
+    # Best-effort effective-availability overlay; None preserves current output.
+    snapshot = fetch_availability(env)
 
     if fmt == "json":
-        print_agent_json(
-            [
-                {
+        records = []
+        for cat, tools in sorted(categories.items()):
+            for name, tool in resolve_tool_command_names(
+                cat, tools, granted_scopes=granted_scopes
+            ):
+                record = {
                     "name": name,
                     "category": cat,
                     "description": tool.description,
                 }
-                for cat, tools in sorted(categories.items())
-                for name, tool in resolve_tool_command_names(
-                    cat, tools, granted_scopes=granted_scopes
-                )
-            ],
+                if snapshot:
+                    entry = snapshot.lookup(tool)
+                    record["available"] = entry.available if entry else None
+                    record["unavailable_reasons"] = (
+                        list(entry.unavailable_reasons)
+                        if entry and not entry.available
+                        else None
+                    )
+                    record["missing_scopes"] = (
+                        list(entry.missing_scopes)
+                        if entry and entry.missing_scopes
+                        else None
+                    )
+                records.append(record)
+        print_agent_json(
+            records,
             pagination=None,
+            availability=(
+                {"content_hash": snapshot.content_hash} if snapshot else None
+            ),
         )
         return
+
+    def _annotate(name: str, tool) -> tuple[str, str]:
+        entry = snapshot.lookup(tool) if snapshot else None
+        if entry and not entry.available:
+            prefix = f"[unavailable: {entry.describe()}]"
+            return name, f"{prefix} {tool.description or ''}".strip()
+        return name, tool.description or ""
 
     BoxHelpFormatter._suppress_wave = True
     try:
@@ -79,7 +106,7 @@ def tools_list(ctx: click.Context) -> None:
         total = 0
         for cat, tools in sorted(categories.items()):
             dl_rows = [
-                (name, tool.description or "")
+                _annotate(name, tool)
                 for name, tool in resolve_tool_command_names(
                     cat, tools, granted_scopes=granted_scopes
                 )

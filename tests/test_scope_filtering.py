@@ -6,6 +6,7 @@ import json
 from unittest.mock import MagicMock
 
 import click
+import pytest
 from click.testing import CliRunner
 
 from ramp_cli.auth import oauth as oauth_module
@@ -14,6 +15,7 @@ from ramp_cli.config import settings
 from ramp_cli.errors import ApiError
 from ramp_cli.main import cli
 from ramp_cli.tools import registry
+from ramp_cli.tools.availability import AvailabilitySnapshot, ToolAvailability
 from ramp_cli.tools.commands import _scope_error_hint
 from ramp_cli.tools.parser import ToolDef
 
@@ -267,6 +269,71 @@ class TestServerScopeErrors:
         assert "ramp --env sandbox tools refresh" in message
         assert "ramp --env sandbox auth login" in message
 
+    def _invoke_with_availability(self, monkeypatch, error, snapshot):
+        store.save_tokens("sandbox", "tok", "", granted_scopes="users:read")
+        client = MagicMock()
+        client.post.side_effect = error
+        tool = self._tool()
+        monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
+        monkeypatch.setattr("ramp_cli.tools.commands.maybe_sync", lambda env: None)
+        monkeypatch.setattr(
+            "ramp_cli.main.list_categories", lambda env: {"tasks": [tool]}
+        )
+        monkeypatch.setattr("ramp_cli.tools.commands.RampClient", lambda env: client)
+        monkeypatch.setattr(
+            "ramp_cli.tools.commands.fetch_availability",
+            lambda env: snapshot,
+        )
+        return CliRunner().invoke(cli, ["--env", "sandbox", "tasks", "list"])
+
+    def test_generic_error_gets_availability_hint_when_tool_unavailable(
+        self, isolated_config, monkeypatch
+    ):
+        snapshot = AvailabilitySnapshot(
+            content_hash="sha256:abc",
+            entries={
+                ("get-attention-feed", "POST"): ToolAvailability(
+                    available=False,
+                    unavailable_reasons=("disabled_for_business",),
+                )
+            },
+        )
+
+        result = self._invoke_with_availability(
+            monkeypatch, ApiError(403, "Forbidden"), snapshot
+        )
+
+        assert result.exit_code != 0
+        message = str(result.exception)
+        assert "currently unavailable" in message
+        assert "not enabled for your business" in message
+
+    @pytest.mark.parametrize(
+        "snapshot",
+        [
+            # No availability data at all.
+            None,
+            # The tool is available, so the 4xx is about something else.
+            AvailabilitySnapshot(
+                content_hash="sha256:abc",
+                entries={
+                    ("get-attention-feed", "POST"): ToolAvailability(available=True)
+                },
+            ),
+        ],
+    )
+    def test_generic_error_is_unchanged_without_unavailable_entry(
+        self, isolated_config, monkeypatch, snapshot
+    ):
+        result = self._invoke_with_availability(
+            monkeypatch, ApiError(403, "Forbidden"), snapshot
+        )
+
+        assert result.exit_code != 0
+        message = str(result.exception)
+        assert "currently unavailable" not in message
+        assert "Forbidden" in message
+
     def test_dry_run_skips_scope_check(self, isolated_config):
         store.save_tokens(
             "production",
@@ -277,7 +344,16 @@ class TestServerScopeErrors:
         runner = CliRunner()
         result = runner.invoke(
             cli,
-            ["get-transactions", "--dry_run", "--json", '{"filters": {}}'],
+            [
+                "get-transactions",
+                "--dry_run",
+                "--rationale",
+                "test",
+                "--transactions_to_retrieve",
+                "my_transactions",
+                "--json",
+                '{"filters": {"filters": []}}',
+            ],
         )
         assert result.exit_code == 0
         assert "dry_run" in result.output

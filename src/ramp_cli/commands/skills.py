@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import click
@@ -13,9 +14,11 @@ from ramp_cli.skills import (
     get_skill_content,
     install_skill,
     list_skills,
+    managed_skill_names,
     previously_removed_skills,
-    record_synced_skills,
+    record_receipt,
     skill_names,
+    uninstall_skills,
 )
 
 
@@ -120,15 +123,28 @@ def skills_install(
         names = [name]
 
     for skill_name_val in names:
+        skill_dir = target / skill_name_val
+        created_directory = not skill_dir.exists()
         status = install_skill(skill_name_val, target)
+        try:
+            record_receipt(target, skill_name_val)
+        except OSError as exc:
+            if created_directory:
+                try:
+                    shutil.rmtree(skill_dir)
+                except OSError as rollback_exc:
+                    raise click.ClickException(
+                        f"Could not record ownership for {skill_name_val}: {exc}. "
+                        f"Rollback also failed for {skill_dir}: {rollback_exc}"
+                    ) from rollback_exc
+            raise click.ClickException(
+                f"Could not record ownership for {skill_name_val}; "
+                f"the install was {'rolled back' if created_directory else 'left in place'}: "
+                f"{exc}"
+            ) from exc
         click.echo(
             f"  {status.capitalize()} {skill_name_val} → {target / skill_name_val}/"
         )
-
-    if install_all:
-        # Only after all copies succeeded — a partial failure must not mark
-        # never-copied skills as user-deleted.
-        record_synced_skills(target)
 
     click.echo(f"\n  {len(names)} skill(s) installed to {target}")
     if removed:
@@ -136,3 +152,87 @@ def skills_install(
             f"  Skipped previously removed: {', '.join(removed)} "
             "(restore: ramp skills install <name>)"
         )
+
+
+@skills_group.command("uninstall", help="Uninstall Ramp-managed skills")
+@click.argument("name", required=False)
+@click.option(
+    "--all", "uninstall_all", is_flag=True, help="Uninstall all managed skills"
+)
+@click.option(
+    "--target",
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Target directory (default: auto-detect agent skill directory)",
+)
+@click.option(
+    "-y",
+    "--yes",
+    "assume_yes",
+    is_flag=True,
+    help="Delete without prompting (for non-interactive use)",
+)
+def skills_uninstall(
+    name: str | None,
+    uninstall_all: bool,
+    target: Path | None,
+    assume_yes: bool,
+) -> None:
+    if not name and not uninstall_all:
+        raise click.UsageError(
+            "Provide a skill name or use --all to uninstall all managed skills."
+        )
+    if name and uninstall_all:
+        raise click.UsageError("Provide a skill name or use --all, not both.")
+
+    if target is None:
+        target = detect_agent_dir()
+        if target is None:
+            raise click.UsageError(
+                "No agent skill directory found. Use --target to specify one, e.g.:\n"
+                "  ramp skills uninstall --all --target ~/.claude/skills"
+            )
+
+    managed = managed_skill_names(target)
+    if name:
+        if name not in managed:
+            hint = (
+                f"Managed skills there: {', '.join(managed)}"
+                if managed
+                else "No Ramp-managed skills are recorded for that directory."
+            )
+            raise click.BadParameter(
+                f"No installation receipt for '{name}' in {target}. {hint}",
+                param_hint="'NAME'",
+            )
+
+    requested = managed if uninstall_all else [name]
+    if requested:
+        _print_uninstall_preview(target, requested)
+        if not assume_yes:
+            click.confirm("Continue?", default=False, abort=True)
+
+    removed = uninstall_skills(target, None if uninstall_all else [name])
+    for skill_name_val in removed:
+        click.echo(f"  Uninstalled {skill_name_val} from {target}")
+    click.echo(f"\n  {len(removed)} skill(s) uninstalled from {target}")
+
+
+def _print_uninstall_preview(target: Path, names: list[str]) -> None:
+    """Show every receipt-backed path that recursive removal will delete."""
+    click.echo(
+        "The following managed skill directories and their contents will be removed:\n"
+    )
+    for name in names:
+        skill_dir = target / name
+        click.echo(f"  {skill_dir}/")
+        if not skill_dir.is_dir():
+            click.echo("    (directory already missing; only its receipt will change)")
+            continue
+        for entry in sorted(skill_dir.rglob("*")):
+            relative = entry.relative_to(skill_dir)
+            suffix = "/" if entry.is_dir() and not entry.is_symlink() else ""
+            click.echo(f"    {relative}{suffix}")
+    click.echo(
+        "\nThese directories may contain files you created or modified. "
+        "Confirming will delete them too."
+    )
