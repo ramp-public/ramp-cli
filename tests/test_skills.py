@@ -100,7 +100,7 @@ class TestSkillsShow:
         result = runner.invoke(cli, ["skills", "show", "browser-automation"])
         assert result.exit_code == 0
         assert "Browser Automation" in result.output
-        assert "playwright-cli" in result.output
+        assert "Browserbase" in result.output
 
     def test_show_vendor_document_upload_skill(self):
         runner = CliRunner()
