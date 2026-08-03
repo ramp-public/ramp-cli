@@ -1,0 +1,13 @@
+{
+  "name": "@ramp/router-integrations-workspace",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "test": "npm run test --workspaces",
+    "typecheck": "npm run typecheck --workspaces",
+    "verify": "npm run verify --workspaces"
+  }
+}

@@ -10,8 +10,12 @@ from pathlib import Path
 import click
 
 from ramp_cli import __version__
+from ramp_cli.commands.router import CLIENT_NAMES, configured_router_clients
 from ramp_cli.version_check import latest_version, parse_version
 
+# This URL serves ramp/agent-cards-site/public/install.sh, not a file from this
+# repository. Every install.oss.sh change must be copied there byte-for-byte
+# and deployed from agent-cards-site so fresh installs and self-updates agree.
 _INSTALL_URL = "https://agents.ramp.com/install.sh"
 
 
@@ -53,9 +57,13 @@ def update_cmd() -> None:
 
     click.echo(f"Update available: v{current} → v{latest}")
 
+    router_clients = configured_router_clients()
     if _is_homebrew_install():
         click.echo("This ramp was installed via Homebrew. Run:")
-        click.echo("  brew update && brew upgrade ramp-cli")
+        command = "brew update && brew upgrade ramp-cli"
+        if router_clients:
+            command += " && ramp router refresh"
+        click.echo(f"  {command}")
         return
 
     if not shutil.which("curl"):
@@ -63,9 +71,26 @@ def update_cmd() -> None:
             "curl is required for updates. Install curl and try again."
         )
 
+    if router_clients:
+        names = ", ".join(CLIENT_NAMES[client] for client in router_clients)
+        click.echo(f"Refreshing Router setup for configured agents only: {names}.")
+
     click.echo("Installing...")
-    run = subprocess.run(["sh", "-c", f"curl -fsSL {_INSTALL_URL} | sh"])
+    install_command = f"curl -fsSL {_INSTALL_URL} | sh"
+    if router_clients:
+        install_command += " -s -- --no-skills"
+    run = subprocess.run(["sh", "-c", install_command])
     if run.returncode != 0:
-        raise click.ClickException(
-            f"Update failed. Try manually:\n  curl -fsSL {_INSTALL_URL} | sh"
-        )
+        raise click.ClickException(f"Update failed. Try manually:\n  {install_command}")
+
+    if router_clients:
+        # Invoke the CLI after installation instead of teaching the separately
+        # hosted installer a new flag. Refresh is receipt-scoped and reads the
+        # credentials already stored for each configured agent.
+        ramp_executable = shutil.which("ramp") or sys.argv[0]
+        refresh = subprocess.run([ramp_executable, "router", "refresh"])
+        if refresh.returncode != 0:
+            raise click.ClickException(
+                "Ramp CLI was updated, but existing Router configurations "
+                "could not be refreshed. Run:\n  ramp router refresh"
+            )

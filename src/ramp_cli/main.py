@@ -88,7 +88,7 @@ _RESOURCE_HELP: dict[str, str] = {
     "business": "Look up business metadata such as departments",
     "cards": "Activate a card, and lock or unlock a card",
     "funds": "Manage funds (budgets/cards), activate cards, and make agent card payments",
-    "general": "Post comments, explain declines, answer policy questions, and search help center",
+    "general": "Post comments, explain declines, answer policy questions, search help center, and report missing capabilities",
     "procurement_requests": "Create and submit procurement requests",
     "purchase_orders": "Search and view purchase order details",
     "receipts": "Upload and attach receipts to transactions and reimbursements",

@@ -39,8 +39,8 @@ uv run python -m nuitka \
     --output-filename="${ARTIFACT}" \
     --output-dir=dist \
     --include-package=ramp_cli \
-    --include-package-data=ramp_cli \
     --include-data-files=src/ramp_cli/specs/*.json=ramp_cli/specs/ \
+    --include-data-dir=src/ramp_cli/router_integrations/packages=ramp_cli/router_integrations/packages \
     --python-flag=no_site \
     --assume-yes-for-downloads \
     src/ramp_cli/main.py

@@ -1,32 +1,268 @@
 """Configure coding agents to use Ramp Router."""
 
+import io
 import json
 import os
 import re
+import shutil
+import sqlite3
+import subprocess
+import sys
 import tempfile
 import tomllib
-from pathlib import Path
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path, PurePath
 
 import click
 import httpx
 import json5
+import zstandard
 
+from ramp_cli.commands import claude_code
 from ramp_cli.output.formatter import print_agent_json, resolve_format
+from ramp_cli.router_integrations import integration_package_path
 
-ROUTER_BASE_URL = "https://router-api.ramp.com/v1"
+DEFAULT_ROUTER_BASE_URL = "https://router-api.ramp.com/v1"
+
+# The bundled plugins already take these, and reading them here too means a
+# stack other than production can be reached without hand-editing the files
+# this command writes, which a later configure would overwrite anyway.
+BASE_URL_ENVS = ("RAMP_ROUTER_BASE_URL", "LLM_GATEWAY_BASE_URL")
+
+# Read by the bundled Pi plugin, which Pi gives no other way to be told which
+# Router to call.
+PI_PLUGIN_CONFIG_FILE = "ramp-router-config.json"
 ROUTER_UI_URL = "https://router.ramp.com"
 ROUTER_PROVIDER = "ramp-router"
-CLIENT_NAMES = {"codex": "Codex", "opencode": "OpenCode", "pi": "Pi"}
+# Read instead of --api-key so the secret stays out of shell history and out
+# of the process list.
+CONFIGURE_KEY_ENV = "RAMP_ROUTER_CONFIGURE_API_KEY"
+
+# Router answers a client in that client's own shape when it says which client
+# it is. This selects a response format and nothing else.
+GATEWAY_CLIENT_HEADER = "X-Gateway-Client"
+CODEX_CLIENT_NAME = "codex"
+CLIENT_NAMES = {
+    "claude-code": "Claude Code",
+    "codex": "Codex",
+    "opencode": "OpenCode",
+    "pi": "Pi",
+}
 
 
-def _codex_provider(api_key: str) -> str:
-    bearer_token = json.dumps(api_key)
+@dataclass(frozen=True)
+class RouterModel:
+    """One model as Router describes it on GET /v1/models.
+
+    Router states its metadata for every model it serves, so this is required
+    rather than optional. Guessing a model's efforts or limits from the shape
+    of its name produced answers that were confidently wrong, and refusing to
+    guess is the point of the extension.
+    """
+
+    id: str
+    metadata: "RouterModelMetadata"
+
+
+@dataclass(frozen=True)
+class RouterModelMetadata:
+    request_name: str
+    display_name: str
+    description: str
+    listing_order: int
+    efforts: tuple[tuple[str, str], ...]
+    default_effort: str
+    input_modalities: tuple[str, ...]
+    # Router states a window for every model it serves. The plugins refuse a
+    # model without one, so accepting it here would let configure claim
+    # success for a list the agent then rejects.
+    context_window: int
+    max_output_tokens: int
+    tool_calls: bool | None
+
+
+def _model_metadata(raw: object, identifier: str) -> RouterModelMetadata:
+    """Read Router's description of one model.
+
+    A missing or unrecognized schema is an error rather than a cue to fall
+    back. Router publishes this for everything it serves, so its absence means
+    the two are out of step, and configuring an agent from guesses would hide
+    that until a request failed.
+    """
+    if not isinstance(raw, dict) or raw.get("schema_version") != 1:
+        raise click.ClickException(
+            f"Ramp Router described {identifier!r} in a format this version of "
+            "the CLI does not understand. Update the Ramp CLI and try again."
+        )
+    capabilities = raw.get("capabilities")
+    capabilities = capabilities if isinstance(capabilities, dict) else {}
+    reasoning = capabilities.get("reasoning")
+    reasoning = reasoning if isinstance(reasoning, dict) else {}
+    modalities = capabilities.get("modalities")
+    modalities = modalities if isinstance(modalities, dict) else {}
+    listing = raw.get("listing")
+    listing = listing if isinstance(listing, dict) else {}
+
+    efforts = tuple(
+        (option["value"], option.get("description") or "")
+        for option in reasoning.get("efforts") or []
+        if isinstance(option, dict) and isinstance(option.get("value"), str)
+    )
+    inputs = tuple(
+        value for value in modalities.get("input") or [] if isinstance(value, str)
+    )
+    limits = raw.get("limits")
+    limits = limits if isinstance(limits, dict) else {}
+    tools = capabilities.get("tools")
+    tools = tools if isinstance(tools, dict) else {}
+    order = listing.get("order")
+    return RouterModelMetadata(
+        request_name=raw.get("request_name") or "",
+        display_name=raw.get("display_name") or "",
+        description=raw.get("description") or "",
+        listing_order=order if isinstance(order, int) else sys.maxsize,
+        efforts=efforts,
+        default_effort=reasoning.get("default_effort") or "",
+        input_modalities=inputs,
+        context_window=_token_limit(
+            limits.get("context_window"), "context_window", identifier
+        ),
+        max_output_tokens=_token_limit(
+            limits.get("max_output_tokens"), "max_output_tokens", identifier
+        ),
+        tool_calls=tools.get("supported")
+        if isinstance(tools.get("supported"), bool)
+        else None,
+    )
+
+
+def _token_limit(value: object, field: str, identifier: str) -> int:
+    """Read a token limit, refusing one Router did not state.
+
+    A guessed limit makes an agent truncate or over-promise against a boundary
+    the model does not have, which surfaces much later as a confusing failure.
+    """
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    raise click.ClickException(
+        f"Ramp Router did not state {field} for {identifier!r}. "
+        "Update the Ramp CLI and try again."
+    )
+
+
+# TODO(router-plugin-npm): Reconsider publishing these plugins if they need a
+# lifecycle independent of ramp-cli. Bundling gives us an atomic, offline-tested
+# CLI/plugin release, but gives up several npm-distribution benefits:
+# - users and third-party installers could install a plugin without ramp-cli;
+# - plugin fixes could ship under their own semver without a new Python release;
+# - OpenCode/Pi could participate in native package install/update and pinning;
+# - npm would provide registry discovery/download telemetry plus standard
+#   dependency resolution, caching, lockfile integrity, and provenance tooling.
+_OPENCODE_PLUGIN_PACKAGE = "@ramp/router-opencode-provider"
+_PI_PLUGIN_PACKAGE = "@ramp/router-pi-provider"
+
+
+def _human_join(values: list[str]) -> str:
+    if len(values) == 1:
+        return values[0]
+    if len(values) == 2:
+        return " and ".join(values)
+    return ", ".join(values[:-1]) + f", and {values[-1]}"
+
+
+def _codex_harness_prompt(default_model: str) -> str | None:
+    """Read Codex's own harness prompt out of the installed binary.
+
+    Codex replaces its prompt with whatever a catalog entry's base_instructions
+    says, and that prompt is some 18,000 characters describing its editing
+    constraints, tool protocol and output rules. Router cannot supply it and a
+    stand-in makes the agent worse, so it comes from the user's own install and
+    matches their version. Returns None when Codex is absent or says something
+    unexpected, since a missing prompt is better than a wrong one.
+    """
+    if not shutil.which("codex"):
+        return None
+    try:
+        result = subprocess.run(
+            ["codex", "debug", "models"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        models = json.loads(result.stdout).get("models")
+    except (json.JSONDecodeError, AttributeError):
+        return None
+    if not isinstance(models, list):
+        return None
+
+    prompts = {
+        model["slug"]: model["base_instructions"]
+        for model in models
+        if isinstance(model, dict)
+        and isinstance(model.get("slug"), str)
+        and isinstance(model.get("base_instructions"), str)
+        and model["base_instructions"]
+    }
+    if not prompts:
+        return None
+    if default_model in prompts:
+        return prompts[default_model]
+    # Codex ships a different prompt per model family, but instructions are a
+    # single global setting. With no prompt for the model being configured,
+    # take the one the most families share: that is Codex's general harness
+    # text rather than a specialization. Ties break on the slug so two runs
+    # against the same install agree.
+    prompt_stats: dict[str, tuple[int, str]] = {}
+    for slug, prompt in prompts.items():
+        count, minimum_slug = prompt_stats.get(prompt, (0, slug))
+        prompt_stats[prompt] = (count + 1, min(minimum_slug, slug))
+    return max(prompt_stats, key=prompt_stats.__getitem__)
+
+
+def _codex_key_command(key_path: Path) -> tuple[str, list[str]]:
+    """Return a command that prints the key file, for this platform.
+
+    Codex needs a command rather than an inline token, and the obvious POSIX
+    choice does not exist on Windows.
+    """
+    if os.name == "nt":
+        return "cmd", ["/c", "type", str(key_path)]
+    return "/bin/cat", [str(key_path)]
+
+
+def _codex_provider(key_path: Path) -> str:
+    """Describe the Router provider to Codex.
+
+    The credential is read by a command rather than written inline, because
+    Codex only refreshes its model list for providers using command auth or a
+    ChatGPT account. With experimental_bearer_token it never asks the provider
+    what models exist, which is what forced a generated catalog file. Printing
+    the key from a private file is the smallest command that satisfies it.
+
+    The client marker is what makes Router answer with Codex's own catalog
+    shape. It is declared here rather than left to the version string Codex
+    already sends, because that shape carries no harness prompt and is only
+    safe alongside the model_instructions_file this same setup writes.
+    """
+    command, args = _codex_key_command(key_path)
     return f'''[model_providers.ramp-router]
 name = "Ramp Router"
-base_url = "{ROUTER_BASE_URL}"
+base_url = "{router_base_url()}"
 wire_api = "responses"
 supports_websockets = false
-experimental_bearer_token = {bearer_token}
+http_headers = {{ "{GATEWAY_CLIENT_HEADER}" = "{CODEX_CLIENT_NAME}" }}
+
+[model_providers.ramp-router.auth]
+command = {json.dumps(command)}
+args = {json.dumps(args)}
+timeout_ms = 5000
 '''
 
 
@@ -36,9 +272,16 @@ _OWNED_CODEX_TABLE = re.compile(
     r"(?:ramp-router|\"ramp-router\"|'ramp-router')\s*(?:\.|])"
 )
 _OWNED_CODEX_ROOT_KEY = re.compile(
-    r"^\s*(?:model|model_provider|model_catalog_json)\s*="
+    r"^\s*(?:model|model_provider|model_catalog_json|model_instructions_file)\s*="
 )
-_OWNED_ROOT_KEYS = ("model", "model_provider", "model_catalog_json")
+_OWNED_ROOT_KEYS = (
+    "model",
+    "model_provider",
+    "model_catalog_json",
+    # Written by this command, so its previous value has to be captured to be
+    # given back.
+    "model_instructions_file",
+)
 
 
 @click.group("router", help="Configure coding agents to use Ramp Router")
@@ -57,7 +300,11 @@ def router_group() -> None:
 @click.option(
     "--api-key",
     metavar="KEY",
-    help="Ramp Router API key. Prompts when omitted.",
+    envvar=CONFIGURE_KEY_ENV,
+    help=(
+        "Ramp Router API key. Prompts when omitted. "
+        f"Set {CONFIGURE_KEY_ENV} instead to keep it out of shell history."
+    ),
 )
 @click.pass_context
 def router_configure(
@@ -65,15 +312,16 @@ def router_configure(
 ) -> None:
     if ctx.obj["no_input"] and api_key is None:
         raise click.UsageError(
-            "Pass --api-key when using non-interactive mode. "
-            f"Create a key at {ROUTER_UI_URL}."
+            "Pass --api-key when using non-interactive mode, or set "
+            f"{CONFIGURE_KEY_ENV} to keep the key out of shell history "
+            f"and process listings. Create a key at {ROUTER_UI_URL}."
         )
 
     clients = (client,) if client else tuple(CLIENT_NAMES)
-    client_names = ", ".join(CLIENT_NAMES[item] for item in clients)
+    agent_label = "coding agent" if len(clients) == 1 else "coding agents"
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     if fmt != "json":
-        click.echo(f"Let's connect {client_names} to Ramp Router.")
+        click.echo(f"Connecting Ramp Router to your {agent_label}")
     if api_key is None:
         click.echo(
             f"Create or copy an API key at {ROUTER_UI_URL}, then paste it below."
@@ -81,15 +329,25 @@ def router_configure(
         click.echo()
         api_key = click.prompt("API key", hide_input=True)
     api_key = api_key.strip()
+    # Click has already copied the configured value into api_key. Do not leave
+    # the secret in the environment inherited by Codex or any other child.
+    os.environ.pop(CONFIGURE_KEY_ENV, None)
     if not api_key:
         raise click.UsageError("The API key cannot be empty.")
 
-    models = _fetch_models(api_key)
+    models_by_client: dict[str, list[RouterModel]] = {}
+    standard_clients = tuple(item for item in clients if item != "claude-code")
+    if standard_clients:
+        models = _fetch_models(api_key)
+        models_by_client.update(dict.fromkeys(standard_clients, models))
+    if "claude-code" in clients:
+        models_by_client["claude-code"] = _fetch_models(api_key, claude_code_view=True)
     results = []
     failures = []
     for item in clients:
+        models = models_by_client[item]
         try:
-            path, catalog_path, default_model = _configure_client(item, api_key, models)
+            path, default_model, repaired = _configure_client(item, api_key, models)
         except click.ClickException as exc:
             failures.append(f"{CLIENT_NAMES[item]}: {exc.message}")
             continue
@@ -99,9 +357,8 @@ def router_configure(
             "provider": ROUTER_PROVIDER,
             "default_model": default_model,
             "models_available": len(models),
+            "replaced_outdated_setup": repaired,
         }
-        if catalog_path is not None:
-            result["model_catalog_path"] = str(catalog_path)
         results.append(result)
 
     if failures and fmt == "json":
@@ -109,28 +366,90 @@ def router_configure(
     if fmt == "json":
         payload = results[0] if client and results else {"clients": results}
         print_agent_json(payload, pagination=None)
-    else:
-        for result in results:
-            item = result["client"]
-            client_name = CLIENT_NAMES[item]
-            click.echo(f"Added {len(models)} Ramp Router model(s) to {client_name}.")
-            restart = (
-                "Restart OpenCode, then open /models"
-                if item == "opencode"
-                else (
-                    "Open /model" if item == "pi" else "Restart Codex, then open /model"
-                )
-            )
-            click.echo(f"{restart} to choose one.")
+    elif not failures:
+        connected_names = _human_join(
+            [CLIENT_NAMES[result["client"]] for result in results]
+        )
+        model_count = results[0]["models_available"]
+        model_label = "model" if model_count == 1 else "models"
+        click.echo(f"Connected to: {connected_names}")
+        click.echo(
+            f"{model_count} {model_label} added. Start an agent and pick a model."
+        )
 
     if failures:
-        raise click.ClickException("Could not configure " + "; ".join(failures))
+        # Configuration is written before the agent-specific steps, so a
+        # partial failure is recoverable; the user has no reason to guess that.
+        raise click.ClickException(
+            "Could not configure "
+            + "; ".join(failures)
+            + ". Run 'ramp router unconfigure' to restore your previous settings."
+        )
     restore_client = f" {client}" if client else ""
     if fmt != "json":
         click.echo(
             f"Run 'ramp router unconfigure{restore_client}' to restore the previous "
             "settings."
         )
+
+
+@router_group.command(
+    "refresh",
+    help="Reapply current Router setup to agents already configured with it",
+)
+@click.pass_context
+def router_refresh(ctx: click.Context) -> None:
+    clients = configured_router_clients()
+    results = []
+    failures = []
+    models_by_request: dict[tuple[str, bool], list[RouterModel]] = {}
+    for client in clients:
+        path = _client_config_path(client)
+        try:
+            api_key = _stored_router_api_key(client, path)
+            claude_code_view = client == "claude-code"
+            request_key = (api_key, claude_code_view)
+            models = models_by_request.get(request_key)
+            if models is None:
+                models = (
+                    _fetch_models(api_key, claude_code_view=True)
+                    if claude_code_view
+                    else _fetch_models(api_key)
+                )
+                models_by_request[request_key] = models
+            selected_model = _configured_model(client, path)
+            _, default_model, _ = _configure_client(
+                client,
+                api_key,
+                models,
+                selected_model=selected_model,
+            )
+        except click.ClickException as exc:
+            failures.append(f"{CLIENT_NAMES[client]}: {exc.message}")
+            continue
+        results.append(
+            {
+                "client": client,
+                "config_path": str(path),
+                "default_model": default_model,
+                "models_available": len(models),
+            }
+        )
+
+    fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
+    if failures and fmt == "json":
+        raise click.ClickException("Could not refresh " + "; ".join(failures))
+    if fmt == "json":
+        print_agent_json({"clients": results}, pagination=None)
+    elif not clients:
+        click.echo("Ramp Router is not configured in any coding agent.")
+    else:
+        for result in results:
+            name = CLIENT_NAMES[result["client"]]
+            click.echo(f"Refreshed the Ramp Router configuration for {name}.")
+
+    if failures:
+        raise click.ClickException("Could not refresh " + "; ".join(failures))
 
 
 @router_group.command(
@@ -147,7 +466,7 @@ def router_unconfigure(ctx: click.Context, client: str | None) -> None:
     results = []
     failures = []
     for item in clients:
-        path = _codex_config_path() if item == "codex" else _json_config_path(item)
+        path = _client_config_path(item)
         if not client and not (path.parent / "ramp-router-state.json").exists():
             continue
         try:
@@ -165,20 +484,22 @@ def router_unconfigure(ctx: click.Context, client: str | None) -> None:
     if fmt == "json":
         payload = results[0] if client and results else {"clients": results}
         print_agent_json(payload, pagination=None)
-    else:
-        for result in results:
-            client_name = CLIENT_NAMES[result["client"]]
-            click.echo(
-                f"Removed Ramp Router and restored your previous {client_name} "
-                "settings."
-            )
-            if result["client"] in ("codex", "opencode"):
-                click.echo(f"Restart {client_name} to apply the change.")
+    elif results:
+        restored_names = _human_join(
+            [CLIENT_NAMES[result["client"]] for result in results]
+        )
+        click.echo(
+            "Removed Ramp Router and restored your previous settings for: "
+            f"{restored_names}."
+        )
     if failures:
         raise click.ClickException("Could not unconfigure " + "; ".join(failures))
 
 
 def _unconfigure_client(client: str, path: Path) -> None:
+    if client == "claude-code":
+        _unconfigure_claude_code(path)
+        return
     if client != "codex":
         _unconfigure_json_client(client, path)
         return
@@ -191,7 +512,10 @@ def _unconfigure_client(client: str, path: Path) -> None:
         state = json.loads(state_path.read_text(encoding="utf-8"))
         root_values = state["root"]
         previous_provider = state["provider"]
+        sessions = state.get("sessions", [])
         if not isinstance(root_values, dict) or not isinstance(previous_provider, list):
+            raise ValueError
+        if not isinstance(sessions, list):
             raise ValueError
     except (OSError, UnicodeError, ValueError, KeyError, TypeError):
         raise click.ClickException(
@@ -214,15 +538,37 @@ def _unconfigure_client(client: str, path: Path) -> None:
         else ""
     )
 
-    try:
-        if updated:
+    if updated:
+        try:
             tomllib.loads(updated)
-        _write_private_file(path, updated)
-        (path.parent / "ramp-router-models.json").unlink(missing_ok=True)
-        state_path.unlink()
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+        except tomllib.TOMLDecodeError as exc:
+            raise click.ClickException(
+                f"Could not restore Codex config {path}: {exc}"
+            ) from None
+    try:
+        _restore_codex_sessions(path.parent, sessions)
+    except (OSError, click.ClickException) as exc:
+        _rollback_codex_sessions(path.parent, sessions)
         raise click.ClickException(
             f"Could not restore Codex config {path}: {exc}"
+        ) from None
+    try:
+        _write_private_file(path, updated)
+    except OSError as exc:
+        _rollback_codex_sessions(path.parent, sessions)
+        raise click.ClickException(
+            f"Could not restore Codex config {path}: {exc}"
+        ) from None
+    try:
+        (path.parent / "ramp-router-models.json").unlink(missing_ok=True)
+        # The key outlives the config unless it is removed here, leaving a
+        # live credential on disk after the user asked for it to be undone.
+        (path.parent / "ramp-router-key").unlink(missing_ok=True)
+        (path.parent / "ramp-router-instructions.md").unlink(missing_ok=True)
+        state_path.unlink()
+    except OSError as exc:
+        raise click.ClickException(
+            f"Restored Codex config but could not remove Ramp Router state: {exc}"
         ) from None
 
 
@@ -231,102 +577,459 @@ def _codex_config_path() -> Path:
     return codex_home.expanduser() / "config.toml"
 
 
+def _configure_claude_code(
+    path: Path,
+    api_key: str,
+    models: list[RouterModel],
+    *,
+    selected_model: str | None = None,
+) -> str:
+    """Write Claude Code's gateway settings and record how to undo them.
+
+    The default model is read from Router's Claude Code view of /v1/models
+    rather than derived locally, because that view is what Claude Code's picker
+    shows and a model written here must be an id it will recognize.
+    """
+    # Read after the network call, not before. The settings are rewritten as a
+    # whole document, so anything Claude Code or the user changed while the
+    # request was in flight would be silently discarded by a stale snapshot.
+    model = _claude_code_default_model(models, selected_model=selected_model)
+    settings = claude_code.read_settings(path)
+    updated, state = claude_code.plan_configuration(
+        settings, path, _router_host(), api_key, model
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state_path = claude_code.state_path(path)
+    previous_state: dict | None = None
+    if state_path.exists():
+        # Keep the original snapshot, but advance the values that identify what
+        # Router currently owns. Otherwise configure A, configure B,
+        # unconfigure would mistake B for a user edit and leave it behind.
+        previous_state = claude_code.read_state(path)
+        state = {**previous_state, "written": state["written"]}
+    # Written first so a successful settings write is always paired with the
+    # managed values needed to undo it. A failed settings write puts the prior
+    # state back below.
+    try:
+        _write_private_file(state_path, json.dumps(state, indent=2) + "\n")
+    except OSError as exc:
+        raise click.ClickException(
+            f"Could not save Claude Code setup state to {state_path}: {exc}"
+        ) from None
+    try:
+        _write_private_file(path, json.dumps(updated, indent=2) + "\n")
+    except OSError as exc:
+        previous_state_contents = (
+            None
+            if previous_state is None
+            else json.dumps(previous_state, indent=2) + "\n"
+        )
+        _restore_private_file(state_path, previous_state_contents)
+        raise click.ClickException(
+            f"Could not update Claude Code settings {path}: {exc}"
+        ) from None
+    return model
+
+
+def _unconfigure_claude_code(path: Path) -> None:
+    state = claude_code.read_state(path)
+    settings = claude_code.read_settings(path)
+    restored = claude_code.plan_restoration(settings, path, state)
+    _write_private_file(path, json.dumps(restored, indent=2) + "\n")
+    claude_code.state_path(path).unlink(missing_ok=True)
+
+
+def _claude_code_default_model(
+    models: list[RouterModel], *, selected_model: str | None = None
+) -> str:
+    """Choose a default from the ids Claude Code itself will see.
+
+    Claude Code sends back the exact id from its picker, so the value written
+    here must come from its own view of the list. That view publishes
+    compatibility aliases, and each entry names the canonical model behind it,
+    which is how the ordinary choice of default is matched to an alias.
+    """
+    if selected_model and selected_model in {model.id for model in models}:
+        return selected_model
+    canonical = [model.metadata.request_name for model in models]
+    preferred = DEFAULT_MODEL if DEFAULT_MODEL in canonical else canonical[0]
+    for model in models:
+        if model.metadata.request_name == preferred:
+            return model.id
+    return preferred
+
+
+def _router_host() -> str:
+    """Return the host root, since Claude Code appends /v1 itself."""
+    return router_base_url().removesuffix("/v1").rstrip("/")
+
+
 def _json_config_path(client: str) -> Path:
     if client == "opencode":
         configured = os.environ.get("OPENCODE_CONFIG")
         if configured:
             return Path(configured).expanduser()
-        return Path.home() / ".config" / "opencode" / "opencode.json"
+        config_home = Path(
+            os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
+        ).expanduser()
+        return config_home / "opencode" / "opencode.json"
     pi_home = Path(os.environ.get("PI_CODING_AGENT_DIR", Path.home() / ".pi" / "agent"))
-    return pi_home.expanduser() / "models.json"
+    return pi_home.expanduser() / "settings.json"
+
+
+def _client_config_path(client: str) -> Path:
+    """Locate one client's configuration file."""
+    if client == "claude-code":
+        return claude_code.settings_path()
+    return _codex_config_path() if client == "codex" else _json_config_path(client)
+
+
+def configured_router_clients() -> tuple[str, ...]:
+    """Return only clients this CLI previously configured for Router.
+
+    The receipt is stronger evidence than the presence of an agent directory,
+    but a first-time configure can be interrupted after creating it and before
+    writing the credential. Requiring both keeps updates from enrolling that
+    partial setup and failing while trying to refresh it.
+    """
+    configured = []
+    for client in CLIENT_NAMES:
+        path = _client_config_path(client)
+        if not (path.parent / "ramp-router-state.json").is_file():
+            continue
+        try:
+            _stored_router_api_key(client, path)
+        except click.ClickException:
+            continue
+        configured.append(client)
+    return tuple(configured)
+
+
+def _stored_router_api_key(client: str, path: Path) -> str:
+    """Read the credential this CLI previously wrote without exposing it."""
+    api_key = None
+    try:
+        if client == "claude-code":
+            settings = claude_code.read_settings(path)
+            environment = settings.get("env")
+            if isinstance(environment, dict):
+                api_key = environment.get("ANTHROPIC_AUTH_TOKEN")
+        elif client == "codex":
+            api_key = (path.parent / "ramp-router-key").read_text(encoding="utf-8")
+        elif client == "opencode":
+            config = _read_json_config(client, path)
+            package_path = _bundled_plugin_path(client)
+            plugins = config.get("plugin", [])
+            if isinstance(plugins, list):
+                for entry in plugins:
+                    if not _is_router_plugin_entry(client, entry, package_path):
+                        continue
+                    if isinstance(entry, list) and len(entry) > 1:
+                        options = entry[1]
+                        if isinstance(options, dict):
+                            api_key = options.get("apiKey")
+                            break
+        elif client == "pi":
+            auth = _read_json_config(client, path.parent / "auth.json")
+            credential = auth.get(ROUTER_PROVIDER)
+            if isinstance(credential, dict):
+                api_key = credential.get("key")
+        else:
+            raise click.ClickException(
+                f"Refreshing {CLIENT_NAMES[client]} is not supported by this CLI."
+            )
+    except (OSError, UnicodeError):
+        api_key = None
+
+    if isinstance(api_key, str) and api_key.strip():
+        return api_key.strip()
+    raise click.ClickException(
+        f"Could not read the existing Ramp Router API key for {CLIENT_NAMES[client]}. "
+        f"Run 'ramp router configure {client}' to repair it."
+    )
+
+
+def _configured_model(client: str, path: Path) -> str | None:
+    """Return the client's selected Router model when one is still selected."""
+    if client == "claude-code":
+        config = claude_code.read_settings(path)
+        model = config.get("model")
+    elif client == "codex":
+        _, config = _read_codex_config(path)
+        model = config.get("model")
+    else:
+        config = _read_json_config(client, path)
+        if client == "opencode":
+            model = config.get("model")
+            prefix = f"{ROUTER_PROVIDER}/"
+            if isinstance(model, str) and model.startswith(prefix):
+                model = model[len(prefix) :]
+            else:
+                model = None
+        elif client == "pi" and config.get("defaultProvider") == ROUTER_PROVIDER:
+            model = config.get("defaultModel")
+        else:
+            model = None
+    return model if isinstance(model, str) and model else None
+
+
+def router_base_url() -> str:
+    """Return the Router this command should point clients at."""
+    for name in BASE_URL_ENVS:
+        configured = os.environ.get(name, "").strip()
+        if configured:
+            return configured.rstrip("/")
+    return DEFAULT_ROUTER_BASE_URL
+
+
+# The model a fresh setup starts on. Router publishes no recommendation, and
+# its listing order is presentation rather than a ranking, so naming one here
+# is the only way to avoid defaulting everybody to whichever model happens to
+# sort first. That means this goes stale on its own and has to be moved when a
+# better default ships.
+DEFAULT_MODEL = "gpt-5.6-sol"
+
+
+def _preferred_model(
+    models: list[RouterModel], selected_model: str | None = None
+) -> str:
+    """Pick the model to configure as the default."""
+    identifiers = [model.id for model in models]
+    if selected_model in identifiers:
+        return selected_model
+    return DEFAULT_MODEL if DEFAULT_MODEL in identifiers else identifiers[0]
 
 
 def _configure_client(
-    client: str, api_key: str, models: list[str]
-) -> tuple[Path, Path | None, str]:
+    client: str,
+    api_key: str,
+    models: list[RouterModel],
+    *,
+    selected_model: str | None = None,
+) -> tuple[Path, str, bool]:
+    """Configure one client, reporting whether it replaced an outdated setup."""
+    if client == "claude-code":
+        path = _client_config_path(client)
+        return (
+            path,
+            _configure_claude_code(
+                path,
+                api_key,
+                models,
+                selected_model=selected_model,
+            ),
+            False,
+        )
+
     if client == "codex":
         path = _codex_config_path()
-        catalog_path, default_model = _configure_codex(path, api_key, models)
-        return path, catalog_path, default_model
+        default_model, repaired = _configure_codex(
+            path, api_key, models, selected_model=selected_model
+        )
+        return path, default_model, repaired
 
     path = _json_config_path(client)
-    default_model = "gpt-5.4" if "gpt-5.4" in models else models[0]
-    _configure_json_client(client, path, api_key, models, default_model)
-    return path, None, default_model
+    default_model = _preferred_model(models, selected_model)
+    _configure_plugin_client(client, path, api_key, default_model)
+    return path, default_model, False
 
 
-def _configure_json_client(
+def _plugin_source(entry: object) -> str | None:
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, list) and entry and isinstance(entry[0], str):
+        return entry[0]
+    if isinstance(entry, dict) and isinstance(entry.get("source"), str):
+        return entry["source"]
+    return None
+
+
+def _is_router_plugin_entry(client: str, entry: object, package_path: Path) -> bool:
+    source = _plugin_source(entry)
+    if source is None:
+        return False
+    package_name = (
+        _OPENCODE_PLUGIN_PACKAGE if client == "opencode" else _PI_PLUGIN_PACKAGE
+    )
+    legacy_name = (
+        "@llm-router/opencode-provider"
+        if client == "opencode"
+        else "@llm-router/pi-provider"
+    )
+    expected_sources = {str(package_path), package_path.as_uri()}
+    if source in expected_sources or source in {package_name, f"npm:{package_name}"}:
+        return True
+    if source in {legacy_name, f"npm:{legacy_name}"}:
+        return True
+    package_dir = package_path.name
+    # The bundled path moves on every CLI upgrade, so a stale entry is matched
+    # by its directory name. Compared as a path rather than a string suffix,
+    # because Pi records a native path and Windows separates with backslashes.
+    if PurePath(source.rstrip("/\\")).name == package_dir:
+        return True
+    if client == "opencode" and isinstance(entry, list) and len(entry) > 1:
+        options = entry[1]
+        if isinstance(options, dict) and options.get("providerID") in {
+            ROUTER_PROVIDER,
+            "router",
+        }:
+            return True
+    return False
+
+
+def _bundled_plugin_path(client: str) -> Path:
+    path = integration_package_path(client).resolve()
+    if (
+        not (path / "package.json").is_file()
+        or not (path / "src" / "index.ts").is_file()
+    ):
+        raise click.ClickException(
+            f"The bundled {CLIENT_NAMES[client]} Ramp Router plugin is missing. "
+            "Reinstall ramp-cli and try again."
+        )
+    return path
+
+
+def _configure_plugin_client(
     client: str,
     path: Path,
     api_key: str,
-    models: list[str],
     default_model: str,
 ) -> None:
-    existing = _read_json_config(client, path)
-    settings_path = path.parent / "settings.json"
-    settings = _read_json_config(client, settings_path) if client == "pi" else None
+    package_path = _bundled_plugin_path(client)
     state_path = path.parent / "ramp-router-state.json"
     state = None
-    if not state_path.exists():
-        providers = existing.get("provider" if client == "opencode" else "providers")
-        providers = providers if isinstance(providers, dict) else {}
-        state_data = {
-            "provider_present": ROUTER_PROVIDER in providers,
-            "provider": providers.get(ROUTER_PROVIDER),
-        }
-        if client == "opencode":
-            state_data.update(
-                {"model_present": "model" in existing, "model": existing.get("model")}
-            )
-        else:
-            state_data.update(
-                {
-                    "default_provider_present": "defaultProvider" in settings,
-                    "default_provider": settings.get("defaultProvider"),
-                    "default_model_present": "defaultModel" in settings,
-                    "default_model": settings.get("defaultModel"),
-                }
-            )
-        state = json.dumps(state_data, indent=2) + "\n"
 
     if client == "opencode":
-        providers = existing.setdefault("provider", {})
+        existing = _read_json_config(client, path)
+        plugins = existing.get("plugin", [])
+        if not isinstance(plugins, list):
+            raise click.ClickException(
+                f"Could not update OpenCode config {path}: 'plugin' must be an array."
+            )
+        providers = existing.get("provider", {})
         if not isinstance(providers, dict):
             raise click.ClickException(
                 f"Could not update OpenCode config {path}: 'provider' must be an object."
             )
-        providers[ROUTER_PROVIDER] = {
-            "npm": "@ai-sdk/openai",
-            "name": "Ramp Router",
-            "options": {"baseURL": ROUTER_BASE_URL, "apiKey": api_key},
-            "models": {model: {"name": model} for model in models},
-        }
+        previous_plugins = [
+            entry
+            for entry in plugins
+            if _is_router_plugin_entry(client, entry, package_path)
+        ]
+        if not state_path.exists():
+            state = (
+                json.dumps(
+                    {
+                        "provider_present": ROUTER_PROVIDER in providers,
+                        "provider": providers.get(ROUTER_PROVIDER),
+                        "model_present": "model" in existing,
+                        "model": existing.get("model"),
+                        "plugin_present": "plugin" in existing,
+                        "plugin_entries": previous_plugins,
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+
+        existing["plugin"] = [
+            entry
+            for entry in plugins
+            if not _is_router_plugin_entry(client, entry, package_path)
+        ]
+        existing["plugin"].append(
+            [
+                package_path.as_uri(),
+                {
+                    "providerID": ROUTER_PROVIDER,
+                    "name": "Ramp Router",
+                    "baseURL": router_base_url(),
+                    "apiKey": api_key,
+                },
+            ]
+        )
+        providers.pop(ROUTER_PROVIDER, None)
+        if providers:
+            existing["provider"] = providers
+        else:
+            existing.pop("provider", None)
         existing["model"] = f"{ROUTER_PROVIDER}/{default_model}"
+        writes = [(path, existing)]
     else:
-        providers = existing.setdefault("providers", {})
+        settings = _read_json_config(client, path)
+        packages = settings.get("packages", [])
+        if not isinstance(packages, list):
+            raise click.ClickException(
+                f"Could not update Pi config {path}: 'packages' must be an array."
+            )
+        models_path = path.parent / "models.json"
+        models_config = _read_json_config(client, models_path)
+        providers = models_config.get("providers", {})
         if not isinstance(providers, dict):
             raise click.ClickException(
-                f"Could not update Pi config {path}: 'providers' must be an object."
+                f"Could not update Pi config {models_path}: "
+                "'providers' must be an object."
             )
-        providers[ROUTER_PROVIDER] = {
-            "baseUrl": ROUTER_BASE_URL,
-            "api": "openai-responses",
-            "apiKey": api_key,
-            "models": [
-                {"id": model, "name": model, "input": ["text", "image"]}
-                for model in models
-            ],
-        }
+        auth_path = path.parent / "auth.json"
+        auth = _read_json_config(client, auth_path)
+        previous_packages = [
+            entry
+            for entry in packages
+            if _is_router_plugin_entry(client, entry, package_path)
+        ]
+        if not state_path.exists():
+            state = (
+                json.dumps(
+                    {
+                        "provider_present": ROUTER_PROVIDER in providers,
+                        "provider": providers.get(ROUTER_PROVIDER),
+                        "default_provider_present": "defaultProvider" in settings,
+                        "default_provider": settings.get("defaultProvider"),
+                        "default_model_present": "defaultModel" in settings,
+                        "default_model": settings.get("defaultModel"),
+                        "packages_present": "packages" in settings,
+                        "package_entries": previous_packages,
+                        "auth_present": ROUTER_PROVIDER in auth,
+                        "auth": auth.get(ROUTER_PROVIDER),
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+
+        settings["packages"] = [
+            entry
+            for entry in packages
+            if not _is_router_plugin_entry(client, entry, package_path)
+        ]
+        settings["packages"].append(str(package_path))
         settings["defaultProvider"] = ROUTER_PROVIDER
         settings["defaultModel"] = default_model
+        auth[ROUTER_PROVIDER] = {"type": "api_key", "key": api_key}
+        providers.pop(ROUTER_PROVIDER, None)
+        # Keep the key even when it empties out. Pi's schema requires
+        # "providers", so dropping it leaves {} on disk, which Pi rejects
+        # wholesale: it discards the file and falls back to cached models
+        # rather than reporting a missing provider.
+        models_config["providers"] = providers
+        # Pi hands an extension no configuration of its own, so the Router to
+        # call is written beside the credential rather than left to the
+        # environment, where it would have to be set again in every shell.
+        writes = [
+            (path, settings),
+            (auth_path, auth),
+            (path.parent / PI_PLUGIN_CONFIG_FILE, {"baseUrl": router_base_url()}),
+        ]
+        if models_path.exists():
+            writes.append((models_path, models_config))
 
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         if state is not None:
             _write_private_file(state_path, state)
-        _write_private_file(path, json.dumps(existing, indent=2) + "\n")
-        if settings is not None:
-            _write_private_file(settings_path, json.dumps(settings, indent=2) + "\n")
+        for output_path, payload in writes:
+            _write_private_file(output_path, json.dumps(payload, indent=2) + "\n")
     except OSError as exc:
         raise click.ClickException(
             f"Could not write {CLIENT_NAMES[client]} config {path}: {exc}"
@@ -339,34 +1042,63 @@ def _unconfigure_json_client(client: str, path: Path) -> None:
         raise click.ClickException(
             f"Ramp Router is not configured in {CLIENT_NAMES[client]}."
         )
-    existing = _read_json_config(client, path)
-    settings_path = path.parent / "settings.json"
-    settings = _read_json_config(client, settings_path) if client == "pi" else None
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
         provider_present = state["provider_present"]
-        if not isinstance(provider_present, bool):
+        if not isinstance(state, dict) or not isinstance(provider_present, bool):
             raise ValueError
-    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, ValueError):
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
         raise click.ClickException(
             f"Could not read Ramp Router setup state from {state_path}."
         ) from None
 
-    provider_key = "provider" if client == "opencode" else "providers"
-    providers = existing.get(provider_key)
-    if not isinstance(providers, dict):
-        raise click.ClickException(
-            f"Could not restore {CLIENT_NAMES[client]} config {path}: "
-            f"'{provider_key}' must be an object."
-        )
-    if provider_present:
-        providers[ROUTER_PROVIDER] = state.get("provider")
-    else:
-        providers.pop(ROUTER_PROVIDER, None)
-        if not providers:
-            existing.pop(provider_key)
-
+    package_path = integration_package_path(client).resolve()
     if client == "opencode":
+        existing = _read_json_config(client, path)
+        plugins = existing.get("plugin", [])
+        if not isinstance(plugins, list):
+            raise click.ClickException(
+                f"Could not restore OpenCode config {path}: 'plugin' must be an array."
+            )
+        previous_plugins = state.get("plugin_entries", [])
+        if not isinstance(previous_plugins, list):
+            raise click.ClickException(
+                f"Could not read Ramp Router setup state from {state_path}."
+            )
+        plugins = [
+            entry
+            for entry in plugins
+            if not _is_router_plugin_entry(client, entry, package_path)
+        ]
+        plugins.extend(previous_plugins)
+        if plugins or state.get("plugin_present") is True:
+            existing["plugin"] = plugins
+        else:
+            existing.pop("plugin", None)
+
+        providers = existing.get("provider", {})
+        if not isinstance(providers, dict):
+            raise click.ClickException(
+                f"Could not restore OpenCode config {path}: "
+                "'provider' must be an object."
+            )
+        _restore_json_value(
+            providers,
+            ROUTER_PROVIDER,
+            provider_present,
+            state.get("provider"),
+        )
+        if providers:
+            existing["provider"] = providers
+        else:
+            existing.pop("provider", None)
         if str(existing.get("model", "")).startswith(f"{ROUTER_PROVIDER}/"):
             _restore_json_value(
                 existing,
@@ -374,24 +1106,78 @@ def _unconfigure_json_client(client: str, path: Path) -> None:
                 state.get("model_present"),
                 state.get("model"),
             )
-    elif settings.get("defaultProvider") == ROUTER_PROVIDER:
+        writes = [(path, existing)]
+    else:
+        settings = _read_json_config(client, path)
+        packages = settings.get("packages", [])
+        if not isinstance(packages, list):
+            raise click.ClickException(
+                f"Could not restore Pi config {path}: 'packages' must be an array."
+            )
+        previous_packages = state.get("package_entries", [])
+        if not isinstance(previous_packages, list):
+            raise click.ClickException(
+                f"Could not read Ramp Router setup state from {state_path}."
+            )
+        packages = [
+            entry
+            for entry in packages
+            if not _is_router_plugin_entry(client, entry, package_path)
+        ]
+        packages.extend(previous_packages)
+        if packages or state.get("packages_present") is True:
+            settings["packages"] = packages
+        else:
+            settings.pop("packages", None)
+        if settings.get("defaultProvider") == ROUTER_PROVIDER:
+            _restore_json_value(
+                settings,
+                "defaultProvider",
+                state.get("default_provider_present"),
+                state.get("default_provider"),
+            )
+            _restore_json_value(
+                settings,
+                "defaultModel",
+                state.get("default_model_present"),
+                state.get("default_model"),
+            )
+
+        auth_path = path.parent / "auth.json"
+        auth = _read_json_config(client, auth_path)
         _restore_json_value(
-            settings,
-            "defaultProvider",
-            state.get("default_provider_present"),
-            state.get("default_provider"),
+            auth,
+            ROUTER_PROVIDER,
+            state.get("auth_present"),
+            state.get("auth"),
         )
+        models_path = path.parent / "models.json"
+        models_config = _read_json_config(client, models_path)
+        providers = models_config.get("providers", {})
+        if not isinstance(providers, dict):
+            raise click.ClickException(
+                f"Could not restore Pi config {models_path}: "
+                "'providers' must be an object."
+            )
         _restore_json_value(
-            settings,
-            "defaultModel",
-            state.get("default_model_present"),
-            state.get("default_model"),
+            providers,
+            ROUTER_PROVIDER,
+            provider_present,
+            state.get("provider"),
         )
+        # Keep the key even when it empties out. Pi's schema requires
+        # "providers", so dropping it leaves {} on disk, which Pi rejects
+        # wholesale: it discards the file and falls back to cached models
+        # rather than reporting a missing provider.
+        models_config["providers"] = providers
+        writes = [(path, settings), (auth_path, auth)]
+        (path.parent / PI_PLUGIN_CONFIG_FILE).unlink(missing_ok=True)
+        if models_path.exists() or provider_present:
+            writes.append((models_path, models_config))
 
     try:
-        _write_private_file(path, json.dumps(existing, indent=2) + "\n")
-        if settings is not None:
-            _write_private_file(settings_path, json.dumps(settings, indent=2) + "\n")
+        for output_path, payload in writes:
+            _write_private_file(output_path, json.dumps(payload, indent=2) + "\n")
         state_path.unlink()
     except OSError as exc:
         raise click.ClickException(
@@ -420,11 +1206,15 @@ def _read_json_config(client: str, path: Path) -> dict:
         ) from None
 
 
-def _fetch_models(api_key: str) -> list[str]:
+def _fetch_models(api_key: str, claude_code_view: bool = False) -> list[RouterModel]:
     try:
         response = httpx.get(
-            f"{ROUTER_BASE_URL}/models",
-            headers={"Authorization": f"Bearer {api_key}"},
+            f"{router_base_url()}/models",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                # Ask for the projection whose ids Claude Code will accept.
+                **({GATEWAY_CLIENT_HEADER: "claude-code"} if claude_code_view else {}),
+            },
             timeout=10,
         )
         response.raise_for_status()
@@ -449,25 +1239,72 @@ def _fetch_models(api_key: str) -> list[str]:
         raise click.ClickException(
             "Ramp Router returned an unexpected response. Please try again."
         )
-    model_ids = list(
-        dict.fromkeys(
-            model["id"].strip()
-            for model in models
-            if isinstance(model, dict)
-            and isinstance(model.get("id"), str)
-            and model["id"].strip()
+    discovered: dict[str, RouterModel] = {}
+    for model in models:
+        identifier = model.get("id", "").strip() if isinstance(model, dict) else ""
+        if not identifier:
+            # The plugins abort on a nameless entry rather than skipping it, so
+            # skipping here would let configure claim success for a list they
+            # will refuse.
+            raise click.ClickException(
+                "Ramp Router returned a model without an id. Please try again."
+            )
+        if identifier in discovered:
+            continue
+        discovered[identifier] = RouterModel(
+            id=identifier, metadata=_model_metadata(model.get("router"), identifier)
         )
-    )
-    if not model_ids:
+    if not discovered:
         raise click.ClickException("No models are available for this Ramp Router key.")
-    return model_ids
+    return list(discovered.values())
 
 
-def _configure_codex(path: Path, api_key: str, models: list[str]) -> tuple[Path, str]:
+def _codex_provider_is_out_of_date(existing: dict) -> bool:
+    """Report an existing Router block written before the client marker.
+
+    Router answers with Codex's own catalog shape only for a client that asks
+    by name. A block written before that will keep receiving the OpenAI model
+    list, which Codex ignores entirely, so its picker simply comes up empty
+    with nothing said. Rewriting the block fixes it, and saying so is what
+    tells someone why they had to.
+    """
+    providers = existing.get("model_providers")
+    if not isinstance(providers, dict):
+        return False
+    router = providers.get(ROUTER_PROVIDER)
+    if not isinstance(router, dict):
+        return False
+    headers = router.get("http_headers")
+    stated = headers.get(GATEWAY_CLIENT_HEADER) if isinstance(headers, dict) else None
+    return stated != CODEX_CLIENT_NAME
+
+
+def _configure_codex(
+    path: Path,
+    api_key: str,
+    models: list[RouterModel],
+    *,
+    selected_model: str | None = None,
+) -> tuple[str, bool]:
+    """Point the Codex CLI at Ramp Router.
+
+    This configures the CLI and TUI. Codex inside the ChatGPT desktop app reads
+    the same file and its engine resolves our models correctly, but the app's
+    picker will not list them: the UI filters the engine's model list against a
+    server-controlled allowlist of first-party OpenAI slugs, so every Router
+    model is dropped before it is drawn. Nothing here can change that, and a
+    full restart does not help. See
+    https://github.com/openai/codex/issues/19694.
+
+    A desktop user can still reach a Router model by pinning `model` in this
+    file; the picker shows "Custom" but the correct slug is sent.
+    """
     existing, existing_data = _read_codex_config(path)
     chunks = _config_chunks(existing)
+    repaired = _codex_provider_is_out_of_date(existing_data)
 
     state_path = path.parent / "ramp-router-state.json"
+    previous_state = None
     state = None
     if not state_path.exists():
         previous_provider = [
@@ -475,6 +1312,8 @@ def _configure_codex(path: Path, api_key: str, models: list[str]) -> tuple[Path,
             for chunk in chunks
             if chunk and _OWNED_CODEX_TABLE.match(chunk[0])
         ]
+        sessions = _prepare_codex_sessions(path.parent)
+        saved_sessions = sessions
         state = (
             json.dumps(
                 {
@@ -484,21 +1323,70 @@ def _configure_codex(path: Path, api_key: str, models: list[str]) -> tuple[Path,
                         if key in existing_data
                     },
                     "provider": previous_provider,
+                    "sessions": sessions,
                 },
                 indent=2,
             )
             + "\n"
         )
+    else:
+        try:
+            previous_state = state_path.read_text(encoding="utf-8")
+            existing_state = json.loads(previous_state)
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise click.ClickException(
+                f"Could not read Ramp Router setup state from {state_path}: {exc}"
+            ) from None
+        if not isinstance(existing_state, dict):
+            raise click.ClickException(
+                f"Could not read Ramp Router setup state from {state_path}."
+            )
+        existing_sessions = existing_state.get("sessions", [])
+        if not isinstance(existing_sessions, list):
+            raise click.ClickException(
+                f"Could not read Ramp Router setup state from {state_path}."
+            )
+        sessions = _prepare_codex_sessions(path.parent)
+        saved_sessions = existing_sessions
+        if sessions or "sessions" not in existing_state:
+            existing_ids = {
+                session.get("id")
+                for session in existing_sessions
+                if isinstance(session, dict)
+            }
+            existing_state["sessions"] = [
+                *existing_sessions,
+                *(
+                    session
+                    for session in sessions
+                    if session.get("id") not in existing_ids
+                ),
+            ]
+            saved_sessions = existing_state["sessions"]
+            state = json.dumps(existing_state, indent=2) + "\n"
 
+    # Removed rather than written: Codex now fetches the list from Router on
+    # each launch, so a file here would freeze it.
     catalog_path = path.parent / "ramp-router-models.json"
-    default_model = "gpt-5.4" if "gpt-5.4" in models else models[0]
+    key_path = path.parent / "ramp-router-key"
+    instructions_path = path.parent / "ramp-router-instructions.md"
+
+    default_model = _preferred_model(models, selected_model)
+    harness_prompt = _codex_harness_prompt(default_model)
     chunks[0] = [
         _render_root_config(
             chunks[0],
+            # A None is not written, and every owned root key is stripped
+            # before these go back, so None is also how an existing one is
+            # dropped.
             {
                 "model": default_model,
                 "model_provider": "ramp-router",
-                "model_catalog_json": str(catalog_path.resolve()),
+                # Restores the harness prompt Router cannot supply. Absent when
+                # Codex is not installed to read it from.
+                "model_instructions_file": str(instructions_path.resolve())
+                if harness_prompt
+                else None,
             },
         )
     ]
@@ -508,19 +1396,20 @@ def _configure_codex(path: Path, api_key: str, models: list[str]) -> tuple[Path,
         for chunk in chunks
         if not chunk or not _OWNED_CODEX_TABLE.match(chunk[0])
     ).rstrip()
-    provider = _codex_provider(api_key)
+    provider = _codex_provider(key_path)
     updated = f"{preserved}\n\n{provider}" if preserved else provider
-    catalog = (
-        json.dumps(
-            {
-                "models": [
-                    _codex_model(model, priority)
-                    for priority, model in enumerate(models)
-                ]
-            },
-            indent=2,
-        )
-        + "\n"
+
+    # Kept so a failure can put the file back. Without it the undo below
+    # deletes the key this config points at and leaves Codex configured for a
+    # provider it can no longer authenticate to.
+    previous_config = path.read_text() if path.exists() else None
+    # Read alongside the config so a failure can put back exactly what was
+    # here. On a repeat configure these already exist and the restored config
+    # still points at them, so deleting them would leave a setup that worked a
+    # moment ago unable to authenticate.
+    previous_key = key_path.read_text() if key_path.exists() else None
+    previous_instructions = (
+        instructions_path.read_text() if instructions_path.exists() else None
     )
 
     try:
@@ -528,13 +1417,238 @@ def _configure_codex(path: Path, api_key: str, models: list[str]) -> tuple[Path,
         path.parent.mkdir(parents=True, exist_ok=True)
         if state is not None:
             _write_private_file(state_path, state)
-        _write_private_file(catalog_path, catalog)
+        # Written before the session rewrite because this is the write that
+        # fails on a full or read-only disk. Succeeding here means a partial
+        # failure afterwards still leaves a usable configuration.
         _write_private_file(path, updated)
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+        _write_private_file(key_path, api_key)
+        if harness_prompt:
+            _write_private_file(instructions_path, harness_prompt)
+        else:
+            instructions_path.unlink(missing_ok=True)
+        _sync_codex_sessions(path.parent, saved_sessions)
+        _update_codex_session_index(path.parent, saved_sessions, restore=False)
+        # A catalog written by an earlier version would keep overriding
+        # discovery, so it goes only after every fallible update succeeds.
+        catalog_path.unlink(missing_ok=True)
+    except (OSError, tomllib.TOMLDecodeError, click.ClickException) as exc:
+        # Only sessions discovered by this invocation can have changed here.
+        # Restoring the cumulative receipt would retag sessions that belonged
+        # to the previously working Router setup.
+        try:
+            _restore_codex_sessions(path.parent, sessions)
+        except (OSError, click.ClickException):
+            # Already failing; a failed undo must not replace the real cause.
+            pass
+        _restore_private_file(path, previous_config)
+        _restore_private_file(key_path, previous_key)
+        _restore_private_file(instructions_path, previous_instructions)
+        _restore_private_file(state_path, previous_state)
+        message = exc.message if isinstance(exc, click.ClickException) else str(exc)
         raise click.ClickException(
-            f"Could not write Codex config {path}: {exc}"
+            f"Could not write Codex config {path}: {message}"
         ) from None
-    return catalog_path, default_model
+    return default_model, repaired
+
+
+def _restore_private_file(path: Path, previous: str | None) -> None:
+    """Put a file back as it was, or remove one this run created."""
+    try:
+        if previous is None:
+            path.unlink(missing_ok=True)
+        else:
+            _write_private_file(path, previous)
+    except OSError:
+        # Already failing; a failed undo must not replace the real cause.
+        pass
+
+
+def _prepare_codex_sessions(home: Path) -> list[dict]:
+    # Codex hides sessions whose provider differs from the active provider.
+    # See https://github.com/openai/codex/issues/15494.
+    sessions = []
+    sessions_dir = home / "sessions"
+    session_paths = []
+    if sessions_dir.is_dir():
+        session_paths = sorted(
+            path
+            for path in sessions_dir.rglob("*")
+            if path.name.endswith((".jsonl", ".jsonl.zst"))
+        )
+    for session_path in session_paths:
+        if session_path.is_symlink() or not session_path.is_file():
+            continue
+        try:
+            item = _read_codex_session_meta(session_path)
+        except (OSError, UnicodeError, zstandard.ZstdError):
+            continue
+        if item is None:
+            continue
+        payload = item["payload"]
+        item_session_id = payload.get("id")
+        provider = payload.get("model_provider")
+        if (
+            not isinstance(item_session_id, str)
+            or (provider is not None and not isinstance(provider, str))
+            or provider == ROUTER_PROVIDER
+        ):
+            continue
+        sessions.append(
+            {
+                "path": str(session_path.relative_to(home)),
+                "id": item_session_id,
+                "transcript_updated": True,
+                "had_model_provider": "model_provider" in payload,
+                "model_provider": provider,
+            }
+        )
+
+    _record_codex_index_providers(home, sessions)
+    return sessions
+
+
+def _record_codex_index_providers(home: Path, sessions: list[dict]) -> None:
+    database_path = home / "state_5.sqlite"
+    if not database_path.is_file():
+        return
+    try:
+        with sqlite3.connect(database_path, timeout=1) as database:
+            columns = {
+                row[1]
+                for row in database.execute("PRAGMA table_info(threads)").fetchall()
+            }
+            if not {"id", "model_provider"}.issubset(columns):
+                return
+            sessions_by_id: dict[str, list[dict]] = {}
+            for session in sessions:
+                sessions_by_id.setdefault(session["id"], []).append(session)
+            has_rollout_path = "rollout_path" in columns
+            selected_columns = (
+                "id, model_provider, rollout_path"
+                if has_rollout_path
+                else "id, model_provider"
+            )
+            for row in database.execute(f"SELECT {selected_columns} FROM threads"):
+                session_id, provider, *rollout_path = row
+                transcript_sessions = sessions_by_id.get(session_id)
+                if transcript_sessions:
+                    for session in transcript_sessions:
+                        session["index_model_provider"] = provider
+                    continue
+                if (
+                    not has_rollout_path
+                    or provider is None
+                    or provider == ROUTER_PROVIDER
+                ):
+                    continue
+                try:
+                    relative_path = (
+                        Path(rollout_path[0]).resolve().relative_to(home.resolve())
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if not relative_path.parts or relative_path.parts[0] != "sessions":
+                    continue
+                session = {
+                    "path": str(relative_path),
+                    "id": session_id,
+                    "transcript_updated": False,
+                    "index_model_provider": provider,
+                }
+                sessions.append(session)
+                sessions_by_id[session_id] = [session]
+    except sqlite3.Error as exc:
+        raise click.ClickException(
+            f"Could not read Codex session index {database_path}: {exc}"
+        ) from None
+
+
+def _update_codex_session_index(
+    home: Path, sessions: list[dict], *, restore: bool
+) -> None:
+    database_path = home / "state_5.sqlite"
+    if not database_path.is_file() or not sessions:
+        return
+    try:
+        with sqlite3.connect(database_path, timeout=1) as database:
+            columns = {
+                row[1]
+                for row in database.execute("PRAGMA table_info(threads)").fetchall()
+            }
+            if not {"id", "model_provider"}.issubset(columns):
+                return
+            for session in sessions:
+                if restore:
+                    if "index_model_provider" not in session:
+                        continue
+                    provider = session["index_model_provider"]
+                    expected_provider = ROUTER_PROVIDER
+                else:
+                    provider = ROUTER_PROVIDER
+                    expected_provider = session.get(
+                        "index_model_provider", session.get("model_provider")
+                    )
+                    if expected_provider is None:
+                        continue
+                database.execute(
+                    "UPDATE threads SET model_provider = ? "
+                    "WHERE id = ? AND model_provider = ?",
+                    (provider, session["id"], expected_provider),
+                )
+    except (KeyError, TypeError, sqlite3.Error) as exc:
+        raise click.ClickException(
+            f"Could not update Codex session index {database_path}: {exc}"
+        ) from None
+
+
+def _restore_codex_sessions(home: Path, sessions: list[dict]) -> None:
+    for session in sessions:
+        if not session.get("transcript_updated", True):
+            continue
+        try:
+            had_provider = session["had_model_provider"]
+            provider = session.get("model_provider")
+        except (KeyError, TypeError):
+            raise click.ClickException(
+                "Codex session setup state is invalid."
+            ) from None
+        _rewrite_codex_session_provider(
+            home,
+            session,
+            expected_provider=ROUTER_PROVIDER,
+            provider_present=had_provider,
+            provider=provider,
+        )
+    _update_codex_session_index(home, sessions, restore=True)
+
+
+def _sync_codex_sessions(home: Path, sessions: list[dict]) -> None:
+    for session in sessions:
+        if not session.get("transcript_updated", True):
+            continue
+        try:
+            expected_provider = session.get("model_provider")
+            provider_present = session["had_model_provider"]
+        except (KeyError, TypeError):
+            raise click.ClickException(
+                "Codex session setup state is invalid."
+            ) from None
+        _rewrite_codex_session_provider(
+            home,
+            session,
+            expected_provider=expected_provider,
+            expected_present=provider_present,
+            provider_present=True,
+            provider=ROUTER_PROVIDER,
+        )
+
+
+def _rollback_codex_sessions(home: Path, sessions: list[dict]) -> None:
+    try:
+        _sync_codex_sessions(home, sessions)
+        _update_codex_session_index(home, sessions, restore=False)
+    except (OSError, click.ClickException):
+        pass
 
 
 def _read_codex_config(path: Path) -> tuple[str, dict]:
@@ -561,38 +1675,17 @@ def _render_root_config(lines: list[str], values: dict) -> str:
     root = "".join(line for line in lines if not _OWNED_CODEX_ROOT_KEY.match(line))
     root = root.rstrip()
     settings = "\n".join(
-        f"{key} = {json.dumps(value)}" for key, value in values.items()
+        # A None would render as the JSON null, which is not valid TOML and
+        # would leave Codex unable to read its own config at all.
+        f"{key} = {json.dumps(value)}"
+        for key, value in values.items()
+        if value is not None
     )
     if root and settings:
         return f"{root}\n{settings}\n"
     if settings:
         return f"{settings}\n"
     return f"{root}\n" if root else ""
-
-
-def _codex_model(model: str, priority: int) -> dict:
-    return {
-        "slug": model,
-        "display_name": model,
-        "description": "Available through Ramp Router",
-        "supported_reasoning_levels": [],
-        "shell_type": "shell_command",
-        "visibility": "list",
-        "supported_in_api": True,
-        "priority": priority,
-        "base_instructions": (
-            "You are a coding agent. Follow the user's instructions and use the "
-            "available tools to complete tasks."
-        ),
-        "supports_reasoning_summary_parameter": False,
-        "supports_reasoning_summaries": False,
-        "default_reasoning_summary": "none",
-        "support_verbosity": False,
-        "truncation_policy": {"mode": "bytes", "limit": 10000},
-        "supports_parallel_tool_calls": True,
-        "experimental_supported_tools": [],
-        "input_modalities": ["text", "image"],
-    }
 
 
 def _write_private_file(path: Path, content: str) -> None:
@@ -610,3 +1703,156 @@ def _write_private_file(path: Path, content: str) -> None:
         except OSError:
             pass
         raise
+
+
+@contextmanager
+def _open_codex_session(path: Path):
+    if path.suffix != ".zst":
+        with path.open(encoding="utf-8") as session:
+            yield session
+        return
+    with path.open("rb") as compressed:
+        with zstandard.ZstdDecompressor().stream_reader(compressed) as reader:
+            with io.TextIOWrapper(reader, encoding="utf-8") as text:
+                yield text
+
+
+def _read_codex_session_meta(path: Path) -> dict | None:
+    with _open_codex_session(path) as session:
+        for line in session:
+            try:
+                item = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(item, dict):
+                continue
+            payload = item.get("payload")
+            if item.get("type") == "session_meta" and isinstance(payload, dict):
+                return item
+    return None
+
+
+def _session_path(home: Path, session: dict) -> Path:
+    try:
+        path = home / Path(session["path"])
+        path.resolve().relative_to(home.resolve())
+    except (KeyError, TypeError, ValueError):
+        raise click.ClickException("Codex session setup state is invalid.") from None
+    return path
+
+
+def _rewrite_codex_session_provider(
+    home: Path,
+    session: dict,
+    *,
+    expected_provider: str | None,
+    provider_present: bool,
+    provider: str | None,
+    expected_present: bool = True,
+) -> None:
+    path = _session_path(home, session)
+    if not path.is_file() or path.is_symlink():
+        return
+    try:
+        meta = _read_codex_session_meta(path)
+    except (OSError, UnicodeError, zstandard.ZstdError) as exc:
+        raise click.ClickException(
+            f"Could not read Codex session {path}: {exc}"
+        ) from None
+    if meta is None or meta["payload"].get("id") != session.get("id"):
+        return
+    payload = meta["payload"]
+    current_present = "model_provider" in payload
+    current_provider = payload.get("model_provider")
+    if current_present == provider_present and current_provider == provider:
+        return
+    if current_present != expected_present or current_provider != expected_provider:
+        return
+
+    original = path.stat()
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with _open_codex_session(path) as source:
+            if path.suffix == ".zst":
+                with os.fdopen(fd, "wb") as raw_output:
+                    with zstandard.ZstdCompressor(level=3).stream_writer(
+                        raw_output, closefd=False
+                    ) as output:
+                        _copy_codex_session(
+                            source,
+                            output.write,
+                            session["id"],
+                            provider_present,
+                            provider,
+                            encode=True,
+                        )
+                    raw_output.flush()
+                    os.fsync(raw_output.fileno())
+            else:
+                with os.fdopen(fd, "w", encoding="utf-8") as output:
+                    _copy_codex_session(
+                        source,
+                        output.write,
+                        session["id"],
+                        provider_present,
+                        provider,
+                    )
+                    output.flush()
+                    os.fsync(output.fileno())
+        os.chmod(tmp_name, 0o600)
+        current = path.stat()
+        if (
+            current.st_dev,
+            current.st_ino,
+            current.st_size,
+            current.st_mtime_ns,
+        ) != (
+            original.st_dev,
+            original.st_ino,
+            original.st_size,
+            original.st_mtime_ns,
+        ):
+            raise click.ClickException(
+                f"Codex session changed while updating {path}. Close Codex and try again."
+            )
+        os.replace(tmp_name, path)
+        os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _copy_codex_session(
+    source,
+    write,
+    session_id: str,
+    provider_present: bool,
+    provider: str | None,
+    *,
+    encode: bool = False,
+) -> None:
+    replaced = False
+    for line in source:
+        rendered = line
+        if not replaced:
+            try:
+                item = json.loads(line)
+            except (ValueError, TypeError):
+                item = None
+            payload = item.get("payload") if isinstance(item, dict) else None
+            if (
+                isinstance(payload, dict)
+                and item.get("type") == "session_meta"
+                and payload.get("id") == session_id
+            ):
+                if provider_present:
+                    payload["model_provider"] = provider
+                else:
+                    payload.pop("model_provider", None)
+                newline = "\n" if line.endswith("\n") else ""
+                rendered = json.dumps(item, separators=(",", ":")) + newline
+                replaced = True
+        write(rendered.encode("utf-8") if encode else rendered)

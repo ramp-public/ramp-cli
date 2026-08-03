@@ -30,6 +30,13 @@
 
 ### Via `ramp` CLI (recommended)
 
+The CLI downloads the latest verified catalog from
+[`ramp-public/skills`](https://github.com/ramp-public/skills) and installs each
+skill with a `ramp-` prefix (for example, `browser-automation` is installed as
+`ramp-browser-automation`) so its ownership is clear alongside skills from
+other providers. The last verified catalog remains available locally until a
+new release is downloaded.
+
 ```bash
 # Install one skill into the detected agent directory
 ramp skills install browser-automation
@@ -41,17 +48,41 @@ ramp skills install --all
 ramp skills install --all --target ~/.cursor/skills
 ```
 
+Reinstalling a Ramp-managed `ramp-*` directory refreshes its CLI-owned
+`SKILL.md`; other files remain until uninstall removes the managed directory.
+To customize a skill, copy it under a different name; the CLI never writes into
+an unreceipted directory.
+
+## Remote release contract
+
+[`ramp-public/skills`](https://github.com/ramp-public/skills) is the source of
+truth for new skill content. Its independent GitHub Releases must publish these
+two assets:
+
+- `ramp-skills.tar.gz`, containing `skills/ramp-<name>/SKILL.md` entries
+- `ramp-skills.tar.gz.sha256`, containing the archive's SHA-256 digest
+
+Release tags must contain only letters, digits, `.`, `_`, and `-`. The CLI
+discovers the default release through GitHub's `releases/latest` API; callers
+can pin an immutable release with `ramp skills update --version <tag>` or
+`RAMP_SKILLS_VERSION=<tag>`. Downloads must match both GitHub's immutable
+release-asset digest and the published checksum sidecar before extraction. If
+no verified catalog is cached, a skills command downloads the latest release;
+interactive installs offer newer releases when a catalog is already active.
+The legacy CLI names `apply-to-ramp` and `incorporate-with-ramp` continue to map
+to their renamed public skills for backwards compatibility.
+
 ### Via npx
 
 ```bash
 # Install one skill (project-level)
-npx skills add ramp-developers/agent-skills --skill receipt-compliance
+npx skills add ramp-public/skills --skill ramp-receipt-compliance
 
 # Install all skills globally
-npx skills add -g ramp-developers/agent-skills
+npx skills add -g ramp-public/skills
 ```
 
-Or copy the skill folder into `.claude/skills/` (Claude Code), `.cursor/skills/` (Cursor), or your agent's skill directory.
+Or copy the skill folder into `.claude/skills/` (Claude Code), `.codex/skills/` (Codex), `.cursor/skills/` (Cursor), or your agent's skill directory.
 
 ## Prerequisites
 
@@ -99,7 +130,9 @@ Always pass `--rationale` (or include `"rationale"` in the `--json` body) on eve
 
 Skills are instruction files that load on demand. The agent reads the SKILL.md, runs CLI commands via shell, and interprets the results. No MCP server, no tool schemas, no running processes.
 
-The core `ramp` skill (bundled with the CLI) covers general commands. These workflow skills layer on top — teaching the agent how to combine commands into action-oriented workflows.
+The core `ramp` skill covers general commands. These workflow skills layer on
+top — teaching the agent how to combine commands into action-oriented
+workflows.
 
 ## Build your own
 

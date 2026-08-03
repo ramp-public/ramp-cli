@@ -1,0 +1,46 @@
+{
+  "name": "@ramp/router-pi-provider",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Native Pi provider for Ramp Router",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test",
+    "verify": "npm run typecheck && npm run test"
+  },
+  "keywords": [
+    "pi-package",
+    "ramp-router",
+    "llm",
+    "provider",
+    "openai-responses"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.81.1",
+    "@earendil-works/pi-coding-agent": "0.81.1",
+    "@types/node": "^24.0.0",
+    "typescript": "^6.0.0"
+  }
+}

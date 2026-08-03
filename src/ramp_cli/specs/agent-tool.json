@@ -11420,7 +11420,7 @@
             "nullable": true,
             "type": "string",
             "x-enum-descriptions": {
-              "doola": "Doola is the incorporation provider backing this action"
+              "doola": "doola is the incorporation provider backing this action"
             }
           },
           "reason": {

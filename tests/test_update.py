@@ -50,6 +50,47 @@ class TestUpdateAvailable:
         cmd = mock_run.call_args[0][0]
         assert "agents.ramp.com/install.sh" in cmd[-1]
 
+    @patch(
+        "ramp_cli.commands.update.configured_router_clients",
+        return_value=("opencode",),
+    )
+    @patch("ramp_cli.commands.update._is_homebrew_install", return_value=False)
+    @patch("ramp_cli.commands.update.subprocess.run")
+    @patch("ramp_cli.commands.update.shutil.which", return_value="/usr/bin/curl")
+    @patch("ramp_cli.commands.update.latest_version", return_value="0.2.0")
+    @patch("ramp_cli.commands.update.__version__", "0.1.3")
+    def test_router_update_refreshes_only_configured_agents(
+        self,
+        mock_latest,
+        mock_which,
+        mock_run,
+        mock_brew,
+        mock_configured,
+        isolated_config,
+    ):
+        mock_which.side_effect = lambda command: {
+            "curl": "/usr/bin/curl",
+            "ramp": "/usr/local/bin/ramp",
+        }[command]
+        mock_run.side_effect = [
+            MagicMock(returncode=0),
+            MagicMock(returncode=0),
+        ]
+
+        result = _invoke(["update"])
+
+        assert result.exit_code == 0
+        assert "configured agents only: OpenCode" in result.output
+        assert mock_run.call_count == 2
+        install_command = mock_run.call_args_list[0].args[0][-1]
+        assert install_command.endswith("| sh -s -- --no-skills")
+        assert "--router" not in install_command
+        assert mock_run.call_args_list[1].args[0] == [
+            "/usr/local/bin/ramp",
+            "router",
+            "refresh",
+        ]
+
     @patch("ramp_cli.commands.update._is_homebrew_install", return_value=False)
     @patch("ramp_cli.commands.update.subprocess.run")
     @patch("ramp_cli.commands.update.shutil.which", return_value="/usr/bin/curl")
@@ -77,6 +118,21 @@ class TestUpdateHomebrew:
         assert "Homebrew" in result.output
         assert "brew upgrade ramp-cli" in result.output
         mock_run.assert_not_called()
+
+    @patch(
+        "ramp_cli.commands.update.configured_router_clients",
+        return_value=("pi",),
+    )
+    @patch("ramp_cli.commands.update._is_homebrew_install", return_value=True)
+    @patch("ramp_cli.commands.update.latest_version", return_value="0.2.0")
+    @patch("ramp_cli.commands.update.__version__", "0.1.3")
+    def test_homebrew_update_refreshes_only_existing_router_configurations(
+        self, mock_latest, mock_brew, mock_configured, isolated_config
+    ):
+        result = _invoke(["update"])
+
+        assert result.exit_code == 0
+        assert "brew upgrade ramp-cli && ramp router refresh" in result.output
 
     @patch("ramp_cli.commands.update.sys")
     def test_detects_apple_silicon_homebrew_path(self, mock_sys):

@@ -1,9 +1,4 @@
-"""Skill discovery — locate and parse bundled SKILL.md files.
-
-Skills are bundled inside this package directory.  Each subdirectory that
-contains a SKILL.md is a skill.  The path is resolved via __file__ so it
-works in both editable and installed (wheel) builds.
-"""
+"""Skill discovery for the verified ramp-public/skills catalog."""
 
 from __future__ import annotations
 
@@ -17,9 +12,22 @@ from pathlib import Path
 import tomli_w
 
 from ramp_cli.config.settings import config_dir
-from ramp_cli.specs import SKILLS_DIR
+from ramp_cli.skills.remote import active_skills_dir
 
-AGENT_SKILL_DIRS = [".claude/skills", ".cursor/skills", ".windsurf/skills"]
+AGENT_SKILL_DIRS = [
+    ".claude/skills",
+    ".codex/skills",
+    ".cursor/skills",
+    ".windsurf/skills",
+]
+INSTALLED_SKILL_PREFIX = "ramp-"
+_CLI_TO_REMOTE_SKILL_NAMES = {
+    "apply-to-ramp": "apply-for-account",
+    "incorporate-with-ramp": "incorporate",
+}
+_REMOTE_TO_CLI_SKILL_NAMES = {
+    remote: cli for cli, remote in _CLI_TO_REMOTE_SKILL_NAMES.items()
+}
 
 
 def _parse_frontmatter(text: str) -> dict[str, str]:
@@ -63,20 +71,31 @@ def _parse_frontmatter(text: str) -> dict[str, str]:
 
 def skill_names() -> list[str]:
     """Return sorted list of skill directory names that contain a SKILL.md."""
-    if not SKILLS_DIR.is_dir():
+    root = active_skills_dir()
+    if root is None:
         return []
     return sorted(
-        d.name
-        for d in SKILLS_DIR.iterdir()
+        _REMOTE_TO_CLI_SKILL_NAMES.get(d.name, d.name)
+        for d in root.iterdir()
         if d.is_dir() and (d / "SKILL.md").is_file()
     )
+
+
+def _skill_path(name: str) -> Path | None:
+    root = active_skills_dir()
+    if root is None:
+        return None
+    remote_name = _CLI_TO_REMOTE_SKILL_NAMES.get(name, name)
+    path = root / remote_name / "SKILL.md"
+    return path if path.is_file() else None
 
 
 def list_skills() -> list[dict[str, str]]:
     """Return list of {name, description} dicts for all available skills."""
     skills: list[dict[str, str]] = []
     for name in skill_names():
-        path = SKILLS_DIR / name / "SKILL.md"
+        path = _skill_path(name)
+        assert path is not None
         fm = _parse_frontmatter(path.read_text(encoding="utf-8"))
         desc = fm.get("description", "")
         # Take only the first sentence for the short description
@@ -87,8 +106,8 @@ def list_skills() -> list[dict[str, str]]:
 
 def get_skill_content(name: str) -> str | None:
     """Return full SKILL.md content for a skill, or None if not found."""
-    path = SKILLS_DIR / name / "SKILL.md"
-    if path.is_file():
+    path = _skill_path(name)
+    if path:
         return path.read_text(encoding="utf-8")
     return None
 
@@ -104,37 +123,58 @@ def detect_agent_dir() -> Path | None:
     return None
 
 
-def install_skill(name: str, target_dir: Path) -> str:
-    """Copy skills/<name>/SKILL.md into target_dir/<name>/SKILL.md.
+def installed_skill_name(name: str) -> str:
+    """Return the namespaced directory and frontmatter name for a skill."""
+    return f"{INSTALLED_SKILL_PREFIX}{name}"
 
-    If target is under a .claude/skills directory, inject user-invocable: true
-    into frontmatter if not present.
+
+def _rewrite_frontmatter_name(content: str, new_name: str) -> str:
+    """Rewrite the frontmatter ``name`` field to ``new_name``.
+
+    Only the leading frontmatter block is touched, never a ``name:`` line
+    in the body.
+    """
+    m = re.match(r"^---\s*\n(.*?\n)---", content, re.DOTALL)
+    if not m:
+        return content
+    block, changed = re.subn(
+        r"(?m)^name:\s*.*$", f"name: {new_name}", m.group(1), count=1
+    )
+    if not changed:
+        return content
+    return content[: m.start(1)] + block + content[m.end(1) :]
+
+
+def install_skill(name: str, target_dir: Path) -> str:
+    """Copy an available skill into target_dir/ramp-<name>/SKILL.md, rewriting
+    its frontmatter name to match. Callers own migration and receipts.
 
     Returns 'installed' or 'updated'.
     """
-    source = SKILLS_DIR / name / "SKILL.md"
-    if not source.is_file():
+    source = _skill_path(name)
+    if source is None:
         msg = f"Skill not found: {name}"
         raise FileNotFoundError(msg)
 
-    dest_dir = target_dir / name
+    dest_dir = target_dir / installed_skill_name(name)
     dest_file = dest_dir / "SKILL.md"
     status = "updated" if dest_file.exists() else "installed"
 
     dest_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, dest_file)
 
-    # Inject user-invocable: true for .claude/skills/ targets
+    content = _rewrite_frontmatter_name(
+        dest_file.read_text(encoding="utf-8"), installed_skill_name(name)
+    )
     needs_inject = target_dir.name == "skills" and target_dir.parent.name == ".claude"
-    if needs_inject:
-        content = dest_file.read_text(encoding="utf-8")
-        if "user-invocable:" not in content:
-            content = content.replace(
-                "\n---\n",
-                "\nuser-invocable: true\n---\n",
-                1,
-            )
-            dest_file.write_text(content, encoding="utf-8")
+    if needs_inject and "user-invocable:" not in content:
+        content = content.replace(
+            "\n---\n",
+            "\nuser-invocable: true\n---\n",
+            1,
+        )
+
+    dest_file.write_text(content, encoding="utf-8")
 
     return status
 
@@ -239,7 +279,7 @@ def _serialize_entry(entry: dict) -> dict:
 
 
 def previously_removed_skills(target_dir: Path) -> list[str]:
-    """Bundled skills that must not be reinstalled by ``install --all``.
+    """Catalog skills that must not be reinstalled by ``install --all``.
 
     Two signals protect a user's removals: a receipt whose directory no
     longer exists (the skill was deleted by hand) and an entry in the
@@ -255,16 +295,26 @@ def previously_removed_skills(target_dir: Path) -> list[str]:
         if not (target_dir / name / "SKILL.md").is_file()
     }
     protected = gone.union(entry["removed"])
-    return [name for name in skill_names() if name in protected]
+    # Either the legacy or the namespaced name protects the catalog skill.
+    return [
+        name
+        for name in skill_names()
+        if name in protected or installed_skill_name(name) in protected
+    ]
 
 
-def record_receipt(target_dir: Path, installed_name: str) -> None:
+def record_receipt(
+    target_dir: Path,
+    installed_name: str,
+    replaces: str | None = None,
+) -> None:
     """Record one successfully installed child directory in ``target_dir``.
 
     The target plus ``installed_name`` is the exact path Ramp owns. Recording
     it also clears the name from the target's ``removed`` list: an explicit
-    install restores a previously removed skill. Write failures propagate so
-    the caller can roll back a newly created directory.
+    install restores a previously removed skill. ``replaces`` retires the
+    legacy name's receipt and tombstone in the same write. Write failures
+    propagate so the caller can roll back a newly created directory.
     """
     if not _valid_name(installed_name):
         raise ValueError(f"Invalid installed skill name: {installed_name!r}")
@@ -275,6 +325,11 @@ def record_receipt(target_dir: Path, installed_name: str) -> None:
         entry["skills"].append(installed_name)
     if installed_name in entry["removed"]:
         entry["removed"].remove(installed_name)
+    if replaces and replaces != installed_name:
+        if replaces in entry["skills"]:
+            entry["skills"].remove(replaces)
+        if replaces in entry["removed"]:
+            entry["removed"].remove(replaces)
     _write_state(state)
 
 

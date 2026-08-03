@@ -64,3 +64,37 @@ jobs:
             echo "::error::Path(__file__) found outside specs module. Use ramp_cli.specs constants instead."
             exit 1
           fi
+
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v4
+
+      - name: Build source distribution from clean checkout
+        run: uv build --sdist --out-dir sdist-house
+
+      - name: Build wheel from source distribution
+        run: uv build --wheel --out-dir wheelhouse sdist-house/*.tar.gz
+
+      - name: Verify compiled integrations are packaged
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheel = next(Path("wheelhouse").glob("*.whl"))
+          files = set(ZipFile(wheel).namelist())
+          expected = {
+              "ramp_cli/router_integrations/packages/opencode-provider/src/index.ts",
+              "ramp_cli/router_integrations/packages/pi-provider/src/index.ts",
+          }
+          missing = expected - files
+          if missing:
+              raise SystemExit(f"wheel is missing: {sorted(missing)}")
+          PY

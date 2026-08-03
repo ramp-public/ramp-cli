@@ -9,6 +9,7 @@ dependencies = [
     "json5>=0.12,<1",
     "jsonref>=1.1.0",
     "tomli-w>=1.0.0",
+    "zstandard>=0.23,<1",
 ]
 dynamic = ["version"]
 
@@ -24,7 +25,26 @@ path = "src/ramp_cli/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ramp_cli"]
-artifacts = ["src/ramp_cli/specs/*.json", "src/ramp_cli/skills/*/SKILL.md"]
+artifacts = [
+    "src/ramp_cli/specs/*.json",
+    "src/ramp_cli/skills/*/SKILL.md",
+]
+exclude = [
+    "/src/ramp_cli/router_integrations/packages/*/dist/*",
+    "/src/ramp_cli/router_integrations/packages/*/package.json",
+]
+
+[tool.hatch.build.targets.wheel.force-include]
+# The TypeScript sources are regular package data. Re-add only the manifests
+# excluded above so Hatch never writes the same source path twice.
+"src/ramp_cli/router_integrations/packages/opencode-provider/package.json" = "ramp_cli/router_integrations/packages/opencode-provider/package.json"
+"src/ramp_cli/router_integrations/packages/pi-provider/package.json" = "ramp_cli/router_integrations/packages/pi-provider/package.json"
+
+[tool.hatch.build.targets.sdist.force-include]
+"src/ramp_cli/router_integrations/packages/opencode-provider/src" = "src/ramp_cli/router_integrations/packages/opencode-provider/src"
+"src/ramp_cli/router_integrations/packages/opencode-provider/package.json" = "src/ramp_cli/router_integrations/packages/opencode-provider/package.json"
+"src/ramp_cli/router_integrations/packages/pi-provider/src" = "src/ramp_cli/router_integrations/packages/pi-provider/src"
+"src/ramp_cli/router_integrations/packages/pi-provider/package.json" = "src/ramp_cli/router_integrations/packages/pi-provider/package.json"
 
 [dependency-groups]
 dev = [
