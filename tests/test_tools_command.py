@@ -251,6 +251,14 @@ class TestToolsListAvailability:
             http_method="POST",
             category="transactions",
         ),
+        ToolDef(
+            name="get-bills",
+            description="List bills",
+            summary="List bills",
+            path="/developer/v1/agent-tools/get-bills",
+            http_method="POST",
+            category="bills",
+        ),
     ]
 
     @staticmethod
@@ -263,6 +271,11 @@ class TestToolsListAvailability:
                     available=False,
                     unavailable_reasons=("missing_scopes",),
                     missing_scopes=("transactions:read",),
+                ),
+                ("get-bills", "POST"): ToolAvailability(
+                    available=False,
+                    unavailable_reasons=("missing_scopes", "disabled_for_business"),
+                    missing_scopes=("bills:read",),
                 ),
             },
         )
@@ -278,10 +291,11 @@ class TestToolsListAvailability:
             "ramp_cli.commands.tools.fetch_availability", lambda env: snapshot
         )
 
-    def test_json_includes_availability_fields(self, monkeypatch, runner):
+    @pytest.mark.parametrize("format_args", [["--agent"], ["--output", "json"]])
+    def test_json_includes_availability_fields(self, monkeypatch, runner, format_args):
         self._setup(monkeypatch, self._snapshot())
 
-        result = runner.invoke(cli, ["--agent", "tools", "list"])
+        result = runner.invoke(cli, [*format_args, "tools", "list"])
 
         assert result.exit_code == 0
         payload = json.loads(result.output)
@@ -292,6 +306,7 @@ class TestToolsListAvailability:
         assert records["get-transactions"]["available"] is False
         assert records["get-transactions"]["unavailable_reasons"] == ["missing_scopes"]
         assert records["get-transactions"]["missing_scopes"] == ["transactions:read"]
+        assert "get-bills" not in records
 
     def test_json_without_availability_matches_current_shape(self, monkeypatch, runner):
         self._setup(monkeypatch, None)
@@ -301,10 +316,17 @@ class TestToolsListAvailability:
         assert result.exit_code == 0
         payload = json.loads(result.output)
         assert "availability" not in payload
+        assert {record["name"] for record in payload["data"]} == {
+            "get-funds",
+            "get-transactions",
+            "get-bills",
+        }
         for record in payload["data"]:
             assert set(record) == {"name", "category", "description"}
 
-    def test_human_annotates_unavailable_tools(self, monkeypatch, runner):
+    def test_human_annotates_unavailable_and_filters_business_disabled_tools(
+        self, monkeypatch, runner
+    ):
         self._setup(monkeypatch, self._snapshot())
 
         result = runner.invoke(cli, ["--human", "tools", "list"])
@@ -313,6 +335,9 @@ class TestToolsListAvailability:
         # The box formatter may wrap the annotation, so assert on whole tokens.
         assert "[unavailable:" in result.output
         assert "transactions:read]" in result.output
+        assert "get-transactions" in result.output
+        assert "get-bills" not in result.output
+        assert "2 tools across 2 categories" in result.output
 
 
 class TestToolsGroup:

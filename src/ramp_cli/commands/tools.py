@@ -59,12 +59,18 @@ def tools_list(ctx: click.Context) -> None:
     # Best-effort effective-availability overlay; None preserves current output.
     snapshot = fetch_availability(env)
 
+    def _is_business_disabled(tool) -> bool:
+        entry = snapshot.lookup(tool) if snapshot else None
+        return bool(entry and "disabled_for_business" in entry.unavailable_reasons)
+
     if fmt == "json":
         records = []
         for cat, tools in sorted(categories.items()):
             for name, tool in resolve_tool_command_names(
                 cat, tools, granted_scopes=granted_scopes
             ):
+                if _is_business_disabled(tool):
+                    continue
                 record = {
                     "name": name,
                     "category": cat,
@@ -104,20 +110,25 @@ def tools_list(ctx: click.Context) -> None:
     try:
         formatter = BoxHelpFormatter()
         total = 0
+        visible_categories = 0
         for cat, tools in sorted(categories.items()):
             dl_rows = [
                 _annotate(name, tool)
                 for name, tool in resolve_tool_command_names(
                     cat, tools, granted_scopes=granted_scopes
                 )
+                if not _is_business_disabled(tool)
             ]
+            if not dl_rows:
+                continue
             total += len(dl_rows)
+            visible_categories += 1
             with formatter.section(cat.replace("_", " ").title()):
                 formatter.write_dl(dl_rows)
         click.echo(formatter.getvalue(), nl=False)
     finally:
         BoxHelpFormatter._suppress_wave = False
-    click.echo(f"\n  {total} tools across {len(categories)} categories")
+    click.echo(f"\n  {total} tools across {visible_categories} categories")
 
 
 @tools_group.command("schema", help="Show a generated tool's request schema")

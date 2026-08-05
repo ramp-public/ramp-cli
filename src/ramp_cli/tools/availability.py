@@ -3,9 +3,10 @@
 Core's ``GET /developer/v1/agent-tools/availability`` endpoint collapses each
 tool's rollout flag, required OAuth scopes, platform allowlist, and
 authorization level into a per-tool answer for the calling token.  The CLI
-uses it to *decorate* the spec-derived tool catalog — it never adds, hides,
-or blocks tools.  ``available: true`` means the call would be admitted, not
-that it is guaranteed to succeed.
+uses it to decorate the spec-derived tool catalog and hide tools disabled by a
+business feature flag from listings. It never blocks direct invocation.
+``available: true`` means the call would be admitted, not that it is guaranteed
+to succeed.
 
 Every failure path returns ``None`` (fail-open): unauthenticated, offline,
 endpoint gated off, or malformed responses all leave the CLI behaving as if

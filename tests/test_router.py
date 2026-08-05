@@ -48,6 +48,10 @@ def _mock_models(
     ]
 
     def get(url, *, headers, timeout):
+        if url.endswith("/claude-code-statusline"):
+            # The status line asset has its own tests in test_claude_code.py;
+            # here it is simply unavailable, so configure skips it.
+            return httpx.Response(404, request=httpx.Request("GET", url))
         assert url == f"{base_url}/models"
         assert headers["Authorization"] == f"Bearer {key}"
         assert set(headers) <= {"Authorization", "X-Gateway-Client"}
@@ -269,7 +273,9 @@ def test_configure_claude_fetches_only_its_model_projection(tmp_path, monkeypatc
     )
 
     assert configured.exit_code == 0, configured.output
-    assert requests == [
+    # The status line download shares the mocked transport; only the
+    # authenticated model fetch matters here.
+    assert [headers for headers in requests if "Authorization" in headers] == [
         {
             "Authorization": "Bearer router-secret",
             "X-Gateway-Client": "claude-code",
@@ -1379,6 +1385,10 @@ def test_configure_and_unconfigure_without_client_targets_everything(
     assert configure.exit_code == 0
     assert configure.output.splitlines() == [
         "Connecting Ramp Router to your coding agents",
+        # _mock_models serves no status line asset, so configure says why the
+        # extra was skipped without failing anything.
+        "Skipping the Claude Code Router status line: it could not be "
+        "downloaded from https://router.ramp.com/claude-code-statusline.",
         "Connected to: Claude Code, Codex, OpenCode, and Pi",
         "1 model added. Start an agent and pick a model.",
         "Run 'ramp router unconfigure' to restore the previous settings.",

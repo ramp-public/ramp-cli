@@ -353,3 +353,332 @@ def test_a_gateway_pointed_elsewhere_since_is_left_alone(tmp_path):
     restored = claude_code.plan_restoration(moved, path, state)
 
     assert restored["env"]["ANTHROPIC_BASE_URL"] == "https://elsewhere"
+
+
+_STATUSLINE_SCRIPT = "#!/usr/bin/env python3\nprint('router statusline')\n"
+
+
+def _mock_router_endpoints(monkeypatch, script=_STATUSLINE_SCRIPT):
+    """Serve both the model list and the status line asset."""
+    models = [
+        {
+            "id": "gpt-5.4",
+            "owned_by": "openai",
+            "router": _router_metadata("gpt-5.4"),
+        }
+    ]
+    urls = []
+
+    def get(url, *, headers, timeout):
+        urls.append(url)
+        request = httpx.Request("GET", url)
+        if url.endswith("/claude-code-statusline"):
+            if script is None:
+                raise httpx.ConnectError("unreachable", request=request)
+            return httpx.Response(200, text=script, request=request)
+        return httpx.Response(200, json={"data": models}, request=request)
+
+    monkeypatch.setattr(router_module.httpx, "get", get)
+    return urls
+
+
+def test_configure_installs_the_status_line(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    urls = _mock_router_endpoints(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "claude-code", "--api-key", "secret"]
+    )
+
+    assert result.exit_code == 0, result.output
+    # Served by the dashboard origin, not the data plane the gateway URL names.
+    assert "https://router.ramp.com/claude-code-statusline" in urls
+    script = tmp_path / "ramp-router-statusline"
+    assert script.read_text() == _STATUSLINE_SCRIPT
+    assert script.stat().st_mode & stat.S_IXUSR
+    settings = json.loads((tmp_path / "settings.json").read_text())
+    assert settings["statusLine"] == {
+        "type": "command",
+        "command": claude_code.statusline_command(tmp_path / "settings.json"),
+    }
+    # The script's ANTHROPIC_BASE_URL fallback points at the data plane, which
+    # does not serve the session-usage endpoint, so the control-plane origin
+    # has to be written explicitly.
+    assert settings["env"]["ROUTER_BASE_URL"] == "https://router.ramp.com"
+
+
+def test_a_status_line_the_user_configured_is_left_alone(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    _mock_router_endpoints(monkeypatch)
+    theirs = {"type": "command", "command": "/home/me/my-statusline.sh"}
+    settings_path = tmp_path / "settings.json"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps({"statusLine": theirs}))
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "claude-code", "--api-key", "secret"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(settings_path.read_text())["statusLine"] == theirs
+
+
+def test_a_repeat_configure_refreshes_the_status_line(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    runner = CliRunner()
+    _mock_router_endpoints(monkeypatch)
+    first = runner.invoke(
+        cli, ["--human", "router", "configure", "claude-code", "--api-key", "secret"]
+    )
+    assert first.exit_code == 0, first.output
+
+    fixed = "#!/usr/bin/env python3\nprint('fixed')\n"
+    _mock_router_endpoints(monkeypatch, script=fixed)
+    second = runner.invoke(
+        cli, ["--human", "router", "configure", "claude-code", "--api-key", "secret"]
+    )
+
+    assert second.exit_code == 0, second.output
+    assert (tmp_path / "ramp-router-statusline").read_text() == fixed
+    # Still wired: our own entry is ours to rewrite.
+    settings = json.loads((tmp_path / "settings.json").read_text())
+    assert settings["statusLine"]["command"] == claude_code.statusline_command(
+        tmp_path / "settings.json"
+    )
+
+
+def test_a_failed_status_line_download_does_not_fail_configure(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    _mock_router_endpoints(monkeypatch, script=None)
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "claude-code", "--api-key", "secret"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Skipping the Claude Code Router status line" in result.output
+    assert not (tmp_path / "ramp-router-statusline").exists()
+    settings = json.loads((tmp_path / "settings.json").read_text())
+    assert "statusLine" not in settings
+    # The gateway configuration itself still went through.
+    assert settings["env"]["ANTHROPIC_AUTH_TOKEN"] == "secret"
+
+
+def test_a_block_page_is_not_installed_as_the_status_line(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    _mock_router_endpoints(monkeypatch, script="<html>blocked</html>")
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "claude-code", "--api-key", "secret"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert not (tmp_path / "ramp-router-statusline").exists()
+    assert "statusLine" not in json.loads((tmp_path / "settings.json").read_text())
+
+
+def test_a_missing_python3_skips_the_status_line(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    _mock_router_endpoints(monkeypatch)
+    monkeypatch.setattr(router_module.shutil, "which", lambda name: None)
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "claude-code", "--api-key", "secret"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "python3 was not found" in result.output
+    assert not (tmp_path / "ramp-router-statusline").exists()
+
+
+def test_unconfigure_removes_the_status_line(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    _mock_router_endpoints(monkeypatch)
+    runner = CliRunner()
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "claude-code", "--api-key", "secret"]
+    )
+    assert configured.exit_code == 0, configured.output
+
+    result = runner.invoke(cli, ["--human", "router", "unconfigure", "claude-code"])
+
+    assert result.exit_code == 0, result.output
+    assert not (tmp_path / "ramp-router-statusline").exists()
+    settings = json.loads((tmp_path / "settings.json").read_text())
+    assert "statusLine" not in settings
+    assert "ROUTER_BASE_URL" not in settings.get("env", {})
+
+
+def test_a_status_line_changed_since_is_left_by_unconfigure(tmp_path):
+    path = tmp_path / "settings.json"
+    ours = claude_code.statusline_command(path)
+    updated, state = claude_code.plan_configuration(
+        {},
+        path,
+        "https://router-api.ramp.com",
+        "secret",
+        "gpt-5.4",
+        statusline=ours,
+    )
+    assert updated["statusLine"] == {"type": "command", "command": ours}
+
+    theirs = {"type": "command", "command": "/home/me/mine.sh"}
+    changed_since = {**updated, "statusLine": theirs}
+    restored = claude_code.plan_restoration(changed_since, path, state)
+
+    assert restored["statusLine"] == theirs
+
+
+def _legacy_state(path, settings):
+    """Write the state a CLI predating the status line would have left."""
+    updated, state = claude_code.plan_configuration(
+        settings, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+    state["env"].pop("ROUTER_BASE_URL")
+    state["written"]["env"].pop("ROUTER_BASE_URL")
+    state.pop("statusLine", None)
+    claude_code.state_path(path).parent.mkdir(parents=True, exist_ok=True)
+    claude_code.state_path(path).write_text(json.dumps(state) + "\n")
+    return updated
+
+
+def test_state_written_before_the_status_line_still_reads(tmp_path):
+    # A state file from a CLI predating the status line lacks its snapshots.
+    # It must still read, and restoring from it must not delete values this
+    # older configure never wrote.
+    path = tmp_path / "settings.json"
+    updated = _legacy_state(path, {})
+
+    read = claude_code.read_state(path)
+    later = {
+        **updated,
+        "statusLine": {"type": "command", "command": "/home/me/mine.sh"},
+        "env": {**updated["env"], "ROUTER_BASE_URL": "https://mine.example"},
+    }
+    restored = claude_code.plan_restoration(later, path, read)
+
+    assert restored["statusLine"]["command"] == "/home/me/mine.sh"
+    assert restored["env"]["ROUTER_BASE_URL"] == "https://mine.example"
+
+
+def test_a_reconfigure_over_legacy_state_keeps_values_set_since(monkeypatch, tmp_path):
+    # A pre-status-line state file has no snapshot for the newly owned keys.
+    # A repeat configure must adopt fresh snapshots for them, or unconfigure
+    # restores their presumed absence and deletes what the user set since.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    _mock_router_endpoints(monkeypatch)
+    settings_path = tmp_path / "settings.json"
+    theirs = {"type": "command", "command": "/home/me/my-statusline.sh"}
+    settings = {
+        "statusLine": theirs,
+        "env": {"ROUTER_BASE_URL": "https://mine.example"},
+    }
+    updated = _legacy_state(settings_path, settings)
+    settings_path.write_text(
+        json.dumps(
+            {
+                **updated,
+                "statusLine": theirs,
+                "env": {**updated["env"], "ROUTER_BASE_URL": "https://mine.example"},
+            }
+        )
+    )
+
+    runner = CliRunner()
+    reconfigured = runner.invoke(
+        cli, ["--human", "router", "configure", "claude-code", "--api-key", "secret"]
+    )
+    assert reconfigured.exit_code == 0, reconfigured.output
+    # The user's own status line survives the reconfigure untouched, while the
+    # usage origin is Router's to overwrite.
+    settings = json.loads(settings_path.read_text())
+    assert settings["statusLine"] == theirs
+    assert settings["env"]["ROUTER_BASE_URL"] == "https://router.ramp.com"
+
+    unconfigured = runner.invoke(
+        cli, ["--human", "router", "unconfigure", "claude-code"]
+    )
+
+    assert unconfigured.exit_code == 0, unconfigured.output
+    settings = json.loads(settings_path.read_text())
+    assert settings["statusLine"] == theirs
+    assert settings["env"]["ROUTER_BASE_URL"] == "https://mine.example"
+
+
+def test_a_user_status_line_never_becomes_router_state(monkeypatch, tmp_path):
+    # A user with their own status line configures Router, then changes their
+    # status line, then reconfigures. The slot was never Router's, so neither
+    # configure may record it, and unconfigure must leave the newest choice.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    _mock_router_endpoints(monkeypatch)
+    settings_path = tmp_path / "settings.json"
+    first = {"type": "command", "command": "/home/me/first.sh"}
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps({"statusLine": first}))
+
+    runner = CliRunner()
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "claude-code", "--api-key", "secret"]
+    )
+    assert configured.exit_code == 0, configured.output
+    assert "statusLine" not in json.loads(
+        (tmp_path / "ramp-router-state.json").read_text()
+    )
+
+    second = {"type": "command", "command": "/home/me/second.sh"}
+    settings = json.loads(settings_path.read_text())
+    settings_path.write_text(json.dumps({**settings, "statusLine": second}))
+    reconfigured = runner.invoke(
+        cli, ["--human", "router", "configure", "claude-code", "--api-key", "secret"]
+    )
+    assert reconfigured.exit_code == 0, reconfigured.output
+    assert json.loads(settings_path.read_text())["statusLine"] == second
+
+    unconfigured = runner.invoke(
+        cli, ["--human", "router", "unconfigure", "claude-code"]
+    )
+
+    assert unconfigured.exit_code == 0, unconfigured.output
+    assert json.loads(settings_path.read_text())["statusLine"] == second
+
+
+def test_a_slot_taken_since_the_first_configure_is_freed_again(monkeypatch, tmp_path):
+    # First configure could not install the status line; the user still has
+    # none when a repeat configure succeeds and takes the empty slot. The
+    # merged state must adopt that fresh snapshot so unconfigure frees it.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    runner = CliRunner()
+    _mock_router_endpoints(monkeypatch, script=None)
+    first = runner.invoke(
+        cli, ["--human", "router", "configure", "claude-code", "--api-key", "secret"]
+    )
+    assert first.exit_code == 0, first.output
+    settings_path = tmp_path / "settings.json"
+    assert "statusLine" not in json.loads(settings_path.read_text())
+
+    _mock_router_endpoints(monkeypatch)
+    second = runner.invoke(
+        cli, ["--human", "router", "configure", "claude-code", "--api-key", "secret"]
+    )
+    assert second.exit_code == 0, second.output
+    assert json.loads(settings_path.read_text())["statusLine"] == {
+        "type": "command",
+        "command": claude_code.statusline_command(settings_path),
+    }
+
+    unconfigured = runner.invoke(
+        cli, ["--human", "router", "unconfigure", "claude-code"]
+    )
+
+    assert unconfigured.exit_code == 0, unconfigured.output
+    assert "statusLine" not in json.loads(settings_path.read_text())
+
+
+def test_the_status_line_origin_follows_a_base_url_override(monkeypatch):
+    monkeypatch.delenv("RAMP_ROUTER_BASE_URL", raising=False)
+    assert router_module._statusline_origin() == "https://router.ramp.com"
+
+    # A base-URL override names a single-origin deployment, so the same host
+    # serves the script and the usage endpoint.
+    monkeypatch.setenv("RAMP_ROUTER_BASE_URL", "https://qa-router.ramp.dev/v1")
+    assert router_module._statusline_origin() == "https://qa-router.ramp.dev"

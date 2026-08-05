@@ -577,6 +577,69 @@ def _codex_config_path() -> Path:
     return codex_home.expanduser() / "config.toml"
 
 
+def _statusline_origin() -> str:
+    """The origin serving the status line script and its usage endpoint.
+
+    The Router dashboard serves both /claude-code-statusline and the
+    /session-usage endpoint the script calls; the data plane behind
+    ANTHROPIC_BASE_URL serves neither, which is why ROUTER_BASE_URL is written
+    explicitly. A base-URL override names a single-origin deployment, so the
+    same host serves everything there.
+    """
+    base = router_base_url()
+    if base == DEFAULT_ROUTER_BASE_URL:
+        return ROUTER_UI_URL
+    return base.removesuffix("/v1").rstrip("/")
+
+
+def _install_claude_code_statusline(settings_file: Path) -> str | None:
+    """Install Router's cost status line for Claude Code, when possible.
+
+    Returns the command to configure, or None when the status line cannot be
+    installed here. The script is downloaded on every run so a repeat configure
+    picks up fixes, and a failure is a notice rather than an error: the status
+    line is an extra, and it must never fail an otherwise working configure.
+    """
+    if os.name == "nt":
+        # The script is run through its python3 shebang, which Windows'
+        # command interpreter does not understand.
+        _skip_statusline("it is not supported on Windows")
+        return None
+    if not shutil.which("python3"):
+        _skip_statusline("python3 was not found on PATH")
+        return None
+    url = f"{_statusline_origin()}/claude-code-statusline"
+    try:
+        response = httpx.get(url, headers={"Accept": "text/plain"}, timeout=10)
+        response.raise_for_status()
+        script = response.text
+    except (httpx.HTTPError, ValueError):
+        script = ""
+    # A WAF block page or a misrouted response must not be installed as an
+    # executable, so anything that does not start like the script itself is
+    # treated as a failed download.
+    if not script.startswith("#!"):
+        _skip_statusline(f"it could not be downloaded from {url}")
+        return None
+    script_path = claude_code.statusline_path(settings_file)
+    try:
+        script_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_private_file(script_path, script)
+        # Claude Code executes it directly, and unlike the other files this
+        # command writes it holds no secret: the script reads the key from the
+        # environment Claude Code passes it and never persists it.
+        script_path.chmod(0o755)
+    except OSError as exc:
+        _skip_statusline(str(exc))
+        return None
+    return claude_code.statusline_command(settings_file)
+
+
+def _skip_statusline(reason: str) -> None:
+    # Written to stderr so agent-mode JSON on stdout stays parseable.
+    click.echo(f"Skipping the Claude Code Router status line: {reason}.", err=True)
+
+
 def _configure_claude_code(
     path: Path,
     api_key: str,
@@ -590,23 +653,30 @@ def _configure_claude_code(
     rather than derived locally, because that view is what Claude Code's picker
     shows and a model written here must be an id it will recognize.
     """
-    # Read after the network call, not before. The settings are rewritten as a
-    # whole document, so anything Claude Code or the user changed while the
-    # request was in flight would be silently discarded by a stale snapshot.
     model = _claude_code_default_model(models, selected_model=selected_model)
+    statusline = _install_claude_code_statusline(path)
+    # Read after the network calls, not before. The settings are rewritten as a
+    # whole document, so anything Claude Code or the user changed while the
+    # requests were in flight would be silently discarded by a stale snapshot.
     settings = claude_code.read_settings(path)
     updated, state = claude_code.plan_configuration(
-        settings, path, _router_host(), api_key, model
+        settings,
+        path,
+        _router_host(),
+        api_key,
+        model,
+        usage_base_url=_statusline_origin(),
+        statusline=statusline,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     state_path = claude_code.state_path(path)
     previous_state: dict | None = None
     if state_path.exists():
         # Keep the original snapshot, but advance the values that identify what
-        # Router currently owns. Otherwise configure A, configure B,
-        # unconfigure would mistake B for a user edit and leave it behind.
+        # Router currently owns; keys that snapshot never captured take the
+        # fresh one taken before this write.
         previous_state = claude_code.read_state(path)
-        state = {**previous_state, "written": state["written"]}
+        state = claude_code.merge_states(previous_state, state)
     # Written first so a successful settings write is always paired with the
     # managed values needed to undo it. A failed settings write puts the prior
     # state back below.
@@ -636,6 +706,9 @@ def _unconfigure_claude_code(path: Path) -> None:
     settings = claude_code.read_settings(path)
     restored = claude_code.plan_restoration(settings, path, state)
     _write_private_file(path, json.dumps(restored, indent=2) + "\n")
+    # The script lives under a name this command manages, so it goes even when
+    # the statusLine setting itself was the user's and stays.
+    claude_code.statusline_path(path).unlink(missing_ok=True)
     claude_code.state_path(path).unlink(missing_ok=True)
 
 
