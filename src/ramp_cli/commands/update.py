@@ -11,7 +11,11 @@ import click
 
 from ramp_cli import __version__
 from ramp_cli.commands.router import CLIENT_NAMES, configured_router_clients
-from ramp_cli.version_check import latest_version, parse_version
+from ramp_cli.version_check import (
+    latest_version,
+    parse_version,
+    suppress_next_update_notice,
+)
 
 # This URL serves ramp/agent-cards-site/public/install.sh, not a file from this
 # repository. Every install.oss.sh change must be copied there byte-for-byte
@@ -82,6 +86,7 @@ def update_cmd() -> None:
     run = subprocess.run(["sh", "-c", install_command])
     if run.returncode != 0:
         raise click.ClickException(f"Update failed. Try manually:\n  {install_command}")
+    suppress_next_update_notice()
 
     if router_clients:
         # Invoke the CLI after installation instead of teaching the separately

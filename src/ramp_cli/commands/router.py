@@ -12,6 +12,7 @@ import tempfile
 import tomllib
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path, PurePath
 
 import click
@@ -290,12 +291,13 @@ def router_group() -> None:
 
 
 @router_group.command(
-    "configure", help="Configure one coding agent, or all agents when omitted"
+    "configure",
+    help="Configure one or more coding agents, or all agents when omitted",
 )
 @click.argument(
-    "client",
+    "clients",
     type=click.Choice(tuple(CLIENT_NAMES), case_sensitive=False),
-    required=False,
+    nargs=-1,
 )
 @click.option(
     "--api-key",
@@ -308,7 +310,7 @@ def router_group() -> None:
 )
 @click.pass_context
 def router_configure(
-    ctx: click.Context, client: str | None, api_key: str | None
+    ctx: click.Context, clients: tuple[str, ...], api_key: str | None
 ) -> None:
     if ctx.obj["no_input"] and api_key is None:
         raise click.UsageError(
@@ -317,7 +319,9 @@ def router_configure(
             f"and process listings. Create a key at {ROUTER_UI_URL}."
         )
 
-    clients = (client,) if client else tuple(CLIENT_NAMES)
+    requested_clients = tuple(dict.fromkeys(clients))
+    clients = requested_clients or tuple(CLIENT_NAMES)
+    restore_clients = "".join(f" {client}" for client in requested_clients)
     agent_label = "coding agent" if len(clients) == 1 else "coding agents"
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     if fmt != "json":
@@ -364,7 +368,11 @@ def router_configure(
     if failures and fmt == "json":
         raise click.ClickException("Could not configure " + "; ".join(failures))
     if fmt == "json":
-        payload = results[0] if client and results else {"clients": results}
+        payload = (
+            results[0]
+            if len(requested_clients) == 1 and results
+            else {"clients": results}
+        )
         print_agent_json(payload, pagination=None)
     elif not failures:
         connected_names = _human_join(
@@ -383,12 +391,12 @@ def router_configure(
         raise click.ClickException(
             "Could not configure "
             + "; ".join(failures)
-            + ". Run 'ramp router unconfigure' to restore your previous settings."
+            + f". Run 'ramp router unconfigure{restore_clients}' to restore your "
+            "previous settings."
         )
-    restore_client = f" {client}" if client else ""
     if fmt != "json":
         click.echo(
-            f"Run 'ramp router unconfigure{restore_client}' to restore the previous "
+            f"Run 'ramp router unconfigure{restore_clients}' to restore the previous "
             "settings."
         )
 
@@ -452,22 +460,270 @@ def router_refresh(ctx: click.Context) -> None:
         raise click.ClickException("Could not refresh " + "; ".join(failures))
 
 
+SUBAGENT_TIERS = ("sonnet", "opus", "haiku", "fable")
+SUBAGENT_DEFAULT_REQUEST_NAMES = {
+    # Match Claude Code's tiers to Router's corresponding capability tiers.
+    "sonnet": "gpt-5.6-terra",
+    "opus": "gpt-5.6-sol",
+    "haiku": "gpt-5.6-luna",
+    "fable": "gpt-5.6-sol",
+}
+SUBAGENT_PREVIOUS_DEFAULT_REQUEST_NAMES = {
+    "sonnet": "gpt-5.6-terra",
+    "opus": "gpt-5.6-terra",
+    "haiku": "gpt-5-mini",
+    "fable": "gpt-5.6-terra",
+}
+MINIMUM_TRUTHFUL_CLAUDE_CODE_VERSION = (2, 1, 118)
+
+
 @router_group.command(
-    "unconfigure", help="Restore one coding agent, or all agents when omitted"
+    "subagents", help="Show or set the models Claude Code sub-agents use"
+)
+@click.option(
+    "--sonnet",
+    metavar="MODEL",
+    help="Model for sonnet-tier sub-agents, the tier Claude Code spawns by default.",
+)
+@click.option("--opus", metavar="MODEL", help="Model for opus-tier sub-agents.")
+@click.option(
+    "--haiku",
+    metavar="MODEL",
+    help="Model for haiku-tier sub-agents and Claude Code's background helpers.",
+)
+@click.option("--fable", metavar="MODEL", help="Model for fable-tier sub-agents.")
+@click.option("--reset", is_flag=True, help="Remove all four tier overrides.")
+@click.pass_context
+def router_subagents(
+    ctx: click.Context,
+    sonnet: str | None,
+    opus: str | None,
+    haiku: str | None,
+    fable: str | None,
+    reset: bool,
+) -> None:
+    """Point Claude Code's sub-agent tiers at models Router serves.
+
+    Claude Code dispatches some sub-agents with a tier alias (sonnet, opus,
+    haiku, fable) that it resolves to a canonical Anthropic model id unless an
+    ANTHROPIC_DEFAULT_<TIER>_MODEL setting names a different model. Router
+    writes the matching _MODEL_NAME and _MODEL_DESCRIPTION settings too, so
+    Claude Code reports the real model instead of the Anthropic tier whose
+    behavior it is using. Changes apply to running sessions.
+
+    MODEL may be an exact id from Claude Code's model list, or any unique
+    fragment of an id, request name, or display name.
+    """
+    picks = {
+        tier: value
+        for tier, value in (
+            ("sonnet", sonnet),
+            ("opus", opus),
+            ("haiku", haiku),
+            ("fable", fable),
+        )
+        if value is not None
+    }
+    if reset and picks:
+        raise click.UsageError("--reset cannot be combined with a tier option.")
+    path = _client_config_path("claude-code")
+    # Read before anything else so an unconfigured setup fails with the state
+    # message rather than a credential or network error.
+    claude_code.read_state(path)
+    if picks:
+        _require_truthful_claude_code_model_names()
+    # Reset only removes local keys, so it must work exactly when the remote
+    # setup is unusable — an expired key or an unreachable Router must not
+    # stop someone from clearing overrides that are failing every spawn.
+    models: list[RouterModel] = []
+    if picks or not reset:
+        api_key = _stored_router_api_key("claude-code", path)
+        models = _fetch_models(
+            api_key,
+            claude_code_view=True,
+            base_url=_configured_claude_code_router_url(path),
+        )
+    models_by_id = {model.id: model for model in models}
+
+    if picks or reset:
+        tiers: dict[str, str | None] = (
+            dict.fromkeys(SUBAGENT_TIERS)
+            if reset
+            else {
+                tier: _resolve_subagent_model(value, models, f"--{tier}")
+                for tier, value in picks.items()
+            }
+        )
+        settings = _write_subagent_tiers(path, tiers, models)
+    else:
+        settings = claude_code.read_settings(path)
+
+    environment = settings.get("env")
+    environment = environment if isinstance(environment, dict) else {}
+    tiers_payload: dict[str, dict] = {}
+    for tier in SUBAGENT_TIERS:
+        value = environment.get(claude_code.SUBAGENT_TIER_ENV_KEYS[tier])
+        entry: dict = {"model": value}
+        if value in models_by_id:
+            entry["display_name"] = models_by_id[value].metadata.display_name
+        elif value is not None:
+            # A model this Router no longer lists still dispatches nothing, so
+            # saying so beats letting sub-agents fail with model_not_found.
+            entry["served"] = False
+        tiers_payload[tier] = entry
+
+    fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
+    if fmt == "json":
+        print_agent_json(
+            {"config_path": str(path), "tiers": tiers_payload}, pagination=None
+        )
+        return
+    for tier in SUBAGENT_TIERS:
+        entry = tiers_payload[tier]
+        if entry["model"] is None:
+            rendered = (
+                "not set — Claude Code uses its Anthropic default, "
+                "which this Router does not serve"
+            )
+        elif "display_name" in entry:
+            rendered = f"{entry['display_name']} ({entry['model']})"
+        else:
+            rendered = f"{entry['model']} — no longer served by this Router"
+        click.echo(f"{tier:<7} {rendered}")
+    if not picks and not reset:
+        click.echo(
+            "Set with: ramp router subagents --sonnet MODEL "
+            "[--opus MODEL] [--haiku MODEL] [--fable MODEL]"
+        )
+
+
+def _write_subagent_tiers(
+    path: Path,
+    tiers: dict[str, str | None],
+    models: list[RouterModel],
+) -> dict:
+    """Apply tier overrides to the settings and state documents, atomically.
+
+    Everything from reading the documents to writing them happens under the
+    settings lock: both files are rewritten whole, so a concurrent update
+    working from its own snapshot would otherwise be silently dropped by
+    whichever write lands last, and the state receipt could end up describing
+    the other update.
+    """
+    with claude_code.settings_lock(path):
+        state = claude_code.read_state(path)
+        settings = claude_code.read_settings(path)
+        display_names, descriptions = _subagent_tier_metadata(tiers, models)
+        updated, new_state = claude_code.plan_subagent_update(
+            settings,
+            path,
+            state,
+            tiers,
+            display_names=display_names,
+            descriptions=descriptions,
+            automatic_tiers=set(),
+        )
+        state_path = claude_code.state_path(path)
+        # State first, so a successful settings write is always paired with
+        # the managed values needed to undo it.
+        try:
+            _write_private_file(state_path, json.dumps(new_state, indent=2) + "\n")
+        except OSError as exc:
+            raise click.ClickException(
+                f"Could not save Claude Code setup state to {state_path}: {exc}"
+            ) from None
+        try:
+            _write_private_file(path, json.dumps(updated, indent=2) + "\n")
+        except OSError as exc:
+            _restore_private_file(state_path, json.dumps(state, indent=2) + "\n")
+            raise click.ClickException(
+                f"Could not update Claude Code settings {path}: {exc}"
+            ) from None
+    return updated
+
+
+def _subagent_tier_metadata(
+    tiers: dict[str, str | None],
+    models: list[RouterModel],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Return truthful presentation metadata for every selected Router model."""
+    models_by_id = {model.id: model for model in models}
+    display_names = {
+        tier: models_by_id[model].metadata.display_name
+        for tier, model in tiers.items()
+        if model in models_by_id
+    }
+    descriptions = {
+        tier: models_by_id[model].metadata.description
+        for tier, model in tiers.items()
+        if model in models_by_id
+    }
+    return display_names, descriptions
+
+
+def _resolve_subagent_model(value: str, models: list[RouterModel], flag: str) -> str:
+    """Resolve what the user typed to one id from Claude Code's model view.
+
+    An exact id wins, then an exact request or display name, then a unique
+    case-insensitive fragment of any of the three. Ambiguity is an error
+    rather than a guess: sub-agents will quietly run whatever this resolves
+    to, so a wrong pick costs real money without being seen.
+    """
+    if value in {model.id for model in models}:
+        return value
+    named = sorted(
+        {
+            model.id
+            for model in models
+            if value in (model.metadata.request_name, model.metadata.display_name)
+        }
+    )
+    if len(named) == 1:
+        return named[0]
+    needle = value.lower()
+    matches = named or sorted(
+        {
+            model.id
+            for model in models
+            if needle in model.id.lower()
+            or needle in model.metadata.request_name.lower()
+            or needle in model.metadata.display_name.lower()
+        }
+    )
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        raise click.BadParameter(
+            f"{value!r} matches several models: {', '.join(matches)}. "
+            "Use the exact id.",
+            param_hint=flag,
+        )
+    raise click.BadParameter(
+        f"{value!r} does not match a model this Router serves.", param_hint=flag
+    )
+
+
+@router_group.command(
+    "unconfigure",
+    help="Restore one or more coding agents, or all agents when omitted",
 )
 @click.argument(
-    "client",
+    "clients",
     type=click.Choice(tuple(CLIENT_NAMES), case_sensitive=False),
-    required=False,
+    nargs=-1,
 )
 @click.pass_context
-def router_unconfigure(ctx: click.Context, client: str | None) -> None:
-    clients = (client,) if client else tuple(CLIENT_NAMES)
+def router_unconfigure(ctx: click.Context, clients: tuple[str, ...]) -> None:
+    requested_clients = tuple(dict.fromkeys(clients))
+    clients = requested_clients or tuple(CLIENT_NAMES)
     results = []
     failures = []
     for item in clients:
         path = _client_config_path(item)
-        if not client and not (path.parent / "ramp-router-state.json").exists():
+        if (
+            not requested_clients
+            and not (path.parent / "ramp-router-state.json").exists()
+        ):
             continue
         try:
             _unconfigure_client(item, path)
@@ -482,7 +738,11 @@ def router_unconfigure(ctx: click.Context, client: str | None) -> None:
     if failures and fmt == "json":
         raise click.ClickException("Could not unconfigure " + "; ".join(failures))
     if fmt == "json":
-        payload = results[0] if client and results else {"clients": results}
+        payload = (
+            results[0]
+            if len(requested_clients) == 1 and results
+            else {"clients": results}
+        )
         print_agent_json(payload, pagination=None)
     elif results:
         restored_names = _human_join(
@@ -653,63 +913,210 @@ def _configure_claude_code(
     rather than derived locally, because that view is what Claude Code's picker
     shows and a model written here must be an id it will recognize.
     """
+    _require_truthful_claude_code_model_names()
     model = _claude_code_default_model(models, selected_model=selected_model)
     statusline = _install_claude_code_statusline(path)
     # Read after the network calls, not before. The settings are rewritten as a
     # whole document, so anything Claude Code or the user changed while the
     # requests were in flight would be silently discarded by a stale snapshot.
-    settings = claude_code.read_settings(path)
-    updated, state = claude_code.plan_configuration(
-        settings,
-        path,
-        _router_host(),
-        api_key,
-        model,
-        usage_base_url=_statusline_origin(),
-        statusline=statusline,
-    )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    state_path = claude_code.state_path(path)
-    previous_state: dict | None = None
-    if state_path.exists():
-        # Keep the original snapshot, but advance the values that identify what
-        # Router currently owns; keys that snapshot never captured take the
-        # fresh one taken before this write.
-        previous_state = claude_code.read_state(path)
-        state = claude_code.merge_states(previous_state, state)
-    # Written first so a successful settings write is always paired with the
-    # managed values needed to undo it. A failed settings write puts the prior
-    # state back below.
-    try:
-        _write_private_file(state_path, json.dumps(state, indent=2) + "\n")
-    except OSError as exc:
-        raise click.ClickException(
-            f"Could not save Claude Code setup state to {state_path}: {exc}"
-        ) from None
-    try:
-        _write_private_file(path, json.dumps(updated, indent=2) + "\n")
-    except OSError as exc:
-        previous_state_contents = (
-            None
-            if previous_state is None
-            else json.dumps(previous_state, indent=2) + "\n"
+    # The lock covers the whole read-modify-write for the same reason: another
+    # writer landing between this read and the writes below would be discarded,
+    # or left paired with a state receipt describing a different setup.
+    with claude_code.settings_lock(path):
+        settings = claude_code.read_settings(path)
+        updated, state = claude_code.plan_configuration(
+            settings,
+            path,
+            _router_host(),
+            api_key,
+            model,
+            usage_base_url=_statusline_origin(),
+            statusline=statusline,
         )
-        _restore_private_file(state_path, previous_state_contents)
-        raise click.ClickException(
-            f"Could not update Claude Code settings {path}: {exc}"
-        ) from None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        state_path = claude_code.state_path(path)
+        previous_state: dict | None = None
+        if state_path.exists():
+            # Keep the original snapshot, but advance the values that identify
+            # what Router currently owns; keys that snapshot never captured
+            # take the fresh one taken before this write.
+            previous_state = claude_code.read_state(path)
+            state = claude_code.merge_states(previous_state, state)
+        tier_defaults = _needed_subagent_tier_defaults(
+            updated, state, models, fallback=model
+        )
+        if tier_defaults:
+            display_names, descriptions = _subagent_tier_metadata(tier_defaults, models)
+            environment = updated.get("env")
+            environment = environment if isinstance(environment, dict) else {}
+            written = state["written"]["env"]
+            available_ids = {available.id for available in models}
+            recorded_defaults = state.get(claude_code.SUBAGENT_DEFAULTS_STATE_KEY, {})
+            automatic_tiers = {
+                tier
+                for tier in tier_defaults
+                if (
+                    recorded_defaults.get(tier)
+                    == environment.get(claude_code.SUBAGENT_TIER_ENV_KEYS[tier])
+                    or (
+                        claude_code.SUBAGENT_TIER_ENV_KEYS[tier] not in written
+                        and environment.get(claude_code.SUBAGENT_TIER_ENV_KEYS[tier])
+                        not in available_ids
+                    )
+                )
+            }
+            updated, state = claude_code.plan_subagent_update(
+                updated,
+                path,
+                state,
+                tier_defaults,
+                display_names=display_names,
+                descriptions=descriptions,
+                automatic_tiers=automatic_tiers,
+            )
+        # Written first so a successful settings write is always paired with
+        # the managed values needed to undo it. A failed settings write puts
+        # the prior state back below.
+        try:
+            _write_private_file(state_path, json.dumps(state, indent=2) + "\n")
+        except OSError as exc:
+            raise click.ClickException(
+                f"Could not save Claude Code setup state to {state_path}: {exc}"
+            ) from None
+        try:
+            _write_private_file(path, json.dumps(updated, indent=2) + "\n")
+        except OSError as exc:
+            previous_state_contents = (
+                None
+                if previous_state is None
+                else json.dumps(previous_state, indent=2) + "\n"
+            )
+            _restore_private_file(state_path, previous_state_contents)
+            raise click.ClickException(
+                f"Could not update Claude Code settings {path}: {exc}"
+            ) from None
     return model
 
 
+def _require_truthful_claude_code_model_names() -> None:
+    """Refuse a client that would label Router models as Anthropic models."""
+    executable = shutil.which("claude")
+    if executable is None:
+        # Configuration may be prepared before Claude Code is installed. A
+        # future install will get the current release, while there is no
+        # executable here that can misreport a model now.
+        return
+    version = _claude_code_version(executable)
+    minimum = MINIMUM_TRUTHFUL_CLAUDE_CODE_VERSION
+    if version is None:
+        raise click.ClickException(
+            "Could not determine the installed Claude Code version. "
+            f"Claude Code {'.'.join(map(str, minimum))} or newer is required "
+            "to show Router models by their real names."
+        )
+    if version < minimum:
+        raise click.ClickException(
+            f"Claude Code {'.'.join(map(str, minimum))} or newer is required "
+            "to show Router models by their real names. Update Claude Code, "
+            "then run this command again."
+        )
+
+
+@lru_cache(maxsize=None)
+def _claude_code_version(executable: str) -> tuple[int, int, int] | None:
+    try:
+        result = subprocess.run(
+            [executable, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", result.stdout)
+    if result.returncode != 0 or match is None:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def _needed_subagent_tier_defaults(
+    settings: dict,
+    state: dict,
+    models: list[RouterModel],
+    *,
+    fallback: str,
+) -> dict[str, str]:
+    """Choose truthful defaults without replacing a user's Router model."""
+    environment = settings.get("env")
+    environment = environment if isinstance(environment, dict) else {}
+    written = state["written"]["env"]
+    by_request_name = {model.metadata.request_name: model.id for model in models}
+    request_name_by_id = {model.id: model.metadata.request_name for model in models}
+    available_ids = {model.id for model in models}
+    automatic_defaults = state.get(claude_code.SUBAGENT_DEFAULTS_STATE_KEY, {})
+    defaults: dict[str, str] = {}
+    for tier, request_name in SUBAGENT_DEFAULT_REQUEST_NAMES.items():
+        model_key = claude_code.SUBAGENT_TIER_ENV_KEYS[tier]
+        current = environment.get(model_key)
+        if model_key in written and current != written[model_key]:
+            # The user changed this tier after Router configured it. Do not
+            # reclaim either their model or its presentation metadata.
+            continue
+        tier_keys = (
+            model_key,
+            claude_code.SUBAGENT_TIER_NAME_ENV_KEYS[tier],
+            claude_code.SUBAGENT_TIER_DESCRIPTION_ENV_KEYS[tier],
+        )
+        if model_key in written and not all(key in written for key in tier_keys):
+            # Older receipts did not own truthful presentation metadata.
+            # Backfill it for a model Router still serves without assuming the
+            # model itself was an automatic choice.
+            if current in available_ids:
+                defaults[tier] = current
+            continue
+        if model_key in written and automatic_defaults.get(tier) != current:
+            # A complete receipt without automatic-default provenance is a
+            # manual selection. It may intentionally match a former default.
+            continue
+        migrate_previous_default = False
+        if all(key in written for key in tier_keys) and current in available_ids:
+            previous_default = SUBAGENT_PREVIOUS_DEFAULT_REQUEST_NAMES[tier]
+            preferred = by_request_name.get(request_name)
+            if (
+                preferred is None
+                or request_name_by_id[current] != previous_default
+                or current == preferred
+            ):
+                continue
+            migrate_previous_default = True
+        defaults[tier] = (
+            by_request_name.get(request_name, fallback)
+            if migrate_previous_default or current not in available_ids
+            else current
+        )
+    return defaults
+
+
 def _unconfigure_claude_code(path: Path) -> None:
-    state = claude_code.read_state(path)
-    settings = claude_code.read_settings(path)
-    restored = claude_code.plan_restoration(settings, path, state)
-    _write_private_file(path, json.dumps(restored, indent=2) + "\n")
-    # The script lives under a name this command manages, so it goes even when
-    # the statusLine setting itself was the user's and stays.
-    claude_code.statusline_path(path).unlink(missing_ok=True)
-    claude_code.state_path(path).unlink(missing_ok=True)
+    # Read once before taking the lock: acquiring it creates the settings
+    # directory and lock file, which a machine with no Claude Code setup
+    # should not gain from a command that then refuses to run.
+    claude_code.read_state(path)
+    # Locked so a concurrent configure or tier update cannot land between the
+    # restoration read and the receipt removal: it would either be discarded
+    # by the restored document or survive with its receipt deleted, leaving
+    # Router configured and impossible to restore. The receipt is re-read
+    # under the lock; the preflight above cannot speak for this moment.
+    with claude_code.settings_lock(path):
+        state = claude_code.read_state(path)
+        settings = claude_code.read_settings(path)
+        restored = claude_code.plan_restoration(settings, path, state)
+        _write_private_file(path, json.dumps(restored, indent=2) + "\n")
+        # The script lives under a name this command manages, so it goes even
+        # when the statusLine setting itself was the user's and stays.
+        claude_code.statusline_path(path).unlink(missing_ok=True)
+        claude_code.state_path(path).unlink(missing_ok=True)
 
 
 def _claude_code_default_model(
@@ -735,6 +1142,26 @@ def _claude_code_default_model(
 def _router_host() -> str:
     """Return the host root, since Claude Code appends /v1 itself."""
     return router_base_url().removesuffix("/v1").rstrip("/")
+
+
+def _configured_claude_code_router_url(path: Path) -> str:
+    """Return the Router URL Claude Code was configured to use.
+
+    An explicit environment override still wins. Otherwise follow the saved
+    Claude Code gateway so commands after a non-production configure do not
+    send that gateway's key to the production Router.
+    """
+    if any(os.environ.get(name, "").strip() for name in BASE_URL_ENVS):
+        return router_base_url()
+    settings = claude_code.read_settings(path)
+    environment = settings.get("env")
+    base_url = (
+        environment.get("ANTHROPIC_BASE_URL") if isinstance(environment, dict) else None
+    )
+    if isinstance(base_url, str) and base_url.strip():
+        host = base_url.strip().rstrip("/").removesuffix("/v1")
+        return f"{host}/v1"
+    return router_base_url()
 
 
 def _json_config_path(client: str) -> Path:
@@ -1279,10 +1706,15 @@ def _read_json_config(client: str, path: Path) -> dict:
         ) from None
 
 
-def _fetch_models(api_key: str, claude_code_view: bool = False) -> list[RouterModel]:
+def _fetch_models(
+    api_key: str,
+    claude_code_view: bool = False,
+    *,
+    base_url: str | None = None,
+) -> list[RouterModel]:
     try:
         response = httpx.get(
-            f"{router_base_url()}/models",
+            f"{(base_url or router_base_url()).rstrip('/')}/models",
             headers={
                 "Authorization": f"Bearer {api_key}",
                 # Ask for the projection whose ids Claude Code will accept.

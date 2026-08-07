@@ -13,6 +13,7 @@ from ramp_cli.client.api import (
 )
 from ramp_cli.client.headers import agent_headers
 from ramp_cli.errors import (
+    EXIT_AUTH_REQUIRED,
     AuthRequiredError,
     EnvironmentAuthRequiredError,
     RefreshFailedError,
@@ -36,6 +37,20 @@ def test_get_access_token__refreshes_when_only_refresh_token_exists(monkeypatch)
     monkeypatch.setattr("ramp_cli.client.api.try_refresh", lambda env: "access-new")
 
     assert client._get_access_token() == "access-new"
+
+
+def test_get_access_token__raises_auth_required_without_local_credentials(monkeypatch):
+    client = RampClient("sandbox")
+    monkeypatch.setattr(
+        "ramp_cli.client.api.store.get_token_state",
+        lambda env: TokenState(),
+    )
+
+    with pytest.raises(AuthRequiredError) as exc_info:
+        client._get_access_token()
+
+    assert exc_info.value.code == EXIT_AUTH_REQUIRED
+    assert "ramp --env sandbox auth login" in str(exc_info.value)
 
 
 def test_get_access_token__raises_when_refresh_fails(monkeypatch):

@@ -34,12 +34,19 @@ class TestUpdateAlreadyCurrent:
 
 class TestUpdateAvailable:
     @patch("ramp_cli.commands.update._is_homebrew_install", return_value=False)
+    @patch("ramp_cli.commands.update.suppress_next_update_notice")
     @patch("ramp_cli.commands.update.subprocess.run")
     @patch("ramp_cli.commands.update.shutil.which", return_value="/usr/bin/curl")
     @patch("ramp_cli.commands.update.latest_version", return_value="0.2.0")
     @patch("ramp_cli.commands.update.__version__", "0.1.3")
     def test_runs_install_script(
-        self, mock_latest, mock_which, mock_run, mock_brew, isolated_config
+        self,
+        mock_latest,
+        mock_which,
+        mock_run,
+        mock_notice,
+        mock_brew,
+        isolated_config,
     ):
         mock_run.return_value = MagicMock(returncode=0)
         result = _invoke(["update"])
@@ -49,12 +56,14 @@ class TestUpdateAvailable:
         mock_run.assert_called_once()
         cmd = mock_run.call_args[0][0]
         assert "agents.ramp.com/install.sh" in cmd[-1]
+        mock_notice.assert_called_once_with()
 
     @patch(
         "ramp_cli.commands.update.configured_router_clients",
         return_value=("opencode",),
     )
     @patch("ramp_cli.commands.update._is_homebrew_install", return_value=False)
+    @patch("ramp_cli.commands.update.suppress_next_update_notice")
     @patch("ramp_cli.commands.update.subprocess.run")
     @patch("ramp_cli.commands.update.shutil.which", return_value="/usr/bin/curl")
     @patch("ramp_cli.commands.update.latest_version", return_value="0.2.0")
@@ -64,6 +73,7 @@ class TestUpdateAvailable:
         mock_latest,
         mock_which,
         mock_run,
+        mock_notice,
         mock_brew,
         mock_configured,
         isolated_config,
@@ -90,6 +100,7 @@ class TestUpdateAvailable:
             "router",
             "refresh",
         ]
+        mock_notice.assert_called_once_with()
 
     @patch("ramp_cli.commands.update._is_homebrew_install", return_value=False)
     @patch("ramp_cli.commands.update.subprocess.run")

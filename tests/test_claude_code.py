@@ -118,9 +118,201 @@ def test_unconfigure_removes_keys_the_user_never_had(tmp_path):
         {}, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
     )
 
+    assert updated["disableClaudeAiConnectors"] is True
     restored = claude_code.plan_restoration(updated, path, state)
 
     assert restored == {}
+
+
+def test_subagent_update_writes_tiers_and_unconfigure_restores_them(tmp_path):
+    path = tmp_path / "settings.json"
+    original = {"env": {"ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-4-5"}}
+
+    configured, state = claude_code.plan_configuration(
+        original, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+    updated, state = claude_code.plan_subagent_update(
+        configured,
+        path,
+        state,
+        {"sonnet": "claude-router-a", "haiku": "claude-router-b"},
+        display_names={"sonnet": "GPT-5.6 Terra", "haiku": "GPT-5 Mini"},
+        descriptions={
+            "sonnet": "Balanced Router model",
+            "haiku": "Fast Router model",
+        },
+    )
+
+    assert updated["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "claude-router-a"
+    assert updated["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "claude-router-b"
+    assert updated["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] == "GPT-5.6 Terra"
+    assert updated["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME"] == "GPT-5 Mini"
+    assert (
+        updated["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION"]
+        == "Balanced Router model"
+    )
+    assert "ANTHROPIC_DEFAULT_OPUS_MODEL" not in updated["env"]
+
+    # A tier override naming a Router-served model is meaningless once Router
+    # is unconfigured, so restoration puts back exactly what was there before.
+    restored = claude_code.plan_restoration(updated, path, state)
+    assert restored == original
+
+
+def test_first_tier_write_snapshots_the_current_hand_set_value(tmp_path):
+    path = tmp_path / "settings.json"
+    # Configure runs on a profile with no tier value, so its snapshot marks
+    # the key absent. The user then hand-sets the tier before the first
+    # subagents write.
+    configured, state = claude_code.plan_configuration(
+        {}, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+    configured["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] = "user-value"
+
+    updated, state = claude_code.plan_subagent_update(
+        configured, path, state, {"sonnet": "claude-router-a"}
+    )
+    # The first write must snapshot the value that is there at write time,
+    # not the stale absence captured at configure time; unconfigure then
+    # puts the user's hand-set value back.
+    restored = claude_code.plan_restoration(updated, path, state)
+    assert restored["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "user-value"
+
+
+def test_subagent_update_backfills_state_written_by_an_older_cli(tmp_path):
+    path = tmp_path / "settings.json"
+    original = {"env": {"ANTHROPIC_DEFAULT_SONNET_MODEL": "hand-set"}}
+    configured, state = claude_code.plan_configuration(
+        original, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+    # An older CLI captured no snapshot for the tier keys. That absence means
+    # "not captured", so the update has to take its snapshot from the settings
+    # as they are, or unconfigure would delete the user's hand-set value.
+    for key in claude_code.SUBAGENT_ENV_KEYS:
+        state["env"].pop(key, None)
+        state["written"]["env"].pop(key, None)
+    assert claude_code._valid_state(state)
+
+    updated, state = claude_code.plan_subagent_update(
+        configured, path, state, {"sonnet": "claude-router-a"}
+    )
+    assert claude_code._valid_state(state)
+    restored = claude_code.plan_restoration(updated, path, state)
+
+    assert restored == original
+
+
+def test_refresh_does_not_claim_a_tier_the_user_edited_themselves(tmp_path):
+    path = tmp_path / "settings.json"
+    configured, state = claude_code.plan_configuration(
+        {}, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+    # The user points a tier somewhere by hand, then a refresh reruns
+    # configure. Configure never writes tier keys, so it must not record the
+    # user's value as its own: unconfigure would otherwise replace their
+    # newer choice with the pre-Router snapshot.
+    configured["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] = "their-own-pick"
+    refreshed, fresh = claude_code.plan_configuration(
+        configured, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+    state = claude_code.merge_states(state, fresh)
+
+    restored = claude_code.plan_restoration(refreshed, path, state)
+
+    assert restored["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "their-own-pick"
+
+
+def test_subagent_ownership_survives_a_refresh(tmp_path):
+    path = tmp_path / "settings.json"
+    configured, state = claude_code.plan_configuration(
+        {}, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+    updated, state = claude_code.plan_subagent_update(
+        configured, path, state, {"sonnet": "claude-router-a"}
+    )
+    # A refresh reruns configure over the updated settings. The tier write
+    # must remain recorded as Router's, or unconfigure would leave the
+    # Router-only model id behind for a gateway that cannot serve it.
+    refreshed, fresh = claude_code.plan_configuration(
+        updated, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+    state = claude_code.merge_states(state, fresh)
+
+    restored = claude_code.plan_restoration(refreshed, path, state)
+
+    assert "ANTHROPIC_DEFAULT_SONNET_MODEL" not in restored.get("env", {})
+
+
+def test_deleting_a_pre_router_tier_edit_is_preserved(tmp_path):
+    path = tmp_path / "settings.json"
+    # A tier value was hand-set before Router. Configure captures it in the
+    # state snapshot for restoration but never claims it as its own write.
+    original = {"env": {"ANTHROPIC_DEFAULT_SONNET_MODEL": "their-own-pick"}}
+    configured, state = claude_code.plan_configuration(
+        original, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+    # The user then deletes the override themselves while Router stays
+    # configured. That deletion must survive unconfigure: two None reads on
+    # the same key must not read as "still ours".
+    configured["env"].pop("ANTHROPIC_DEFAULT_SONNET_MODEL")
+    restored = claude_code.plan_restoration(configured, path, state)
+
+    assert "ANTHROPIC_DEFAULT_SONNET_MODEL" not in restored.get("env", {})
+
+
+def test_settings_lock_excludes_a_second_holder(tmp_path):
+    fcntl = pytest.importorskip("fcntl")
+    path = tmp_path / "settings.json"
+
+    with claude_code.settings_lock(path):
+        lock_path = tmp_path / ".ramp-router-settings.lock"
+        assert lock_path.exists()
+        with lock_path.open("a+b") as second:
+            with pytest.raises(OSError):
+                fcntl.flock(second.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    # Released on exit: a fresh attempt succeeds.
+    with claude_code.settings_lock(path):
+        pass
+
+
+def test_subagent_reset_removes_the_override(tmp_path):
+    path = tmp_path / "settings.json"
+    configured, state = claude_code.plan_configuration(
+        {}, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+    updated, state = claude_code.plan_subagent_update(
+        configured, path, state, {"opus": "claude-router-a"}
+    )
+    cleared, state = claude_code.plan_subagent_update(
+        updated, path, state, dict.fromkeys(claude_code.SUBAGENT_TIER_ENV_KEYS)
+    )
+
+    assert "ANTHROPIC_DEFAULT_OPUS_MODEL" not in cleared["env"]
+    assert claude_code.plan_restoration(cleared, path, state) == {}
+
+
+def test_unconfigure_restores_existing_connector_preference(tmp_path):
+    path = tmp_path / "settings.json"
+    original = {"disableClaudeAiConnectors": False}
+    updated, state = claude_code.plan_configuration(
+        original, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+
+    assert updated["disableClaudeAiConnectors"] is True
+    assert claude_code.plan_restoration(updated, path, state) == original
+
+
+def test_connector_preference_changed_since_configure_is_left_alone(tmp_path):
+    path = tmp_path / "settings.json"
+    updated, state = claude_code.plan_configuration(
+        {}, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+    changed = {**updated, "disableClaudeAiConnectors": False}
+
+    restored = claude_code.plan_restoration(changed, path, state)
+
+    assert restored["disableClaudeAiConnectors"] is False
 
 
 def test_malformed_settings_are_refused_not_replaced(tmp_path):
@@ -163,6 +355,46 @@ def test_configure_is_idempotent_and_keeps_the_original_state(monkeypatch, tmp_p
     assert json.loads(path.read_text()) == {
         "env": {"ANTHROPIC_BASE_URL": "https://mine"}
     }
+
+
+def test_reconfigure_upgrades_legacy_state_for_connector_setting(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    _mock_models(monkeypatch)
+    path = tmp_path / "settings.json"
+    configured, state = claude_code.plan_configuration(
+        {}, path, "https://router-api.ramp.com", "old-key", "gpt-5.4"
+    )
+    configured.pop("disableClaudeAiConnectors")
+    state["top_level"].pop("disableClaudeAiConnectors")
+    state["written"]["top_level"].pop("disableClaudeAiConnectors")
+    path.write_text(json.dumps(configured))
+    claude_code.state_path(path).write_text(json.dumps(state))
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure",
+            "claude-code",
+            "--api-key",
+            "replacement-key",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    upgraded = claude_code.read_state(path)
+    assert upgraded["top_level"]["disableClaudeAiConnectors"] == {
+        "present": False,
+        "value": None,
+    }
+    assert json.loads(path.read_text())["disableClaudeAiConnectors"] is True
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "unconfigure", "claude-code"]
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(path.read_text()) == {}
 
 
 def test_failed_reconfigure_restores_the_previous_managed_values(monkeypatch, tmp_path):

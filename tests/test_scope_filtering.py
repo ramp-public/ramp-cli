@@ -457,6 +457,29 @@ class TestServerScopeErrors:
         assert "tools refresh" not in message
         assert "auth login" not in message
 
+    def test_non_403_scope_code_does_not_get_auth_guidance(
+        self, isolated_config, monkeypatch
+    ):
+        error = ApiError(
+            404,
+            json.dumps(
+                {
+                    "error_v2": {
+                        "error_code": "DEVELOPER_7100",
+                        "message": "Resource not found",
+                    }
+                }
+            ),
+        )
+
+        result = self._invoke_with_availability(monkeypatch, error, None)
+
+        assert result.exit_code != 0
+        message = str(result.exception)
+        assert "Resource not found" in message
+        assert "OAuth scope" not in message
+        assert "auth login" not in message
+
 
 class TestAuthStatusScopes:
     """ramp auth status shows scope information."""

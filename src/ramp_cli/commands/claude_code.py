@@ -8,11 +8,47 @@ writing the documented environment values and being able to put them back.
 import json
 import os
 import shlex
+from contextlib import contextmanager
 from pathlib import Path
 
 import click
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX fallback
+    msvcrt = None
+
 CLAUDE_SETTINGS_ENV = "CLAUDE_CONFIG_DIR"
+
+# Claude Code dispatches sub-agents with a tier alias (sonnet, opus, haiku,
+# fable)
+# that it resolves to a canonical Anthropic model id unless one of these
+# variables names a different model. Router serves no Anthropic models, so
+# these are how sub-agent tiers are pointed at models Router can serve.
+# Claude Code reads them at each sub-agent spawn, not just at session start.
+SUBAGENT_TIER_ENV_KEYS = {
+    "sonnet": "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "opus": "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "haiku": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "fable": "ANTHROPIC_DEFAULT_FABLE_MODEL",
+}
+SUBAGENT_TIER_NAME_ENV_KEYS = {
+    tier: f"{key}_NAME" for tier, key in SUBAGENT_TIER_ENV_KEYS.items()
+}
+SUBAGENT_TIER_DESCRIPTION_ENV_KEYS = {
+    tier: f"{key}_DESCRIPTION" for tier, key in SUBAGENT_TIER_ENV_KEYS.items()
+}
+SUBAGENT_ENV_KEYS = (
+    *SUBAGENT_TIER_ENV_KEYS.values(),
+    *SUBAGENT_TIER_NAME_ENV_KEYS.values(),
+    *SUBAGENT_TIER_DESCRIPTION_ENV_KEYS.values(),
+)
+SUBAGENT_DEFAULTS_STATE_KEY = "automatic_subagent_tiers"
 
 # Router keys are bearer tokens, so ANTHROPIC_AUTH_TOKEN is correct and
 # ANTHROPIC_API_KEY is deliberately not set: Claude Code treats them
@@ -30,13 +66,26 @@ _OWNED_ENV_KEYS = (
     # base because that points at the data plane, which does not answer the
     # session-usage endpoint the script calls.
     "ROUTER_BASE_URL",
+    # Owned because 'ramp router subagents' writes them, and a value naming a
+    # Router-served model is meaningless once Router is unconfigured: left
+    # behind, every sub-agent spawn would fail against the restored gateway.
+    *SUBAGENT_ENV_KEYS,
 )
-# Keys owned only since the status line shipped. A state file written by an
-# older CLI has no snapshot for these, and that absence means "not captured",
-# never "was absent": restoration leaves an uncaptured key alone, and
-# merge_states adopts the fresh snapshot taken before this configure wrote it.
-_ENV_KEYS_OWNED_LATER = ("ROUTER_BASE_URL",)
-_OWNED_TOP_LEVEL_KEYS = ("model",)
+# Keys owned only since the feature that writes them shipped. A state file
+# written by an older CLI has no snapshot for these, and that absence means
+# "not captured", never "was absent": restoration leaves an uncaptured key
+# alone, and merge_states adopts the fresh snapshot taken before this
+# configure wrote it.
+_ENV_KEYS_OWNED_LATER = ("ROUTER_BASE_URL", *SUBAGENT_ENV_KEYS)
+# Keys plan_configuration itself writes. Tier settings are applied separately
+# through plan_subagent_update, so this first pass must not claim values it
+# merely passed through: doing so would make a later unconfigure mistake the
+# user's own tier edit for a Router write and replace it with an older snapshot.
+_CONFIGURE_WRITTEN_ENV_KEYS = tuple(
+    key for key in _OWNED_ENV_KEYS if key not in SUBAGENT_ENV_KEYS
+)
+_OWNED_TOP_LEVEL_KEYS = ("model", "disableClaudeAiConnectors")
+_LEGACY_TOP_LEVEL_KEYS = ("model",)
 
 # Selects Router's Claude Code view of /v1/models, where models whose ids are
 # not Claude-shaped appear under compatibility aliases. Presentation only; it
@@ -163,6 +212,10 @@ def plan_configuration(
     if usage_base_url is not None:
         updated["env"]["ROUTER_BASE_URL"] = usage_base_url
     updated["model"] = model
+    # Gateway authentication disables claude.ai connectors regardless. State
+    # that explicitly so Claude Code does not warn that the configured auth
+    # source has disabled them on every launch.
+    updated["disableClaudeAiConnectors"] = True
     if statusline is not None and _statusline_slot_is_ours(settings, path):
         updated["statusLine"] = {"type": "command", "command": statusline}
         # Recorded only when this command actually takes the slot. A status
@@ -174,10 +227,84 @@ def plan_configuration(
             "written": updated["statusLine"],
         }
     state["written"] = {
-        "env": {key: updated["env"].get(key) for key in _OWNED_ENV_KEYS},
+        "env": {key: updated["env"].get(key) for key in _CONFIGURE_WRITTEN_ENV_KEYS},
         "top_level": {key: updated.get(key) for key in _OWNED_TOP_LEVEL_KEYS},
     }
     return updated, state
+
+
+def plan_subagent_update(
+    settings: dict,
+    path: Path,
+    state: dict,
+    tiers: dict[str, str | None],
+    *,
+    display_names: dict[str, str] | None = None,
+    descriptions: dict[str, str] | None = None,
+    automatic_tiers: set[str] | None = None,
+) -> tuple[dict, dict]:
+    """Return the settings and state after pointing sub-agent tiers at models.
+
+    A string points the tier's variable at that model and writes its real
+    display name and description. Claude Code otherwise labels the tier as
+    Sonnet, Opus, Haiku, or Fable even when a gateway runs a different model.
+    None removes the model and presentation overrides so the tier falls back
+    to Claude Code's own default.
+
+    ``automatic_tiers`` records which writes came from configure defaults.
+    Passing an empty set marks every tier in this update as a manual choice.
+    Omitting it preserves provenance for callers that only update the receipt.
+
+    The state advances the same way plan_configuration records its writes: the
+    written values move to what Router owns now, and a setting this state never
+    captured takes its snapshot from the settings as they are before this
+    write — the old file cannot say what the key held earlier, and unconfigure
+    has to restore the user's value, not delete it.
+    """
+    environment = _environment(settings, path)
+    updated_state = {
+        **state,
+        "env": dict(state["env"]),
+        "written": {**state["written"], "env": dict(state["written"]["env"])},
+    }
+    updated_environment = dict(environment)
+    display_names = display_names or {}
+    descriptions = descriptions or {}
+    for tier, model in tiers.items():
+        values = {
+            SUBAGENT_TIER_ENV_KEYS[tier]: model,
+            SUBAGENT_TIER_NAME_ENV_KEYS[tier]: (
+                display_names.get(tier) if model is not None else None
+            ),
+            SUBAGENT_TIER_DESCRIPTION_ENV_KEYS[tier]: (
+                descriptions.get(tier) if model is not None else None
+            ),
+        }
+        for key, value in values.items():
+            # Snapshot on the first write of this key, not the first sighting.
+            # A snapshot taken at configure time cannot speak for a value the
+            # user hand-set between configure and the first subagents write:
+            # restoring that stale snapshot would revert the user's edit.
+            if key not in updated_state["written"]["env"]:
+                updated_state["env"][key] = {
+                    "present": key in environment,
+                    "value": environment.get(key),
+                }
+            if value is None:
+                updated_environment.pop(key, None)
+            else:
+                updated_environment[key] = value
+            updated_state["written"]["env"][key] = value
+    if automatic_tiers is not None:
+        automatic_defaults = dict(state.get(SUBAGENT_DEFAULTS_STATE_KEY, {}))
+        for tier, model in tiers.items():
+            if tier in automatic_tiers and model is not None:
+                automatic_defaults[tier] = model
+            else:
+                automatic_defaults.pop(tier, None)
+        updated_state[SUBAGENT_DEFAULTS_STATE_KEY] = automatic_defaults
+    updated = {**settings, "env": updated_environment}
+    return updated, updated_state
 
 
 def plan_restoration(settings: dict, path: Path, state: dict) -> dict:
@@ -237,7 +364,14 @@ def merge_states(previous: dict, fresh: dict) -> dict:
         **previous,
         "env": {**fresh["env"], **previous["env"]},
         "top_level": {**fresh["top_level"], **previous["top_level"]},
-        "written": fresh["written"],
+        # Written values advance to this configure's writes, except keys it
+        # does not write: a tier the subagents command owns keeps its record,
+        # or a refresh would orphan that write and unconfigure would leave the
+        # Router-only model id behind.
+        "written": {
+            **fresh["written"],
+            "env": {**previous["written"]["env"], **fresh["written"]["env"]},
+        },
     }
     if "statusLine" in fresh:
         record = previous.get("statusLine")
@@ -250,12 +384,59 @@ def merge_states(previous: dict, fresh: dict) -> dict:
 
 
 def _still_ours(current: dict, key: str, written: dict) -> bool:
-    """Report whether a key still holds the value this command wrote."""
-    return current.get(key) == written.get(key)
+    """Report whether a key still holds the value this CLI wrote.
+
+    Membership in ``written`` is required. Otherwise a key the CLI captured
+    without ever writing (a tier value the user hand-set before Router, which
+    configure records but never claims) would appear equal to a matching
+    absence — both sides ``None`` — and get restored to its old value after
+    the user deletes it themselves.
+    """
+    return key in written and current.get(key) == written[key]
 
 
 def state_path(path: Path) -> Path:
     return path.parent / _STATE_FILENAME
+
+
+@contextmanager
+def settings_lock(path: Path):
+    """Serialize a read-modify-write of the settings and state documents.
+
+    Both files are rewritten whole from an in-memory snapshot, so two
+    concurrent updates would each keep their own view and the last writer
+    would silently drop the first one's change — and could pair a settings
+    document with a state receipt describing the other update. Same advisory
+    lock shape as the auth token refresh.
+    """
+    lock_path = path.parent / ".ramp-router-settings.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        elif msvcrt is not None:
+            _lock_with_msvcrt(lock_file)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            elif msvcrt is not None:
+                _unlock_with_msvcrt(lock_file)
+
+
+def _lock_with_msvcrt(lock_file):  # pragma: no cover - exercised on Windows
+    lock_file.seek(0, 2)
+    if lock_file.tell() == 0:
+        lock_file.write(b"\0")
+        lock_file.flush()
+    lock_file.seek(0)
+    msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+
+
+def _unlock_with_msvcrt(lock_file):  # pragma: no cover - exercised on Windows
+    lock_file.seek(0)
+    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def read_state(path: Path) -> dict:
@@ -292,16 +473,22 @@ def _valid_state(state: object) -> bool:
     top_level = state.get("top_level")
     written = state.get("written")
     record = state.get("statusLine")
+    automatic_defaults = state.get(SUBAGENT_DEFAULTS_STATE_KEY, {})
+    top_level_keys = set(top_level) if isinstance(top_level, dict) else set()
     if (
         not isinstance(environment, dict)
         or not _valid_env_keys(set(environment))
         or not isinstance(top_level, dict)
-        or set(top_level) != set(_OWNED_TOP_LEVEL_KEYS)
+        or top_level_keys
+        not in (set(_LEGACY_TOP_LEVEL_KEYS), set(_OWNED_TOP_LEVEL_KEYS))
         or not isinstance(written, dict)
         or not isinstance(written.get("env"), dict)
         or not _valid_env_keys(set(written["env"]))
         or not isinstance(written.get("top_level"), dict)
-        or set(written["top_level"]) != set(_OWNED_TOP_LEVEL_KEYS)
+        or set(written["top_level"]) != top_level_keys
+        or not isinstance(automatic_defaults, dict)
+        or not set(automatic_defaults) <= set(SUBAGENT_TIER_ENV_KEYS)
+        or not all(isinstance(model, str) for model in automatic_defaults.values())
     ):
         return False
     # The status line record exists only for a slot Router actually took.

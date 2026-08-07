@@ -13,37 +13,53 @@ EXIT_AUTH_REQUIRED = 4
 # Maps ramp_error_code values from API responses to actionable CLI hints.
 # Only include codes where the user can self-service; skip transient/server errors.
 # Source: Datadog 30-day analysis of 4xx errors on /developer/v1/agent-tools/*.
-_ERROR_CODE_HINTS: dict[str, str] = {
+_ERROR_CODE_HINTS: dict[str, tuple[frozenset[int], str]] = {
     # Request validation failure — bad or missing parameters.
     "2001": (
-        "The request body failed validation.  Run `ramp <resource> <command> --help`\n"
-        "  to check required parameters and accepted values."
+        frozenset({400, 422}),
+        (
+            "The request body failed validation.  Run `ramp <resource> <command> --help`\n"
+            "  to check required parameters and accepted values."
+        ),
     ),
     # Request-body validation failure on an agent-tool (DEVELOPER_INVALID_SCHEMA).
     "DEVELOPER_7001": (
-        "The request body failed validation — a required field is missing or invalid.\n"
-        "  Run `ramp <resource> <command> --help` to check required parameters and\n"
-        "  accepted values.\n"
+        frozenset({400, 422}),
+        (
+            "The request body failed validation — a required field is missing or invalid.\n"
+            "  Run `ramp <resource> <command> --help` to check required parameters and\n"
+            "  accepted values.\n"
+        ),
     ),
     # Auth token not found.
     "DEVELOPER_7002": (
-        "No valid auth token was found for this request.\n"
-        "  Run `ramp auth login` to authenticate, then retry."
+        frozenset({401}),
+        (
+            "No valid auth token was found for this request.\n"
+            "  Run `ramp auth login` to authenticate, then retry."
+        ),
     ),
     # Expired access token.
     "DEVELOPER_7028": (
-        "Your access token has expired.\n  Run `ramp auth login` to re-authenticate."
+        frozenset({401}),
+        ("Your access token has expired.\n  Run `ramp auth login` to re-authenticate."),
     ),
     # Insufficient OAuth scope.
     "DEVELOPER_7100": (
-        "Your token is missing the OAuth scope required by this endpoint.\n"
-        "  Refresh the tool definitions with `ramp tools refresh`, then run\n"
-        "  `ramp auth login` to re-authorize with the necessary permissions."
+        frozenset({403}),
+        (
+            "Your token is missing the OAuth scope required by this endpoint.\n"
+            "  Refresh the tool definitions with `ramp tools refresh`, then run\n"
+            "  `ramp auth login` to re-authorize with the necessary permissions."
+        ),
     ),
     # Tool not found on the server — spec may be outdated.
     "DEVELOPER_7127": (
-        "This tool does not exist on the server.  Your CLI spec may be outdated.\n"
-        "  Run `ramp tools list` to see available tools, or update the CLI."
+        frozenset({404}),
+        (
+            "This tool does not exist on the server.  Your CLI spec may be outdated.\n"
+            "  Run `ramp tools list` to see available tools, or update the CLI."
+        ),
     ),
 }
 
@@ -108,8 +124,14 @@ class ApiError(RampCLIError):
 
         self.error_code = error_code
 
-        # Append actionable hints for known error codes
-        hint = contextual_hint or _ERROR_CODE_HINTS.get(error_code or "")
+        # Error codes can be reused in responses with different HTTP semantics.
+        # Only offer recovery guidance when both classifications agree.
+        hint = contextual_hint
+        error_hint = _ERROR_CODE_HINTS.get(error_code or "")
+        if hint is None and error_hint is not None:
+            expected_statuses, candidate_hint = error_hint
+            if status_code in expected_statuses:
+                hint = candidate_hint
         if hint:
             detail += f"\n\n  {hint}"
 

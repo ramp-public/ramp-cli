@@ -561,7 +561,7 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
                 started_at=t0,
             )
     except ApiError as error:
-        if error.error_code == "DEVELOPER_7100":
+        if error.status_code == 403 and error.error_code == "DEVELOPER_7100":
             raise ApiError(
                 error.status_code,
                 error.body,

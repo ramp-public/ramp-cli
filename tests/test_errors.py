@@ -4,19 +4,43 @@ from __future__ import annotations
 
 import json
 
-from ramp_cli.errors import ApiError
+from ramp_cli.errors import EXIT_RUNTIME, ApiError
+
+
+def _error_body(error_code: str, message: str) -> str:
+    return json.dumps({"error_v2": {"error_code": error_code, "message": message}})
+
+
+def test_unauthenticated_error_includes_login_hint() -> None:
+    error = ApiError(
+        401,
+        _error_body("DEVELOPER_7002", "Authentication token not found"),
+    )
+
+    message = str(error)
+    assert "Authentication token not found" in message
+    assert "No valid auth token was found" in message
+    assert "ramp auth login" in message
+    assert error.code == EXIT_RUNTIME
+
+
+def test_expired_token_error_includes_reauthorization_hint() -> None:
+    error = ApiError(
+        401,
+        _error_body("DEVELOPER_7028", "Access token expired"),
+    )
+
+    message = str(error)
+    assert "Access token expired" in message
+    assert "ramp auth login" in message
 
 
 def test_business_authorization_error_does_not_claim_scope_is_missing() -> None:
     error = ApiError(
         403,
-        json.dumps(
-            {
-                "error_v2": {
-                    "error_code": "CUSTOMER_7004",
-                    "message": "Business not authorized to use this application",
-                }
-            }
+        _error_body(
+            "CUSTOMER_7004",
+            "Business not authorized to use this application",
         ),
     )
 
@@ -29,14 +53,7 @@ def test_business_authorization_error_does_not_claim_scope_is_missing() -> None:
 def test_insufficient_scope_error_includes_scope_specific_hint() -> None:
     error = ApiError(
         403,
-        json.dumps(
-            {
-                "error_v2": {
-                    "error_code": "DEVELOPER_7100",
-                    "message": "Insufficient scope",
-                }
-            }
-        ),
+        _error_body("DEVELOPER_7100", "Insufficient scope"),
     )
 
     message = str(error)
@@ -47,20 +64,27 @@ def test_insufficient_scope_error_includes_scope_specific_hint() -> None:
     assert error.error_code == "DEVELOPER_7100"
 
 
+def test_resource_not_found_does_not_claim_auth_is_missing() -> None:
+    error = ApiError(
+        404,
+        _error_body("DEVELOPER_7002", "Session not found"),
+    )
+
+    message = str(error)
+    assert "API error 404: Session not found" in message
+    assert "No valid auth token was found" not in message
+    assert "ramp auth login" not in message
+    assert error.code == EXIT_RUNTIME
+
+
 def test_invalid_schema_error_hints_at_missing_field() -> None:
     error = ApiError(
         422,
-        json.dumps(
-            {
-                "error_v2": {
-                    "error_code": "DEVELOPER_7001",
-                    "message": "There was an error.",
-                }
-            }
-        ),
+        _error_body("DEVELOPER_7001", "There was an error."),
     )
 
     message = str(error)
     assert "API error 422" in message
     assert "failed validation" in message
     assert "--help" in message
+    assert "auth login" not in message
