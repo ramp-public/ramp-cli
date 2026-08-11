@@ -608,6 +608,17 @@ def _classify_property(name: str, prop: dict, schemas: dict) -> ToolParam:
     if prop.get("type") == "array":
         return _classify_array(name, prop.get("items", {}), schemas, desc, default)
 
+    # Boolean enum/const constraints still use boolean CLI flags. Treating
+    # enum: [true] as a string enum breaks help rendering and serialization.
+    if prop.get("type") == "boolean":
+        return ToolParam(
+            name=name,
+            flag=name,
+            description=desc,
+            type=ParamType.BOOL,
+            default=default,
+        )
+
     # Inline enums (enum values directly on the property, not via $ref)
     if "enum" in prop:
         return ToolParam(
@@ -640,6 +651,15 @@ def _resolve_ref(
             flag=name,
             description=desc,
             type=ParamType.FILE,
+            default=default,
+        )
+
+    if ref_schema.get("type") == "boolean":
+        return ToolParam(
+            name=name,
+            flag=name,
+            description=desc,
+            type=ParamType.BOOL,
             default=default,
         )
 

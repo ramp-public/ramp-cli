@@ -384,6 +384,38 @@ class TestAgentAccountNumbers:
 
 
 class TestParamTypes:
+    @pytest.mark.parametrize("constraint", [{"enum": [True]}, {"const": True}])
+    def test_boolean_constraints_remain_boolean_params(self, constraint):
+        spec = {
+            "paths": {
+                "/developer/v1/agent-tools/create-x402": {
+                    "post": {
+                        "summary": "Create an x402 payment",
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "confirmed": {
+                                                "type": "boolean",
+                                                **constraint,
+                                            }
+                                        },
+                                    }
+                                }
+                            }
+                        },
+                    }
+                }
+            }
+        }
+
+        confirmed = parse_spec_dict(spec)[0].params[0]
+
+        assert confirmed.type is ParamType.BOOL
+        assert confirmed.enum_values is None
+
     def test_all_params_have_names(self, tools: list[ToolDef]):
         for tool in tools:
             for param in tool.params:

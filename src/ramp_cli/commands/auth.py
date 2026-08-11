@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 
 import click
@@ -9,6 +10,7 @@ import httpx
 
 from ramp_cli.animations.nyc import show_nyc
 from ramp_cli.auth import store
+from ramp_cli.auth.client_credentials import login as do_client_credentials_login
 from ramp_cli.auth.environment import (
     environment_auth_required_message,
     missing_required_environment_auth,
@@ -22,6 +24,8 @@ from ramp_cli.onboarding import is_first_login, record_first_login, show_welcome
 from ramp_cli.output.formatter import print_agent_json, resolve_format
 from ramp_cli.output.style import env_label, show_status_box
 from ramp_cli.specs.sync import fetch_spec
+
+CLIENT_SECRET_ENV_VAR = "RAMP_CLIENT_SECRET"
 
 
 @click.group("auth", help="Manage authentication")
@@ -105,6 +109,14 @@ def _refresh_tool_spec_before_login(env: str) -> None:
     show_default=True,
     help="OAuth authorization level to request.",
 )
+@click.option(
+    "--client-id",
+    help="OAuth client ID for standalone agent authentication.",
+)
+@click.option(
+    "--client-secret",
+    help=f"OAuth client secret. Prefer the {CLIENT_SECRET_ENV_VAR} environment variable.",
+)
 @click.pass_context
 def login(
     ctx: click.Context,
@@ -112,12 +124,18 @@ def login(
     no_browser: bool,
     scopes: tuple[str, ...],
     auth_level: str,
+    client_id: str | None,
+    client_secret: str | None,
 ) -> None:
-    """Authenticate with Ramp via browser."""
+    """Authenticate with Ramp."""
     env = ctx.obj["env"]
     label = env_label(env)
 
     if token_stdin:
+        if client_id or client_secret is not None:
+            raise click.UsageError(
+                "--token_stdin cannot be used with --client-id or --client-secret."
+            )
         if scopes or auth_level != "auto":
             raise click.UsageError(
                 "--scope and --auth-level cannot be used with --token_stdin."
@@ -141,6 +159,22 @@ def login(
         else:
             click.echo(f"Token saved for {label}.")
             _show_default_env_hint(env)
+        return
+
+    if client_secret is not None and not client_id:
+        raise click.UsageError("--client-secret requires --client-id.")
+
+    if client_id:
+        _login_standalone_agent(
+            ctx,
+            env=env,
+            label=label,
+            client_id=client_id,
+            client_secret=client_secret,
+            no_browser=no_browser,
+            scopes=scopes,
+            auth_level=auth_level,
+        )
         return
 
     if missing_required_environment_auth(env):
@@ -197,6 +231,80 @@ def login(
     else:
         _show_post_login_hints(env)
         click.echo()
+
+
+def _login_standalone_agent(
+    ctx: click.Context,
+    *,
+    env: str,
+    label: str,
+    client_id: str,
+    client_secret: str | None,
+    no_browser: bool,
+    scopes: tuple[str, ...],
+    auth_level: str,
+) -> None:
+    if no_browser:
+        raise click.UsageError("--no_browser cannot be used with --client-id.")
+    if auth_level != "auto":
+        raise click.UsageError("--auth-level cannot be used with --client-id.")
+    if missing_required_environment_auth(env):
+        raise EnvironmentAuthRequiredError(environment_auth_required_message(env))
+
+    env_secret = os.environ.get(CLIENT_SECRET_ENV_VAR)
+    if client_secret is not None and env_secret is not None:
+        click.echo(
+            f"Warning: --client-secret overrides {CLIENT_SECRET_ENV_VAR}.",
+            err=True,
+        )
+    resolved_secret = client_secret if client_secret is not None else env_secret
+    if not resolved_secret:
+        raise click.UsageError(
+            f"--client-id requires --client-secret or {CLIENT_SECRET_ENV_VAR}."
+        )
+
+    try:
+        token_resp = do_client_credentials_login(
+            env,
+            client_id=client_id,
+            client_secret=resolved_secret,
+            scopes=scopes,
+        )
+    except OAuthTokenError as exc:
+        raise click.ClickException(str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise click.ClickException(f"Token request failed: {exc}") from exc
+
+    store.save_tokens(
+        env,
+        token_resp.access_token,
+        "",
+        access_token_expires_in=token_resp.expires_in,
+        refresh_token_expires_in=0,
+        granted_scopes=token_resp.scope,
+        agent_key_uuid="",
+        clear_granted_scopes=not bool(token_resp.scope),
+    )
+
+    fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
+    if fmt == "json":
+        print_agent_json(
+            {
+                "message": f"Authenticated standalone agent for {label}.",
+                "environment": env,
+                "scopes": sorted(set(token_resp.scope.split())),
+                "expires_in": token_resp.expires_in,
+            },
+            pagination=None,
+        )
+        return
+
+    click.echo(f"Authenticated standalone agent for {label}.")
+    click.echo(
+        f"  Access token expires in {token_resp.expires_in} seconds and cannot be refreshed."
+    )
+    click.echo("  Run the same auth login command again after it expires.")
+    _show_default_env_hint(env)
 
 
 @auth_group.command()

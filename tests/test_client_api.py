@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from ramp_cli import __version__ as VERSION
@@ -12,6 +13,7 @@ from ramp_cli.client.api import (
     user_agent_string,
 )
 from ramp_cli.client.headers import agent_headers
+from ramp_cli.client.transport import AuthenticatedRampTransport
 from ramp_cli.errors import (
     EXIT_AUTH_REQUIRED,
     AuthRequiredError,
@@ -28,21 +30,23 @@ def clear_agent_client_env(monkeypatch):
 
 
 def test_get_access_token__refreshes_when_only_refresh_token_exists(monkeypatch):
-    client = RampClient("sandbox")
+    client = AuthenticatedRampTransport("sandbox")
 
     monkeypatch.setattr(
-        "ramp_cli.client.api.store.get_token_state",
+        "ramp_cli.client.transport.store.get_token_state",
         lambda env: TokenState(refresh_token="refresh-only"),
     )
-    monkeypatch.setattr("ramp_cli.client.api.try_refresh", lambda env: "access-new")
+    monkeypatch.setattr(
+        "ramp_cli.client.transport.try_refresh", lambda env: "access-new"
+    )
 
     assert client._get_access_token() == "access-new"
 
 
 def test_get_access_token__raises_auth_required_without_local_credentials(monkeypatch):
-    client = RampClient("sandbox")
+    client = AuthenticatedRampTransport("sandbox")
     monkeypatch.setattr(
-        "ramp_cli.client.api.store.get_token_state",
+        "ramp_cli.client.transport.store.get_token_state",
         lambda env: TokenState(),
     )
 
@@ -54,23 +58,43 @@ def test_get_access_token__raises_auth_required_without_local_credentials(monkey
 
 
 def test_get_access_token__raises_when_refresh_fails(monkeypatch):
-    client = RampClient("sandbox")
+    client = AuthenticatedRampTransport("sandbox")
 
     monkeypatch.setattr(
-        "ramp_cli.client.api.store.get_token_state",
+        "ramp_cli.client.transport.store.get_token_state",
         lambda env: TokenState(refresh_token="refresh-only"),
     )
-    monkeypatch.setattr("ramp_cli.client.api.try_refresh", lambda env: None)
+    monkeypatch.setattr("ramp_cli.client.transport.try_refresh", lambda env: None)
+
+    with pytest.raises(AuthRequiredError):
+        client._get_access_token()
+
+
+def test_get_access_token__expired_access_only_token_does_not_refresh(monkeypatch):
+    client = AuthenticatedRampTransport("sandbox")
+    monkeypatch.setattr(
+        "ramp_cli.client.transport.store.get_token_state",
+        lambda env: TokenState(
+            access_token="standalone-access",
+            access_token_issued_at=100,
+            access_token_expires_in=300,
+        ),
+    )
+    monkeypatch.setattr("ramp_cli.client.transport.time.time", lambda: 500)
+    monkeypatch.setattr(
+        "ramp_cli.client.transport.try_refresh",
+        lambda env: pytest.fail("access-only credentials cannot be refreshed"),
+    )
 
     with pytest.raises(AuthRequiredError):
         client._get_access_token()
 
 
 def test_get_access_token__refreshes_proactively_when_expiring_soon(monkeypatch):
-    client = RampClient("sandbox")
+    client = AuthenticatedRampTransport("sandbox")
 
     monkeypatch.setattr(
-        "ramp_cli.client.api.store.get_token_state",
+        "ramp_cli.client.transport.store.get_token_state",
         lambda env: TokenState(
             access_token="access-old",
             refresh_token="refresh-old",
@@ -78,8 +102,10 @@ def test_get_access_token__refreshes_proactively_when_expiring_soon(monkeypatch)
             access_token_expires_in=300,
         ),
     )
-    monkeypatch.setattr("ramp_cli.client.api.time.time", lambda: 380)
-    monkeypatch.setattr("ramp_cli.client.api.try_refresh", lambda env: "access-new")
+    monkeypatch.setattr("ramp_cli.client.transport.time.time", lambda: 380)
+    monkeypatch.setattr(
+        "ramp_cli.client.transport.try_refresh", lambda env: "access-new"
+    )
 
     assert client._get_access_token() == "access-new"
 
@@ -87,10 +113,10 @@ def test_get_access_token__refreshes_proactively_when_expiring_soon(monkeypatch)
 def test_get_access_token__uses_current_token_when_proactive_refresh_fails(
     monkeypatch,
 ):
-    client = RampClient("sandbox")
+    client = AuthenticatedRampTransport("sandbox")
 
     monkeypatch.setattr(
-        "ramp_cli.client.api.store.get_token_state",
+        "ramp_cli.client.transport.store.get_token_state",
         lambda env: TokenState(
             access_token="access-old",
             refresh_token="refresh-old",
@@ -98,18 +124,18 @@ def test_get_access_token__uses_current_token_when_proactive_refresh_fails(
             access_token_expires_in=300,
         ),
     )
-    monkeypatch.setattr("ramp_cli.client.api.time.time", lambda: 380)
+    monkeypatch.setattr("ramp_cli.client.transport.time.time", lambda: 380)
 
     def fail_refresh(env: str) -> str:
         raise RefreshFailedError("temporarily unavailable")
 
-    monkeypatch.setattr("ramp_cli.client.api.try_refresh", fail_refresh)
+    monkeypatch.setattr("ramp_cli.client.transport.try_refresh", fail_refresh)
 
     assert client._get_access_token() == "access-old"
 
 
 def test_request__sends_extra_auth_header(monkeypatch):
-    client = RampClient("sandbox")
+    client = AuthenticatedRampTransport("sandbox")
     captured = {}
 
     class FakeHTTP:
@@ -118,7 +144,7 @@ def test_request__sends_extra_auth_header(monkeypatch):
             return b"ok"
 
     monkeypatch.setattr(
-        "ramp_cli.client.api.extra_auth_headers",
+        "ramp_cli.client.transport.extra_auth_headers",
         lambda env: {"X-Extra-Auth": f"{env}-token"},
     )
 
@@ -129,7 +155,7 @@ def test_request__sends_extra_auth_header(monkeypatch):
 
 
 def test_request__sends_operation_headers(monkeypatch):
-    client = RampClient("sandbox")
+    client = AuthenticatedRampTransport("sandbox")
     captured = {}
 
     class FakeHTTP:
@@ -150,7 +176,7 @@ def test_request__sends_operation_headers(monkeypatch):
 
 
 def test_request__user_agent_includes_client_comment_when_sentinel_set(monkeypatch):
-    client = RampClient("sandbox")
+    client = AuthenticatedRampTransport("sandbox")
     captured = {}
 
     class FakeHTTP:
@@ -169,7 +195,7 @@ def test_request__user_agent_includes_client_comment_when_sentinel_set(monkeypat
 
 
 def test_request__sends_typed_agent_headers(monkeypatch):
-    client = RampClient("sandbox")
+    client = AuthenticatedRampTransport("sandbox")
     captured = {}
 
     class FakeHTTP:
@@ -202,7 +228,7 @@ def test_request__sends_typed_agent_headers(monkeypatch):
 def test_request__does_not_treat_legacy_client_override_as_typed_harness(
     monkeypatch,
 ):
-    client = RampClient("sandbox")
+    client = AuthenticatedRampTransport("sandbox")
     captured = {}
 
     class FakeHTTP:
@@ -292,20 +318,115 @@ def test_user_agent_string__includes_client_comment_when_known():
 
 
 def test_request__requires_environment_auth(monkeypatch):
-    client = RampClient("sandbox")
+    client = AuthenticatedRampTransport("sandbox")
 
     monkeypatch.setattr(
-        "ramp_cli.client.api.missing_required_environment_auth", lambda env: True
+        "ramp_cli.client.transport.missing_required_environment_auth",
+        lambda env: True,
     )
     monkeypatch.setattr(
-        "ramp_cli.client.api.environment_auth_required_message",
+        "ramp_cli.client.transport.environment_auth_required_message",
         lambda env: f"{env} requires extra auth",
     )
 
     with pytest.raises(EnvironmentAuthRequiredError) as exc_info:
-        client._do_request("GET", "https://example.test/developer/v1/users/me")
+        client.request("GET", "https://example.test/developer/v1/users/me")
 
     assert "sandbox requires extra auth" in str(exc_info.value)
+
+
+def test_request__refreshes_and_replays_after_401(monkeypatch):
+    client = AuthenticatedRampTransport("sandbox")
+    attempted_tokens = []
+
+    def handler(request):
+        attempted_tokens.append(request.headers["Authorization"])
+        status_code = 401 if len(attempted_tokens) == 1 else 200
+        return httpx.Response(status_code, content=b"ok")
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr("ramp_cli.client.transport.httpx.Client", lambda **kwargs: http)
+    monkeypatch.setattr(
+        "ramp_cli.client.transport.store.get_token_state",
+        lambda env: TokenState(access_token="access-old"),
+    )
+    monkeypatch.setattr(
+        "ramp_cli.client.transport.try_refresh", lambda env: "access-new"
+    )
+
+    assert client.request("GET", "https://example.test/things") == b"ok"
+    assert attempted_tokens == ["Bearer access-old", "Bearer access-new"]
+
+
+def test_request__does_not_refresh_static_token_after_401(monkeypatch):
+    client = AuthenticatedRampTransport("sandbox", access_token="access-static")
+    attempted_tokens = []
+
+    def handler(request):
+        attempted_tokens.append(request.headers["Authorization"])
+        return httpx.Response(401)
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr("ramp_cli.client.transport.httpx.Client", lambda **kwargs: http)
+
+    def fail_if_called(env):
+        raise AssertionError("static tokens must not be refreshed")
+
+    monkeypatch.setattr("ramp_cli.client.transport.try_refresh", fail_if_called)
+
+    with pytest.raises(AuthRequiredError):
+        client.request("GET", "https://example.test/things")
+
+    assert attempted_tokens == ["Bearer access-static"]
+
+
+def test_request_multipart__refreshes_and_replays_after_401(monkeypatch):
+    client = AuthenticatedRampTransport("sandbox")
+    attempted_tokens = []
+
+    def handler(request):
+        attempted_tokens.append(request.headers["Authorization"])
+        status_code = 401 if len(attempted_tokens) == 1 else 200
+        return httpx.Response(status_code, content=b"ok")
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr("ramp_cli.client.transport.httpx.Client", lambda **kwargs: http)
+    monkeypatch.setattr(
+        "ramp_cli.client.transport.store.get_token_state",
+        lambda env: TokenState(access_token="access-old"),
+    )
+    monkeypatch.setattr(
+        "ramp_cli.client.transport.try_refresh", lambda env: "access-new"
+    )
+
+    result = client.request_multipart(
+        "POST",
+        "https://example.test/uploads",
+        data={"purpose": "receipt"},
+        files={"file": ("receipt.txt", b"contents")},
+    )
+
+    assert result == b"ok"
+    assert attempted_tokens == ["Bearer access-old", "Bearer access-new"]
+
+
+def test_post__resolves_core_base_url_at_request_time(monkeypatch):
+    client = RampClient("sandbox")
+    captured = {}
+
+    def fake_request(method, url, body=None, request_headers=None):
+        captured.update(method=method, url=url, body=body)
+        return b"ok"
+
+    monkeypatch.setattr(client._transport, "request", fake_request)
+    monkeypatch.setenv("RAMP_API_URL", "https://core.example.test/")
+
+    assert client.post("/developer/v1/things", b"{}") == b"ok"
+    assert captured == {
+        "method": "POST",
+        "url": "https://core.example.test/developer/v1/things",
+        "body": b"{}",
+    }
 
 
 def test_get_url__allows_active_api_origin(monkeypatch):
@@ -316,7 +437,7 @@ def test_get_url__allows_active_api_origin(monkeypatch):
         captured.update(method=method, url=url)
         return b"ok"
 
-    monkeypatch.setattr(client, "_do_request", fake_request)
+    monkeypatch.setattr(client._transport, "request", fake_request)
 
     assert (
         client.get_url("https://api.ramp.com:443/developer/v1/things?start=2") == b"ok"

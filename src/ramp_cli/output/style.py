@@ -434,6 +434,103 @@ def header(text: str) -> None:
     click.echo(BOX_H * len(text))
 
 
+# === Public: Inline Spinner ===
+
+_BRAND_YELLOW = (228, 242, 33)  # #e4f221
+_SPINNER_FRAMES = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
+_SPINNER_INTERVAL = 1 / 12
+
+
+def start_spinner(text: str, file: TextIO | None = None) -> Callable[[], None]:
+    """Spin a one-line progress indicator until the returned callable is run.
+
+    Goes to stderr so it never lands in piped output, and draws nothing at all
+    when that is not a terminal: a redirected log wants the result, not a
+    thousand repainted frames. Stopping clears the line, leaving the caller's
+    own output to say what happened.
+    """
+    file = file or sys.stderr
+    stop_event = threading.Event()
+    if not _color_supported(file):
+        return lambda: None
+
+    def _run() -> None:
+        frame = 0
+        while not stop_event.is_set():
+            glyph = _SPINNER_FRAMES[frame % len(_SPINNER_FRAMES)]
+            file.write(f"\r{_clear_eol()}{_fg(*_BRAND_YELLOW)}{glyph}{_reset()} {text}")
+            file.flush()
+            frame += 1
+            stop_event.wait(_SPINNER_INTERVAL)
+
+    file.write(_hide_cursor())
+    file.flush()
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    def stop() -> None:
+        stop_event.set()
+        thread.join(timeout=1)
+        file.write(f"\r{_clear_eol()}{_show_cursor()}")
+        file.flush()
+
+    return stop
+
+
+# === Public: Notice Card ===
+
+_NOTICE_YELLOW = _BRAND_YELLOW
+
+
+def show_notice(title: str, lines: list[str], file: TextIO | None = None) -> None:
+    """Print a framed notice in brand yellow.
+
+    For consequences the user has to know before they meet them, so it is
+    deliberately louder than the surrounding output.
+
+    Three conventions keep the caller free of formatting. An empty string is a
+    blank row. Leading spaces survive wrapping, so a list of commands stays
+    indented under whatever introduced it. An unindented line ending in a
+    colon is the heading of the block below it and is emphasized.
+    """
+    file = file or sys.stdout
+    use_color = _color_supported(file)
+    width = max(_WIDTH_MIN, min(_term_width(), _WIDTH_MAX))
+    inner = width - 4
+    yellow = _fg(*_NOTICE_YELLOW) if use_color else ""
+    close = _reset() if use_color else ""
+
+    rendered: list[tuple[str, bool]] = []
+    for line in lines:
+        indent = " " * (len(line) - len(line.lstrip()))
+        heading = not indent and line.rstrip().endswith(":")
+        for part in wrap_text(line.strip(), max(1, inner - len(indent))):
+            rendered.append((f"{indent}{part}" if part else "", heading))
+
+    title_display = f" {title} "
+    right_pad = max(1, width - 2 - 3 - len(title_display))
+    top = (
+        f"{yellow}{BOX_TL}{BOX_H * 3}{_bold() if use_color else ''}{title_display}"
+        f"{close}{yellow}{BOX_H * right_pad}{BOX_TR}{close}"
+    )
+    bottom = f"{yellow}{BOX_BL}{BOX_H * (width - 2)}{BOX_BR}{close}"
+
+    out = [top]
+    for text, heading in rendered:
+        # Padded by visible length, since the emphasis is added around the
+        # text rather than counted as part of it.
+        padding = " " * max(0, inner - len(text))
+        body = (
+            f"{_bold()}{yellow}{text}{close}{padding}"
+            if heading and use_color
+            else f"{text}{padding}"
+        )
+        out.append(f"{yellow}{BOX_V}{close} {body} {yellow}{BOX_V}{close}")
+    out.append(bottom)
+    file.write("\n".join(out) + "\n")
+    file.flush()
+
+
 # === NYC Skyline (mode-14 port) ===
 
 

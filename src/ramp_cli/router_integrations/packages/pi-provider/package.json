@@ -35,7 +35,7 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": ">=0.81.1"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "0.81.1",

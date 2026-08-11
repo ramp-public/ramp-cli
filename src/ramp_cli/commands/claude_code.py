@@ -49,6 +49,7 @@ SUBAGENT_ENV_KEYS = (
     *SUBAGENT_TIER_DESCRIPTION_ENV_KEYS.values(),
 )
 SUBAGENT_DEFAULTS_STATE_KEY = "automatic_subagent_tiers"
+_CLAUDE_AI_CONNECTORS_ENV = "ENABLE_CLAUDEAI_MCP_SERVERS"
 
 # Router keys are bearer tokens, so ANTHROPIC_AUTH_TOKEN is correct and
 # ANTHROPIC_API_KEY is deliberately not set: Claude Code treats them
@@ -62,6 +63,10 @@ _OWNED_ENV_KEYS = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_CUSTOM_HEADERS",
     "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+    # Suppresses Claude's expected "connectors are disabled" warning in Router
+    # sessions. Unlike the restrictive top-level setting, this normal env value
+    # can be unset by the original settings overlay.
+    _CLAUDE_AI_CONNECTORS_ENV,
     # Read by the status line script. ANTHROPIC_BASE_URL cannot serve as its
     # base because that points at the data plane, which does not answer the
     # session-usage endpoint the script calls.
@@ -76,7 +81,11 @@ _OWNED_ENV_KEYS = (
 # "not captured", never "was absent": restoration leaves an uncaptured key
 # alone, and merge_states adopts the fresh snapshot taken before this
 # configure wrote it.
-_ENV_KEYS_OWNED_LATER = ("ROUTER_BASE_URL", *SUBAGENT_ENV_KEYS)
+_ENV_KEYS_OWNED_LATER = (
+    "ROUTER_BASE_URL",
+    _CLAUDE_AI_CONNECTORS_ENV,
+    *SUBAGENT_ENV_KEYS,
+)
 # Keys plan_configuration itself writes. Tier settings are applied separately
 # through plan_subagent_update, so this first pass must not claim values it
 # merely passed through: doing so would make a later unconfigure mistake the
@@ -85,7 +94,9 @@ _CONFIGURE_WRITTEN_ENV_KEYS = tuple(
     key for key in _OWNED_ENV_KEYS if key not in SUBAGENT_ENV_KEYS
 )
 _OWNED_TOP_LEVEL_KEYS = ("model", "disableClaudeAiConnectors")
+_CONFIGURE_WRITTEN_TOP_LEVEL_KEYS = ("model",)
 _LEGACY_TOP_LEVEL_KEYS = ("model",)
+_ROUTER_MODEL_PREFIX = "claude-router-"
 
 # Selects Router's Claude Code view of /v1/models, where models whose ids are
 # not Claude-shaped appear under compatibility aliases. Presentation only; it
@@ -93,6 +104,13 @@ _LEGACY_TOP_LEVEL_KEYS = ("model",)
 _GATEWAY_CLIENT_HEADER = "X-Gateway-Client: claude-code"
 
 _STATE_FILENAME = "ramp-router-state.json"
+_ORIGINAL_SETTINGS_FILENAME = "original.settings.json"
+# Records that this CLI created the overlay, so unconfigure removes only a
+# file it wrote and never one the user happened to name the same.
+ORIGINAL_SETTINGS_STATE_KEY = "original_settings"
+# Records what the overlay held when it was written, so one the user has since
+# edited is left alone instead of deleted.
+ORIGINAL_SETTINGS_DIGEST_KEY = "original_settings_digest"
 
 
 def settings_path() -> Path:
@@ -123,6 +141,11 @@ def read_settings(path: Path) -> dict:
             "the top-level value must be an object."
         )
     return data
+
+
+def _is_router_model(value: object) -> bool:
+    """Return whether Claude Code's selected model is one of Router's aliases."""
+    return isinstance(value, str) and value.startswith(_ROUTER_MODEL_PREFIX)
 
 
 def _environment(settings: dict, path: Path) -> dict:
@@ -187,15 +210,20 @@ def plan_configuration(
     value is no longer ours would undo their newer choice.
     """
     environment = _environment(settings, path)
+    top_level = {}
+    for key in _OWNED_TOP_LEVEL_KEYS:
+        value = settings.get(key)
+        # A Router model selected during an earlier Router session is not part
+        # of the native setup. Treat it as absent so a fresh configure cannot
+        # preserve it in the escape overlay or restore it on unconfigure.
+        present = key in settings and not (key == "model" and _is_router_model(value))
+        top_level[key] = {"present": present, "value": value if present else None}
     state = {
         "env": {
             key: {"present": key in environment, "value": environment.get(key)}
             for key in _OWNED_ENV_KEYS
         },
-        "top_level": {
-            key: {"present": key in settings, "value": settings.get(key)}
-            for key in _OWNED_TOP_LEVEL_KEYS
-        },
+        "top_level": top_level,
     }
     updated = dict(settings)
     updated["env"] = {
@@ -204,6 +232,7 @@ def plan_configuration(
         "ANTHROPIC_AUTH_TOKEN": api_key,
         "ANTHROPIC_CUSTOM_HEADERS": _GATEWAY_CLIENT_HEADER,
         "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+        _CLAUDE_AI_CONNECTORS_ENV: "false",
     }
     # Two auth variables at once is ambiguous to Claude Code, so the one we do
     # not own is cleared rather than left to compete. It is restored on
@@ -212,10 +241,6 @@ def plan_configuration(
     if usage_base_url is not None:
         updated["env"]["ROUTER_BASE_URL"] = usage_base_url
     updated["model"] = model
-    # Gateway authentication disables claude.ai connectors regardless. State
-    # that explicitly so Claude Code does not warn that the configured auth
-    # source has disabled them on every launch.
-    updated["disableClaudeAiConnectors"] = True
     if statusline is not None and _statusline_slot_is_ours(settings, path):
         updated["statusLine"] = {"type": "command", "command": statusline}
         # Recorded only when this command actually takes the slot. A status
@@ -228,9 +253,64 @@ def plan_configuration(
         }
     state["written"] = {
         "env": {key: updated["env"].get(key) for key in _CONFIGURE_WRITTEN_ENV_KEYS},
-        "top_level": {key: updated.get(key) for key in _OWNED_TOP_LEVEL_KEYS},
+        "top_level": {
+            key: updated.get(key) for key in _CONFIGURE_WRITTEN_TOP_LEVEL_KEYS
+        },
     }
     return updated, state
+
+
+def original_settings_path(path: Path) -> Path:
+    """Where the settings Router displaced live as a runnable overlay."""
+    return path.parent / _ORIGINAL_SETTINGS_FILENAME
+
+
+def original_settings_command(path: Path, *, use_default_model: bool = False) -> str:
+    """The command that runs Claude Code on the setup Router replaced.
+
+    Written against ``~`` when the file sits under the home directory, since
+    this is meant to be typed. Only the part after the tilde is quoted: a
+    quoted tilde is a literal one, and the shell would look for a directory
+    actually named "~".
+    """
+    settings = original_settings_path(path)
+    model_option = " --model default" if use_default_model else ""
+    try:
+        relative = settings.relative_to(Path.home())
+    except (ValueError, RuntimeError):
+        return f"claude --settings {shlex.quote(str(settings))}{model_option}"
+    return f"claude --settings ~/{shlex.quote(str(relative))}{model_option}"
+
+
+def plan_original_settings(state: dict) -> dict:
+    """Build an overlay that puts one session back on the previous provider.
+
+    Claude Code has no profiles, but ``--settings`` overrides the keys it names
+    for a single session and leaves the rest of the file alone. A key Router
+    introduced is written as an empty string rather than omitted: omitting it
+    would inherit the Router value from user settings, and Claude Code
+    documents an empty value as unset for provider selection.
+
+    ``model`` is the exception. It is a top-level key, where the empty-value
+    rule does not apply. When the previous settings did not pin one, leave it
+    out and let Claude Code resolve its default for the restored provider.
+    """
+    environment = {}
+    for key in _OWNED_ENV_KEYS:
+        captured = state.get("env", {}).get(key)
+        if not isinstance(captured, dict):
+            continue
+        environment[key] = captured["value"] if captured.get("present") else ""
+    overlay: dict = {"env": environment}
+    for key in _OWNED_TOP_LEVEL_KEYS:
+        captured = state.get("top_level", {}).get(key)
+        if (
+            isinstance(captured, dict)
+            and captured.get("present")
+            and not (key == "model" and _is_router_model(captured.get("value")))
+        ):
+            overlay[key] = captured["value"]
+    return overlay
 
 
 def plan_subagent_update(
@@ -313,7 +393,8 @@ def plan_restoration(settings: dict, path: Path, state: dict) -> dict:
     A key the user has changed since is left alone. Claude Code writes these
     itself when someone picks a different model or points at another gateway,
     and replacing that with a snapshot from before Router was configured would
-    silently undo it.
+    silently undo it. A model in Router's alias namespace is the exception:
+    switching between Router models must not make one survive Router itself.
     """
     written = state["written"]
     environment = dict(_environment(settings, path))
@@ -331,9 +412,15 @@ def plan_restoration(settings: dict, path: Path, state: dict) -> dict:
         # An env object we created and then emptied should not be left behind.
         restored.pop("env", None)
     for key, previous in state["top_level"].items():
-        if not _still_ours(settings, key, written["top_level"]):
+        current_is_router_model = key == "model" and _is_router_model(settings.get(key))
+        if not current_is_router_model and not _still_ours(
+            settings, key, written["top_level"]
+        ):
             continue
-        if previous.get("present"):
+        previous_is_router_model = key == "model" and _is_router_model(
+            previous.get("value")
+        )
+        if previous.get("present") and not previous_is_router_model:
             restored[key] = previous.get("value")
         else:
             restored.pop(key, None)
@@ -347,6 +434,27 @@ def plan_restoration(settings: dict, path: Path, state: dict) -> dict:
         else:
             restored.pop("statusLine", None)
     return restored
+
+
+def restore_legacy_connector_preference(settings: dict, state: dict) -> dict:
+    """Restore the connector preference replaced by older Router setups.
+
+    Claude Code treats ``true`` in any settings source as authoritative, so an
+    additional settings file cannot re-enable connectors while this value
+    remains in user settings. Change it only when the old receipt proves that
+    Router wrote the current value, then put back the captured user preference.
+    """
+    written = state.get("written", {}).get("top_level", {})
+    key = "disableClaudeAiConnectors"
+    if settings.get(key) is not True or written.get(key) is not True:
+        return settings
+    updated = dict(settings)
+    previous = state.get("top_level", {}).get(key)
+    if isinstance(previous, dict) and previous.get("present"):
+        updated[key] = previous.get("value")
+    else:
+        updated.pop(key)
+    return updated
 
 
 def merge_states(previous: dict, fresh: dict) -> dict:
@@ -475,6 +583,10 @@ def _valid_state(state: object) -> bool:
     record = state.get("statusLine")
     automatic_defaults = state.get(SUBAGENT_DEFAULTS_STATE_KEY, {})
     top_level_keys = set(top_level) if isinstance(top_level, dict) else set()
+    written_top_level = written.get("top_level") if isinstance(written, dict) else None
+    written_top_level_keys = (
+        set(written_top_level) if isinstance(written_top_level, dict) else set()
+    )
     if (
         not isinstance(environment, dict)
         or not _valid_env_keys(set(environment))
@@ -484,8 +596,8 @@ def _valid_state(state: object) -> bool:
         or not isinstance(written, dict)
         or not isinstance(written.get("env"), dict)
         or not _valid_env_keys(set(written["env"]))
-        or not isinstance(written.get("top_level"), dict)
-        or set(written["top_level"]) != top_level_keys
+        or not isinstance(written_top_level, dict)
+        or not (set(_LEGACY_TOP_LEVEL_KEYS) <= written_top_level_keys <= top_level_keys)
         or not isinstance(automatic_defaults, dict)
         or not set(automatic_defaults) <= set(SUBAGENT_TIER_ENV_KEYS)
         or not all(isinstance(model, str) for model in automatic_defaults.values())

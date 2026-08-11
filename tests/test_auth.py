@@ -528,6 +528,21 @@ def test_try_refresh__raises_on_transient_refresh_failure(isolated_config, monke
         refresh_helper.try_refresh("sandbox")
 
 
+def test_try_refresh__access_only_credentials_do_not_exchange(
+    isolated_config, monkeypatch
+):
+    store.save_tokens("sandbox", "standalone-access", "")
+    monkeypatch.setattr(
+        refresh_helper,
+        "refresh_tokens",
+        lambda env, refresh_token: pytest.fail(
+            "access-only credentials cannot use a refresh-token exchange"
+        ),
+    )
+
+    assert refresh_helper.try_refresh("sandbox") is None
+
+
 class TestUsageErrorDisplay:
     """Verify that UsageErrors show the usage box but not the strip-wave banner."""
 
@@ -584,10 +599,9 @@ class TestCallbackHtml:
         )
         assert "<!DOCTYPE html>" in html
         assert "ramp-cli" in html
-        assert "\u25c6" in html  # ◆ filled diamond
         assert "Authenticated" in html
         assert "close this window" in html
-        assert "#10b981" in html  # green accent
+        assert "#e4f222" in html  # Ramp brand yellow on the heading
 
     def test_error_page_contains_key_elements(self):
         html = _callback_html(
@@ -597,10 +611,20 @@ class TestCallbackHtml:
             detail="access_denied — user cancelled",
         )
         assert "<!DOCTYPE html>" in html
-        assert "\u2715" in html  # ✕ symbol
         assert "Authentication failed" in html
         assert "access_denied" in html
         assert "#ef4444" in html  # red accent
+        assert "#e4f222" not in html
+
+    def test_page_is_rendered_in_the_router_dark_palette(self):
+        # The browser lands here straight from Router, so a white card would
+        # flash bright in the middle of an otherwise dark hand-off.
+        html = _callback_html(success=True, title="OK", message="msg")
+
+        assert 'content="dark"' in html
+        assert "background:#090909" in html
+        assert "#fff" not in html
+        assert "#fafafa" not in html
 
     def test_detail_block_rendered_when_provided(self):
         html = _callback_html(
@@ -977,6 +1001,234 @@ class TestAuthLoginSpecRefresh:
         )
 
         auth_command_module._refresh_tool_spec_before_login("sandbox")
+
+
+class TestStandaloneAgentLogin:
+    def test_env_secret_selects_client_credentials_and_replaces_stale_state(
+        self, isolated_config, monkeypatch
+    ):
+        store.save_tokens(
+            "sandbox",
+            "old-access",
+            "old-refresh",
+            granted_scopes="old:scope",
+            agent_key_uuid="old-agent-key",
+        )
+        monkeypatch.setenv("RAMP_CLIENT_SECRET", "secret-from-env")
+        monkeypatch.setattr(
+            auth_command_module,
+            "fetch_spec",
+            lambda env: pytest.fail("standalone login must not refresh the spec"),
+        )
+        monkeypatch.setattr(
+            auth_command_module,
+            "do_login",
+            lambda env, opts: pytest.fail("standalone login must not use PKCE"),
+        )
+
+        def fake_client_credentials_login(
+            env: str,
+            *,
+            client_id: str,
+            client_secret: str,
+            scopes: tuple[str, ...],
+        ) -> TokenResponse:
+            assert env == "sandbox"
+            assert client_id == "agent-client"
+            assert client_secret == "secret-from-env"
+            assert scopes == ()
+            return TokenResponse(
+                access_token="standalone-access",
+                refresh_token="unexpected-refresh",
+                expires_in=604800,
+                refresh_token_expires_in=86400,
+                scope="transactions:read users:read",
+                agent_key_uuid="unexpected-agent-key",
+            )
+
+        monkeypatch.setattr(
+            auth_command_module,
+            "do_client_credentials_login",
+            fake_client_credentials_login,
+        )
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--agent",
+                "--env",
+                "sandbox",
+                "auth",
+                "login",
+                "--client-id",
+                "agent-client",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        output = json.loads(result.output)
+        assert output["data"][0] == {
+            "message": "Authenticated standalone agent for Sandbox.",
+            "environment": "sandbox",
+            "scopes": ["transactions:read", "users:read"],
+            "expires_in": 604800,
+        }
+        state = store.get_token_state("sandbox")
+        assert state.access_token == "standalone-access"
+        assert state.refresh_token == ""
+        assert state.access_token_expires_in == 604800
+        assert state.refresh_token_expires_in == 0
+        assert store.get_granted_scopes("sandbox") == {
+            "transactions:read",
+            "users:read",
+        }
+        assert store.get_agent_key_uuid("sandbox") == ""
+
+    def test_flag_secret_wins_over_env_and_warns(self, isolated_config, monkeypatch):
+        monkeypatch.setenv("RAMP_CLIENT_SECRET", "secret-from-env")
+
+        def fake_client_credentials_login(
+            env: str,
+            *,
+            client_id: str,
+            client_secret: str,
+            scopes: tuple[str, ...],
+        ) -> TokenResponse:
+            assert client_secret == "secret-from-flag"
+            return TokenResponse(
+                access_token="standalone-access",
+                expires_in=3600,
+                scope="transactions:read",
+            )
+
+        monkeypatch.setattr(
+            auth_command_module,
+            "do_client_credentials_login",
+            fake_client_credentials_login,
+        )
+        monkeypatch.setattr(
+            auth_command_module,
+            "show_nyc",
+            lambda duration: pytest.fail("standalone login must not show onboarding"),
+        )
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--human",
+                "auth",
+                "login",
+                "--client-id",
+                "agent-client",
+                "--client-secret",
+                "secret-from-flag",
+                "--scope",
+                "transactions:read",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert "Warning: --client-secret overrides RAMP_CLIENT_SECRET." in result.output
+        assert "Authenticated standalone agent" in result.output
+        assert "cannot be refreshed" in result.output
+        assert "secret-from-env" not in result.output
+        assert "secret-from-flag" not in result.output
+
+    def test_env_secret_alone_does_not_change_pkce_flow(
+        self, isolated_config, monkeypatch
+    ):
+        monkeypatch.setenv("RAMP_CLIENT_SECRET", "standalone-secret")
+        monkeypatch.setattr(auth_command_module, "fetch_spec", lambda env: 1)
+        monkeypatch.setattr(auth_command_module, "show_nyc", lambda duration: None)
+        monkeypatch.setattr(auth_command_module, "show_status_box", lambda envs: None)
+        monkeypatch.setattr(auth_command_module, "is_first_login", lambda: False)
+        monkeypatch.setattr(auth_command_module, "record_first_login", lambda: None)
+
+        def fake_login(env: str, opts: oauth_module.LoginOptions) -> TokenResponse:
+            return TokenResponse(
+                access_token="human-access",
+                refresh_token="human-refresh",
+                scope="users:read",
+            )
+
+        monkeypatch.setattr(auth_command_module, "do_login", fake_login)
+        monkeypatch.setattr(
+            auth_command_module,
+            "do_client_credentials_login",
+            lambda *args, **kwargs: pytest.fail(
+                "environment secret alone must not select client credentials"
+            ),
+        )
+
+        result = CliRunner().invoke(
+            cli,
+            ["--human", "--env", "sandbox", "auth", "login"],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert store.get_tokens("sandbox") == ("human-access", "human-refresh")
+
+    @pytest.mark.parametrize(
+        ("args", "message"),
+        [
+            pytest.param(
+                ["--client-secret", "secret"],
+                "--client-secret requires --client-id",
+                id="secret-without-client-id",
+            ),
+            pytest.param(
+                ["--client-id", "agent-client"],
+                "--client-id requires --client-secret or RAMP_CLIENT_SECRET",
+                id="missing-secret",
+            ),
+            pytest.param(
+                [
+                    "--client-id",
+                    "agent-client",
+                    "--client-secret",
+                    "secret",
+                    "--no_browser",
+                ],
+                "--no_browser cannot be used with --client-id",
+                id="no-browser",
+            ),
+            pytest.param(
+                [
+                    "--client-id",
+                    "agent-client",
+                    "--client-secret",
+                    "secret",
+                    "--auth-level",
+                    "user",
+                ],
+                "--auth-level cannot be used with --client-id",
+                id="auth-level",
+            ),
+            pytest.param(
+                [
+                    "--token_stdin",
+                    "--client-id",
+                    "agent-client",
+                    "--client-secret",
+                    "secret",
+                ],
+                "--token_stdin cannot be used with --client-id or --client-secret",
+                id="token-stdin",
+            ),
+        ],
+    )
+    def test_rejects_invalid_option_combinations(
+        self, isolated_config, monkeypatch, args: list[str], message: str
+    ):
+        monkeypatch.delenv("RAMP_CLIENT_SECRET", raising=False)
+
+        result = CliRunner().invoke(cli, ["--human", "auth", "login", *args])
+
+        assert result.exit_code == 2
+        assert message in result.output
 
 
 class TestPostLoginEnvHint:

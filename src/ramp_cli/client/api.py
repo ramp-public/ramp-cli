@@ -1,45 +1,21 @@
-"""httpx-based API client with automatic token refresh on 401."""
+"""Core Developer API client."""
 
 from __future__ import annotations
 
-import os
-import time
-from collections.abc import Mapping
-from typing import Any
 from urllib.parse import urlsplit
 
-import httpx
-
-from ramp_cli import __version__ as VERSION
-from ramp_cli.auth import store
-from ramp_cli.auth.environment import (
-    environment_auth_required_message,
-    extra_auth_headers,
-    missing_required_environment_auth,
-)
-from ramp_cli.auth.refresh import try_refresh
-from ramp_cli.client.agent import infer_client_name, infer_harness_name
-from ramp_cli.client.headers import agent_headers
+from ramp_cli.client.agent import infer_client_name
+from ramp_cli.client.transport import AuthenticatedRampTransport, user_agent_string
 from ramp_cli.config.constants import api_url, base_url
-from ramp_cli.errors import (
-    ApiError,
-    AuthRequiredError,
-    EnvironmentAuthRequiredError,
-    RefreshFailedError,
-    UnsafeRequestUrlError,
-)
-
-# Client timeout should exceed the server-side timeout (60s) so we always
-# receive the server's response rather than giving up prematurely.
-_REQUEST_TIMEOUT = 75.0
+from ramp_cli.errors import UnsafeRequestUrlError
 
 
 class RampClient:
-    """Synchronous Ramp API client with auto-refresh."""
+    """Synchronous Core Developer API client with automatic token refresh."""
 
     def __init__(self, env: str, access_token: str | None = None) -> None:
         self.env = env
-        self._static_access_token = access_token or os.environ.get("RAMP_ACCESS_TOKEN")
+        self._transport = AuthenticatedRampTransport(env, access_token)
 
     def get(
         self,
@@ -47,34 +23,45 @@ class RampClient:
         params: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
     ) -> bytes:
-        return self._do_request(
-            "GET", api_url(self.env, path, params), request_headers=headers
+        return self._transport.request(
+            "GET",
+            api_url(self.env, path, params),
+            request_headers=headers,
         )
 
     def get_url(self, url: str) -> bytes:
         if not _same_origin(url, base_url(self.env)):
             raise UnsafeRequestUrlError(url)
-        return self._do_request("GET", url)
+        return self._transport.request("GET", url)
 
     def post(
         self, path: str, json_body: bytes, headers: dict[str, str] | None = None
     ) -> bytes:
-        return self._do_request(
-            "POST", api_url(self.env, path), body=json_body, request_headers=headers
+        return self._transport.request(
+            "POST",
+            api_url(self.env, path),
+            body=json_body,
+            request_headers=headers,
         )
 
     def patch(
         self, path: str, json_body: bytes, headers: dict[str, str] | None = None
     ) -> bytes:
-        return self._do_request(
-            "PATCH", api_url(self.env, path), body=json_body, request_headers=headers
+        return self._transport.request(
+            "PATCH",
+            api_url(self.env, path),
+            body=json_body,
+            request_headers=headers,
         )
 
     def put(
         self, path: str, json_body: bytes, headers: dict[str, str] | None = None
     ) -> bytes:
-        return self._do_request(
-            "PUT", api_url(self.env, path), body=json_body, request_headers=headers
+        return self._transport.request(
+            "PUT",
+            api_url(self.env, path),
+            body=json_body,
+            request_headers=headers,
         )
 
     def delete(
@@ -83,8 +70,11 @@ class RampClient:
         json_body: bytes | None = None,
         headers: dict[str, str] | None = None,
     ) -> bytes:
-        return self._do_request(
-            "DELETE", api_url(self.env, path), body=json_body, request_headers=headers
+        return self._transport.request(
+            "DELETE",
+            api_url(self.env, path),
+            body=json_body,
+            request_headers=headers,
         )
 
     def post_multipart(
@@ -106,182 +96,13 @@ class RampClient:
         headers: dict[str, str] | None = None,
     ) -> bytes:
         """Send multipart/form-data using the operation's declared method."""
-        return self._do_request_multipart(
+        return self._transport.request_multipart(
             method.upper(),
             api_url(self.env, path),
             data=data,
             files=files,
             request_headers=headers,
         )
-
-    def _do_request_multipart(
-        self,
-        method: str,
-        url: str,
-        data: dict[str, str],
-        files: dict[str, tuple],
-        request_headers: dict[str, str] | None = None,
-    ) -> bytes:
-        extra_headers = self._extra_auth_headers_or_raise()
-        access_token = self._get_request_access_token()
-
-        with httpx.Client(timeout=_REQUEST_TIMEOUT) as http:
-            resp = self._request_multipart(
-                http,
-                method,
-                url,
-                access_token,
-                data=data,
-                files=files,
-                extra_headers=extra_headers,
-                request_headers=request_headers,
-            )
-
-            if resp.status_code == 401 and not self._static_access_token:
-                new_token = try_refresh(self.env)
-                if new_token:
-                    resp = self._request_multipart(
-                        http,
-                        method,
-                        url,
-                        new_token,
-                        data=data,
-                        files=files,
-                        extra_headers=extra_headers,
-                        request_headers=request_headers,
-                    )
-                else:
-                    raise AuthRequiredError(self.env)
-
-            if resp.status_code == 401:
-                raise AuthRequiredError(self.env)
-            if resp.is_error:
-                raise ApiError(resp.status_code, resp.text)
-            return resp.content
-
-    def _do_request(
-        self,
-        method: str,
-        url: str,
-        body: bytes | None = None,
-        request_headers: dict[str, str] | None = None,
-    ) -> bytes:
-        extra_headers = self._extra_auth_headers_or_raise()
-        access_token = self._get_request_access_token()
-
-        with httpx.Client(timeout=_REQUEST_TIMEOUT) as http:
-            resp = self._request(
-                http,
-                method,
-                url,
-                access_token,
-                body=body,
-                extra_headers=extra_headers,
-                request_headers=request_headers,
-            )
-
-            if resp.status_code == 401 and not self._static_access_token:
-                new_token = try_refresh(self.env)
-                if new_token:
-                    resp = self._request(
-                        http,
-                        method,
-                        url,
-                        new_token,
-                        body=body,
-                        extra_headers=extra_headers,
-                        request_headers=request_headers,
-                    )
-                else:
-                    raise AuthRequiredError(self.env)
-
-            if resp.status_code == 401:
-                raise AuthRequiredError(self.env)
-            if resp.is_error:
-                raise ApiError(resp.status_code, resp.text)
-            return resp.content
-
-    def _get_request_access_token(self) -> str:
-        if self._static_access_token:
-            return self._static_access_token
-        return self._get_access_token()
-
-    def _extra_auth_headers_or_raise(self) -> dict[str, str]:
-        if missing_required_environment_auth(self.env):
-            raise EnvironmentAuthRequiredError(
-                environment_auth_required_message(self.env)
-            )
-        return extra_auth_headers(self.env)
-
-    def _get_access_token(self) -> str:
-        state = store.get_token_state(self.env)
-        now = int(time.time())
-
-        if state.access_token and not state.access_token_is_expired(now):
-            if state.refresh_token and state.access_token_is_expiring_soon(now):
-                try:
-                    new_token = try_refresh(self.env)
-                except RefreshFailedError:
-                    return state.access_token
-                if new_token:
-                    return new_token
-            return state.access_token
-
-        if state.refresh_token:
-            new_token = try_refresh(self.env)
-            if new_token:
-                return new_token
-        raise AuthRequiredError(self.env)
-
-    def _request(
-        self,
-        http: Any,
-        method: str,
-        url: str,
-        token: str,
-        body: bytes | None = None,
-        extra_headers: dict[str, str] | None = None,
-        request_headers: dict[str, str] | None = None,
-    ) -> Any:
-        headers = self._base_headers(token, extra_headers)
-        if body is not None:
-            headers["Content-Type"] = "application/json"
-        if request_headers:
-            headers.update(request_headers)
-        return http.request(method, url, headers=headers, content=body)
-
-    def _request_multipart(
-        self,
-        http: Any,
-        method: str,
-        url: str,
-        token: str,
-        data: dict[str, str],
-        files: dict[str, tuple],
-        extra_headers: dict[str, str] | None = None,
-        request_headers: dict[str, str] | None = None,
-    ) -> Any:
-        headers = self._base_headers(token, extra_headers)
-        if request_headers:
-            headers.update(request_headers)
-        # Do NOT set Content-Type — httpx sets the multipart boundary automatically
-        return http.request(method, url, headers=headers, data=data, files=files)
-
-    def _base_headers(
-        self,
-        token: str,
-        extra_headers: dict[str, str] | None = None,
-    ) -> dict[str, str]:
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "User-Agent": user_agent_string(),
-            "Accept": "application/json",
-            **agent_headers(infer_harness_name()),
-        }
-        headers.update(
-            extra_headers if extra_headers is not None else extra_auth_headers(self.env)
-        )
-        return headers
 
 
 def _same_origin(url: str, expected_base_url: str) -> bool:
@@ -303,11 +124,4 @@ def _origin(url: str) -> tuple[str, str, int | None] | None:
     return parts.scheme.lower(), parts.hostname.lower(), port
 
 
-def user_agent_string(environ: Mapping[str, str] | None = None) -> str:
-    """Build the User-Agent header value, including a parenthesized
-    product-comment naming the host harness when one can be identified."""
-    base = f"ramp-cli/{VERSION}"
-    client = infer_client_name(environ)
-    if client is None:
-        return base
-    return f"{base} ({client})"
+__all__ = ["RampClient", "infer_client_name", "user_agent_string"]

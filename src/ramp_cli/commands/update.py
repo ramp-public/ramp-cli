@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -21,6 +24,107 @@ from ramp_cli.version_check import (
 # repository. Every install.oss.sh change must be copied there byte-for-byte
 # and deployed from agent-cards-site so fresh installs and self-updates agree.
 _INSTALL_URL = "https://agents.ramp.com/install.sh"
+_SKILLS_CATALOG_HOST = "api.github.com"
+_SKILL_TARGETS = (
+    ("Claude", Path(".claude/skills")),
+    ("Codex", Path(".codex/skills")),
+)
+
+
+def _install_optional_skills(ramp_executable: Path) -> None:
+    for agent, relative_target in _SKILL_TARGETS:
+        target = Path.home() / relative_target
+        retry_command = f"ramp skills install --all --target ~/{relative_target}"
+        try:
+            result = subprocess.run(
+                _installed_invocation(
+                    ramp_executable,
+                    "skills",
+                    "install",
+                    "--all",
+                    "--target",
+                    str(target),
+                )
+            )
+        except OSError:
+            result = None
+        if result is not None and result.returncode == 0:
+            click.echo(f"{agent} skills installed.")
+        else:
+            click.echo(
+                f"Ramp CLI update succeeded, but optional {agent} skills could not "
+                f"be installed. Skills catalog host: {_SKILLS_CATALOG_HOST}. Retry with:\n"
+                f"  {retry_command}",
+                err=True,
+            )
+
+
+def _installed_executable() -> Path:
+    bin_dir = Path(os.environ.get("RAMP_INSTALL_DIR") or Path.home() / ".local/bin")
+    return bin_dir.expanduser() / "ramp"
+
+
+def _installed_invocation(installed: Path, *args: str) -> list[str]:
+    command = [str(installed), *args]
+    return ["sh", *command] if sys.platform == "win32" else command
+
+
+def _installed_version(installed: Path) -> str:
+    try:
+        result = subprocess.run(
+            _installed_invocation(installed, "--version"),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    match = re.search(r"\b(\d+\.\d+\.\d+)\b", result.stdout)
+    return match.group(1) if result.returncode == 0 and match else "unknown"
+
+
+def _same_executable(left: Path, right: str | Path) -> bool:
+    try:
+        return left.samefile(right)
+    except OSError:
+        return left.absolute() == Path(right).absolute()
+
+
+def _running_version(resolved: str) -> str:
+    invoked = Path(sys.argv[0])
+    if invoked.name == "ramp" and invoked.parent == Path("."):
+        return __version__
+    if any(
+        _same_executable(candidate, resolved)
+        for candidate in (invoked, Path(sys.executable))
+    ):
+        return __version__
+    return "unknown; not executed"
+
+
+def _warn_if_shadowed(installed: Path) -> None:
+    resolved = shutil.which("ramp")
+    if resolved is None:
+        return
+
+    if _same_executable(installed, resolved):
+        return
+
+    resolved_version = _running_version(resolved)
+    installed_version = _installed_version(installed)
+    click.secho(
+        "WARNING: The updated ramp CLI is shadowed on PATH.",
+        fg="yellow",
+        bold=True,
+    )
+    click.echo(f"  Resolved ramp:  {resolved} (v{resolved_version})")
+    click.echo(f"  Installed ramp: {installed} (v{installed_version})")
+    click.echo("Run the updated CLI directly:")
+    direct_command = _installed_invocation(installed, "--version")
+    click.echo(f"  {' '.join(shlex.quote(part) for part in direct_command)}")
+    click.echo("Use the updated CLI in this shell with:")
+    click.echo(f"  export PATH={shlex.quote(str(installed.parent))}:$PATH && hash -r")
 
 
 def _is_homebrew_install() -> bool:
@@ -80,22 +184,34 @@ def update_cmd() -> None:
         click.echo(f"Refreshing Router setup for configured agents only: {names}.")
 
     click.echo("Installing...")
-    install_command = f"curl -fsSL {_INSTALL_URL} | sh"
-    if router_clients:
-        install_command += " -s -- --no-skills"
+    installed_executable = _installed_executable()
+    install_command = (
+        'tmp="$(mktemp)" && trap \'rm -f "$tmp"\' 0 && '
+        f'curl -fsSL {_INSTALL_URL} -o "$tmp" && sh "$tmp" --no-skills'
+    )
     run = subprocess.run(["sh", "-c", install_command])
     if run.returncode != 0:
         raise click.ClickException(f"Update failed. Try manually:\n  {install_command}")
     suppress_next_update_notice()
+    click.echo(
+        "Ramp CLI update succeeded; the installed binary passed checksum verification."
+    )
+    _warn_if_shadowed(installed_executable)
 
     if router_clients:
         # Invoke the CLI after installation instead of teaching the separately
         # hosted installer a new flag. Refresh is receipt-scoped and reads the
         # credentials already stored for each configured agent.
-        ramp_executable = shutil.which("ramp") or sys.argv[0]
-        refresh = subprocess.run([ramp_executable, "router", "refresh"])
+        refresh_command = _installed_invocation(
+            installed_executable, "router", "refresh"
+        )
+        refresh = subprocess.run(refresh_command)
         if refresh.returncode != 0:
             raise click.ClickException(
                 "Ramp CLI was updated, but existing Router configurations "
-                "could not be refreshed. Run:\n  ramp router refresh"
+                "could not be refreshed. Run:\n"
+                f"  {' '.join(shlex.quote(part) for part in refresh_command)}"
             )
+    else:
+        click.echo("Installing optional agent skills...")
+        _install_optional_skills(installed_executable)

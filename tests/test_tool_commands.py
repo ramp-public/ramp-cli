@@ -759,6 +759,64 @@ class TestBuildToolCommand:
         assert "inactive" in status_opt.help
         assert "values:" in status_opt.help
 
+    def test_x402_create_boolean_enum_help_and_serialization(self, monkeypatch):
+        spec = {
+            "paths": {
+                "/developer/v1/agent-tools/create-x402": {
+                    "post": {
+                        "summary": "Create an x402 payment",
+                        "tags": ["Agent Tool", "x402"],
+                        "x-alias": "create",
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "confirmed": {
+                                                "type": "boolean",
+                                                "enum": [True],
+                                                "description": "Confirm the payment",
+                                            }
+                                        },
+                                        "required": ["confirmed"],
+                                    }
+                                }
+                            }
+                        },
+                    }
+                },
+                "/developer/v1/agent-tools/pay-with-x402": {
+                    "post": {
+                        "summary": "Pay an x402 request",
+                        "tags": ["Agent Tool", "x402"],
+                        "x-alias": "pay",
+                    }
+                },
+            }
+        }
+        tools = parse_spec_dict(spec, synthesize_cli_tools=False)
+        monkeypatch.setattr(_registry, "_tools", tools)
+        monkeypatch.setattr(_registry, "_index", {tool.name: tool for tool in tools})
+        monkeypatch.setattr(_registry, "_loaded_env", "production")
+        monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
+        runner = CliRunner()
+
+        help_result = runner.invoke(
+            cli, ["--env", "production", "x402", "create", "--help"]
+        )
+
+        assert help_result.exit_code == 0, help_result.output
+        assert "--confirmed / --no-confirmed" in help_result.output
+
+        for flag, expected in (("--confirmed", True), ("--no-confirmed", False)):
+            result = runner.invoke(
+                cli,
+                ["--agent", "--env", "production", "x402", "create", flag, "-n"],
+            )
+            assert result.exit_code == 0, result.output
+            assert json.loads(result.output)["data"][0]["body"]["confirmed"] is expected
+
     def test_complex_params_excluded_from_flags(self):
         tool = ToolDef(
             name="complex-tool",

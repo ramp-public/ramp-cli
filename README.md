@@ -10,10 +10,11 @@ curl -fsSL https://agents.ramp.com/install.sh | sh
 
 This detects your platform, downloads a pre-built binary, and sets up the `ramp` command.
 
-After installation, configure Codex, OpenCode, and Pi for Ramp Router:
+After installation, choose which coding agents to connect to Ramp Router. The
+picker lists the agents found on your machine, all selected by default:
 
 ```bash
-RAMP_ROUTER_CONFIGURE_API_KEY='<YOUR_API_KEY>' ramp router configure
+ramp router configure
 ```
 
 **Homebrew** (macOS and Linux):

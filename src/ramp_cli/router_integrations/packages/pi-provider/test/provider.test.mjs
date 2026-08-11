@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { execFileSync } from "node:child_process"
 import { mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -222,3 +223,156 @@ function registeredBaseUrl() {
   registerRouterProvider({ registerProvider: (p) => { seen = p.baseUrl } })
   return seen
 }
+
+function lineageHeaders({
+  provider = "ramp-router",
+  sessionID = "019ff2af-7ce1-7000-8000-000000000001",
+  parentSession,
+  initialHeaders = { "Existing-Header": "preserved" },
+} = {}) {
+  let handler
+  registerRouterProvider({
+    registerProvider: () => {},
+    on: (event, candidate) => {
+      if (event === "before_provider_headers") handler = candidate
+    },
+  })
+  assert.equal(typeof handler, "function")
+
+  const headers = { ...initialHeaders }
+  handler(
+    { type: "before_provider_headers", headers },
+    {
+      model: { provider },
+      sessionManager: {
+        getSessionId: () => sessionID,
+        getHeader: () => ({
+          type: "session",
+          id: sessionID,
+          ...(parentSession ? { parentSession } : {}),
+        }),
+      },
+    },
+  )
+  return headers
+}
+
+describe("Pi session lineage headers", () => {
+  it("emits the durable session ID only for Ramp Router", () => {
+    assert.deepEqual(lineageHeaders(), {
+      "Existing-Header": "preserved",
+      "X-Gateway-Client": "pi",
+      "X-Session-Id": "019ff2af-7ce1-7000-8000-000000000001",
+    })
+    assert.deepEqual(lineageHeaders({ provider: "openai" }), {
+      "Existing-Header": "preserved",
+    })
+  })
+
+  it("replaces differently-cased stale lineage headers", () => {
+    assert.deepEqual(
+      lineageHeaders({
+        initialHeaders: {
+          "x-gateway-client": "stale",
+          "x-session-id": "stale",
+          "X-PARENT-SESSION-ID": "stale",
+          "x-forked-from-session-id": "stale",
+        },
+      }),
+      {
+        "X-Gateway-Client": "pi",
+        "X-Session-Id": "019ff2af-7ce1-7000-8000-000000000001",
+      },
+    )
+  })
+
+  it("resolves a fork source from only the parent session header", () => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-parent-"))
+    const parent = join(directory, "parent.jsonl")
+    writeFileSync(
+      parent,
+      [
+        JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "019ff2af-7ce1-7000-8000-000000000000",
+          timestamp: "2026-08-11T00:00:00.000Z",
+          cwd: "/tmp",
+        }),
+        // The resolver must not parse conversation entries after this header.
+        "not-json-private-conversation-data",
+      ].join("\n"),
+    )
+
+    assert.deepEqual(lineageHeaders({ parentSession: parent }), {
+      "Existing-Header": "preserved",
+      "X-Gateway-Client": "pi",
+      "X-Session-Id": "019ff2af-7ce1-7000-8000-000000000001",
+      "X-Parent-Session-Id": "019ff2af-7ce1-7000-8000-000000000000",
+      "X-Forked-From-Session-Id": "019ff2af-7ce1-7000-8000-000000000000",
+    })
+  })
+
+  it("omits invalid, unreadable, and oversized parent headers", () => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-parent-"))
+    const invalid = join(directory, "invalid.jsonl")
+    const oversized = join(directory, "oversized.jsonl")
+    const unterminated = join(directory, "unterminated.jsonl")
+    writeFileSync(invalid, '{"type":"session","id":"bad id"}\n')
+    writeFileSync(oversized, `${"x".repeat(4097)}\n`)
+    writeFileSync(
+      unterminated,
+      JSON.stringify({ type: "session", id: "valid-but-unterminated" }),
+    )
+
+    for (const parentSession of [
+      join(directory, "missing.jsonl"),
+      invalid,
+      oversized,
+      unterminated,
+    ]) {
+      assert.deepEqual(lineageHeaders({ parentSession }), {
+        "Existing-Header": "preserved",
+        "X-Gateway-Client": "pi",
+        "X-Session-Id": "019ff2af-7ce1-7000-8000-000000000001",
+      })
+    }
+  })
+
+  it(
+    "rejects a FIFO parent path without blocking the inference request",
+    { skip: process.platform === "win32" },
+    () => {
+      const directory = mkdtempSync(join(tmpdir(), "pi-parent-"))
+      const fifo = join(directory, "parent.fifo")
+      execFileSync("mkfifo", [fifo])
+
+      assert.deepEqual(lineageHeaders({ parentSession: fifo }), {
+        "Existing-Header": "preserved",
+        "X-Gateway-Client": "pi",
+        "X-Session-Id": "019ff2af-7ce1-7000-8000-000000000001",
+      })
+    },
+  )
+
+  it("does not emit invalid or self-referential session ancestry", () => {
+    assert.deepEqual(lineageHeaders({ sessionID: "bad id" }), {
+      "Existing-Header": "preserved",
+    })
+
+    const directory = mkdtempSync(join(tmpdir(), "pi-parent-"))
+    const parent = join(directory, "parent.jsonl")
+    writeFileSync(
+      parent,
+      `${JSON.stringify({
+        type: "session",
+        id: "019ff2af-7ce1-7000-8000-000000000001",
+      })}\n`,
+    )
+    assert.deepEqual(lineageHeaders({ parentSession: parent }), {
+      "Existing-Header": "preserved",
+      "X-Gateway-Client": "pi",
+      "X-Session-Id": "019ff2af-7ce1-7000-8000-000000000001",
+    })
+  })
+})

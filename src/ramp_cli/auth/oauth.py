@@ -101,16 +101,20 @@ class OAuthTokenError(Exception):
         super().__init__(message)
 
 
+# Ramp Router's own palette, so the page the browser lands on looks like the
+# product the CLI just connected to. Mirrors client-ui/src/styles.css.
+_BRAND_YELLOW = "#e4f222"
+_ERROR_RED = "#ef4444"
+
+
 def _callback_html(*, success: bool, title: str, message: str, detail: str = "") -> str:
     """Build a styled HTML page for the OAuth callback screen.
 
-    The design mirrors the terminal-window aesthetic of agents.ramp.com/cards:
-    neutral background, white card, macOS-style title bar with traffic-light
-    dots, monospace content area, and the CLI's signature filled-diamond
-    status indicator.
+    A terminal window in Ramp Router's dark palette: near-black surfaces,
+    hairline borders, a monospace content area, and the brand yellow spent
+    only on the heading that reports the outcome.
     """
-    accent = "#10b981" if success else "#ef4444"
-    symbol = "\u25c6" if success else "\u2715"  # ◆ or ✕
+    accent = _BRAND_YELLOW if success else _ERROR_RED
     safe_title = html_mod.escape(title)
     safe_message = html_mod.escape(message)
 
@@ -125,49 +129,49 @@ def _callback_html(*, success: bool, title: str, message: str, detail: str = "")
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
 <title>ramp-cli</title>
 <style>
 *,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
 body{{
-  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,
+  font-family:"Lausanne",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,
     Helvetica,Arial,sans-serif;
-  background:#fafafa;min-height:100vh;
+  background:#090909;min-height:100vh;
   display:flex;align-items:center;justify-content:center;padding:20px
 }}
 .w{{
-  width:520px;max-width:calc(100vw - 40px);background:#fff;
-  border-radius:12px;border:1px solid #e5e5e5;overflow:hidden;
-  box-shadow:0 1px 3px rgba(0,0,0,.04),0 6px 16px rgba(0,0,0,.04)
+  width:520px;max-width:calc(100vw - 40px);background:#111;
+  border-radius:12px;border:1px solid #272727;overflow:hidden;
+  box-shadow:0 1px 3px rgba(0,0,0,.5),0 12px 32px rgba(0,0,0,.45)
 }}
 .tb{{
-  height:32px;background:#fafafa;border-bottom:1px solid #e5e5e5;
+  height:32px;background:#1c1c19;border-bottom:1px solid #272727;
   display:flex;align-items:center;padding:0 12px;position:relative
 }}
 .dots{{display:flex;gap:6px}}
 .dot{{
   width:12px;height:12px;border-radius:50%;
-  border:1.5px solid #d4d4d4
+  border:1.5px solid #3d3b3a
 }}
 .tt{{
   position:absolute;left:0;right:0;text-align:center;
-  font-size:12px;color:#262626;pointer-events:none;
+  font-size:12px;color:#a39d99;pointer-events:none;
   font-weight:500
 }}
 .c{{
-  padding:40px 32px 32px;
-  font-family:"SF Mono","Fira Code","Cascadia Code",
+  padding:36px 32px 32px;
+  font-family:"Geist Mono","SF Mono","Fira Code","Cascadia Code",
     "JetBrains Mono",Menlo,Monaco,"Courier New",monospace;
-  font-size:14px;line-height:1.6;color:#262626
+  font-size:14px;line-height:1.6;color:#d2cecb
 }}
-.si{{font-size:22px;color:{accent};margin-bottom:16px}}
-.h{{font-size:15px;font-weight:600;margin-bottom:8px;color:#262626}}
-.m{{color:#737373;font-size:13px}}
+.h{{font-size:15px;font-weight:600;margin-bottom:8px;color:{accent}}}
+.m{{color:#a39d99;font-size:13px}}
 .d{{
-  margin-top:16px;padding:12px 16px;background:#fafafa;
-  border:1px solid #e5e5e5;border-radius:8px;
-  font-size:12px;color:#525252;word-break:break-word
+  margin-top:16px;padding:12px 16px;background:#1c1c19;
+  border:1px solid #272727;border-radius:8px;
+  font-size:12px;color:#a39d99;word-break:break-word
 }}
-.p{{margin-top:28px;color:#a3a3a3;font-size:13px}}
+.p{{margin-top:28px;color:#474543;font-size:13px}}
 </style>
 </head>
 <body>
@@ -179,7 +183,6 @@ body{{
     <span class="tt">ramp-cli</span>
   </div>
   <div class="c">
-    <div class="si">{symbol}</div>
     <div class="h">{safe_title}</div>
     <div class="m">{safe_message}</div>
     {detail_block}

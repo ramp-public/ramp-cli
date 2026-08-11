@@ -24,7 +24,9 @@ from ramp_cli.output.style import (
     env_label,
     header,
     show_detail_card,
+    show_notice,
     show_table_card,
+    start_spinner,
     start_waiting_animation,
     status_line,
     wrap_text,
@@ -500,3 +502,80 @@ def test_bill_invoice_line_items_5col():
     assert "Unit Rate" in output
     assert "Count" in output
     assert "Amount (USD)" in output
+
+
+def test_show_notice_emphasizes_only_its_headings(monkeypatch):
+    # A developer running with NO_COLOR set would otherwise see no escapes at
+    # all and the assertions below would pass for the wrong reason.
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    buf = io.StringIO()
+    buf.isatty = lambda: True  # type: ignore[attr-defined]
+
+    show_notice(
+        "NOTICE",
+        [
+            "Plain body text that carries no emphasis.",
+            "",
+            "Run your previous setup at any time:",
+            "  codex --profile original",
+        ],
+        file=buf,
+    )
+
+    rows = {}
+    for line in buf.getvalue().splitlines():
+        plain = re.sub(r"\033\[[0-9;]*m", "", line)
+        if not plain.startswith("│"):
+            continue
+        # Drop the borders and the single space of padding, keeping any
+        # indentation the caller asked for.
+        rows[plain[1:-1][1:].rstrip()] = line
+    bold = f"{ESC}[1m"
+    # An unindented line ending in a colon introduces the block below it.
+    assert bold in rows["Run your previous setup at any time:"]
+    # A command under it, and ordinary prose, stay unemphasized.
+    assert bold not in rows["  codex --profile original"]
+    assert bold not in rows["Plain body text that carries no emphasis."]
+
+
+def test_show_notice_stays_legible_without_color():
+    buf = io.StringIO()  # not a tty, so no escapes at all
+
+    show_notice("NOTICE", ["Heading:", "  a command"], file=buf)
+
+    output = buf.getvalue()
+    assert ESC not in output
+    assert "Heading:" in output
+    assert "  a command" in output
+
+
+def test_start_spinner_animates_then_leaves_the_line_clean(monkeypatch):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    buf = io.StringIO()
+    buf.isatty = lambda: True  # type: ignore[attr-defined]
+
+    stop = start_spinner("Setting up your coding agents", file=buf)
+    try:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and "Setting up" not in buf.getvalue():
+            time.sleep(0.02)
+    finally:
+        stop()
+
+    output = buf.getvalue()
+    assert "Setting up your coding agents" in output
+    assert any(frame in output for frame in "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+    # The cursor is put back and the line wiped, so the caller's own output
+    # starts from a clean line.
+    assert output.startswith(f"{ESC}[?25l")
+    assert output.endswith(f"\r{ESC}[K{ESC}[?25h")
+
+
+def test_start_spinner_draws_nothing_without_a_terminal():
+    buf = io.StringIO()  # not a tty, as when output is piped to a file
+
+    stop = start_spinner("Setting up your coding agents", file=buf)
+    time.sleep(0.05)
+    stop()
+
+    assert buf.getvalue() == ""

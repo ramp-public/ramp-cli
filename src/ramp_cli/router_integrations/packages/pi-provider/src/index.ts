@@ -7,7 +7,14 @@ import {
 } from "@earendil-works/pi-ai"
 import { openAIResponsesApi } from "@earendil-works/pi-ai/compat"
 
-import { readFileSync } from "node:fs"
+import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  openSync,
+  readFileSync,
+  readSync,
+} from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
@@ -18,6 +25,15 @@ const PROVIDER_ID = "ramp-router"
 const API_KEY_ENVS = ["RAMP_ROUTER_API_KEY", "LLM_GATEWAY_API_KEY"]
 const BASE_URL_ENVS = ["RAMP_ROUTER_BASE_URL", "LLM_GATEWAY_BASE_URL"]
 const DEFAULT_BASE_URL = "https://router-api.ramp.com/v1"
+const MAX_SESSION_ID_BYTES = 128
+const MAX_SESSION_HEADER_BYTES = 4096
+const SESSION_ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/
+const LINEAGE_HEADERS = [
+  "X-Gateway-Client",
+  "X-Session-Id",
+  "X-Parent-Session-Id",
+  "X-Forked-From-Session-Id",
+] as const
 
 // Written by "ramp router configure pi" beside the credential it also writes.
 // Pi hands an extension no configuration of its own, so without this the
@@ -42,6 +58,76 @@ function firstEnvironmentValue(names: string[]): string | undefined {
     if (value) return value
   }
   return undefined
+}
+
+function boundedSessionID(value: unknown): string | undefined {
+  if (
+    typeof value !== "string" ||
+    Buffer.byteLength(value, "utf8") > MAX_SESSION_ID_BYTES ||
+    !SESSION_ID_PATTERN.test(value)
+  ) {
+    return undefined
+  }
+  return value
+}
+
+/**
+ * Resolve Pi's fork source without reading any conversation entries.
+ *
+ * A Pi child session records its parent as a file path, while Router needs the
+ * parent's stable session ID. The session header is always the first JSONL
+ * record, so cap the read and refuse files whose first record exceeds the cap.
+ */
+function parentSessionID(parentSessionPath: unknown): string | undefined {
+  if (typeof parentSessionPath !== "string" || !parentSessionPath) {
+    return undefined
+  }
+
+  let descriptor: number | undefined
+  try {
+    descriptor = openSync(
+      parentSessionPath,
+      // O_NONBLOCK ensures a malicious/extension-supplied FIFO cannot stall
+      // the inference request before fstat rejects it as a non-regular file.
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+    )
+    if (!fstatSync(descriptor).isFile()) return undefined
+    const buffer = Buffer.alloc(MAX_SESSION_HEADER_BYTES + 1)
+    const bytesRead = readSync(
+      descriptor,
+      buffer,
+      0,
+      buffer.length,
+      0,
+    )
+    const newline = buffer.subarray(0, bytesRead).indexOf(0x0a)
+    if (newline < 0) return undefined
+
+    const firstLine = buffer.subarray(0, newline)
+    const parsed: unknown = JSON.parse(firstLine.toString("utf8"))
+    if (!parsed || typeof parsed !== "object") return undefined
+    const header = parsed as { type?: unknown; id?: unknown }
+    if (header.type !== "session") return undefined
+    return boundedSessionID(header.id)
+  } catch {
+    return undefined
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor)
+  }
+}
+
+function replaceHeader(
+  headers: Record<string, string | null>,
+  name: string,
+  value?: string,
+): void {
+  const normalizedName = name.toLowerCase()
+  for (const existingName of Object.keys(headers)) {
+    if (existingName.toLowerCase() === normalizedName) {
+      delete headers[existingName]
+    }
+  }
+  if (value !== undefined) headers[name] = value
 }
 
 
@@ -174,6 +260,29 @@ export default function registerRouterProvider(pi: ExtensionAPI): void {
       api: openAIResponsesApi(),
     }),
   )
+
+  pi.on?.("before_provider_headers", (event, context) => {
+    if (context.model?.provider !== PROVIDER_ID) return
+
+    for (const name of LINEAGE_HEADERS) replaceHeader(event.headers, name)
+
+    const sessionID = boundedSessionID(context.sessionManager.getSessionId())
+    if (!sessionID) return
+
+    replaceHeader(event.headers, "X-Gateway-Client", "pi")
+    replaceHeader(event.headers, "X-Session-Id", sessionID)
+
+    const forkedFromSessionID = parentSessionID(
+      context.sessionManager.getHeader()?.parentSession,
+    )
+    if (!forkedFromSessionID || forkedFromSessionID === sessionID) return
+
+    // Keep the compatibility parent field during rollout while giving Router
+    // an unambiguous conversation-fork source that is not overloaded with
+    // control-plane/subagent parentage.
+    replaceHeader(event.headers, "X-Parent-Session-Id", forkedFromSessionID)
+    replaceHeader(event.headers, "X-Forked-From-Session-Id", forkedFromSessionID)
+  })
 }
 
 export { discoverRouterModels, normalizeBaseURL } from "./discovery.ts"

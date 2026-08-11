@@ -118,7 +118,12 @@ def test_unconfigure_removes_keys_the_user_never_had(tmp_path):
         {}, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
     )
 
-    assert updated["disableClaudeAiConnectors"] is True
+    assert "disableClaudeAiConnectors" not in updated
+    assert updated["env"]["ENABLE_CLAUDEAI_MCP_SERVERS"] == "false"
+    assert (
+        claude_code.plan_original_settings(state)["env"]["ENABLE_CLAUDEAI_MCP_SERVERS"]
+        == ""
+    )
     restored = claude_code.plan_restoration(updated, path, state)
 
     assert restored == {}
@@ -299,8 +304,32 @@ def test_unconfigure_restores_existing_connector_preference(tmp_path):
         original, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
     )
 
-    assert updated["disableClaudeAiConnectors"] is True
+    assert updated["disableClaudeAiConnectors"] is False
+    assert (
+        claude_code.plan_original_settings(state)["disableClaudeAiConnectors"] is False
+    )
     assert claude_code.plan_restoration(updated, path, state) == original
+
+
+@pytest.mark.parametrize("previous", [True, False])
+def test_legacy_connector_migration_preserves_the_users_preference(tmp_path, previous):
+    path = tmp_path / "settings.json"
+    _, state = claude_code.plan_configuration(
+        {"disableClaudeAiConnectors": previous},
+        path,
+        "https://router-api.ramp.com",
+        "secret",
+        "gpt-5.4",
+    )
+    # Simulate a receipt from the version that always replaced the preference
+    # with true while Router was active.
+    state["written"]["top_level"]["disableClaudeAiConnectors"] = True
+
+    restored = claude_code.restore_legacy_connector_preference(
+        {"disableClaudeAiConnectors": True}, state
+    )
+
+    assert restored["disableClaudeAiConnectors"] is previous
 
 
 def test_connector_preference_changed_since_configure_is_left_alone(tmp_path):
@@ -357,6 +386,57 @@ def test_configure_is_idempotent_and_keeps_the_original_state(monkeypatch, tmp_p
     }
 
 
+def test_configure_acquires_a_missing_key_through_browser_setup(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    _mock_models(monkeypatch)
+    seen = {}
+
+    def acquire(url, *, no_browser):
+        seen.update(url=url, no_browser=no_browser)
+        return "browser-returned-key"
+
+    monkeypatch.setattr(router_module, "acquire_router_api_key", acquire)
+
+    result = CliRunner().invoke(cli, ["--human", "router", "configure", "claude-code"])
+
+    assert result.exit_code == 0, result.output
+    assert seen == {"url": "https://router.ramp.com", "no_browser": False}
+    assert "browser-returned-key" not in result.output
+    settings = json.loads((tmp_path / "settings.json").read_text())
+    assert settings["env"]["ANTHROPIC_AUTH_TOKEN"] == "browser-returned-key"
+
+
+def test_configure_no_browser_uses_the_same_handoff(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    _mock_models(monkeypatch)
+    seen = {}
+
+    def acquire(url, *, no_browser):
+        seen.update(url=url, no_browser=no_browser)
+        return "browser-returned-key"
+
+    monkeypatch.setattr(router_module, "acquire_router_api_key", acquire)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "claude-code", "--no-browser"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["no_browser"] is True
+
+
+def test_non_interactive_configure_still_requires_an_explicit_key(monkeypatch):
+    monkeypatch.delenv(router_module.CONFIGURE_KEY_ENV, raising=False)
+
+    result = CliRunner().invoke(
+        cli, ["--no-input", "router", "configure", "claude-code"]
+    )
+
+    assert result.exit_code == 2
+    assert "Pass --api-key" in result.output
+
+
 def test_reconfigure_upgrades_legacy_state_for_connector_setting(monkeypatch, tmp_path):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
     _mock_models(monkeypatch)
@@ -364,9 +444,11 @@ def test_reconfigure_upgrades_legacy_state_for_connector_setting(monkeypatch, tm
     configured, state = claude_code.plan_configuration(
         {}, path, "https://router-api.ramp.com", "old-key", "gpt-5.4"
     )
-    configured.pop("disableClaudeAiConnectors")
-    state["top_level"].pop("disableClaudeAiConnectors")
-    state["written"]["top_level"].pop("disableClaudeAiConnectors")
+    # Older versions wrote a restrictive value that no additional settings
+    # file could override. Preserve its receipt so configure can prove it owns
+    # this value and remove it safely.
+    configured["disableClaudeAiConnectors"] = True
+    state["written"]["top_level"]["disableClaudeAiConnectors"] = True
     path.write_text(json.dumps(configured))
     claude_code.state_path(path).write_text(json.dumps(state))
 
@@ -388,7 +470,8 @@ def test_reconfigure_upgrades_legacy_state_for_connector_setting(monkeypatch, tm
         "present": False,
         "value": None,
     }
-    assert json.loads(path.read_text())["disableClaudeAiConnectors"] is True
+    assert "disableClaudeAiConnectors" not in upgraded["written"]["top_level"]
+    assert "disableClaudeAiConnectors" not in json.loads(path.read_text())
 
     result = CliRunner().invoke(
         cli, ["--human", "router", "unconfigure", "claude-code"]
@@ -558,6 +641,48 @@ def test_a_model_chosen_after_configuring_survives_unconfigure(tmp_path):
     restored = claude_code.plan_restoration(chosen_since, path, state)
 
     assert restored["model"] == "claude-sonnet-4-6"
+
+
+def test_a_different_router_model_selected_since_configure_is_still_removed(tmp_path):
+    path = tmp_path / "settings.json"
+    updated, state = claude_code.plan_configuration(
+        {}, path, "https://router.example", "k", "claude-router-gpt-5-6-sol"
+    )
+
+    switched = {**updated, "model": "claude-router-deepseek-v4-flash"}
+    restored = claude_code.plan_restoration(switched, path, state)
+
+    assert "model" not in restored
+
+
+def test_a_stale_router_model_is_not_captured_as_the_original_setup(tmp_path):
+    path = tmp_path / "settings.json"
+    updated, state = claude_code.plan_configuration(
+        {"model": "claude-router-deepseek-v4-flash"},
+        path,
+        "https://router.example",
+        "k",
+        "claude-router-gpt-5-6-sol",
+    )
+
+    assert state["top_level"]["model"] == {"present": False, "value": None}
+    assert "model" not in claude_code.plan_original_settings(state)
+    assert "model" not in claude_code.plan_restoration(updated, path, state)
+
+
+def test_legacy_state_cannot_restore_a_stale_router_model(tmp_path):
+    path = tmp_path / "settings.json"
+    updated, state = claude_code.plan_configuration(
+        {}, path, "https://router.example", "k", "claude-router-gpt-5-6-sol"
+    )
+    # Older receipts could capture a Router model as if it predated Router.
+    state["top_level"]["model"] = {
+        "present": True,
+        "value": "claude-router-deepseek-v4-flash",
+    }
+
+    assert "model" not in claude_code.plan_original_settings(state)
+    assert "model" not in claude_code.plan_restoration(updated, path, state)
 
 
 def test_an_untouched_setting_is_still_put_back(tmp_path):

@@ -1,5 +1,6 @@
 """Configure coding agents to use Ramp Router."""
 
+import hashlib
 import io
 import json
 import os
@@ -9,20 +10,25 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path, PurePath
+from typing import Literal
 
 import click
 import httpx
 import json5
+import questionary
 import zstandard
 
 from ramp_cli.commands import claude_code
 from ramp_cli.output.formatter import print_agent_json, resolve_format
+from ramp_cli.output.style import show_notice, start_spinner
 from ramp_cli.router_integrations import integration_package_path
+from ramp_cli.router_setup import acquire_router_api_key
 
 DEFAULT_ROUTER_BASE_URL = "https://router-api.ramp.com/v1"
 
@@ -35,10 +41,15 @@ BASE_URL_ENVS = ("RAMP_ROUTER_BASE_URL", "LLM_GATEWAY_BASE_URL")
 # Router to call.
 PI_PLUGIN_CONFIG_FILE = "ramp-router-config.json"
 ROUTER_UI_URL = "https://router.ramp.com"
+ROUTER_UI_URL_ENV = "RAMP_ROUTER_UI_URL"
 ROUTER_PROVIDER = "ramp-router"
 # Read instead of --api-key so the secret stays out of shell history and out
 # of the process list.
 CONFIGURE_KEY_ENV = "RAMP_ROUTER_CONFIGURE_API_KEY"
+# Browser-created keys reach the control-plane database before the data plane's
+# request-time projection. Retry only that known-new key long enough for its
+# materialized record to arrive.
+NEW_KEY_RETRY_DELAYS = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
 
 # Router answers a client in that client's own shape when it says which client
 # it is. This selects a response format and nothing else.
@@ -50,6 +61,16 @@ CLIENT_NAMES = {
     "opencode": "OpenCode",
     "pi": "Pi",
 }
+# The command each agent puts on PATH. Used to tell which agents this machine
+# actually has, so the picker does not offer to write configuration into
+# directories for agents that were never installed.
+CLIENT_EXECUTABLES = {
+    "claude-code": "claude",
+    "codex": "codex",
+    "opencode": "opencode",
+    "pi": "pi",
+}
+ArtifactClaim = Literal["create", "replace"]
 
 
 @dataclass(frozen=True)
@@ -227,6 +248,71 @@ def _codex_harness_prompt(default_model: str) -> str | None:
     return max(prompt_stats, key=prompt_stats.__getitem__)
 
 
+def _codex_original_catalog(root_values: dict) -> str | None:
+    """Snapshot the restored provider's catalog for the original profile.
+
+    Codex 0.147.0 caches every provider in the same models_cache.json and keys
+    that cache only by Codex version. A profile can therefore select OpenAI
+    correctly and still draw Router's cached models. model_catalog_json is
+    authoritative, so a profile-local snapshot keeps its picker isolated until
+    Codex starts partitioning the shared cache by provider.
+    """
+    if root_values.get("model_catalog_json") or not shutil.which("codex"):
+        return None
+
+    provider = _codex_restored_provider(root_values)
+    if provider == "openai":
+        # The ordinary debug command still consults models_cache.json. That is
+        # the provider-agnostic cache we are escaping, so a fresh Router entry
+        # there would make us snapshot the exact contamination this file is
+        # meant to prevent. The bundled catalog cannot read that cache.
+        commands = [
+            [
+                "codex",
+                "-c",
+                f"model_provider={json.dumps(provider)}",
+                "debug",
+                "models",
+                "--bundled",
+            ]
+        ]
+    else:
+        commands = [
+            [
+                "codex",
+                "-c",
+                f"model_provider={json.dumps(provider)}",
+                "debug",
+                "models",
+            ]
+        ]
+
+    for command in commands:
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode != 0:
+            continue
+        try:
+            catalog = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(catalog, dict)
+            and isinstance(catalog.get("models"), list)
+            and catalog["models"]
+        ):
+            return json.dumps(catalog, indent=2) + "\n"
+    return None
+
+
 def _codex_key_command(key_path: Path) -> tuple[str, list[str]]:
     """Return a command that prints the key file, for this platform.
 
@@ -284,6 +370,388 @@ _OWNED_ROOT_KEYS = (
     "model_instructions_file",
 )
 
+# Codex has no way to make a profile the default, so Router has to own the root
+# keys to be the default. The selection it displaces is written here instead of
+# only into the undo receipt, which keeps the previous setup one flag away
+# rather than reachable only by unconfiguring.
+CODEX_ORIGINAL_PROFILE = "original"
+# Codex resolves an empty model_instructions_file to CODEX_HOME and refuses to
+# start, so a profile cannot blank the key Router writes at the root. It gets
+# its own copy of Codex's prompt instead. Named like the rest of what this
+# command writes, since the profile filename is the only one Codex dictates.
+CODEX_ORIGINAL_INSTRUCTIONS = "ramp-router-original-instructions.md"
+# Codex currently shares models_cache.json across providers. The original
+# profile points at this provider-specific snapshot instead.
+CODEX_ORIGINAL_CATALOG = "ramp-router-original-models.json"
+# Records what the escape profile held when it was written, so a profile the
+# user has since edited is left alone instead of deleted.
+CODEX_ORIGINAL_PROFILE_DIGEST_KEY = "original_profile_digest"
+# Names the file this CLI created, so unconfigure removes only its own and
+# never a profile the user happened to name the same.
+CODEX_ORIGINAL_PROFILE_STATE_KEY = "original_profile"
+CODEX_ORIGINAL_CATALOG_DIGEST_KEY = "original_catalog_digest"
+CODEX_ORIGINAL_CATALOG_STATE_KEY = "original_catalog"
+CODEX_ORIGINAL_INSTRUCTIONS_DIGEST_KEY = "original_instructions_digest"
+CODEX_ORIGINAL_INSTRUCTIONS_STATE_KEY = "original_instructions"
+CODEX_PREEXISTING_ROUTER_SESSIONS_STATE_KEY = "preexisting_router_sessions"
+
+
+# prompt_toolkit ships ("selected", "reverse"), which paints every checked row
+# in inverse video. Every agent starts checked here, so the default turns the
+# whole list into one indistinguishable block. Each class is therefore stated
+# outright, and the checked rows carry the brand color the rest of the CLI uses
+# for a current selection.
+_PICKER_YELLOW = "#e4f221"
+_PICKER_POINTER = "\u25b6"
+_PICKER_STYLE = questionary.Style(
+    [
+        ("qmark", f"fg:{_PICKER_YELLOW} bold"),
+        ("question", "bold"),
+        ("instruction", "fg:#8a8a8a"),
+        ("pointer", f"fg:{_PICKER_YELLOW} bold"),
+        ("highlighted", "fg:#ffffff bold noreverse"),
+        ("selected", f"fg:{_PICKER_YELLOW} noreverse"),
+        ("answer", f"fg:{_PICKER_YELLOW} bold"),
+        ("text", "fg:#a8a8a8"),
+        ("disabled", "fg:#585858 italic"),
+    ]
+)
+
+
+def _codex_original_profile_path(home: Path) -> Path:
+    return home / f"{CODEX_ORIGINAL_PROFILE}.config.toml"
+
+
+def _claim_escape_artifact(
+    path: Path,
+    state: dict,
+    state_key: str,
+    digest_key: str,
+) -> ArtifactClaim | None:
+    """Decide what to do with an escape artifact this run wants to own.
+
+    A missing path can be created exclusively. An existing path is replaceable
+    only when the receipt names it and its recorded digest still matches.
+    Matching bytes alone establish no provenance: a user can independently
+    create exactly the same default profile or overlay.
+    """
+    if not path.exists():
+        return "create"
+    if (
+        state.get(state_key) == path.name
+        and isinstance(state.get(digest_key), str)
+        and _is_unmodified(path, state.get(digest_key))
+    ):
+        return "replace"
+    return None
+
+
+def _record_escape_artifact(
+    state: dict,
+    path: Path,
+    content: str,
+    state_key: str,
+    digest_key: str,
+) -> bool:
+    """Record one owned artifact; return whether the receipt changed."""
+    recorded = (path.name, _content_digest(content))
+    if (state.get(state_key), state.get(digest_key)) == recorded:
+        return False
+    state[state_key], state[digest_key] = recorded
+    return True
+
+
+def _render_codex_original_profile(
+    root_values: dict,
+    instructions: Path | None = None,
+    catalog: Path | None = None,
+) -> str:
+    """Render the profile that puts a session back on the previous provider.
+
+    A profile overrides only the keys it states, and the base config now holds
+    Router's values, so every key Router writes has to be answered here. A
+    config that never named a provider still names the built-in one, and one
+    that never named an instructions file is pointed at its own copy of
+    Codex's prompt rather than being left to inherit Router's.
+    """
+    values = {key: root_values.get(key) for key in _OWNED_ROOT_KEYS}
+    # Do not synthesize a model when the previous setup had none. Once this
+    # profile selects its provider and isolated catalog, Codex resolves that
+    # catalog's own default without inheriting Router's root model.
+    values["model_provider"] = values.get("model_provider") or "openai"
+    if instructions is not None and not values.get("model_instructions_file"):
+        values["model_instructions_file"] = str(instructions)
+    if catalog is not None and not values.get("model_catalog_json"):
+        values["model_catalog_json"] = str(catalog)
+    return "".join(
+        f"{key} = {json.dumps(value)}\n"
+        for key, value in values.items()
+        if value is not None
+    )
+
+
+_PROFILE_CLIENTS = ("claude-code", "codex")
+
+
+def _profile_notice(results: list[dict], restore_clients: str) -> list[str]:
+    """Spell out what taking the default costs, for the agents it costs it in.
+
+    Neither Claude Code nor Codex can select a profile by default, so Router
+    has to own the default outright, and that is not something a user should
+    discover from a support thread. Returns no lines when neither was
+    configured, since nothing was displaced.
+    """
+    configured = [
+        result["client"] for result in results if result["client"] in _PROFILE_CLIENTS
+    ]
+    if not configured:
+        return []
+    names = " & ".join(CLIENT_NAMES[client] for client in configured)
+    verb = "supports" if len(configured) == 1 else "support"
+    lines = [
+        f"{names} only {verb} one model provider at a time, so we've replaced "
+        "the default with Ramp Router.",
+    ]
+    escapes = [
+        result["original_setup_command"]
+        for result in results
+        if result["original_setup_command"]
+    ]
+    if escapes:
+        lines += ["", "Run your previous setup at any time in parallel:"]
+        lines += [f"  {escape}" for escape in escapes]
+    lines += [
+        "",
+        "To remove Router and make your previous setup the default again:",
+        f"  ramp router unconfigure{restore_clients}",
+    ]
+    if "claude-code" in configured:
+        # Last, because it is the consequence a reader should leave with rather
+        # than something to scroll past on the way to the commands.
+        lines += [
+            "",
+            "claude.ai connectors and other subscription-only features are "
+            "unavailable in Claude Code while Router is the default.",
+        ]
+    return lines
+
+
+def _read_state_file(path: Path) -> dict:
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _read_codex_catalog(path_value: object) -> dict | None:
+    if not isinstance(path_value, str) or not path_value:
+        return None
+    catalog_path = Path(path_value).expanduser()
+    if not catalog_path.is_absolute():
+        return None
+    try:
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    models = catalog.get("models") if isinstance(catalog, dict) else None
+    return catalog if isinstance(models, list) and bool(models) else None
+
+
+def _codex_catalog_is_usable(path_value: object) -> bool:
+    return _read_codex_catalog(path_value) is not None
+
+
+def _codex_original_profile_is_usable(home: Path, state: dict) -> bool:
+    """Check that an unowned profile still escapes Router safely.
+
+    Codex writes selections such as model_reasoning_effort back into the active
+    profile. That intentionally breaks our deletion digest, but it does not
+    make the profile unusable. Provider and catalog are the fields that decide
+    whether the command really leaves Router, so validate those directly.
+    """
+    root_values = state.get("root")
+    if not isinstance(root_values, dict):
+        return False
+    try:
+        profile = tomllib.loads(
+            _codex_original_profile_path(home).read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+        return False
+    if profile.get("model_provider") != _codex_restored_provider(root_values):
+        return False
+
+    expected_catalog = root_values.get("model_catalog_json")
+    if not isinstance(expected_catalog, str) or not expected_catalog:
+        expected_catalog = str(home / CODEX_ORIGINAL_CATALOG)
+    if profile.get("model_catalog_json") != expected_catalog:
+        return False
+    catalog = _read_codex_catalog(expected_catalog)
+    if catalog is None:
+        return False
+    profile_model = profile.get("model")
+    catalog_models = {
+        model.get("slug")
+        for model in catalog["models"]
+        if isinstance(model, dict) and isinstance(model.get("slug"), str)
+    }
+    if profile_model is not None and profile_model not in catalog_models:
+        return False
+    if root_values.get("model_catalog_json"):
+        # A catalog from the pre-Router config is user-selected provenance.
+        return True
+
+    catalog_path = Path(expected_catalog)
+    if state.get(CODEX_ORIGINAL_CATALOG_STATE_KEY) == catalog_path.name and isinstance(
+        state.get(CODEX_ORIGINAL_CATALOG_DIGEST_KEY), str
+    ):
+        return _is_unmodified(
+            catalog_path, state.get(CODEX_ORIGINAL_CATALOG_DIGEST_KEY)
+        )
+
+    # A profile may survive because Codex added harmless settings and broke
+    # its ownership digest. If its catalog lacks receipt provenance too,
+    # compare it with a fresh provider-specific snapshot before advertising.
+    expected_body = _codex_original_catalog(root_values)
+    if expected_body is None:
+        return False
+    try:
+        return catalog_path.read_text(encoding="utf-8") == expected_body
+    except (OSError, UnicodeError):
+        return False
+
+
+def _claude_original_settings_are_usable(path: Path, state: dict) -> bool:
+    """Validate an escape overlay independently of who owns its file."""
+    try:
+        current = claude_code.read_settings(claude_code.original_settings_path(path))
+    except click.ClickException:
+        return False
+    expected = claude_code.plan_original_settings(state)
+    current_environment = current.get("env")
+    expected_environment = expected.get("env")
+    if not isinstance(current_environment, dict) or not isinstance(
+        expected_environment, dict
+    ):
+        return False
+    if any(
+        current_environment.get(key) != value
+        for key, value in expected_environment.items()
+    ):
+        return False
+    return all(
+        current.get(key) == value for key, value in expected.items() if key != "env"
+    )
+
+
+def _original_setup_command(client: str, path: Path) -> str | None:
+    """How to run one agent on the setup Router replaced, if we kept it.
+
+    A receipt proves ownership. A profile Codex or the user has since edited
+    remains theirs, but can still be offered when its provider and catalog
+    prove that it safely runs the setup Router replaced.
+    """
+    if client == "codex":
+        state = _read_state_file(path.parent / "ramp-router-state.json")
+        if _codex_original_profile_is_usable(path.parent, state):
+            return f"codex --profile {CODEX_ORIGINAL_PROFILE}"
+        return None
+    if client == "claude-code":
+        try:
+            state = claude_code.read_state(path)
+        except click.ClickException:
+            return None
+        if _claude_original_settings_are_usable(path, state):
+            original = claude_code.plan_original_settings(state)
+            return claude_code.original_settings_command(
+                path, use_default_model="model" not in original
+            )
+    return None
+
+
+def _clients_with_a_receipt() -> tuple[str, ...]:
+    """Return the agents this CLI has a Router setup recorded for.
+
+    Deliberately weaker than configured_router_clients, which also requires a
+    readable credential: an unusable key is a reason to unconfigure, not a
+    reason to hide the agent from the list of what can be undone.
+    """
+    return tuple(
+        client
+        for client in CLIENT_NAMES
+        if (_client_config_path(client).parent / "ramp-router-state.json").is_file()
+    )
+
+
+def _installed_clients() -> tuple[str, ...]:
+    """Return the coding agents that appear to be present on this machine.
+
+    An agent counts when its command is on PATH or when it already keeps a
+    configuration directory, because an agent installed somewhere PATH does not
+    reach still has a setup worth pointing at Router. Detection only narrows
+    what the picker offers; naming an agent explicitly always configures it, so
+    a missed install costs an argument rather than the whole command.
+    """
+    return tuple(
+        client
+        for client, executable in CLIENT_EXECUTABLES.items()
+        if shutil.which(executable) or _client_config_path(client).parent.is_dir()
+    )
+
+
+def _can_draw_picker(ctx: click.Context) -> bool:
+    """Report whether there is a terminal to draw the picker on.
+
+    An installer or CI job supplies the key through the environment without
+    passing --no-input, and a full-screen prompt in that shape aborts the
+    command instead of configuring anything. Omitting agent names there means
+    what it always meant: every agent.
+    """
+    if ctx.obj["no_input"]:
+        return False
+    return all(
+        hasattr(stream, "isatty") and stream.isatty()
+        for stream in (sys.stdin, sys.stdout)
+    )
+
+
+def _can_prompt(ctx: click.Context, fmt: str) -> bool:
+    """Keep machine output non-interactive even when it is attached to a TTY."""
+    return fmt != "json" and _can_draw_picker(ctx)
+
+
+def _pick_installed_clients() -> tuple[str, ...]:
+    """Ask which coding agents to configure, with every agent preselected."""
+    candidates = _installed_clients()
+    if not candidates:
+        # Offering nothing would end the command on a machine where detection
+        # simply missed, and configuring an agent before installing it is a
+        # supported thing to do.
+        click.echo("No coding agents found. Showing every agent Router supports.")
+        candidates = tuple(CLIENT_NAMES)
+    return _pick_clients(
+        "Choose the agents you want to configure with Ramp Router", candidates
+    )
+
+
+def _pick_clients(message: str, candidates: tuple[str, ...]) -> tuple[str, ...]:
+    """Ask which of ``candidates`` to act on, with every one preselected."""
+    selected = questionary.checkbox(
+        message,
+        choices=[
+            questionary.Choice(title=CLIENT_NAMES[client], value=client, checked=True)
+            for client in candidates
+        ],
+        validate=lambda answer: bool(answer) or "Select at least one coding agent.",
+        style=_PICKER_STYLE,
+        pointer=_PICKER_POINTER,
+        instruction="(enter to confirm, space to toggle)",
+    ).ask()
+    if selected is None:
+        raise click.Abort()
+    return tuple(selected)
+
 
 @click.group("router", help="Configure coding agents to use Ramp Router")
 def router_group() -> None:
@@ -292,7 +760,7 @@ def router_group() -> None:
 
 @router_group.command(
     "configure",
-    help="Configure one or more coding agents, or all agents when omitted",
+    help="Configure coding agents; omit agent names to choose interactively",
 )
 @click.argument(
     "clients",
@@ -304,34 +772,44 @@ def router_group() -> None:
     metavar="KEY",
     envvar=CONFIGURE_KEY_ENV,
     help=(
-        "Ramp Router API key. Prompts when omitted. "
+        "Ramp Router API key. Opens browser setup when omitted. "
         f"Set {CONFIGURE_KEY_ENV} instead to keep it out of shell history."
     ),
 )
+@click.option(
+    "--no-browser",
+    is_flag=True,
+    help="Print the Router setup URL instead of opening a browser.",
+)
 @click.pass_context
 def router_configure(
-    ctx: click.Context, clients: tuple[str, ...], api_key: str | None
+    ctx: click.Context,
+    clients: tuple[str, ...],
+    api_key: str | None,
+    no_browser: bool,
 ) -> None:
     if ctx.obj["no_input"] and api_key is None:
         raise click.UsageError(
             "Pass --api-key when using non-interactive mode, or set "
             f"{CONFIGURE_KEY_ENV} to keep the key out of shell history "
-            f"and process listings. Create a key at {ROUTER_UI_URL}."
+            f"and process listings. Create a key at {router_ui_url()}."
         )
 
-    requested_clients = tuple(dict.fromkeys(clients))
-    clients = requested_clients or tuple(CLIENT_NAMES)
-    restore_clients = "".join(f" {client}" for client in requested_clients)
-    agent_label = "coding agent" if len(clients) == 1 else "coding agents"
+    all_clients = tuple(CLIENT_NAMES)
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
+    requested_clients = tuple(dict.fromkeys(clients))
+    if not requested_clients and _can_prompt(ctx, fmt):
+        requested_clients = _pick_installed_clients()
+    clients = requested_clients or all_clients
+    restore_clients = (
+        "" if clients == all_clients else "".join(f" {client}" for client in clients)
+    )
+    agent_label = "coding agent" if len(clients) == 1 else "coding agents"
     if fmt != "json":
         click.echo(f"Connecting Ramp Router to your {agent_label}")
+    browser_acquired_key = api_key is None
     if api_key is None:
-        click.echo(
-            f"Create or copy an API key at {ROUTER_UI_URL}, then paste it below."
-        )
-        click.echo()
-        api_key = click.prompt("API key", hide_input=True)
+        api_key = acquire_router_api_key(router_ui_url(), no_browser=no_browser)
     api_key = api_key.strip()
     # Click has already copied the configured value into api_key. Do not leave
     # the secret in the environment inherited by Codex or any other child.
@@ -339,32 +817,50 @@ def router_configure(
     if not api_key:
         raise click.UsageError("The API key cannot be empty.")
 
-    models_by_client: dict[str, list[RouterModel]] = {}
-    standard_clients = tuple(item for item in clients if item != "claude-code")
-    if standard_clients:
-        models = _fetch_models(api_key)
-        models_by_client.update(dict.fromkeys(standard_clients, models))
-    if "claude-code" in clients:
-        models_by_client["claude-code"] = _fetch_models(api_key, claude_code_view=True)
     results = []
     failures = []
-    for item in clients:
-        models = models_by_client[item]
-        try:
-            path, default_model, repaired = _configure_client(item, api_key, models)
-        except click.ClickException as exc:
-            failures.append(f"{CLIENT_NAMES[item]}: {exc.message}")
-            continue
-        result = {
-            "client": item,
-            "config_path": str(path),
-            "provider": ROUTER_PROVIDER,
-            "default_model": default_model,
-            "models_available": len(models),
-            "replaced_outdated_setup": repaired,
-        }
-        results.append(result)
+    # Everything from here to the summary is silent work against the network
+    # and each agent's files, so it is the stretch that needs to look alive.
+    stop_spinner = (
+        start_spinner(f"Setting up your {agent_label}")
+        if fmt != "json"
+        else (lambda: None)
+    )
+    try:
+        models_by_client: dict[str, list[RouterModel]] = {}
+        standard_clients = tuple(item for item in clients if item != "claude-code")
+        if standard_clients:
+            models = _fetch_models(api_key, wait_for_key=browser_acquired_key)
+            models_by_client.update(dict.fromkeys(standard_clients, models))
+        if "claude-code" in clients:
+            models_by_client["claude-code"] = _fetch_models(
+                api_key,
+                claude_code_view=True,
+                wait_for_key=browser_acquired_key,
+            )
+        for item in clients:
+            models = models_by_client[item]
+            try:
+                path, default_model, repaired = _configure_client(item, api_key, models)
+            except click.ClickException as exc:
+                failures.append(f"{CLIENT_NAMES[item]}: {exc.message}")
+                continue
+            result = {
+                "client": item,
+                "config_path": str(path),
+                "provider": ROUTER_PROVIDER,
+                "default_model": default_model,
+                "models_available": len(models),
+                "replaced_outdated_setup": repaired,
+                "original_setup_command": _original_setup_command(item, path),
+            }
+            results.append(result)
+    finally:
+        # Stopped on the way out too, so a failed key does not leave the
+        # terminal spinning with the cursor hidden.
+        stop_spinner()
 
+    notice = _profile_notice(results, restore_clients) if fmt != "json" else []
     if failures and fmt == "json":
         raise click.ClickException("Could not configure " + "; ".join(failures))
     if fmt == "json":
@@ -384,6 +880,8 @@ def router_configure(
         click.echo(
             f"{model_count} {model_label} added. Start an agent and pick a model."
         )
+        if notice:
+            show_notice("NOTICE", notice)
 
     if failures:
         # Configuration is written before the agent-specific steps, so a
@@ -394,7 +892,9 @@ def router_configure(
             + f". Run 'ramp router unconfigure{restore_clients}' to restore your "
             "previous settings."
         )
-    if fmt != "json":
+    if fmt != "json" and not notice:
+        # The notice carries this line itself, alongside the profiles it is
+        # restoring, so repeating it here would only be noise.
         click.echo(
             f"Run 'ramp router unconfigure{restore_clients}' to restore the previous "
             "settings."
@@ -467,6 +967,12 @@ SUBAGENT_DEFAULT_REQUEST_NAMES = {
     "opus": "gpt-5.6-sol",
     "haiku": "gpt-5.6-luna",
     "fable": "gpt-5.6-sol",
+}
+SUBAGENT_TIER_DISPLAY_SUFFIXES = {
+    # Opus and Fable intentionally share a backend model. Distinguish their
+    # tier-specific picker entries without changing the model they dispatch.
+    "opus": "Opus tier",
+    "fable": "Fable tier",
 }
 SUBAGENT_PREVIOUS_DEFAULT_REQUEST_NAMES = {
     "sonnet": "gpt-5.6-terra",
@@ -661,6 +1167,40 @@ def _subagent_tier_metadata(
     return display_names, descriptions
 
 
+def _reconcile_automatic_sol_tier_names(
+    settings: dict,
+    state: dict,
+    models: list[RouterModel],
+) -> None:
+    """Distinguish the automatic Sol pair without reclaiming custom names."""
+    environment = settings["env"]
+    written = state["written"]["env"]
+    automatic_defaults = state.get(claude_code.SUBAGENT_DEFAULTS_STATE_KEY, {})
+    models_by_id = {model.id: model for model in models}
+    assignments = {
+        tier: environment.get(claude_code.SUBAGENT_TIER_ENV_KEYS[tier])
+        for tier in SUBAGENT_TIER_DISPLAY_SUFFIXES
+    }
+    qualify_names = all(
+        automatic_defaults.get(tier) == model_id
+        and model_id in models_by_id
+        and models_by_id[model_id].metadata.request_name == "gpt-5.6-sol"
+        for tier, model_id in assignments.items()
+    )
+
+    for tier, model_id in assignments.items():
+        if automatic_defaults.get(tier) != model_id or model_id not in models_by_id:
+            continue
+        name_key = claude_code.SUBAGENT_TIER_NAME_ENV_KEYS[tier]
+        if environment.get(name_key) != written.get(name_key):
+            continue
+        display_name = models_by_id[model_id].metadata.display_name
+        if qualify_names:
+            display_name += f" ({SUBAGENT_TIER_DISPLAY_SUFFIXES[tier]})"
+        environment[name_key] = display_name
+        written[name_key] = display_name
+
+
 def _resolve_subagent_model(value: str, models: list[RouterModel], flag: str) -> str:
     """Resolve what the user typed to one id from Claude Code's model view.
 
@@ -705,7 +1245,7 @@ def _resolve_subagent_model(value: str, models: list[RouterModel], flag: str) ->
 
 @router_group.command(
     "unconfigure",
-    help="Restore one or more coding agents, or all agents when omitted",
+    help="Restore coding agents; omit agent names to choose interactively",
 )
 @click.argument(
     "clients",
@@ -714,27 +1254,47 @@ def _resolve_subagent_model(value: str, models: list[RouterModel], flag: str) ->
 )
 @click.pass_context
 def router_unconfigure(ctx: click.Context, clients: tuple[str, ...]) -> None:
+    fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     requested_clients = tuple(dict.fromkeys(clients))
+    if not requested_clients and _can_prompt(ctx, fmt):
+        # Offered from the receipts rather than the installed agents: this
+        # removes a setup, so the only meaningful choices are the setups that
+        # exist. With none, the list would be empty and the command falls
+        # through to saying Router is not configured anywhere.
+        configured = _clients_with_a_receipt()
+        if configured:
+            requested_clients = _pick_clients(
+                "Which coding agents do you want to remove Ramp Router from?",
+                configured,
+            )
     clients = requested_clients or tuple(CLIENT_NAMES)
+    agent_label = "coding agent" if len(clients) == 1 else "coding agents"
     results = []
     failures = []
-    for item in clients:
-        path = _client_config_path(item)
-        if (
-            not requested_clients
-            and not (path.parent / "ramp-router-state.json").exists()
-        ):
-            continue
-        try:
-            _unconfigure_client(item, path)
-        except click.ClickException as exc:
-            failures.append(f"{CLIENT_NAMES[item]}: {exc.message}")
-            continue
-        results.append({"client": item, "config_path": str(path), "removed": True})
+    stop_spinner = (
+        start_spinner(f"Restoring your {agent_label}")
+        if fmt != "json"
+        else (lambda: None)
+    )
+    try:
+        for item in clients:
+            path = _client_config_path(item)
+            if (
+                not requested_clients
+                and not (path.parent / "ramp-router-state.json").exists()
+            ):
+                continue
+            try:
+                _unconfigure_client(item, path)
+            except click.ClickException as exc:
+                failures.append(f"{CLIENT_NAMES[item]}: {exc.message}")
+                continue
+            results.append({"client": item, "config_path": str(path), "removed": True})
+    finally:
+        stop_spinner()
 
     if not results and not failures:
         raise click.ClickException("Ramp Router is not configured in any coding agent.")
-    fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     if failures and fmt == "json":
         raise click.ClickException("Could not unconfigure " + "; ".join(failures))
     if fmt == "json":
@@ -773,9 +1333,26 @@ def _unconfigure_client(client: str, path: Path) -> None:
         root_values = state["root"]
         previous_provider = state["provider"]
         sessions = state.get("sessions", [])
+        original_profile = state.get(CODEX_ORIGINAL_PROFILE_STATE_KEY)
+        original_digest = state.get(CODEX_ORIGINAL_PROFILE_DIGEST_KEY)
+        original_catalog = state.get(CODEX_ORIGINAL_CATALOG_STATE_KEY)
+        original_catalog_digest = state.get(CODEX_ORIGINAL_CATALOG_DIGEST_KEY)
+        original_instructions = state.get(CODEX_ORIGINAL_INSTRUCTIONS_STATE_KEY)
+        original_instructions_digest = state.get(CODEX_ORIGINAL_INSTRUCTIONS_DIGEST_KEY)
+        preexisting_router_sessions = state.get(
+            CODEX_PREEXISTING_ROUTER_SESSIONS_STATE_KEY
+        )
         if not isinstance(root_values, dict) or not isinstance(previous_provider, list):
             raise ValueError
-        if not isinstance(sessions, list):
+        if not isinstance(sessions, list) or (
+            preexisting_router_sessions is not None
+            and (
+                not isinstance(preexisting_router_sessions, list)
+                or not all(
+                    isinstance(item, str) for item in preexisting_router_sessions
+                )
+            )
+        ):
             raise ValueError
     except (OSError, UnicodeError, ValueError, KeyError, TypeError):
         raise click.ClickException(
@@ -820,11 +1397,58 @@ def _unconfigure_client(client: str, path: Path) -> None:
             f"Could not restore Codex config {path}: {exc}"
         ) from None
     try:
+        if preexisting_router_sessions is None:
+            # Receipts from before this snapshot existed cannot distinguish a
+            # Router thread that predated configure from one created during it.
+            # Preserve every unknown Router thread rather than risk silently
+            # reassigning user-owned history.
+            preexisting_router_sessions = _preexisting_codex_router_session_ids(
+                path.parent
+            )
+        _reclaim_codex_router_sessions(
+            path.parent,
+            sessions,
+            _codex_restored_provider(root_values),
+            preexisting_router_sessions=preexisting_router_sessions,
+        )
+    except (OSError, sqlite3.Error, click.ClickException) as exc:
+        # Raised rather than warned so the receipt below survives. A locked
+        # session index is the ordinary cause and it clears on its own, but
+        # without the receipt there is nothing left to retry from and those
+        # conversations stay hidden for good.
+        message = exc.message if isinstance(exc, click.ClickException) else exc
+        raise click.ClickException(
+            f"Restored the Codex configuration, but could not move the "
+            f"conversations created while Ramp Router was configured: {message}. "
+            "Close Codex and run this command again to finish."
+        ) from None
+    try:
         (path.parent / "ramp-router-models.json").unlink(missing_ok=True)
         # The key outlives the config unless it is removed here, leaving a
         # live credential on disk after the user asked for it to be undone.
         (path.parent / "ramp-router-key").unlink(missing_ok=True)
         (path.parent / "ramp-router-instructions.md").unlink(missing_ok=True)
+        # The values it holds are back at the root, so the profile would only
+        # be a stale duplicate of the default. Removed by the name recorded at
+        # configure time, and only while it still holds what was written then:
+        # a profile the user has since edited is theirs to keep, and the
+        # instructions file it points at has to stay with it.
+        if isinstance(original_profile, str) and original_profile:
+            profile_path = path.parent / Path(original_profile).name
+            if _is_unmodified(profile_path, original_digest):
+                profile_path.unlink(missing_ok=True)
+                if isinstance(original_instructions, str) and original_instructions:
+                    original_instructions_path = (
+                        path.parent / Path(original_instructions).name
+                    )
+                    if _is_unmodified(
+                        original_instructions_path, original_instructions_digest
+                    ):
+                        original_instructions_path.unlink(missing_ok=True)
+                if isinstance(original_catalog, str) and original_catalog:
+                    catalog_path = path.parent / Path(original_catalog).name
+                    if _is_unmodified(catalog_path, original_catalog_digest):
+                        catalog_path.unlink(missing_ok=True)
         state_path.unlink()
     except OSError as exc:
         raise click.ClickException(
@@ -848,8 +1472,13 @@ def _statusline_origin() -> str:
     """
     base = router_base_url()
     if base == DEFAULT_ROUTER_BASE_URL:
-        return ROUTER_UI_URL
+        return router_ui_url()
     return base.removesuffix("/v1").rstrip("/")
+
+
+def router_ui_url() -> str:
+    """Return the Router browser origin, allowing local end-to-end testing."""
+    return os.environ.get(ROUTER_UI_URL_ENV, ROUTER_UI_URL).rstrip("/")
 
 
 def _install_claude_code_statusline(settings_file: Path) -> str | None:
@@ -941,6 +1570,9 @@ def _configure_claude_code(
             # what Router currently owns; keys that snapshot never captured
             # take the fresh one taken before this write.
             previous_state = claude_code.read_state(path)
+            updated = claude_code.restore_legacy_connector_preference(
+                updated, previous_state
+            )
             state = claude_code.merge_states(previous_state, state)
         tier_defaults = _needed_subagent_tier_defaults(
             updated, state, models, fallback=model
@@ -974,6 +1606,29 @@ def _configure_claude_code(
                 descriptions=descriptions,
                 automatic_tiers=automatic_tiers,
             )
+        _reconcile_automatic_sol_tier_names(updated, state, models)
+        # Rendered before the receipt is written so the receipt can record
+        # what the overlay holds, which is what lets unconfigure tell its own
+        # file from one the user has edited. Planned from the merged state, so
+        # it describes what the user had before Router rather than what a
+        # previous configure left behind.
+        original_settings = claude_code.original_settings_path(path)
+        overlay_body = (
+            json.dumps(claude_code.plan_original_settings(state), indent=2) + "\n"
+        )
+        overlay_claim = _claim_escape_artifact(
+            original_settings,
+            state,
+            claude_code.ORIGINAL_SETTINGS_STATE_KEY,
+            claude_code.ORIGINAL_SETTINGS_DIGEST_KEY,
+        )
+        if overlay_claim is None:
+            original_settings = None
+        else:
+            state[claude_code.ORIGINAL_SETTINGS_STATE_KEY] = original_settings.name
+            state[claude_code.ORIGINAL_SETTINGS_DIGEST_KEY] = _content_digest(
+                overlay_body
+            )
         # Written first so a successful settings write is always paired with
         # the managed values needed to undo it. A failed settings write puts
         # the prior state back below.
@@ -995,6 +1650,22 @@ def _configure_claude_code(
             raise click.ClickException(
                 f"Could not update Claude Code settings {path}: {exc}"
             ) from None
+        if overlay_claim in ("create", "replace"):
+            # Written last, and only after the settings landed, because it is
+            # an extra: failing to write it must not fail a setup that is
+            # otherwise complete. New files are created exclusively; existing
+            # files are rewritten only with receipt provenance above.
+            try:
+                if overlay_claim == "create":
+                    _write_new_private_file(original_settings, overlay_body)
+                else:
+                    _write_private_file(original_settings, overlay_body)
+            except OSError as exc:
+                click.echo(
+                    "Could not save your previous Claude Code settings to "
+                    f"{original_settings}: {exc}.",
+                    err=True,
+                )
     return model
 
 
@@ -1116,6 +1787,15 @@ def _unconfigure_claude_code(path: Path) -> None:
         # The script lives under a name this command manages, so it goes even
         # when the statusLine setting itself was the user's and stays.
         claude_code.statusline_path(path).unlink(missing_ok=True)
+        # These values are back in the settings file, so the overlay would only
+        # be a stale duplicate. Removed by the name recorded at configure time,
+        # and only while it still holds what was written then: an overlay the
+        # user has since edited is theirs to keep.
+        overlay = claude_code.original_settings_path(path)
+        if state.get(claude_code.ORIGINAL_SETTINGS_STATE_KEY) and _is_unmodified(
+            overlay, state.get(claude_code.ORIGINAL_SETTINGS_DIGEST_KEY)
+        ):
+            overlay.unlink(missing_ok=True)
         claude_code.state_path(path).unlink(missing_ok=True)
 
 
@@ -1711,17 +2391,31 @@ def _fetch_models(
     claude_code_view: bool = False,
     *,
     base_url: str | None = None,
+    wait_for_key: bool = False,
 ) -> list[RouterModel]:
     try:
-        response = httpx.get(
-            f"{(base_url or router_base_url()).rstrip('/')}/models",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                # Ask for the projection whose ids Claude Code will accept.
-                **({GATEWAY_CLIENT_HEADER: "claude-code"} if claude_code_view else {}),
-            },
-            timeout=10,
-        )
+        for retry in range(len(NEW_KEY_RETRY_DELAYS) + 1):
+            response = httpx.get(
+                f"{(base_url or router_base_url()).rstrip('/')}/models",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    # Ask for the projection whose ids Claude Code will accept.
+                    **(
+                        {GATEWAY_CLIENT_HEADER: "claude-code"}
+                        if claude_code_view
+                        else {}
+                    ),
+                },
+                timeout=10,
+            )
+            if (
+                wait_for_key
+                and response.status_code == 401
+                and retry < len(NEW_KEY_RETRY_DELAYS)
+            ):
+                time.sleep(NEW_KEY_RETRY_DELAYS[retry])
+                continue
+            break
         response.raise_for_status()
         payload = response.json()
     except httpx.HTTPStatusError as exc:
@@ -1808,9 +2502,17 @@ def _configure_codex(
     chunks = _config_chunks(existing)
     repaired = _codex_provider_is_out_of_date(existing_data)
 
+    # Read before the receipt is assembled, because the escape profile is
+    # recorded there along with what it was written to hold, and both depend
+    # on the model this run settles on.
+    default_model = _preferred_model(models, selected_model)
+    harness_prompt = _codex_harness_prompt(default_model)
+
     state_path = path.parent / "ramp-router-state.json"
     previous_state = None
-    state = None
+    # The receipt as it will be written, or None when this run changes nothing
+    # in it.
+    state_document: dict | None = None
     if not state_path.exists():
         previous_provider = [
             "".join(chunk)
@@ -1819,21 +2521,18 @@ def _configure_codex(
         ]
         sessions = _prepare_codex_sessions(path.parent)
         saved_sessions = sessions
-        state = (
-            json.dumps(
-                {
-                    "root": {
-                        key: existing_data[key]
-                        for key in _OWNED_ROOT_KEYS
-                        if key in existing_data
-                    },
-                    "provider": previous_provider,
-                    "sessions": sessions,
-                },
-                indent=2,
-            )
-            + "\n"
-        )
+        root_values = {
+            key: existing_data[key] for key in _OWNED_ROOT_KEYS if key in existing_data
+        }
+        receipt = {
+            "root": root_values,
+            "provider": previous_provider,
+            "sessions": sessions,
+            CODEX_PREEXISTING_ROUTER_SESSIONS_STATE_KEY: (
+                _preexisting_codex_router_session_ids(path.parent)
+            ),
+        }
+        state_document = receipt
     else:
         try:
             previous_state = state_path.read_text(encoding="utf-8")
@@ -1853,6 +2552,9 @@ def _configure_codex(
             )
         sessions = _prepare_codex_sessions(path.parent)
         saved_sessions = existing_sessions
+        receipt = existing_state
+        recorded_root = existing_state.get("root")
+        root_values = recorded_root if isinstance(recorded_root, dict) else {}
         if sessions or "sessions" not in existing_state:
             existing_ids = {
                 session.get("id")
@@ -1868,16 +2570,105 @@ def _configure_codex(
                 ),
             ]
             saved_sessions = existing_state["sessions"]
-            state = json.dumps(existing_state, indent=2) + "\n"
+            state_document = existing_state
 
     # Removed rather than written: Codex now fetches the list from Router on
     # each launch, so a file here would freeze it.
-    catalog_path = path.parent / "ramp-router-models.json"
+    legacy_catalog_path = path.parent / "ramp-router-models.json"
     key_path = path.parent / "ramp-router-key"
     instructions_path = path.parent / "ramp-router-instructions.md"
 
-    default_model = _preferred_model(models, selected_model)
-    harness_prompt = _codex_harness_prompt(default_model)
+    # Router sets model_instructions_file only when it could read Codex's own
+    # prompt, so exactly when the key needs answering in the profile, the
+    # prompt for the profile's own model can be read the same way.
+    original_instructions = None
+    original_prompt = None
+    instructions_claim = None
+    if harness_prompt and not root_values.get("model_instructions_file"):
+        original_prompt = _codex_harness_prompt(
+            root_values.get("model") or default_model
+        )
+        if original_prompt:
+            instructions_path_candidate = path.parent / CODEX_ORIGINAL_INSTRUCTIONS
+            instructions_claim = _claim_escape_artifact(
+                instructions_path_candidate,
+                receipt,
+                CODEX_ORIGINAL_INSTRUCTIONS_STATE_KEY,
+                CODEX_ORIGINAL_INSTRUCTIONS_DIGEST_KEY,
+            )
+            if instructions_claim is not None:
+                original_instructions = instructions_path_candidate
+
+    original_catalog = None
+    catalog_body = _codex_original_catalog(root_values)
+    catalog_claim = None
+    if catalog_body is not None:
+        catalog_path = path.parent / CODEX_ORIGINAL_CATALOG
+        catalog_claim = _claim_escape_artifact(
+            catalog_path,
+            receipt,
+            CODEX_ORIGINAL_CATALOG_STATE_KEY,
+            CODEX_ORIGINAL_CATALOG_DIGEST_KEY,
+        )
+        if catalog_claim is not None:
+            original_catalog = catalog_path
+
+    root_catalog = root_values.get("model_catalog_json")
+    profile_path = _codex_original_profile_path(path.parent)
+    profile_body = _render_codex_original_profile(
+        root_values,
+        original_instructions,
+        original_catalog,
+    )
+    needs_generated_catalog = not _codex_catalog_is_usable(root_catalog)
+    needs_generated_instructions = bool(
+        harness_prompt and not root_values.get("model_instructions_file")
+    )
+    if (needs_generated_catalog and original_catalog is None) or (
+        needs_generated_instructions and original_instructions is None
+    ):
+        # Without both provider-specific artifacts the profile would inherit
+        # Router's shared model cache or harness prompt. Do not create or
+        # advertise an escape command that does not actually escape Router.
+        profile_claim = None
+    else:
+        profile_claim = _claim_escape_artifact(
+            profile_path,
+            receipt,
+            CODEX_ORIGINAL_PROFILE_STATE_KEY,
+            CODEX_ORIGINAL_PROFILE_DIGEST_KEY,
+        )
+    original_profile = profile_path if profile_claim is not None else None
+    if original_profile is not None:
+        if _record_escape_artifact(
+            receipt,
+            original_profile,
+            profile_body,
+            CODEX_ORIGINAL_PROFILE_STATE_KEY,
+            CODEX_ORIGINAL_PROFILE_DIGEST_KEY,
+        ):
+            state_document = receipt
+        if original_catalog is not None and _record_escape_artifact(
+            receipt,
+            original_catalog,
+            catalog_body,
+            CODEX_ORIGINAL_CATALOG_STATE_KEY,
+            CODEX_ORIGINAL_CATALOG_DIGEST_KEY,
+        ):
+            state_document = receipt
+        if original_instructions is not None and _record_escape_artifact(
+            receipt,
+            original_instructions,
+            original_prompt,
+            CODEX_ORIGINAL_INSTRUCTIONS_STATE_KEY,
+            CODEX_ORIGINAL_INSTRUCTIONS_DIGEST_KEY,
+        ):
+            state_document = receipt
+    state = (
+        json.dumps(state_document, indent=2) + "\n"
+        if state_document is not None
+        else None
+    )
     chunks[0] = [
         _render_root_config(
             chunks[0],
@@ -1917,6 +2708,12 @@ def _configure_codex(
         instructions_path.read_text() if instructions_path.exists() else None
     )
 
+    previous_profile_body = None
+    created_profile = False
+    previous_catalog_body = None
+    created_catalog = False
+    previous_original_instructions_body = None
+    created_instructions = False
     try:
         tomllib.loads(updated)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1926,6 +2723,34 @@ def _configure_codex(
         # fails on a full or read-only disk. Succeeding here means a partial
         # failure afterwards still leaves a usable configuration.
         _write_private_file(path, updated)
+        if original_profile is not None:
+            if original_catalog is not None:
+                if catalog_claim == "create":
+                    _write_new_private_file(original_catalog, catalog_body)
+                    created_catalog = True
+                elif catalog_claim == "replace":
+                    previous_catalog_body = original_catalog.read_text(encoding="utf-8")
+                    _write_private_file(original_catalog, catalog_body)
+            # Keep each receipt-provenanced dependency current before writing
+            # the profile that points at it.
+            if original_instructions is not None:
+                if instructions_claim == "create":
+                    _write_new_private_file(original_instructions, original_prompt)
+                    created_instructions = True
+                elif instructions_claim == "replace":
+                    previous_original_instructions_body = (
+                        original_instructions.read_text(encoding="utf-8")
+                    )
+                    _write_private_file(original_instructions, original_prompt)
+            if profile_claim == "create":
+                # Exclusive: a file that appeared under this name since the
+                # check above is the user's, and failing here leaves it alone
+                # rather than replacing it and deleting it at unconfigure.
+                _write_new_private_file(original_profile, profile_body)
+                created_profile = True
+            elif profile_claim == "replace":
+                previous_profile_body = original_profile.read_text(encoding="utf-8")
+                _write_private_file(original_profile, profile_body)
         _write_private_file(key_path, api_key)
         if harness_prompt:
             _write_private_file(instructions_path, harness_prompt)
@@ -1935,7 +2760,7 @@ def _configure_codex(
         _update_codex_session_index(path.parent, saved_sessions, restore=False)
         # A catalog written by an earlier version would keep overriding
         # discovery, so it goes only after every fallible update succeeds.
-        catalog_path.unlink(missing_ok=True)
+        legacy_catalog_path.unlink(missing_ok=True)
     except (OSError, tomllib.TOMLDecodeError, click.ClickException) as exc:
         # Only sessions discovered by this invocation can have changed here.
         # Restoring the cumulative receipt would retag sessions that belonged
@@ -1946,6 +2771,22 @@ def _configure_codex(
             # Already failing; a failed undo must not replace the real cause.
             pass
         _restore_private_file(path, previous_config)
+        # Removed only when this run is what created them, so a file that
+        # turned out to be the user's survives the failure it caused.
+        if created_profile:
+            _restore_private_file(original_profile, None)
+        elif previous_profile_body is not None:
+            _restore_private_file(original_profile, previous_profile_body)
+        if created_catalog:
+            _restore_private_file(original_catalog, None)
+        elif previous_catalog_body is not None:
+            _restore_private_file(original_catalog, previous_catalog_body)
+        if created_instructions:
+            _restore_private_file(original_instructions, None)
+        elif previous_original_instructions_body is not None:
+            _restore_private_file(
+                original_instructions, previous_original_instructions_body
+            )
         _restore_private_file(key_path, previous_key)
         _restore_private_file(instructions_path, previous_instructions)
         _restore_private_file(state_path, previous_state)
@@ -1954,6 +2795,38 @@ def _configure_codex(
             f"Could not write Codex config {path}: {message}"
         ) from None
     return default_model, repaired
+
+
+def _write_new_private_file(path: Path, content: str) -> None:
+    """Create a file this command owns, refusing to replace an existing one.
+
+    The escape artifacts are the only files here written under names a user
+    could plausibly have chosen, and unconfigure deletes what it wrote, so
+    creation has to fail rather than clobber.
+    """
+    descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+        output.write(content)
+        output.flush()
+        os.fsync(output.fileno())
+
+
+def _content_digest(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _is_unmodified(path: Path, digest: object) -> bool:
+    """Report whether a file still holds exactly what this command wrote.
+
+    A receipt without a digest predates them being recorded, and its file is
+    treated as ours: that was the behavior when it was written.
+    """
+    if not isinstance(digest, str) or not digest:
+        return True
+    try:
+        return _content_digest(path.read_text(encoding="utf-8")) == digest
+    except (OSError, UnicodeError):
+        return False
 
 
 def _restore_private_file(path: Path, previous: str | None) -> None:
@@ -1966,6 +2839,54 @@ def _restore_private_file(path: Path, previous: str | None) -> None:
     except OSError:
         # Already failing; a failed undo must not replace the real cause.
         pass
+
+
+def _preexisting_codex_router_session_ids(home: Path) -> list[str]:
+    """Snapshot Router threads that predate this CLI-managed configuration."""
+    identifiers: set[str] = set()
+    for directory in ("sessions", "archived_sessions"):
+        root = home / directory
+        if not root.is_dir():
+            continue
+        for transcript in sorted(root.rglob("*")):
+            if (
+                transcript.is_symlink()
+                or not transcript.is_file()
+                or not transcript.name.endswith((".jsonl", ".jsonl.zst"))
+            ):
+                continue
+            try:
+                item = _read_codex_session_meta(transcript)
+            except (OSError, UnicodeError, zstandard.ZstdError):
+                continue
+            if item is None or item["payload"].get("model_provider") != ROUTER_PROVIDER:
+                continue
+            identifier = item["payload"].get("id")
+            if isinstance(identifier, str):
+                identifiers.add(identifier)
+
+    database_path = home / "state_5.sqlite"
+    if database_path.is_file():
+        try:
+            with sqlite3.connect(database_path, timeout=1) as database:
+                columns = {
+                    row[1]
+                    for row in database.execute("PRAGMA table_info(threads)").fetchall()
+                }
+                if {"id", "model_provider"}.issubset(columns):
+                    identifiers.update(
+                        identifier
+                        for (identifier,) in database.execute(
+                            "SELECT id FROM threads WHERE model_provider = ?",
+                            (ROUTER_PROVIDER,),
+                        )
+                        if isinstance(identifier, str)
+                    )
+        except sqlite3.Error as exc:
+            raise click.ClickException(
+                f"Could not read Codex session index {database_path}: {exc}"
+            ) from None
+    return sorted(identifiers)
 
 
 def _prepare_codex_sessions(home: Path) -> list[dict]:
@@ -2104,6 +3025,101 @@ def _update_codex_session_index(
         raise click.ClickException(
             f"Could not update Codex session index {database_path}: {exc}"
         ) from None
+
+
+def _codex_restored_provider(root_values: dict) -> str:
+    """The provider Codex answers to once Router's root keys are gone.
+
+    An absent model_provider means Codex falls back to its built-in one, which
+    is also what the threads predating Router are tagged with.
+    """
+    configured = root_values.get("model_provider")
+    if isinstance(configured, str) and configured.strip():
+        return configured.strip()
+    return "openai"
+
+
+def _reclaim_codex_router_sessions(
+    home: Path,
+    sessions: list[dict],
+    provider: str,
+    *,
+    preexisting_router_sessions: list[str] | tuple[str, ...] = (),
+) -> None:
+    """Move conversations Router itself created onto the restored provider.
+
+    Codex hides a thread whose provider is not the active one, so a session
+    started while Router was configured disappears the moment Router is
+    removed. The receipt cannot account for these: it lists what existed
+    before configure, and these were born after it.
+
+    A session the receipt does know about is skipped. One still on Router here
+    is one whose restoration was declined because the user had changed it, and
+    reclaiming it would override exactly the choice that declining protected.
+    """
+    recorded = {
+        session.get("id") for session in sessions if isinstance(session, dict)
+    } | set(preexisting_router_sessions)
+    for directory in ("sessions", "archived_sessions"):
+        root = home / directory
+        if not root.is_dir():
+            continue
+        for transcript in sorted(root.rglob("*")):
+            if transcript.is_symlink() or not transcript.is_file():
+                continue
+            if not transcript.name.endswith((".jsonl", ".jsonl.zst")):
+                continue
+            try:
+                item = _read_codex_session_meta(transcript)
+            except (OSError, UnicodeError, zstandard.ZstdError):
+                continue
+            if item is None:
+                continue
+            payload = item["payload"]
+            identifier = payload.get("id")
+            if (
+                not isinstance(identifier, str)
+                or identifier in recorded
+                or payload.get("model_provider") != ROUTER_PROVIDER
+            ):
+                continue
+            _rewrite_codex_session_provider(
+                home,
+                {"path": str(transcript.relative_to(home)), "id": identifier},
+                expected_provider=ROUTER_PROVIDER,
+                provider_present=True,
+                provider=provider,
+            )
+    _reclaim_codex_index_rows(home, recorded, provider)
+
+
+def _reclaim_codex_index_rows(home: Path, recorded: set, provider: str) -> None:
+    """Point index rows Router still owns at the restored provider.
+
+    The index is what the pickers read, and it holds rows for threads whose
+    transcript is gone or unreadable, so it is swept in its own right rather
+    than only alongside a rewritten file.
+    """
+    database_path = home / "state_5.sqlite"
+    if not database_path.is_file():
+        return
+    with sqlite3.connect(database_path, timeout=1) as database:
+        columns = {
+            row[1] for row in database.execute("PRAGMA table_info(threads)").fetchall()
+        }
+        if not {"id", "model_provider"}.issubset(columns):
+            return
+        stranded = database.execute(
+            "SELECT id FROM threads WHERE model_provider = ?", (ROUTER_PROVIDER,)
+        ).fetchall()
+        for (identifier,) in stranded:
+            if identifier in recorded:
+                continue
+            database.execute(
+                "UPDATE threads SET model_provider = ? "
+                "WHERE id = ? AND model_provider = ?",
+                (provider, identifier, ROUTER_PROVIDER),
+            )
 
 
 def _restore_codex_sessions(home: Path, sessions: list[dict]) -> None:
