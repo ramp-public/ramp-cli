@@ -2198,6 +2198,9 @@ def test_unconfigure_pi_removes_router_and_preserves_other_providers(
         ["--human", "router", "configure", "pi"],
         input="router-secret\n",
     )
+    (pi_home / "ramp-router-model-cache.json").write_text("cached")
+    (pi_home / "ramp-router-model-cache-key").write_text("cache-key")
+    (pi_home / "ramp-router-runtime-models.json").write_text("runtime")
     unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "pi"])
 
     assert configure.exit_code == unconfigure.exit_code == 0
@@ -2205,6 +2208,9 @@ def test_unconfigure_pi_removes_router_and_preserves_other_providers(
     assert json.loads((pi_home / "settings.json").read_text()) == original_settings
     assert json.loads((pi_home / "auth.json").read_text()) == original_auth
     assert not (pi_home / "ramp-router-state.json").exists()
+    assert not (pi_home / "ramp-router-model-cache.json").exists()
+    assert not (pi_home / "ramp-router-model-cache-key").exists()
+    assert not (pi_home / "ramp-router-runtime-models.json").exists()
     assert (
         "Removed Ramp Router and restored your previous settings for: Pi."
         in unconfigure.output
@@ -2233,6 +2239,118 @@ def test_unconfigure_pi_keeps_newer_default_selection(tmp_path, monkeypatch):
         "defaultProvider": "new",
         "defaultModel": "new-model",
     }
+
+
+def test_unconfigure_pi_keeps_newer_auth_and_provider(tmp_path, monkeypatch):
+    pi_home = tmp_path / "pi"
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(pi_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    configure = runner.invoke(
+        cli,
+        ["--human", "router", "configure", "pi"],
+        input="configured-secret\n",
+    )
+    assert configure.exit_code == 0
+
+    auth_path = pi_home / "auth.json"
+    auth = json.loads(auth_path.read_text())
+    auth["ramp-router"] = {"type": "api_key", "key": "newer-login-secret"}
+    auth_path.write_text(json.dumps(auth))
+
+    models_path = pi_home / "models.json"
+    models_path.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "newer-provider": {
+                        "baseUrl": "https://newer-provider.example/v1",
+                        "models": [],
+                    },
+                    "ramp-router": {
+                        "baseUrl": "https://newer-router.example/v1",
+                        "models": [],
+                    },
+                }
+            }
+        )
+    )
+
+    unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "pi"])
+
+    assert unconfigure.exit_code == 0
+    assert json.loads(auth_path.read_text())["ramp-router"] == {
+        "type": "api_key",
+        "key": "newer-login-secret",
+    }
+    assert json.loads(models_path.read_text())["providers"]["ramp-router"] == {
+        "baseUrl": "https://newer-router.example/v1",
+        "models": [],
+    }
+    assert json.loads(models_path.read_text())["providers"]["newer-provider"] == {
+        "baseUrl": "https://newer-provider.example/v1",
+        "models": [],
+    }
+
+
+def test_unconfigure_pi_fails_closed_for_legacy_auth_state(tmp_path, monkeypatch):
+    pi_home = tmp_path / "pi"
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(pi_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    configure = runner.invoke(
+        cli,
+        ["--human", "router", "configure", "pi"],
+        input="configured-secret\n",
+    )
+    assert configure.exit_code == 0
+
+    state_path = pi_home / "ramp-router-state.json"
+    state = json.loads(state_path.read_text())
+    state.pop("configured_auth_marker")
+    state["auth_present"] = True
+    state["auth"] = {"type": "api_key", "key": "original-secret"}
+    state_path.write_text(json.dumps(state))
+    settings_before = (pi_home / "settings.json").read_text()
+    auth_before = (pi_home / "auth.json").read_text()
+
+    unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "pi"])
+
+    assert unconfigure.exit_code != 0
+    assert "legacy Pi credentials" in unconfigure.output
+    assert (pi_home / "settings.json").read_text() == settings_before
+    assert (pi_home / "auth.json").read_text() == auth_before
+    assert state_path.exists()
+
+
+def test_unconfigure_pi_restores_original_auth_after_reconfigure(tmp_path, monkeypatch):
+    pi_home = tmp_path / "pi"
+    pi_home.mkdir()
+    auth_path = pi_home / "auth.json"
+    original_auth = {"ramp-router": {"type": "api_key", "key": "original-secret"}}
+    auth_path.write_text(json.dumps(original_auth))
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(pi_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+
+    first = runner.invoke(
+        cli,
+        ["--human", "router", "configure", "pi"],
+        input="first-configured-secret\n",
+    )
+    second = runner.invoke(
+        cli,
+        ["--human", "router", "configure", "pi"],
+        input="second-configured-secret\n",
+    )
+    assert (
+        "second-configured-secret"
+        not in (pi_home / "ramp-router-state.json").read_text()
+    )
+    unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "pi"])
+
+    assert first.exit_code == second.exit_code == unconfigure.exit_code == 0
+    assert json.loads(auth_path.read_text()) == original_auth
 
 
 def _capture_picker(monkeypatch, answer):

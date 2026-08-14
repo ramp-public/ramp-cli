@@ -13,9 +13,10 @@ from ramp_cli.client.api import (
     user_agent_string,
 )
 from ramp_cli.client.headers import agent_headers
-from ramp_cli.client.transport import AuthenticatedRampTransport
+from ramp_cli.client.transport import AuthenticatedRampTransport, BearerTokenTransport
 from ramp_cli.errors import (
     EXIT_AUTH_REQUIRED,
+    ApiError,
     AuthRequiredError,
     EnvironmentAuthRequiredError,
     RefreshFailedError,
@@ -358,6 +359,85 @@ def test_request__refreshes_and_replays_after_401(monkeypatch):
     assert attempted_tokens == ["Bearer access-old", "Bearer access-new"]
 
 
+def test_request__proxied_401_recovers_via_refresh_then_retry(monkeypatch):
+    # A Core bearer that expires just before Core validates it is forwarded back
+    # through the proxy as a 401; the normal refresh-and-retry must still recover.
+    client = AuthenticatedRampTransport("sandbox")
+    attempted_tokens = []
+
+    def handler(request):
+        attempted_tokens.append(request.headers["Authorization"])
+        status_code = 401 if len(attempted_tokens) == 1 else 200
+        return httpx.Response(status_code, content=b"ok")
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr("ramp_cli.client.transport.httpx.Client", lambda **kwargs: http)
+    monkeypatch.setattr(
+        "ramp_cli.client.transport.store.get_token_state",
+        lambda env: TokenState(access_token="access-old"),
+    )
+    monkeypatch.setattr(
+        "ramp_cli.client.transport.try_refresh", lambda env: "access-new"
+    )
+
+    assert (
+        client.request("POST", "https://proxy.example.com/creds", proxied=True) == b"ok"
+    )
+    assert attempted_tokens == ["Bearer access-old", "Bearer access-new"]
+
+
+def test_request__proxied_401_surfaces_api_error_after_failed_recovery(monkeypatch):
+    # A residual 401 (e.g. a bad proxy-auth key) must surface the actual response
+    # body as ApiError rather than the misleading `ramp auth login` path.
+    client = AuthenticatedRampTransport("sandbox")
+    attempted_tokens = []
+
+    def handler(request):
+        attempted_tokens.append(request.headers["Authorization"])
+        return httpx.Response(401, content=b"proxy auth rejected")
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr("ramp_cli.client.transport.httpx.Client", lambda **kwargs: http)
+    monkeypatch.setattr(
+        "ramp_cli.client.transport.store.get_token_state",
+        lambda env: TokenState(access_token="access-old"),
+    )
+    monkeypatch.setattr(
+        "ramp_cli.client.transport.try_refresh", lambda env: "access-new"
+    )
+
+    with pytest.raises(ApiError) as exc_info:
+        client.request("POST", "https://proxy.example.com/creds", proxied=True)
+
+    assert exc_info.value.status_code == 401
+    assert "proxy auth rejected" in exc_info.value.body
+    # Refresh-and-retry was attempted before surfacing the proxy failure.
+    assert attempted_tokens == ["Bearer access-old", "Bearer access-new"]
+
+
+def test_request__proxied_401_without_refresh_token_surfaces_api_error(monkeypatch):
+    # No refresh token available: a proxied 401 must still surface the response
+    # body via ApiError rather than AuthRequiredError.
+    client = AuthenticatedRampTransport("sandbox")
+
+    def handler(request):
+        return httpx.Response(401, content=b"proxy auth rejected")
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr("ramp_cli.client.transport.httpx.Client", lambda **kwargs: http)
+    monkeypatch.setattr(
+        "ramp_cli.client.transport.store.get_token_state",
+        lambda env: TokenState(access_token="access-old"),
+    )
+    monkeypatch.setattr("ramp_cli.client.transport.try_refresh", lambda env: None)
+
+    with pytest.raises(ApiError) as exc_info:
+        client.request("POST", "https://proxy.example.com/creds", proxied=True)
+
+    assert exc_info.value.status_code == 401
+    assert "proxy auth rejected" in exc_info.value.body
+
+
 def test_request__does_not_refresh_static_token_after_401(monkeypatch):
     client = AuthenticatedRampTransport("sandbox", access_token="access-static")
     attempted_tokens = []
@@ -378,6 +458,28 @@ def test_request__does_not_refresh_static_token_after_401(monkeypatch):
         client.request("GET", "https://example.test/things")
 
     assert attempted_tokens == ["Bearer access-static"]
+
+
+def test_bearer_token_transport__does_not_refresh_or_replay_after_401(monkeypatch):
+    client = BearerTokenTransport("wallet-key")
+    attempted_tokens = []
+
+    def handler(request):
+        attempted_tokens.append(request.headers["Authorization"])
+        return httpx.Response(401)
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr("ramp_cli.client.transport.httpx.Client", lambda **kwargs: http)
+    monkeypatch.setattr(
+        "ramp_cli.client.transport.try_refresh",
+        lambda env: pytest.fail("static bearer tokens must not be refreshed"),
+    )
+
+    with pytest.raises(ApiError) as exc_info:
+        client.request("GET", "https://wallet.ramp.com/things")
+
+    assert exc_info.value.status_code == 401
+    assert attempted_tokens == ["Bearer wallet-key"]
 
 
 def test_request_multipart__refreshes_and_replays_after_401(monkeypatch):
@@ -429,6 +531,54 @@ def test_post__resolves_core_base_url_at_request_time(monkeypatch):
     }
 
 
+def test_post_url__allows_https_proxy_and_forwards_headers(monkeypatch):
+    client = RampClient("production")
+    captured = {}
+
+    def fake_request(method, url, body=None, request_headers=None, proxied=False):
+        captured.update(
+            method=method,
+            url=url,
+            body=body,
+            request_headers=request_headers,
+            proxied=proxied,
+        )
+        return b"ok"
+
+    monkeypatch.setattr(client._transport, "request", fake_request)
+
+    assert (
+        client.post_url(
+            "https://proxy.example.com/developer/v1/agent-tools/x",
+            b"{}",
+            headers={"BT-API-KEY": "secret"},
+        )
+        == b"ok"
+    )
+    assert captured == {
+        "method": "POST",
+        "url": "https://proxy.example.com/developer/v1/agent-tools/x",
+        "body": b"{}",
+        "request_headers": {"BT-API-KEY": "secret"},
+        "proxied": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://proxy.example.com/developer/v1/agent-tools/x",
+        "https://user@proxy.example.com/developer/v1/agent-tools/x",
+        "https://proxy.example.com/developer/v1/agent-tools/x#fragment",
+    ],
+)
+def test_post_url__rejects_unsafe_proxy_url(url):
+    client = RampClient("production")
+
+    with pytest.raises(UnsafeRequestUrlError):
+        client.post_url(url, b"{}")
+
+
 def test_get_url__allows_active_api_origin(monkeypatch):
     client = RampClient("production")
     captured = {}
@@ -445,6 +595,30 @@ def test_get_url__allows_active_api_origin(monkeypatch):
     assert captured == {
         "method": "GET",
         "url": "https://api.ramp.com:443/developer/v1/things?start=2",
+    }
+
+
+def test_get_url__forwards_request_headers(monkeypatch):
+    client = RampClient("production")
+    captured = {}
+
+    def fake_request(method, url, body=None, request_headers=None):
+        captured.update(method=method, url=url, request_headers=request_headers)
+        return b"ok"
+
+    monkeypatch.setattr(client._transport, "request", fake_request)
+
+    assert (
+        client.get_url(
+            "https://api.ramp.com/developer/v1/things?start=2",
+            headers={"X-Ramp-Agent-Mode": "agent"},
+        )
+        == b"ok"
+    )
+    assert captured == {
+        "method": "GET",
+        "url": "https://api.ramp.com/developer/v1/things?start=2",
+        "request_headers": {"X-Ramp-Agent-Mode": "agent"},
     }
 
 

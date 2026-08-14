@@ -96,16 +96,17 @@ ramp tools refresh   # fetch latest tool aliases
 ## Flag conventions
 
 - All CLI flags use **underscores**, not hyphens (e.g. `--page_size`, not `--page-size`).
-- **`--rationale` is required on every agent-tool command** (see below).
+- Skills must invoke agent-tool commands with `--agent` and a `--rationale` (see below).
 - **`--page_size` / `--limit`**: Paginated commands use either `--page_size` or `--limit` depending on the endpoint. The CLI adds a bidirectional alias so both names are accepted on every command that has either flag. Use whichever reads more naturally.
 
-## `--rationale` is required
+## Agent-tool calls require `--agent` and `--rationale`
 
-Every `ramp <resource> <tool>` command maps to an agent-tool endpoint, and the
-Developer API **requires** a `rationale` on each call. The CLI exposes it as the
-`--rationale` flag (or a `"rationale"` key when you use `--json`).
+Every `ramp <resource> <tool>` command maps to an agent-tool endpoint. Skills
+must run these commands with `--agent`; the Developer API requires a rationale
+on each call. The CLI exposes it as the `--rationale` flag (or a `"rationale"`
+key when you use `--json`).
 
-- **Required for every invocation** — agent (`--agent`) *and* human (`--human` / `agent=false`). Omitting it is the most common cause of failures.
+- **Required for every skill invocation** — use `--agent` and pass a non-empty rationale explicitly.
 - **Constraints:** a non-empty string, **max 1024 characters**. An empty string (`--rationale ""`) is rejected.
 - **What it is:** a brief, human-readable reason for the call — what goal or workflow it serves and what you intend to do with the result (e.g. `--rationale "Categorize the user's March transactions"`).
 - **If you omit it**, the API returns:
@@ -117,14 +118,11 @@ Developer API **requires** a `rationale` on each call. The CLI exposes it as the
   This is `DEVELOPER_7001` / `DEVELOPER_INVALID_SCHEMA`, a request-body validation error — **not** a permissions or account-enablement problem. A Read+Write key with a malformed body fails the same way. `--dry_run` only prints the outgoing body and does **not** validate it, so a body that dry-runs cleanly can still 422 if `rationale` is missing.
 
   ```bash
-  # Fails: no rationale → HTTP 422 (DEVELOPER_INVALID_SCHEMA)
-  ramp transactions missing {transaction_uuid}
-
-  # Works: rationale supplied
-  ramp transactions missing {transaction_uuid} --rationale "Check missing items before cleanup"
+   # Skills must use --agent and provide a rationale
+   ramp --agent transactions missing {transaction_uuid} --rationale "Check missing items before cleanup"
   ```
 
-Always pass `--rationale` (or include `"rationale"` in the `--json` body) on every command in these skills.
+Always pass `--agent` and `--rationale` (or include `"rationale"` in the `--json` body) when a skill invokes an agent-tool command.
 
 ## How skills work
 

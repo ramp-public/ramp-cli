@@ -29,6 +29,9 @@ def isolated_config(
         "RAMP_ROUTER_BASE_URL",
         "LLM_GATEWAY_BASE_URL",
         "RAMP_ROUTER_CONFIGURE_API_KEY",
+        "RAMP_AGENT_WALLET_API_KEY",
+        "RAMP_AGENT_WALLET_CONFIGURE_API_KEY",
+        "RAMP_AGENT_WALLET_API_URL",
     ):
         monkeypatch.delenv(leaked, raising=False)
     monkeypatch.setenv("RAMP_NO_TOOL_AVAILABILITY", "1")

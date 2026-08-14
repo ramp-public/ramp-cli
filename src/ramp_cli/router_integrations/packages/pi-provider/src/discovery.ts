@@ -223,6 +223,10 @@ export async function discoverRouterModels(input: {
   const response = await fetcher(`${baseURL}/models`, {
     headers: {
       authorization: `Bearer ${input.apiKey}`,
+      // Production rejects an empty/default fetch user agent before Router
+      // can return the catalog. This request is model discovery, not an
+      // inference, so use the integration's own stable identifier.
+      "user-agent": "ramp-cli-pi-provider",
     },
     signal: input.signal
       ? AbortSignal.any([input.signal, timeoutSignal])

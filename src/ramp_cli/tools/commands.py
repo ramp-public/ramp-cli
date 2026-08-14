@@ -22,6 +22,7 @@ import click
 
 from ramp_cli.client.api import RampClient
 from ramp_cli.client.session import get_session_id
+from ramp_cli.client.vault import vault_proxy_headers, vault_proxy_target
 from ramp_cli.config.constants import api_url, append_query_params
 from ramp_cli.config.settings import configured_scopes, resolve_environment
 from ramp_cli.errors import ApiError
@@ -51,11 +52,15 @@ _SPINNER_CHARS = "░▒▓█▓▒"
 
 _ID_SUFFIXES = ("_id", "_uuid")
 _IDEMPOTENCY_HEADER = "X-Idempotency-Key"
+_TOOL_CALL_MODE_HEADER = "X-Ramp-Agent-Mode"
+_HUMAN_RATIONALE = "User initiated this request through the Ramp CLI."
 _APPLICATION_PROGRESS_PATH = "/developer/v1/applications/progress"
+_VAULT_PROXY_TOOL = "get-agent-card-creds"
 
 CLI_RESOURCE_CATEGORIES = frozenset(
     {
         "accounting",
+        "agent",
         "ai-spend",
         "bills",
         "business",
@@ -459,6 +464,8 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
     dry_run: bool = kwargs.get("dry_run", False)
     wait_config = _application_progress_wait_config(tool, kwargs)
     synced_for_json_validation = False
+    is_agent_mode = ctx.obj.get("agent_mode", False)
+    kwargs = _with_human_rationale(tool, kwargs, is_agent_mode=is_agent_mode)
 
     if dry_run and wait_config is not None:
         raise click.UsageError(
@@ -509,30 +516,51 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
             if param.location == "body" and param.name in values
         }
 
-    request = _prepare_request(tool, values, body)
+    request = _prepare_request(
+        tool,
+        values,
+        body,
+        mode="agent" if is_agent_mode else "human",
+    )
+    query = {name: str(value) for name, value in request.query.items()}
+    request_path = append_query_params(request.path, query)
+    proxy_url: str | None = None
+    proxy_headers: dict[str, str] = {}
+    if tool.name == _VAULT_PROXY_TOOL:
+        proxy_url = vault_proxy_target(request_path)
+        if proxy_url:
+            if request.method != "post":
+                raise click.UsageError(
+                    "Agent Card credential proxy routing requires a POST operation"
+                )
+            proxy_headers = vault_proxy_headers()
 
     if dry_run:
-        query = {name: str(value) for name, value in request.query.items()}
         resolved = resolve_format(fmt, config_format)
+        target_url = proxy_url or api_url(env, request.path, query)
         if resolved == "json":
             payload = {
                 "dry_run": True,
                 "method": request.method.upper(),
-                "url": api_url(env, request.path, query),
+                "url": target_url,
                 "body": request.display_body(),
             }
             if request.headers:
                 payload["headers"] = request.headers
+            if proxy_url:
+                payload["via_vault_proxy"] = True
+                payload["proxy_headers"] = {key: "<redacted>" for key in proxy_headers}
             print_agent_json(
                 payload,
                 pagination=None,
             )
         else:
             click.echo(
-                f"DRY RUN: {request.method.upper()} "
-                f"{api_url(env, request.path, query)}",
+                f"DRY RUN: {request.method.upper()} {target_url}",
                 err=True,
             )
+            if proxy_url:
+                click.echo("  (routed through payment-vault proxy)", err=True)
             print_json(request.display_body())
         return
 
@@ -550,7 +578,12 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
     client = RampClient(env)
     try:
         if wait_config is None:
-            resp_bytes = _execute_prepared_request(client, request)
+            resp_bytes = _execute_prepared_request(
+                client,
+                request,
+                post_url=proxy_url,
+                extra_headers=proxy_headers,
+            )
             data = json.loads(resp_bytes) if resp_bytes.strip() else {}
         else:
             data = _execute_waiting_application_progress(
@@ -777,6 +810,8 @@ def _prepare_request(
     tool: ToolDef,
     values: dict[str, Any],
     body: dict[str, Any],
+    *,
+    mode: str,
 ) -> PreparedRequest:
     path_values = _values_for_location(tool, values, "path")
     query_values = {
@@ -808,6 +843,7 @@ def _prepare_request(
     resolved_path = _resolve_path(tool.path, path_values)
     if _declares_idempotency_key(tool) and _IDEMPOTENCY_HEADER not in header_values:
         header_values[_IDEMPOTENCY_HEADER] = _default_idempotency_key(tool)
+    header_values[_TOOL_CALL_MODE_HEADER] = mode
     return PreparedRequest(
         method=tool.http_method,
         path=resolved_path,
@@ -818,6 +854,33 @@ def _prepare_request(
         headers=header_values,
         content_type=tool.request_content_type,
     )
+
+
+def _with_human_rationale(
+    tool: ToolDef,
+    kwargs: dict[str, Any],
+    *,
+    is_agent_mode: bool,
+) -> dict[str, Any]:
+    """Supply the API-required rationale for interactive CLI calls."""
+    if is_agent_mode:
+        return kwargs
+
+    rationale = next(
+        (
+            param
+            for param in tool.params
+            if param.name == "rationale" and param.required and not param.is_complex
+        ),
+        None,
+    )
+    if rationale is None:
+        return kwargs
+
+    key = rationale.flag.replace("-", "_")
+    if kwargs.get(key) is not None:
+        return kwargs
+    return {**kwargs, key: _HUMAN_RATIONALE}
 
 
 def _declares_idempotency_key(tool: ToolDef) -> bool:
@@ -836,10 +899,14 @@ def _default_idempotency_key(tool: ToolDef) -> str:
 def _execute_prepared_request(
     client: RampClient,
     request: PreparedRequest,
+    *,
+    post_url: str | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> bytes:
     params = {name: str(value) for name, value in request.query.items()}
     path = append_query_params(request.path, params)
-    headers_kw = {"headers": request.headers} if request.headers else {}
+    headers = {**request.headers, **(extra_headers or {})}
+    headers_kw = {"headers": headers} if headers else {}
 
     if request.content_type == "multipart/form-data":
         with ExitStack() as stack:
@@ -867,6 +934,8 @@ def _execute_prepared_request(
         return client.put(path, payload or b"{}", **headers_kw)
     if request.method == "delete":
         return client.delete(path, payload, **headers_kw)
+    if post_url is not None:
+        return client.post_url(post_url, payload or b"{}", **headers_kw)
     return client.post(path, payload or b"{}", **headers_kw)
 
 
@@ -1172,7 +1241,7 @@ def _try_interactive_table(
 
     def fetch_next(cursor: str) -> tuple[list[dict[str, str]], str | None]:
         if cursor.startswith(("https://", "http://")):
-            resp = client.get_url(cursor)
+            resp = client.get_url(cursor, headers=request.headers)
         else:
             next_request = _with_request_value(tool, request, cursor_param, cursor)
             resp = _execute_prepared_request(client, next_request)

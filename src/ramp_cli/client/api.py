@@ -29,10 +29,11 @@ class RampClient:
             request_headers=headers,
         )
 
-    def get_url(self, url: str) -> bytes:
+    def get_url(self, url: str, headers: dict[str, str] | None = None) -> bytes:
         if not _same_origin(url, base_url(self.env)):
             raise UnsafeRequestUrlError(url)
-        return self._transport.request("GET", url)
+        headers_kw = {"request_headers": headers} if headers else {}
+        return self._transport.request("GET", url, **headers_kw)
 
     def post(
         self, path: str, json_body: bytes, headers: dict[str, str] | None = None
@@ -42,6 +43,23 @@ class RampClient:
             api_url(self.env, path),
             body=json_body,
             request_headers=headers,
+        )
+
+    def post_url(
+        self, url: str, json_body: bytes, headers: dict[str, str] | None = None
+    ) -> bytes:
+        """POST to a validated HTTPS proxy URL using normal Ramp authentication."""
+        parts = urlsplit(url)
+        if (
+            parts.scheme.lower() != "https"
+            or not parts.hostname
+            or parts.username
+            or parts.password
+            or parts.fragment
+        ):
+            raise UnsafeRequestUrlError(url)
+        return self._transport.request(
+            "POST", url, body=json_body, request_headers=headers, proxied=True
         )
 
     def patch(

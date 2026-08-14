@@ -200,6 +200,7 @@ def test_document_pagination_returns_reusable_start_cursor(
     request.assert_called_once_with(
         "/developer/v1/applications/documents",
         {"page_size": "2"},
+        headers={"X-Ramp-Agent-Mode": "agent"},
     )
     assert json.loads(result.output)["pagination"]["next_cursor"] == "2"
 

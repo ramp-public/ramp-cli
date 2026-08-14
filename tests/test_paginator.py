@@ -125,6 +125,7 @@ def test_interactive_pagination_reuses_prepared_request(monkeypatch):
         tool,
         {"group_id": "group/1", "page_size": 2},
         {},
+        mode="agent",
     )
     client = MagicMock()
     client.get.return_value = b'{"data":[],"page":{"next":null}}'
@@ -151,6 +152,46 @@ def test_interactive_pagination_reuses_prepared_request(monkeypatch):
     client.get.assert_called_once_with(
         "/developer/v1/groups/group%2F1/things",
         {"page_size": "2", "cursor": "next-token"},
+        headers={"X-Ramp-Agent-Mode": "agent"},
+    )
+
+
+def test_interactive_pagination_preserves_headers_for_absolute_url(monkeypatch):
+    tool = ToolDef(
+        name="list-things",
+        path="/developer/v1/groups/things",
+        http_method="get",
+        summary="List things",
+        description="List things",
+    )
+    request = _prepare_request(tool, {}, {}, mode="human")
+    client = MagicMock()
+    client.get_url.return_value = b'{"data":[],"page":{"next":null}}'
+
+    class FetchNextPage:
+        def __init__(self, **kwargs):
+            self.fetch_next_page = kwargs["fetch_next_page"]
+
+        def run(self):
+            self.fetch_next_page(
+                "https://api.ramp.com/developer/v1/groups/things?cursor=next"
+            )
+            return None
+
+    monkeypatch.setattr(
+        "ramp_cli.tools.commands.ToolPaginator",
+        FetchNextPage,
+    )
+
+    assert _try_interactive_table(
+        tool,
+        {"data": [{"id": "thing-1"}], "cursor": "first"},
+        request,
+        client,
+    )
+    client.get_url.assert_called_once_with(
+        "https://api.ramp.com/developer/v1/groups/things?cursor=next",
+        headers={"X-Ramp-Agent-Mode": "human"},
     )
 
 

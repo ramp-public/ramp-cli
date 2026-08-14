@@ -672,6 +672,7 @@ class TestBuildToolCommand:
         client.delete.assert_called_once_with(
             "/developer/v1/things/thing%2F1",
             None,
+            headers={"X-Ramp-Agent-Mode": "agent"},
         )
         assert json.loads(result.output)["data"] == [{}]
 
@@ -704,7 +705,9 @@ class TestBuildToolCommand:
 
         assert result.exit_code == 0, result.output
         client.get.assert_called_once_with(
-            "/developer/v1/agent-tools/procurement-draft", request_body
+            "/developer/v1/agent-tools/procurement-draft",
+            request_body,
+            headers={"X-Ramp-Agent-Mode": "agent"},
         )
         client.post.assert_not_called()
         client.delete.assert_not_called()
@@ -1069,11 +1072,32 @@ class TestRequiredNonBodyParams:
     def test_json_cannot_bypass_required_query_param(self):
         result = CliRunner().invoke(
             cli,
-            ["get-investment-account-balance", "--dry_run", "--json", "{}"],
+            ["--agent", "get-investment-account-balance", "--dry_run", "--json", "{}"],
         )
 
         assert result.exit_code == 2
         assert "Missing required flags: --rationale" in result.output
+
+    def test_human_mode_supplies_required_rationale_and_mode_header(self):
+        result = CliRunner().invoke(cli, ["get-funds", "--dry_run"])
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)["data"][0]
+        assert payload["body"]["rationale"] == (
+            "User initiated this request through the Ramp CLI."
+        )
+        assert payload["headers"]["X-Ramp-Agent-Mode"] == "human"
+
+    def test_agent_mode_retains_required_rationale_and_mode_header(self):
+        result = CliRunner().invoke(
+            cli,
+            ["--agent", "get-funds", "--dry_run", "--rationale", "List funds"],
+        )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)["data"][0]
+        assert payload["body"]["rationale"] == "List funds"
+        assert payload["headers"]["X-Ramp-Agent-Mode"] == "agent"
 
     def test_json_can_supply_required_query_param(self):
         result = CliRunner().invoke(
@@ -1508,7 +1532,8 @@ class TestDryRun:
 
         assert result.exit_code == 0, result.output
         assert client.post.call_args.kwargs["headers"] == {
-            "X-Idempotency-Key": "manual-key"
+            "X-Idempotency-Key": "manual-key",
+            "X-Ramp-Agent-Mode": "agent",
         }
 
     def test_json_merges_positional_body_ids(self):
@@ -1695,6 +1720,33 @@ class TestCLIIntegration:
 
         assert result.exit_code == 0
         assert "list" in result.output
+
+    def test_agent_singleton_stays_resource(self, monkeypatch):
+        agent_tool = ToolDef(
+            name="get_agent_list_resource",
+            path="/developer/v1/agents",
+            http_method="get",
+            summary="List active standalone agents",
+            description="Return standalone agents",
+            category="agent",
+            alias="list",
+            params=[],
+        )
+
+        monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
+        monkeypatch.setattr(
+            "ramp_cli.main.list_categories",
+            lambda env: {"agent": [agent_tool]},
+        )
+
+        runner = CliRunner()
+        root_help = runner.invoke(cli, ["--help"])
+        list_help = runner.invoke(cli, ["agent", "list", "--help"])
+
+        assert root_help.exit_code == 0
+        assert "Manage standalone agent identities" in root_help.output
+        assert list_help.exit_code == 0
+        assert "Usage: cli agent list" in list_help.output
 
     def test_resource_remains_visible_without_required_scope(
         self, monkeypatch, isolated_config
@@ -3004,3 +3056,98 @@ class TestGetEndpointDryRun:
         parsed = json.loads(result.output)
         assert parsed["data"][0]["method"] == "GET"
         assert parsed["data"][0]["body"] == {"batch_id": "abc-123"}
+
+
+class TestVaultProxyRouting:
+    _CREDS_ARGS = [
+        "funds",
+        "creds",
+        "fund-123",
+        "--amount",
+        "1.00",
+        "--currency_code",
+        "USD",
+        "--merchant_name",
+        "Wikimedia Foundation",
+        "--merchant_url",
+        "https://donate.wikimedia.org",
+        "--merchant_country_code",
+        "US",
+        "--rationale",
+        "Validate the ephemeral Agent Card fallback",
+    ]
+
+    def test_dry_run_targets_proxy_and_redacts_proxy_auth(self, monkeypatch):
+        _use_bundled_spec(monkeypatch)
+        monkeypatch.setenv("RAMP_VAULT_PROXY_ENABLED", "1")
+        monkeypatch.setenv("RAMP_VAULT_PROXY_URL", "https://proxy.example.com")
+        monkeypatch.setenv("RAMP_VAULT_PROXY_HEADERS", '{"BT-API-KEY": "secret"}')
+
+        result = CliRunner().invoke(
+            cli,
+            ["--agent", "--env", "production", *self._CREDS_ARGS, "--dry_run"],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)["data"][0]
+        assert payload["url"] == (
+            "https://proxy.example.com/developer/v1/agent-tools/get-agent-card-creds"
+        )
+        assert payload["via_vault_proxy"] is True
+        assert payload["proxy_headers"] == {"BT-API-KEY": "<redacted>"}
+        assert "secret" not in result.output
+
+    def test_flag_off_stays_on_direct_ramp_api(self, monkeypatch):
+        _use_bundled_spec(monkeypatch)
+        monkeypatch.delenv("RAMP_VAULT_PROXY_ENABLED", raising=False)
+        monkeypatch.setenv("RAMP_VAULT_PROXY_URL", "https://proxy.example.com")
+
+        result = CliRunner().invoke(
+            cli,
+            ["--agent", "--env", "production", *self._CREDS_ARGS, "--dry_run"],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)["data"][0]
+        assert payload["url"].startswith("https://api.ramp.com/")
+        assert "via_vault_proxy" not in payload
+
+    def test_live_call_uses_proxy_url_and_preserves_ramp_headers(self, monkeypatch):
+        _use_bundled_spec(monkeypatch)
+        monkeypatch.setenv("RAMP_VAULT_PROXY_ENABLED", "1")
+        monkeypatch.setenv("RAMP_VAULT_PROXY_URL", "https://proxy.example.com")
+        monkeypatch.setenv("RAMP_VAULT_PROXY_HEADERS", '{"BT-API-KEY": "secret"}')
+        monkeypatch.setattr("ramp_cli.tools.commands.maybe_sync", lambda env: None)
+        client = MagicMock()
+        client.post_url.return_value = b'{"cardholder_name": "Test User"}'
+        monkeypatch.setattr("ramp_cli.tools.commands.RampClient", lambda env: client)
+
+        result = CliRunner().invoke(
+            cli,
+            ["--agent", "--env", "production", *self._CREDS_ARGS],
+        )
+
+        assert result.exit_code == 0, result.output
+        client.post.assert_not_called()
+        target, body = client.post_url.call_args.args
+        headers = client.post_url.call_args.kwargs["headers"]
+        assert target.endswith("/developer/v1/agent-tools/get-agent-card-creds")
+        assert json.loads(body)["merchant_name"] == "Wikimedia Foundation"
+        assert headers["BT-API-KEY"] == "secret"
+        assert headers["X-Ramp-Agent-Mode"] == "agent"
+
+    def test_proxy_headers_cannot_override_authorization(self, monkeypatch):
+        _use_bundled_spec(monkeypatch)
+        monkeypatch.setenv("RAMP_VAULT_PROXY_ENABLED", "1")
+        monkeypatch.setenv("RAMP_VAULT_PROXY_URL", "https://proxy.example.com")
+        monkeypatch.setenv(
+            "RAMP_VAULT_PROXY_HEADERS", '{"Authorization": "Bearer attacker"}'
+        )
+
+        result = CliRunner().invoke(
+            cli,
+            ["--agent", "--env", "production", *self._CREDS_ARGS, "--dry_run"],
+        )
+
+        assert result.exit_code != 0
+        assert "cannot override Ramp authentication" in result.output

@@ -44,6 +44,16 @@ _ERROR_CODE_HINTS: dict[str, tuple[frozenset[int], str]] = {
         frozenset({401}),
         ("Your access token has expired.\n  Run `ramp auth login` to re-authenticate."),
     ),
+    # Agent Card credentials request did not traverse the required vault proxy.
+    "DEVELOPER_7098": (
+        frozenset({400}),
+        (
+            "This Agent Card credential request must go through the payment-vault "
+            "proxy.\n  Set RAMP_VAULT_PROXY_ENABLED=1 and RAMP_VAULT_PROXY_URL to "
+            "the proxy host provisioned for your integration, or contact your Ramp "
+            "representative."
+        ),
+    ),
     # Insufficient OAuth scope.
     "DEVELOPER_7100": (
         frozenset({403}),

@@ -1,6 +1,7 @@
 """Configure coding agents to use Ramp Router."""
 
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -40,6 +41,9 @@ BASE_URL_ENVS = ("RAMP_ROUTER_BASE_URL", "LLM_GATEWAY_BASE_URL")
 # Read by the bundled Pi plugin, which Pi gives no other way to be told which
 # Router to call.
 PI_PLUGIN_CONFIG_FILE = "ramp-router-config.json"
+PI_PLUGIN_MODEL_CACHE_FILE = "ramp-router-model-cache.json"
+PI_PLUGIN_MODEL_CACHE_KEY_FILE = "ramp-router-model-cache-key"
+PI_PLUGIN_RUNTIME_MODELS_FILE = "ramp-router-runtime-models.json"
 ROUTER_UI_URL = "https://router.ramp.com"
 ROUTER_UI_URL_ENV = "RAMP_ROUTER_UI_URL"
 ROUTER_PROVIDER = "ramp-router"
@@ -2158,25 +2162,37 @@ def _configure_plugin_client(
             for entry in packages
             if _is_router_plugin_entry(client, entry, package_path)
         ]
-        if not state_path.exists():
-            state = (
-                json.dumps(
-                    {
-                        "provider_present": ROUTER_PROVIDER in providers,
-                        "provider": providers.get(ROUTER_PROVIDER),
-                        "default_provider_present": "defaultProvider" in settings,
-                        "default_provider": settings.get("defaultProvider"),
-                        "default_model_present": "defaultModel" in settings,
-                        "default_model": settings.get("defaultModel"),
-                        "packages_present": "packages" in settings,
-                        "package_entries": previous_packages,
-                        "auth_present": ROUTER_PROVIDER in auth,
-                        "auth": auth.get(ROUTER_PROVIDER),
-                    },
-                    indent=2,
-                )
-                + "\n"
-            )
+        configured_auth = {"type": "api_key", "key": api_key}
+        if state_path.exists():
+            try:
+                state_payload = json.loads(state_path.read_text(encoding="utf-8"))
+                if not isinstance(state_payload, dict):
+                    raise ValueError
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+                raise click.ClickException(
+                    f"Could not read Ramp Router setup state from {state_path}."
+                ) from None
+        else:
+            state_payload = {
+                "provider_present": ROUTER_PROVIDER in providers,
+                "provider": providers.get(ROUTER_PROVIDER),
+                "default_provider_present": "defaultProvider" in settings,
+                "default_provider": settings.get("defaultProvider"),
+                "default_model_present": "defaultModel" in settings,
+                "default_model": settings.get("defaultModel"),
+                "packages_present": "packages" in settings,
+                "package_entries": previous_packages,
+                "auth_present": ROUTER_PROVIDER in auth,
+                "auth": auth.get(ROUTER_PROVIDER),
+            }
+        # Preserve the original values across repeated configure calls, but
+        # update the salted marker for the credential this invocation
+        # installed. Unconfigure restores the original only while this marker
+        # still matches, so a later Pi /login or manual rotation is never
+        # overwritten. The installed secret itself is not duplicated into the
+        # longer-lived setup-state file.
+        state_payload["configured_auth_marker"] = _auth_marker(api_key)
+        state = json.dumps(state_payload, indent=2) + "\n"
 
         settings["packages"] = [
             entry
@@ -2186,7 +2202,7 @@ def _configure_plugin_client(
         settings["packages"].append(str(package_path))
         settings["defaultProvider"] = ROUTER_PROVIDER
         settings["defaultModel"] = default_model
-        auth[ROUTER_PROVIDER] = {"type": "api_key", "key": api_key}
+        auth[ROUTER_PROVIDER] = configured_auth
         providers.pop(ROUTER_PROVIDER, None)
         # Keep the key even when it empties out. Pi's schema requires
         # "providers", so dropping it leaves {} on disk, which Pi rejects
@@ -2325,12 +2341,28 @@ def _unconfigure_json_client(client: str, path: Path) -> None:
 
         auth_path = path.parent / "auth.json"
         auth = _read_json_config(client, auth_path)
-        _restore_json_value(
-            auth,
-            ROUTER_PROVIDER,
-            state.get("auth_present"),
-            state.get("auth"),
-        )
+        if "configured_auth_marker" not in state:
+            # Older setup state does not identify the credential installed by
+            # Ramp. Restoring unconditionally could overwrite a later Pi
+            # /login; leaving it silently would lose the only copy of the
+            # original credential. Fail before writing anything so a repeated
+            # configure can add a marker while preserving that original state.
+            raise click.ClickException(
+                "Could not safely restore legacy Pi credentials. Run "
+                "'ramp router configure pi' once, then unconfigure again."
+            )
+        configured_auth_marker = state.get("configured_auth_marker")
+        if not _valid_auth_marker(configured_auth_marker):
+            raise click.ClickException(
+                f"Could not read Ramp Router setup state from {state_path}."
+            )
+        if _auth_matches_marker(auth.get(ROUTER_PROVIDER), configured_auth_marker):
+            _restore_json_value(
+                auth,
+                ROUTER_PROVIDER,
+                state.get("auth_present"),
+                state.get("auth"),
+            )
         models_path = path.parent / "models.json"
         models_config = _read_json_config(client, models_path)
         providers = models_config.get("providers", {})
@@ -2339,12 +2371,16 @@ def _unconfigure_json_client(client: str, path: Path) -> None:
                 f"Could not restore Pi config {models_path}: "
                 "'providers' must be an object."
             )
-        _restore_json_value(
-            providers,
-            ROUTER_PROVIDER,
-            provider_present,
-            state.get("provider"),
-        )
+        # Configure removes the legacy Router provider entry. Restore it only
+        # if that absence is still intact; a provider added afterward belongs
+        # to the user or a newer Pi flow and must survive unconfigure.
+        if ROUTER_PROVIDER not in providers:
+            _restore_json_value(
+                providers,
+                ROUTER_PROVIDER,
+                provider_present,
+                state.get("provider"),
+            )
         # Keep the key even when it empties out. Pi's schema requires
         # "providers", so dropping it leaves {} on disk, which Pi rejects
         # wholesale: it discards the file and falls back to cached models
@@ -2352,6 +2388,9 @@ def _unconfigure_json_client(client: str, path: Path) -> None:
         models_config["providers"] = providers
         writes = [(path, settings), (auth_path, auth)]
         (path.parent / PI_PLUGIN_CONFIG_FILE).unlink(missing_ok=True)
+        (path.parent / PI_PLUGIN_MODEL_CACHE_FILE).unlink(missing_ok=True)
+        (path.parent / PI_PLUGIN_MODEL_CACHE_KEY_FILE).unlink(missing_ok=True)
+        (path.parent / PI_PLUGIN_RUNTIME_MODELS_FILE).unlink(missing_ok=True)
         if models_path.exists() or provider_present:
             writes.append((models_path, models_config))
 
@@ -2370,6 +2409,43 @@ def _restore_json_value(data: dict, key: str, present: object, value: object) ->
         data[key] = value
     else:
         data.pop(key, None)
+
+
+def _auth_marker(api_key: str) -> dict[str, str]:
+    salt = os.urandom(32)
+    return {
+        "salt": salt.hex(),
+        "digest": hmac.new(salt, api_key.encode("utf-8"), hashlib.sha256).hexdigest(),
+    }
+
+
+def _valid_auth_marker(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"salt", "digest"}
+        and isinstance(value.get("salt"), str)
+        and isinstance(value.get("digest"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", value["salt"]) is not None
+        and re.fullmatch(r"[0-9a-f]{64}", value["digest"]) is not None
+    )
+
+
+def _auth_matches_marker(value: object, marker: object) -> bool:
+    if (
+        not _valid_auth_marker(marker)
+        or not isinstance(value, dict)
+        or set(value) != {"type", "key"}
+        or value.get("type") != "api_key"
+        or not isinstance(value.get("key"), str)
+    ):
+        return False
+    salt = bytes.fromhex(marker["salt"])
+    actual = hmac.new(
+        salt,
+        value["key"].encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(actual, marker["digest"])
 
 
 def _read_json_config(client: str, path: Path) -> dict:

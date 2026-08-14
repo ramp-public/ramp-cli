@@ -656,6 +656,12 @@ class TestCallbackHtml:
 class TestResolveScopes:
     """Verify _resolve_scopes uses env-specific cached spec when available."""
 
+    def test_does_not_inject_agent_wallet_scope(self, monkeypatch):
+        monkeypatch.setattr(oauth_module, "configured_scopes", lambda: "")
+        monkeypatch.setattr(oauth_module, "_resolve_scope_spec_paths", lambda env: ())
+
+        assert oauth_module._resolve_scopes("sandbox") == ""
+
     def test_uses_env_specific_cached_spec(self, tmp_path, monkeypatch):
         """If an env-specific cached spec exists, its scopes are included."""
         # Create a cached spec with a custom scope

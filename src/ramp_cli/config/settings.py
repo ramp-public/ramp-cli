@@ -86,7 +86,6 @@ def load() -> Config:
             agent_key_uuid=section.get("agent_key_uuid", ""),
         )
         set_env_config(cfg, env_name, ec)
-
     # Warn on loose permissions. Windows has no POSIX permission bits and
     # synthesizes modes like 0o666, so the check only makes sense on POSIX.
     if os.name != "nt":
@@ -140,7 +139,6 @@ def save(cfg: Config) -> None:
             section["agent_key_uuid"] = ec.agent_key_uuid
         if section:
             raw[env_name] = section
-
     path = config_path()
     fd, tmp_name = tempfile.mkstemp(prefix=".config.", suffix=".toml", dir=d)
     try:

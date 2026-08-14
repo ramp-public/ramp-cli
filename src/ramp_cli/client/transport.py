@@ -31,6 +31,33 @@ from ramp_cli.errors import (
 _REQUEST_TIMEOUT = 75.0
 
 
+class BearerTokenTransport:
+    """Send requests authenticated by one caller-supplied bearer token."""
+
+    def __init__(self, access_token: str) -> None:
+        self._static_access_token = access_token
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        body: bytes | None = None,
+    ) -> bytes:
+        headers = {
+            "Authorization": f"Bearer {self._static_access_token}",
+            "User-Agent": user_agent_string(),
+            "Accept": "application/json",
+            **agent_headers(infer_harness_name()),
+        }
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        with httpx.Client(timeout=_REQUEST_TIMEOUT) as http:
+            response = http.request(method, url, headers=headers, content=body)
+        if response.is_error:
+            raise ApiError(response.status_code, response.text)
+        return response.content
+
+
 class AuthenticatedRampTransport:
     """Send authenticated requests without owning service URLs or operations."""
 
@@ -44,6 +71,7 @@ class AuthenticatedRampTransport:
         url: str,
         body: bytes | None = None,
         request_headers: dict[str, str] | None = None,
+        proxied: bool = False,
     ) -> bytes:
         extra_headers = self._extra_auth_headers_or_raise()
         access_token = self._get_request_access_token()
@@ -59,6 +87,13 @@ class AuthenticatedRampTransport:
                 request_headers=request_headers,
             )
 
+            # A proxied request (payment-vault routing) forwards both proxy-origin
+            # and Core-origin responses. A genuine Core bearer expiry still gets
+            # the normal refresh-and-retry below, but a residual 401 (e.g. a bad
+            # proxy-auth key, or a Core auth failure that refresh could not fix)
+            # is surfaced as the actual response via ApiError instead of being
+            # reported as AuthRequiredError, which would wrongly send the user to
+            # `ramp auth login` for a proxy-configuration problem.
             if resp.status_code == 401 and not self._static_access_token:
                 new_token = try_refresh(self.env)
                 if new_token:
@@ -71,10 +106,14 @@ class AuthenticatedRampTransport:
                         extra_headers=extra_headers,
                         request_headers=request_headers,
                     )
+                elif proxied:
+                    raise ApiError(resp.status_code, resp.text)
                 else:
                     raise AuthRequiredError(self.env)
 
             if resp.status_code == 401:
+                if proxied:
+                    raise ApiError(resp.status_code, resp.text)
                 raise AuthRequiredError(self.env)
             if resp.is_error:
                 raise ApiError(resp.status_code, resp.text)

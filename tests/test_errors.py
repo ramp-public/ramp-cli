@@ -35,6 +35,19 @@ def test_expired_token_error_includes_reauthorization_hint() -> None:
     assert "ramp auth login" in message
 
 
+def test_vault_required_error_includes_proxy_hint() -> None:
+    error = ApiError(
+        400,
+        _error_body("DEVELOPER_7098", "Vault service required"),
+    )
+
+    message = str(error)
+    assert "Vault service required" in message
+    assert "payment-vault proxy" in message
+    assert "RAMP_VAULT_PROXY_ENABLED" in message
+    assert "RAMP_VAULT_PROXY_URL" in message
+
+
 def test_business_authorization_error_does_not_claim_scope_is_missing() -> None:
     error = ApiError(
         403,

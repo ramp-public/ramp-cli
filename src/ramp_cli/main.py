@@ -12,6 +12,7 @@ import click
 
 from ramp_cli import __version__ as VERSION
 from ramp_cli.auth.store import get_known_granted_scopes
+from ramp_cli.commands.agent_wallet import agent_wallet_group
 from ramp_cli.commands.applications import applications_group
 from ramp_cli.commands.auth import auth_group
 from ramp_cli.commands.config import config_group
@@ -61,6 +62,7 @@ class Resource(StrEnum):
     """Tool categories exposed as CLI resource groups."""
 
     ACCOUNTING = "accounting"
+    AGENT = "agent"
     BILLS = "bills"
     CARDS = "cards"
     FUNDS = "funds"
@@ -83,6 +85,7 @@ class Resource(StrEnum):
 
 _RESOURCE_HELP: dict[str, str] = {
     "accounting": "Manage tracking categories and GL codes for expense classification",
+    "agent": "Manage standalone agent identities",
     "ai-spend": "Inspect AI token spend, provider connections, and reporting filters",
     "bills": "Review, approve, and manage vendor bills and invoices",
     "business": "Look up business metadata such as departments",
@@ -520,6 +523,7 @@ def _validate_flags(
 # ── Command registration ────────────────────────────────────────────────────
 
 for _cmd in (
+    agent_wallet_group,
     applications_group,
     auth_group,
     incorporation_group,
