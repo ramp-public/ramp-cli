@@ -70,8 +70,11 @@ def canonical_to_display(amount: int, currency_code: str) -> str:
     """
     code = currency_code.upper() if currency_code else ""
     exp = ISO_4217_EXPONENTS.get(code, _DEFAULT_EXPONENT)
-    value = amount / (10**exp)
-    return f"{value:,.{exp}f}"
+    sign = "-" if amount < 0 else ""
+    whole, fractional = divmod(abs(amount), 10**exp)
+    if exp == 0:
+        return f"{sign}{whole:,}"
+    return f"{sign}{whole:,}.{fractional:0{exp}d}"
 
 
 SUPPORTED_FORMATS = {"json", "table"}

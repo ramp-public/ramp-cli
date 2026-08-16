@@ -15,7 +15,12 @@ from ramp_cli.commands.agent_wallet_validation import (
     build_structured_vic_body,
     validate_vic_json_body,
 )
-from ramp_cli.output.formatter import print_agent_json, print_json, resolve_format
+from ramp_cli.output.formatter import (
+    canonical_to_display,
+    print_agent_json,
+    print_json,
+    resolve_format,
+)
 from ramp_cli.tools.commands import GeneratedToolGroup
 
 CONFIGURE_KEY_ENV = "RAMP_AGENT_WALLET_CONFIGURE_API_KEY"
@@ -46,8 +51,14 @@ def _submit_payment(
     ctx: click.Context,
     payment_id: UUID,
     body: dict[str, Any],
+    display_amount: str | None = None,
 ) -> None:
     click.echo(f"Payment ID: {payment_id}", err=True)
+    if (
+        display_amount
+        and resolve_format(ctx.obj["format"], ctx.obj["config_format"]) != "json"
+    ):
+        click.echo(f"Amount: {display_amount}", err=True)
     result = AgentWalletClient().pay(body)
     if result.get("payment_operation_id") != str(payment_id):
         raise AgentWalletClientError("Agent Wallet returned an invalid response")
@@ -148,12 +159,11 @@ def pay_group() -> None:
     help="Two-letter merchant country code",
 )
 @click.option(
-    "--amount-value",
-    type=click.IntRange(min=1),
+    "--amount",
     default=None,
-    help="Amount in the currency's smallest denomination",
+    metavar="USD",
+    help="Payment amount in US dollars, e.g. 10.35",
 )
-@click.option("--amount-currency", default=None, help="ISO currency code")
 @click.option(
     "--expires-at",
     default=None,
@@ -166,8 +176,7 @@ def pay_cards(
     merchant_name: str | None,
     merchant_url: str | None,
     merchant_country_code: str | None,
-    amount_value: int | None,
-    amount_currency: str | None,
+    amount: str | None,
     expires_at: str | None,
 ) -> None:
     """Submit a virtual card payment."""
@@ -177,11 +186,19 @@ def pay_cards(
         merchant_name,
         merchant_url,
         merchant_country_code,
-        amount_value,
-        amount_currency,
+        amount,
         expires_at,
     )
-    _submit_payment(ctx, payment_id, body)
+    request_amount = body["method_request"]["amount"]
+    _submit_payment(
+        ctx,
+        payment_id,
+        body,
+        display_amount=(
+            f"{request_amount['currency']} "
+            f"{canonical_to_display(request_amount['value'], request_amount['currency'])}"
+        ),
+    )
 
 
 @pay_group.command("json", short_help="Submit a raw JSON payment body")

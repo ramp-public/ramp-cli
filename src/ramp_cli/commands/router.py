@@ -24,7 +24,9 @@ import httpx
 import json5
 import questionary
 import zstandard
+from click.core import ParameterSource
 
+from ramp_cli import claude_cowork
 from ramp_cli.commands import claude_code
 from ramp_cli.output.formatter import print_agent_json, resolve_format
 from ramp_cli.output.style import show_notice, start_spinner
@@ -763,6 +765,146 @@ def router_group() -> None:
 
 
 @router_group.command(
+    "configure-cowork",
+    help="Configure Claude Desktop Cowork to use Ramp Router (macOS)",
+)
+@click.option(
+    "--setup-file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Router setup JSON downloaded by the Get started button.",
+)
+@click.option(
+    "--api-key",
+    metavar="KEY",
+    envvar=CONFIGURE_KEY_ENV,
+    help=(
+        "Ramp Router API key. Opens browser setup when omitted. "
+        f"Set {CONFIGURE_KEY_ENV} instead to keep it out of shell history."
+    ),
+)
+@click.option(
+    "--no-browser",
+    is_flag=True,
+    help="Print the Router setup URL instead of opening a browser.",
+)
+@click.pass_context
+def router_configure_cowork(
+    ctx: click.Context,
+    setup_file: Path | None,
+    api_key: str | None,
+    no_browser: bool,
+) -> None:
+    """Configure the host app Cowork itself cannot reach from its VM."""
+    api_key_source = ctx.get_parameter_source("api_key")
+    if (
+        setup_file is not None
+        and api_key is not None
+        and api_key_source is ParameterSource.COMMANDLINE
+    ):
+        raise click.UsageError("--setup-file cannot be combined with --api-key.")
+    if ctx.obj["no_input"] and setup_file is None and api_key is None:
+        raise click.UsageError(
+            "Pass --setup-file or --api-key when using non-interactive mode, "
+            f"or set {CONFIGURE_KEY_ENV} to keep the key out of shell history."
+        )
+
+    base_url = router_base_url()
+    browser_acquired_key = False
+    host_preflight_done = False
+    if setup_file is not None:
+        base_url, api_key = claude_cowork.read_setup_file(setup_file)
+    elif api_key is None:
+        # Fail before opening a browser or creating a key for a host where
+        # automatic Cowork configuration cannot succeed.
+        claude_cowork.preflight()
+        host_preflight_done = True
+        api_key = acquire_router_api_key(router_ui_url(), no_browser=no_browser)
+        browser_acquired_key = True
+    # Validate before discovery puts the bearer credential on the wire.
+    claude_cowork.gateway_base_url(base_url)
+    api_key = api_key.strip()
+    os.environ.pop(CONFIGURE_KEY_ENV, None)
+    if not api_key:
+        if api_key_source in {
+            ParameterSource.COMMANDLINE,
+            ParameterSource.ENVIRONMENT,
+        }:
+            raise click.BadParameter(
+                "cannot be empty", param_hint="'--api-key'"
+            ) from None
+        raise click.ClickException("Ramp Router did not return an API key.")
+    if not host_preflight_done:
+        claude_cowork.preflight()
+
+    fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
+    stop_spinner = (
+        start_spinner("Setting up Claude Cowork")
+        if fmt != "json" and not ctx.obj["quiet"]
+        else (lambda: None)
+    )
+    try:
+        models = _fetch_models(
+            api_key,
+            gateway_client=claude_cowork.GATEWAY_CLIENT,
+            base_url=base_url,
+            wait_for_key=setup_file is not None or browser_acquired_key,
+        )
+        profile_path = claude_cowork.configure(api_key, base_url)
+        if setup_file is not None:
+            try:
+                setup_file.unlink()
+            except OSError as exc:
+                raise click.ClickException(
+                    f"Claude Cowork was configured, but the setup file "
+                    f"{setup_file} could not be deleted: {exc}"
+                ) from None
+    finally:
+        stop_spinner()
+
+    preferred = next(
+        (model for model in models if model.metadata.request_name == DEFAULT_MODEL),
+        models[0],
+    )
+    payload = {
+        "client": "claude-cowork",
+        "config_path": str(profile_path),
+        "provider": ROUTER_PROVIDER,
+        "recommended_model": preferred.id,
+        "models_available": len(models),
+        "setup_file_deleted": setup_file is not None,
+    }
+    if fmt == "json":
+        print_agent_json(payload, pagination=None)
+        return
+    model_label = "model" if len(models) == 1 else "models"
+    click.echo("Connected to: Claude Cowork")
+    click.echo(f"{len(models)} {model_label} discovered. Claude Desktop was restarted.")
+    preferred_label = (
+        preferred.metadata.display_name
+        or preferred.metadata.request_name
+        or preferred.id
+    )
+    click.echo(
+        f"Pick {preferred_label} in Cowork and send a message to verify the connection."
+    )
+    click.echo("Run 'ramp router unconfigure-cowork' to restore the previous setup.")
+
+
+@router_group.command(
+    "unconfigure-cowork",
+    help="Remove Ramp Router from Claude Desktop Cowork (macOS)",
+)
+@click.pass_context
+def router_unconfigure_cowork(ctx: click.Context) -> None:
+    claude_cowork.unconfigure()
+    fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
+    if fmt == "json":
+        print_agent_json({"client": "claude-cowork", "restored": True}, pagination=None)
+    else:
+        click.echo("Removed Ramp Router and restored Claude Cowork's previous setup.")
+
+
+@router_group.command(
     "configure",
     help="Configure coding agents; omit agent names to choose interactively",
 )
@@ -811,6 +953,8 @@ def router_configure(
     agent_label = "coding agent" if len(clients) == 1 else "coding agents"
     if fmt != "json":
         click.echo(f"Connecting Ramp Router to your {agent_label}")
+    if api_key is None and _can_prompt(ctx, fmt):
+        api_key = _pick_stored_router_api_key()
     browser_acquired_key = api_key is None
     if api_key is None:
         api_key = acquire_router_api_key(router_ui_url(), no_browser=no_browser)
@@ -1889,6 +2033,86 @@ def configured_router_clients() -> tuple[str, ...]:
     return tuple(configured)
 
 
+def _stored_router_api_key_choices() -> list[tuple[str, tuple[str, ...]]]:
+    """Group compatible receipt-backed credentials by the clients using them."""
+    active_url = router_base_url().rstrip("/")
+    api_keys: dict[str, list[str]] = {}
+    for client in configured_router_clients():
+        path = _client_config_path(client)
+        try:
+            if _stored_router_base_url(client, path) != active_url:
+                continue
+            api_key = _stored_router_api_key(client, path)
+        except click.ClickException:
+            continue
+        api_keys.setdefault(api_key, []).append(client)
+    return [(api_key, tuple(clients)) for api_key, clients in api_keys.items()]
+
+
+def _pick_stored_router_api_key() -> str | None:
+    """Choose a compatible stored credential or request browser key creation."""
+    credentials = _stored_router_api_key_choices()
+    if not credentials:
+        return None
+    choices = [
+        questionary.Choice(
+            title=f"Reuse existing key used by {_human_join([CLIENT_NAMES[item] for item in clients])}",
+            value=index,
+        )
+        for index, (_, clients) in enumerate(credentials)
+    ]
+    choices.append(questionary.Choice(title="Create a new key", value="new"))
+    selected = questionary.select(
+        "Choose a Ramp Router API key",
+        choices=choices,
+        style=_PICKER_STYLE,
+        pointer=_PICKER_POINTER,
+        instruction="(enter to confirm)",
+    ).ask()
+    if selected is None:
+        raise click.Abort()
+    return None if selected == "new" else credentials[selected][0]
+
+
+def _stored_router_base_url(client: str, path: Path) -> str | None:
+    """Read the Router endpoint paired with a stored client credential."""
+    base_url = None
+    if client == "claude-code":
+        settings = claude_code.read_settings(path)
+        environment = settings.get("env")
+        if isinstance(environment, dict):
+            base_url = environment.get("ANTHROPIC_BASE_URL")
+        if isinstance(base_url, str) and base_url.strip():
+            base_url = f"{base_url.strip().rstrip('/').removesuffix('/v1')}/v1"
+    elif client == "codex":
+        _, config = _read_codex_config(path)
+        providers = config.get("model_providers")
+        provider = (
+            providers.get(ROUTER_PROVIDER) if isinstance(providers, dict) else None
+        )
+        if isinstance(provider, dict):
+            base_url = provider.get("base_url")
+    elif client == "opencode":
+        config = _read_json_config(client, path)
+        package_path = _bundled_plugin_path(client)
+        plugins = config.get("plugin", [])
+        if isinstance(plugins, list):
+            for entry in plugins:
+                if _is_router_plugin_entry(client, entry, package_path):
+                    if isinstance(entry, list) and len(entry) > 1:
+                        options = entry[1]
+                        if isinstance(options, dict):
+                            base_url = options.get("baseURL")
+                    break
+    elif client == "pi":
+        config = _read_json_config(client, path.parent / PI_PLUGIN_CONFIG_FILE)
+        base_url = config.get("baseUrl")
+
+    if isinstance(base_url, str) and base_url.strip():
+        return base_url.strip().rstrip("/")
+    return None
+
+
 def _stored_router_api_key(client: str, path: Path) -> str:
     """Read the credential this CLI previously wrote without exposing it."""
     api_key = None
@@ -2466,19 +2690,23 @@ def _fetch_models(
     api_key: str,
     claude_code_view: bool = False,
     *,
+    gateway_client: str | None = None,
     base_url: str | None = None,
     wait_for_key: bool = False,
 ) -> list[RouterModel]:
+    if claude_code_view and gateway_client is not None:
+        raise ValueError("Choose one Router client projection.")
+    requested_client = "claude-code" if claude_code_view else gateway_client
     try:
         for retry in range(len(NEW_KEY_RETRY_DELAYS) + 1):
             response = httpx.get(
                 f"{(base_url or router_base_url()).rstrip('/')}/models",
                 headers={
                     "Authorization": f"Bearer {api_key}",
-                    # Ask for the projection whose ids Claude Code will accept.
+                    # Ask for the projection whose ids the named client accepts.
                     **(
-                        {GATEWAY_CLIENT_HEADER: "claude-code"}
-                        if claude_code_view
+                        {GATEWAY_CLIENT_HEADER: requested_client}
+                        if requested_client is not None
                         else {}
                     ),
                 },

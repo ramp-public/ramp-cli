@@ -3,11 +3,38 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
 
 import click
+
+_MAX_USD_CENTS = 10**22 - 1
+
+
+def _usd_to_cents(amount: str) -> int:
+    try:
+        dollars = Decimal(amount)
+    except InvalidOperation as error:
+        raise click.BadParameter(
+            "must be a decimal amount", param_hint="'--amount'"
+        ) from error
+    if not dollars.is_finite() or dollars <= 0:
+        raise click.BadParameter("must be greater than zero", param_hint="'--amount'")
+    numerator, denominator = dollars.as_integer_ratio()
+    cents, fractional_cents = divmod(numerator * 100, denominator)
+    if fractional_cents:
+        raise click.BadParameter(
+            "supports at most 2 decimal places", param_hint="'--amount'"
+        )
+    if cents > _MAX_USD_CENTS:
+        max_dollars, max_cents = divmod(_MAX_USD_CENTS, 100)
+        raise click.BadParameter(
+            f"must not exceed USD {max_dollars}.{max_cents:02d}",
+            param_hint="'--amount'",
+        )
+    return cents
 
 
 def _validate_url(value: str) -> str:
@@ -46,16 +73,14 @@ def build_structured_vic_body(
     merchant_name: str | None,
     merchant_url: str | None,
     merchant_country_code: str | None,
-    amount_value: int | None,
-    amount_currency: str | None,
+    amount: str | None,
     expires_at: str | None,
 ) -> dict[str, Any]:
     fields = {
         "--merchant-name": merchant_name,
         "--merchant-url": merchant_url,
         "--merchant-country-code": merchant_country_code,
-        "--amount-value": amount_value,
-        "--amount-currency": amount_currency,
+        "--amount": amount,
         "--expires-at": expires_at,
     }
     missing = [name for name, value in fields.items() if value is None]
@@ -71,9 +96,7 @@ def build_structured_vic_body(
             "must be a two-letter country code",
             param_hint="'--merchant-country-code'",
         )
-    currency = amount_currency.strip().upper() if amount_currency else ""
-    if not currency:
-        raise click.BadParameter("must not be empty", param_hint="'--amount-currency'")
+    amount_cents = _usd_to_cents(amount or "")
     return {
         "payment_operation_id": str(payment_operation_id),
         "method": "vic",
@@ -83,7 +106,7 @@ def build_structured_vic_body(
                 "url": _validate_url(merchant_url or ""),
                 "country_code": country,
             },
-            "amount": {"value": amount_value, "currency": currency},
+            "amount": {"value": amount_cents, "currency": "USD"},
             "expires_at": _validate_expires_at(expires_at or ""),
         },
     }

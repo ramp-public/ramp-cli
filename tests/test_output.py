@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ramp_cli.output.formatter import (
+    canonical_to_display,
     extract_headers,
     format_value,
     resolve_format,
@@ -56,6 +57,10 @@ def test_format_value_dict():
 
 def test_format_value_list():
     assert format_value([1, 2, 3]) == "1, 2, 3"
+
+
+def test_canonical_to_display_preserves_large_minor_unit_amount():
+    assert canonical_to_display(9007199254740993, "USD") == "90,071,992,547,409.93"
 
 
 def test_extract_headers_priority():

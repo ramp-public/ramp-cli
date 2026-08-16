@@ -17,6 +17,7 @@ import zstandard
 from click.testing import CliRunner
 
 import ramp_cli.commands.router as router_module
+from ramp_cli import claude_cowork
 from ramp_cli.commands import claude_code
 from ramp_cli.commands.router import DEFAULT_ROUTER_BASE_URL as ROUTER_BASE_URL
 from ramp_cli.main import cli
@@ -24,12 +25,13 @@ from ramp_cli.main import cli
 
 @pytest.fixture(autouse=True)
 def _complete_browser_key_setup(monkeypatch):
-    """Keep configuration tests focused beyond the browser handoff boundary."""
+    """Keep configuration tests focused beyond host-only setup boundaries."""
     monkeypatch.setattr(
         router_module,
         "acquire_router_api_key",
         lambda _url, *, no_browser: "router-secret",
     )
+    monkeypatch.setattr(claude_cowork, "preflight", lambda: None)
 
 
 def _router_metadata(identifier, **overrides):
@@ -97,6 +99,427 @@ def _mock_codex_catalog(monkeypatch, slugs=("gpt-5.4",)):
         ),
     )
     return catalog
+
+
+def _router_model(identifier, *, request_name=None, display_name=None):
+    metadata = _router_metadata(
+        identifier,
+        request_name=request_name or identifier,
+        display_name=display_name or identifier,
+    )
+    return router_module.RouterModel(
+        id=identifier,
+        metadata=router_module._model_metadata(metadata, identifier),
+    )
+
+
+def test_configure_cowork_consumes_the_setup_file_and_deletes_it_after_success(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(router_module.CONFIGURE_KEY_ENV, "ambient-secret")
+    setup_file = tmp_path / "ramp-router-setup-abc123.json"
+    setup_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "name": "Ramp Router",
+                "base_url": "https://router.example/v1",
+                "api_key": "router-secret",
+            }
+        )
+    )
+    captured = {}
+
+    def fetch_models(api_key, **kwargs):
+        captured["fetch"] = (api_key, kwargs)
+        return [
+            _router_model(
+                "claude-router-5-6-sol-abc123",
+                request_name="gpt-5.6-sol",
+                display_name="5.6 Sol",
+            )
+        ]
+
+    def configure(api_key, base_url):
+        captured["configure"] = (api_key, base_url)
+        return tmp_path / "Claude-3p" / "configLibrary" / "profile.json"
+
+    monkeypatch.setattr(router_module, "_fetch_models", fetch_models)
+    monkeypatch.setattr(claude_cowork, "configure", configure)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure-cowork",
+            "--setup-file",
+            str(setup_file),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["fetch"] == (
+        "router-secret",
+        {
+            "gateway_client": "claude-cowork",
+            "base_url": "https://router.example/v1",
+            "wait_for_key": True,
+        },
+    )
+    assert captured["configure"] == (
+        "router-secret",
+        "https://router.example/v1",
+    )
+    assert not setup_file.exists()
+    assert "router-secret" not in result.output
+    assert "ambient-secret" not in result.output
+    assert "Connected to: Claude Cowork" in result.output
+    assert "1 model discovered" in result.output
+    assert "5.6 Sol" in result.output
+
+
+def test_configure_cowork_rejects_an_explicit_key_with_a_setup_file(
+    tmp_path, monkeypatch
+):
+    setup_file = tmp_path / "ramp-router-setup-abc123.json"
+    setup_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "name": "Ramp Router",
+                "base_url": "https://router.example/v1",
+                "api_key": "router-secret",
+            }
+        )
+    )
+    monkeypatch.setattr(
+        router_module,
+        "_fetch_models",
+        lambda *_args, **_kwargs: pytest.fail("discovery should not run"),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure-cowork",
+            "--setup-file",
+            str(setup_file),
+            "--api-key",
+            "explicit-secret",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "cannot be combined" in result.output
+    assert setup_file.exists()
+    assert "explicit-secret" not in result.output
+
+
+@pytest.mark.parametrize("source", ["flag", "environment"])
+def test_configure_cowork_reports_empty_api_key_as_a_bad_parameter(monkeypatch, source):
+    args = ["--human", "router", "configure-cowork"]
+    if source == "flag":
+        args += ["--api-key", ""]
+    else:
+        monkeypatch.setenv(router_module.CONFIGURE_KEY_ENV, " ")
+
+    result = CliRunner().invoke(cli, args)
+
+    assert result.exit_code == 2
+    assert "Invalid value for '--api-key': cannot be empty" in result.output
+
+
+def test_configure_cowork_names_the_model_that_was_actually_discovered(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        router_module,
+        "_fetch_models",
+        lambda *_args, **_kwargs: [
+            _router_model(
+                "claude-router-model-abc123",
+                request_name="other-model",
+                display_name="Other Model",
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        claude_cowork,
+        "configure",
+        lambda *_args, **_kwargs: tmp_path / "profile.json",
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure-cowork",
+            "--api-key",
+            "router-secret",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Pick Other Model in Cowork" in result.output
+
+
+def test_configure_cowork_agent_output_recommends_without_claiming_a_default(
+    tmp_path, monkeypatch
+):
+    model = _router_model(
+        "claude-router-model-abc123",
+        request_name="other-model",
+        display_name="Other Model",
+    )
+    monkeypatch.setattr(
+        router_module, "_fetch_models", lambda *_args, **_kwargs: [model]
+    )
+    monkeypatch.setattr(
+        claude_cowork,
+        "configure",
+        lambda *_args, **_kwargs: tmp_path / "profile.json",
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--agent",
+            "router",
+            "configure-cowork",
+            "--api-key",
+            "router-secret",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)["data"][0]
+    assert payload["recommended_model"] == model.id
+    assert "default_model" not in payload
+
+
+def test_configure_cowork_quiet_mode_does_not_start_a_spinner(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        router_module,
+        "_fetch_models",
+        lambda *_args, **_kwargs: [_router_model("claude-router-model-abc123")],
+    )
+    monkeypatch.setattr(
+        claude_cowork,
+        "configure",
+        lambda *_args, **_kwargs: tmp_path / "profile.json",
+    )
+    monkeypatch.setattr(
+        router_module,
+        "start_spinner",
+        lambda *_args, **_kwargs: pytest.fail("spinner should be quiet"),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "--quiet",
+            "router",
+            "configure-cowork",
+            "--api-key",
+            "router-secret",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+
+
+def test_configure_cowork_rejects_plaintext_base_url_before_model_discovery(
+    monkeypatch,
+):
+    monkeypatch.setenv("RAMP_ROUTER_BASE_URL", "http://router.example/v1")
+    called = False
+
+    def fetch_models(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return []
+
+    monkeypatch.setattr(router_module, "_fetch_models", fetch_models)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure-cowork",
+            "--api-key",
+            "router-secret",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "HTTPS" in result.output
+    assert called is False
+
+
+def test_configure_cowork_runs_host_preflight_before_model_discovery(monkeypatch):
+    discovered = False
+
+    def fetch_models(*_args, **_kwargs):
+        nonlocal discovered
+        discovered = True
+        return []
+
+    monkeypatch.setattr(router_module, "_fetch_models", fetch_models)
+    monkeypatch.setattr(
+        claude_cowork,
+        "preflight",
+        lambda: (_ for _ in ()).throw(
+            click.ClickException("Claude Desktop is not installed on this Mac.")
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure-cowork",
+            "--api-key",
+            "router-secret",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "Claude Desktop is not installed" in result.output
+    assert discovered is False
+
+
+def test_configure_cowork_runs_host_preflight_before_browser_key_setup(monkeypatch):
+    monkeypatch.setattr(
+        router_module,
+        "acquire_router_api_key",
+        lambda *_args, **_kwargs: pytest.fail("browser setup should not run"),
+    )
+    monkeypatch.setattr(
+        claude_cowork,
+        "preflight",
+        lambda: (_ for _ in ()).throw(
+            click.ClickException("Claude Desktop is not installed on this Mac.")
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure-cowork"],
+    )
+
+    assert result.exit_code != 0
+    assert "Claude Desktop is not installed" in result.output
+
+
+def test_configure_cowork_keeps_the_setup_file_when_configuration_fails(
+    tmp_path, monkeypatch
+):
+    setup_file = tmp_path / "ramp-router-setup-abc123.json"
+    setup_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "name": "Ramp Router",
+                "base_url": "https://router.example/v1",
+                "api_key": "router-secret",
+            }
+        )
+    )
+    monkeypatch.setattr(
+        router_module,
+        "_fetch_models",
+        lambda *_args, **_kwargs: [_router_model("claude-router-model-abc123")],
+    )
+    monkeypatch.setattr(
+        claude_cowork,
+        "configure",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            click.ClickException("host setup failed")
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure-cowork",
+            "--setup-file",
+            str(setup_file),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert setup_file.exists()
+    assert "router-secret" not in result.output
+
+
+def test_configure_cowork_reports_malformed_setup_json_as_a_bad_parameter(
+    tmp_path,
+):
+    setup_file = tmp_path / "ramp-router-setup-broken.json"
+    setup_file.write_text("{not-json")
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure-cowork",
+            "--setup-file",
+            str(setup_file),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Invalid value for '--setup-file'" in result.output
+    assert "internal error" not in result.output
+    assert setup_file.exists()
+
+
+def test_fetch_models_can_request_the_claude_cowork_projection(monkeypatch):
+    seen = {}
+
+    def get(url, *, headers, timeout):
+        seen["request"] = (url, headers, timeout)
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "claude-router-model-abc123",
+                        "router": _router_metadata(
+                            "claude-router-model-abc123",
+                            request_name="gpt-5.6-sol",
+                        ),
+                    }
+                ]
+            },
+            request=httpx.Request("GET", f"{ROUTER_BASE_URL}/models"),
+        )
+
+    monkeypatch.setattr(router_module.httpx, "get", get)
+
+    models = router_module._fetch_models(
+        "router-secret", gateway_client="claude-cowork"
+    )
+
+    assert models[0].id == "claude-router-model-abc123"
+    assert seen["request"] == (
+        f"{ROUTER_BASE_URL}/models",
+        {
+            "Authorization": "Bearer router-secret",
+            "X-Gateway-Client": "claude-cowork",
+        },
+        10,
+    )
 
 
 def test_configured_router_clients_requires_receipts_and_credentials(
@@ -1846,6 +2269,141 @@ def test_configure_codex_requires_interactive_input(tmp_path, monkeypatch):
     assert "Pass --api-key when using non-interactive mode" in result.output
     assert "https://router.ramp.com" in result.output
     assert not (tmp_path / "codex" / "config.toml").exists()
+
+
+def test_configure_reuses_one_existing_router_key_without_browser(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    pi_home = tmp_path / "pi"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(pi_home))
+    (codex_home / "ramp-router-state.json").write_text("{}\n")
+    (codex_home / "ramp-router-key").write_text("existing-key\n")
+    (codex_home / "config.toml").write_text(
+        f'[model_providers.ramp-router]\nbase_url = "{ROUTER_BASE_URL}"\n'
+    )
+    _mock_models(monkeypatch, key="existing-key")
+
+    def unexpected_browser_setup(*_args, **_kwargs):
+        raise AssertionError("browser setup should not run")
+
+    monkeypatch.setattr(
+        router_module, "acquire_router_api_key", unexpected_browser_setup
+    )
+    monkeypatch.setattr(router_module, "_can_prompt", lambda _ctx, _fmt: True)
+
+    class Prompt:
+        def ask(self):
+            return 0
+
+    captured = {}
+
+    def select(message, **kwargs):
+        captured["message"] = message
+        captured.update(kwargs)
+        return Prompt()
+
+    monkeypatch.setattr(router_module.questionary, "select", select)
+
+    result = CliRunner().invoke(cli, ["--human", "router", "configure", "pi"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["message"] == "Choose a Ramp Router API key"
+    assert [choice.title for choice in captured["choices"]] == [
+        "Reuse existing key used by Codex",
+        "Create a new key",
+    ]
+    assert json.loads((pi_home / "auth.json").read_text())["ramp-router"]["key"] == (
+        "existing-key"
+    )
+    assert "existing-key" not in result.output
+
+
+def test_configure_does_not_reuse_a_key_from_another_router_endpoint(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    pi_home = tmp_path / "pi"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(pi_home))
+    (codex_home / "ramp-router-state.json").write_text("{}\n")
+    (codex_home / "ramp-router-key").write_text("nonproduction-key\n")
+    (codex_home / "config.toml").write_text(
+        '[model_providers.ramp-router]\nbase_url = "https://qa-router.ramp.dev/v1"\n'
+    )
+    _mock_models(monkeypatch, key="browser-key")
+    browser_calls = []
+
+    def acquire(url, *, no_browser):
+        browser_calls.append((url, no_browser))
+        return "browser-key"
+
+    monkeypatch.setattr(router_module, "acquire_router_api_key", acquire)
+
+    result = CliRunner().invoke(cli, ["--human", "router", "configure", "pi"])
+
+    assert result.exit_code == 0, result.output
+    assert browser_calls == [("https://router.ramp.com", False)]
+    assert json.loads((pi_home / "auth.json").read_text())["ramp-router"]["key"] == (
+        "browser-key"
+    )
+
+
+def test_configure_uses_browser_when_existing_router_keys_disagree(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    pi_home = tmp_path / "pi"
+    for home in (codex_home, pi_home):
+        home.mkdir()
+        (home / "ramp-router-state.json").write_text("{}\n")
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(pi_home))
+    (codex_home / "ramp-router-key").write_text("codex-key\n")
+    (codex_home / "config.toml").write_text(
+        f'[model_providers.ramp-router]\nbase_url = "{ROUTER_BASE_URL}"\n'
+    )
+    (pi_home / "auth.json").write_text(
+        json.dumps({"ramp-router": {"type": "api_key", "key": "pi-key"}}) + "\n"
+    )
+    (pi_home / "ramp-router-config.json").write_text(
+        json.dumps({"baseUrl": ROUTER_BASE_URL}) + "\n"
+    )
+    _mock_models(monkeypatch, key="browser-key")
+    browser_calls = []
+
+    def acquire(url, *, no_browser):
+        browser_calls.append((url, no_browser))
+        return "browser-key"
+
+    monkeypatch.setattr(router_module, "acquire_router_api_key", acquire)
+    monkeypatch.setattr(router_module, "_can_prompt", lambda _ctx, _fmt: True)
+
+    class Prompt:
+        def ask(self):
+            return "new"
+
+    captured = {}
+
+    def select(_message, **kwargs):
+        captured.update(kwargs)
+        return Prompt()
+
+    monkeypatch.setattr(router_module.questionary, "select", select)
+
+    result = CliRunner().invoke(cli, ["--human", "router", "configure", "codex"])
+
+    assert result.exit_code == 0, result.output
+    assert [choice.title for choice in captured["choices"]] == [
+        "Reuse existing key used by Codex",
+        "Reuse existing key used by Pi",
+        "Create a new key",
+    ]
+    assert browser_calls == [("https://router.ramp.com", False)]
+    assert (codex_home / "ramp-router-key").read_text() == "browser-key"
 
 
 def test_configure_codex_accepts_api_key_flag_noninteractively(tmp_path, monkeypatch):

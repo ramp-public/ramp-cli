@@ -33,10 +33,8 @@ def _card_args() -> list[str]:
         "https://acme.example/checkout",
         "--merchant-country-code",
         "us",
-        "--amount-value",
-        "1250",
-        "--amount-currency",
-        "usd",
+        "--amount",
+        "12.50",
         "--expires-at",
         (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
     ]
@@ -294,6 +292,54 @@ def test_pay__posts_structured_request_to_production_wallet(monkeypatch):
     }
 
 
+def test_pay__displays_normalized_usd_amount(monkeypatch):
+    captured = {}
+
+    def fake_pay(client, body):
+        captured["body"] = body
+        return {"payment_operation_id": body["payment_operation_id"]}
+
+    monkeypatch.setattr(AgentWalletClient, "pay", fake_pay)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "agent-wallet", "pay", "cards"] + _card_args(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["body"]["method_request"]["amount"] == {
+        "value": 1250,
+        "currency": "USD",
+    }
+    assert "Amount: USD 12.50" in result.output
+
+
+@pytest.mark.parametrize(
+    ("amount", "message"),
+    [
+        ("10.351", "at most 2 decimal places"),
+        ("0", "greater than zero"),
+        ("not-a-number", "decimal amount"),
+        (
+            "123456789012345678901234567.89",
+            "must not exceed USD 99999999999999999999.99",
+        ),
+    ],
+)
+def test_pay__rejects_invalid_usd_amounts(amount, message):
+    args = _card_args()
+    amount_index = args.index("--amount") + 1
+    args[amount_index] = amount
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "agent-wallet", "pay", "cards"] + args,
+    )
+
+    assert result.exit_code != 0
+    assert message in result.output
+
+
 def test_pay__base_url_override_wins(monkeypatch):
     captured = {}
     monkeypatch.setenv("RAMP_AGENT_WALLET_API_URL", "https://wallet.example.test/")
@@ -453,6 +499,9 @@ def test_pay__separates_method_specific_options():
 
     assert cards_help.exit_code == 0, cards_help.output
     assert "--merchant-name" in cards_help.output
+    assert "--amount USD" in cards_help.output
+    assert "--amount-value" not in cards_help.output
+    assert "--amount-currency" not in cards_help.output
     assert "--json" not in cards_help.output
     assert json_help.exit_code == 0, json_help.output
     assert "--json" in json_help.output
