@@ -7,7 +7,8 @@
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts",
-    "./server": "./src/index.ts"
+    "./server": "./src/index.ts",
+    "./tui": "./src/tui.tsx"
   },
   "files": [
     "src",
@@ -31,11 +32,29 @@
     "openai-responses"
   ],
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.18.3 <2"
+    "@opencode-ai/plugin": ">=1.18.3 <2",
+    "@opentui/core": ">=0.4.3",
+    "@opentui/solid": ">=0.4.3",
+    "solid-js": ">=1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/core": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@opencode-ai/plugin": "1.18.3",
+    "@opentui/core": "0.5.3",
+    "@opentui/keymap": "0.5.3",
+    "@opentui/solid": "0.5.3",
     "@types/node": "^24.0.0",
+    "solid-js": "1.9.12",
     "typescript": "^6.0.0"
   }
 }

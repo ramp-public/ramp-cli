@@ -597,9 +597,16 @@ def test_refresh_reapplies_only_clients_with_router_receipts(tmp_path, monkeypat
             "providerID": "ramp-router",
             "name": "Ramp Router",
             "baseURL": ROUTER_BASE_URL,
+            "usageBaseURL": "https://router.ramp.com",
             "apiKey": "keep-me",
         },
     ]
+    # A refresh rewrites the TUI registration too, so a rotated key never
+    # leaves the sidebar querying with the old one.
+    tui_plugins = json.loads(router_module._opencode_tui_config_path().read_text())[
+        "plugin"
+    ]
+    assert tui_plugins == [plugin]
     assert json.loads(pi_config.read_text()) == {
         "packages": ["/old/ramp-cli/pi-provider"]
     }
@@ -2574,23 +2581,53 @@ def test_configure_opencode_installs_plugin_and_preserves_config(tmp_path, monke
     assert config["provider"]["existing"] == {"models": {"model": {}}}
     assert "ramp-router" not in config["provider"]
     plugin_path = router_module.integration_package_path("opencode").resolve()
-    assert config["plugin"] == [
-        [
-            plugin_path.as_uri(),
-            {
-                "providerID": "ramp-router",
-                "name": "Ramp Router",
-                "baseURL": "https://router-api.ramp.com/v1",
-                "apiKey": "router-secret",
-            },
-        ]
+    expected_entry = [
+        plugin_path.as_uri(),
+        {
+            "providerID": "ramp-router",
+            "name": "Ramp Router",
+            "baseURL": "https://router-api.ramp.com/v1",
+            # The dashboard origin the plugin's session-usage status
+            # display queries; the data plane does not serve it.
+            "usageBaseURL": "https://router.ramp.com",
+            "apiKey": "router-secret",
+        },
     ]
+    assert config["plugin"] == [expected_entry]
     assert config["model"] == "ramp-router/a"
+    # OpenCode's TUI loads plugins only from tui.json, so the sidebar entry
+    # must be registered there as well, with the same tuple.
+    tui_path = router_module._opencode_tui_config_path()
+    tui_config = json.loads(tui_path.read_text())
+    assert tui_config["$schema"] == "https://opencode.ai/tui.json"
+    assert tui_config["plugin"] == [expected_entry]
+    assert tui_path.stat().st_mode & 0o777 == 0o600
     assert "Connecting Ramp Router to your coding agent" in result.output
     assert "Connected to: OpenCode" in result.output
     assert "2 models added. Start an agent and pick a model." in result.output
     assert "router-secret" not in result.output
     assert config_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_configure_opencode_derives_usage_origin_from_base_url_override(
+    tmp_path, monkeypatch
+):
+    """A base-URL override names a single-origin deployment serving usage too."""
+    config_path = tmp_path / "opencode.json"
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
+    monkeypatch.setenv("RAMP_ROUTER_BASE_URL", "https://router.internal.example/v1")
+    _mock_models(monkeypatch, base_url="https://router.internal.example/v1")
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "opencode"],
+        input="router-secret\n",
+    )
+
+    assert result.exit_code == 0
+    options = json.loads(config_path.read_text())["plugin"][0][1]
+    assert options["baseURL"] == "https://router.internal.example/v1"
+    assert options["usageBaseURL"] == "https://router.internal.example"
 
 
 def test_unconfigure_opencode_restores_previous_settings(tmp_path, monkeypatch):
@@ -2618,15 +2655,106 @@ def test_unconfigure_opencode_restores_previous_settings(tmp_path, monkeypatch):
         ["--human", "router", "configure", "opencode"],
         input="router-secret\n",
     )
+    tui_path = router_module._opencode_tui_config_path()
+    assert tui_path.exists()
     unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "opencode"])
 
     assert configure.exit_code == unconfigure.exit_code == 0
     assert json.loads(config_path.read_text()) == original
     assert not (tmp_path / "ramp-router-state.json").exists()
+    # Configure created tui.json, so unconfigure restores its absence.
+    assert not tui_path.exists()
     assert (
         "Removed Ramp Router and restored your previous settings for: OpenCode."
         in unconfigure.output
     )
+
+
+def test_configure_opencode_preserves_foreign_tui_plugins(tmp_path, monkeypatch):
+    config_path = tmp_path / "opencode.json"
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
+    tui_path = tmp_path / "custom" / "tui.json"
+    tui_path.parent.mkdir()
+    monkeypatch.setenv("OPENCODE_TUI_CONFIG", str(tui_path))
+    tui_path.write_text(
+        json.dumps(
+            {
+                "theme": "dark",
+                "plugin": [
+                    "some-other-plugin",
+                    ["@llm-router/opencode-provider", {"providerID": "ramp-router"}],
+                ],
+            }
+        )
+    )
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+
+    configure = runner.invoke(
+        cli,
+        ["--human", "router", "configure", "opencode"],
+        input="router-secret\n",
+    )
+
+    assert configure.exit_code == 0
+    tui_config = json.loads(tui_path.read_text())
+    # The user's file gains no schema rewrite and keeps unrelated plugins;
+    # only the stale Router entry is replaced.
+    assert "$schema" not in tui_config
+    assert tui_config["theme"] == "dark"
+    assert tui_config["plugin"][0] == "some-other-plugin"
+    assert len(tui_config["plugin"]) == 2
+    assert tui_config["plugin"][1][1]["apiKey"] == "router-secret"
+
+    unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "opencode"])
+
+    assert unconfigure.exit_code == 0
+    restored = json.loads(tui_path.read_text())
+    # The file predates configure, so it survives with the original Router
+    # entry put back beside the untouched foreign plugin.
+    assert restored["theme"] == "dark"
+    assert restored["plugin"] == [
+        "some-other-plugin",
+        ["@llm-router/opencode-provider", {"providerID": "ramp-router"}],
+    ]
+
+
+def test_unconfigure_opencode_tolerates_receipt_without_tui_state(
+    tmp_path, monkeypatch
+):
+    """A receipt from before configure wrote tui.json still unconfigures."""
+    config_path = tmp_path / "opencode.json"
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    configure = runner.invoke(
+        cli,
+        ["--human", "router", "configure", "opencode"],
+        input="router-secret\n",
+    )
+    assert configure.exit_code == 0
+    state_path = tmp_path / "ramp-router-state.json"
+    state = json.loads(state_path.read_text())
+    for legacy_missing in (
+        "tui_file_present",
+        "tui_plugin_present",
+        "tui_plugin_entries",
+    ):
+        state.pop(legacy_missing)
+    state_path.write_text(json.dumps(state) + "\n")
+    tui_path = router_module._opencode_tui_config_path()
+    tui_config = json.loads(tui_path.read_text())
+    tui_config["plugin"].insert(0, "user-added-plugin")
+    tui_path.write_text(json.dumps(tui_config) + "\n")
+
+    unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "opencode"])
+
+    assert unconfigure.exit_code == 0
+    restored = json.loads(tui_path.read_text())
+    # Without a recorded snapshot, only the Router entries this CLI
+    # recognizes are stripped; everything else stays exactly as found.
+    assert restored["plugin"] == ["user-added-plugin"]
+    assert tui_path.exists()
 
 
 def test_configure_opencode_accepts_jsonc(tmp_path, monkeypatch):

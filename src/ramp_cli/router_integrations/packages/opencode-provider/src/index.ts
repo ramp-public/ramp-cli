@@ -1,23 +1,17 @@
-import type { Config, Plugin, PluginModule, PluginOptions } from "@opencode-ai/plugin"
+import type { Config, Plugin, PluginModule } from "@opencode-ai/plugin"
 
-import { discoverRouterModels, normalizeBaseURL } from "./discovery.ts"
+import { discoverRouterModels } from "./discovery.ts"
 import type { RouterModel } from "./discovery.ts"
-
-const DEFAULT_PROVIDER_ID = "ramp-router"
-const DEFAULT_PROVIDER_NAME = "Ramp Router"
-const DEFAULT_API_KEY_ENV = "RAMP_ROUTER_API_KEY"
-const LEGACY_API_KEY_ENV = "LLM_GATEWAY_API_KEY"
-const DEFAULT_BASE_URL_ENV = "RAMP_ROUTER_BASE_URL"
-const LEGACY_BASE_URL_ENV = "LLM_GATEWAY_BASE_URL"
-const DEFAULT_BASE_URL = "https://router-api.ramp.com/v1"
-
-type RouterPluginOptions = PluginOptions & {
-  providerID?: string
-  name?: string
-  baseURL?: string
-  apiKey?: string
-  apiKeyEnv?: string
-}
+import {
+  DEFAULT_API_KEY_ENV,
+  LEGACY_API_KEY_ENV,
+  nonEmpty,
+  resolveAPIKey,
+  resolveBaseURL,
+  resolveProviderID,
+  resolveProviderName,
+  routerPluginOptions,
+} from "./options.ts"
 
 type MutableProviderConfig = {
   npm?: string
@@ -26,11 +20,6 @@ type MutableProviderConfig = {
   options?: Record<string, unknown>
   models?: Record<string, Record<string, unknown>>
 }
-
-function nonEmpty(value: unknown, fallback: string): string {
-  return typeof value === "string" && value.trim().length > 0 ? value.trim() : fallback
-}
-
 
 function providerConfig(
   config: Config,
@@ -137,24 +126,16 @@ function openCodeModalities(modalities: readonly string[]): OpenCodeModality[] {
 }
 
 const RouterProvider: Plugin = async (_input, rawOptions) => {
-  const options = (rawOptions ?? {}) as RouterPluginOptions
-  const providerID = nonEmpty(options.providerID, DEFAULT_PROVIDER_ID)
-  const name = nonEmpty(options.name, DEFAULT_PROVIDER_NAME)
+  const options = routerPluginOptions(rawOptions)
+  const providerID = resolveProviderID(options)
+  const name = resolveProviderName(options)
   const apiKeyEnv = nonEmpty(options.apiKeyEnv, DEFAULT_API_KEY_ENV)
   const inlineAPIKey = nonEmpty(options.apiKey, "")
 
   return {
     config: async (config) => {
-      const baseURL = normalizeBaseURL(
-        options.baseURL ??
-          process.env[DEFAULT_BASE_URL_ENV] ??
-          process.env[LEGACY_BASE_URL_ENV] ??
-          DEFAULT_BASE_URL,
-      )
-      const apiKey =
-        inlineAPIKey ||
-        process.env[apiKeyEnv] ||
-        process.env[LEGACY_API_KEY_ENV]
+      const baseURL = resolveBaseURL(options)
+      const apiKey = resolveAPIKey(options)
       if (!apiKey) {
         throw new Error(
           `Set the plugin apiKey option or ${apiKeyEnv} before starting OpenCode`,

@@ -45,6 +45,56 @@ def test_gateway_base_url_removes_only_the_final_v1():
         claude_cowork.gateway_base_url("https://router.example:not-a-port/v1")
 
 
+def test_successful_configuration_requests_a_fresh_cowork_session(
+    cowork_host, monkeypatch
+):
+    launches = []
+    monkeypatch.setattr(
+        claude_cowork,
+        "_launch_claude",
+        lambda **kwargs: launches.append(kwargs),
+    )
+
+    claude_cowork.configure("router-secret", "https://router.example/v1")
+
+    assert launches == [{"fresh_cowork": True}]
+
+
+def test_fresh_cowork_relaunch_uses_the_cowork_deep_link(monkeypatch):
+    commands = []
+
+    def record_run(command, **_kwargs):
+        commands.append(command)
+        return 0
+
+    monkeypatch.setattr(claude_cowork, "_run_quiet", record_run)
+
+    claude_cowork._launch_claude(fresh_cowork=True)
+
+    assert commands == [
+        [
+            "open",
+            "-b",
+            claude_cowork.CLAUDE_BUNDLE_ID,
+            "claude://cowork/",
+        ]
+    ]
+
+
+def test_normal_relaunch_does_not_force_a_new_cowork(monkeypatch):
+    commands = []
+
+    def record_run(command, **_kwargs):
+        commands.append(command)
+        return 0
+
+    monkeypatch.setattr(claude_cowork, "_run_quiet", record_run)
+
+    claude_cowork._launch_claude()
+
+    assert commands == [["open", "-b", claude_cowork.CLAUDE_BUNDLE_ID]]
+
+
 def test_transaction_lock_excludes_a_second_holder(cowork_host):
     fcntl = pytest.importorskip("fcntl")
     lock_path = claude_cowork.state_path().parent / ".ramp-router-cowork.lock"

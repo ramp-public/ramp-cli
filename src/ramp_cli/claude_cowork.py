@@ -29,6 +29,7 @@ except ImportError:  # pragma: no cover - Cowork setup is macOS-only
     fcntl = None
 
 CLAUDE_BUNDLE_ID = "com.anthropic.claudefordesktop"
+CLAUDE_COWORK_URL = "claude://cowork/"
 GATEWAY_CLIENT_HEADER = "X-Gateway-Client"
 GATEWAY_CLIENT = "claude-cowork"
 PROFILE_NAME = "Ramp Router"
@@ -315,8 +316,15 @@ def _quit_claude() -> None:
         )
 
 
-def _launch_claude(*, failure_message: str | None = None) -> None:
-    if _run_quiet(["open", "-b", CLAUDE_BUNDLE_ID], timeout=10) != 0:
+def _launch_claude(
+    *, fresh_cowork: bool = False, failure_message: str | None = None
+) -> None:
+    command = (
+        ["open", "-b", CLAUDE_BUNDLE_ID, CLAUDE_COWORK_URL]
+        if fresh_cowork
+        else ["open", "-b", CLAUDE_BUNDLE_ID]
+    )
+    if _run_quiet(command, timeout=10) != 0:
         raise click.ClickException(
             failure_message
             or "Ramp Router was configured, but Claude Desktop could not be reopened. "
@@ -469,7 +477,7 @@ def configure(api_key: str, router_base_url: str) -> Path:
                 pass
             raise
 
-        _launch_claude()
+        _launch_claude(fresh_cowork=True)
         return profile_path
 
 

@@ -2005,6 +2005,22 @@ def _json_config_path(client: str) -> Path:
     return pi_home.expanduser() / "settings.json"
 
 
+def _opencode_tui_config_path() -> Path:
+    """Locate the TUI plugin config, exactly as OpenCode's TUI resolves it.
+
+    Deliberately not derived from OPENCODE_CONFIG: the TUI does not consult
+    that variable either, so following it would write a file the TUI never
+    reads.
+    """
+    configured = os.environ.get("OPENCODE_TUI_CONFIG")
+    if configured:
+        return Path(configured).expanduser()
+    config_home = Path(
+        os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
+    ).expanduser()
+    return config_home / "opencode" / "tui.json"
+
+
 def _client_config_path(client: str) -> Path:
     """Locate one client's configuration file."""
     if client == "claude-code":
@@ -2320,9 +2336,27 @@ def _configure_plugin_client(
             raise click.ClickException(
                 f"Could not update OpenCode config {path}: 'provider' must be an object."
             )
+        # OpenCode's TUI loads plugins only from tui.json; a package listed in
+        # opencode.json alone never gets its sidebar entrypoint loaded. The
+        # same tuple therefore goes into both files: opencode.json for the
+        # server-side provider, tui.json for the usage sidebar.
+        tui_path = _opencode_tui_config_path()
+        tui_existed = tui_path.exists()
+        tui_config = _read_json_config(client, tui_path)
+        tui_plugins = tui_config.get("plugin", [])
+        if not isinstance(tui_plugins, list):
+            raise click.ClickException(
+                f"Could not update OpenCode config {tui_path}: "
+                "'plugin' must be an array."
+            )
         previous_plugins = [
             entry
             for entry in plugins
+            if _is_router_plugin_entry(client, entry, package_path)
+        ]
+        previous_tui_plugins = [
+            entry
+            for entry in tui_plugins
             if _is_router_plugin_entry(client, entry, package_path)
         ]
         if not state_path.exists():
@@ -2335,35 +2369,51 @@ def _configure_plugin_client(
                         "model": existing.get("model"),
                         "plugin_present": "plugin" in existing,
                         "plugin_entries": previous_plugins,
+                        "tui_file_present": tui_existed,
+                        "tui_plugin_present": "plugin" in tui_config,
+                        "tui_plugin_entries": previous_tui_plugins,
                     },
                     indent=2,
                 )
                 + "\n"
             )
 
+        plugin_entry = [
+            package_path.as_uri(),
+            {
+                "providerID": ROUTER_PROVIDER,
+                "name": "Ramp Router",
+                "baseURL": router_base_url(),
+                # The dashboard origin serving /session-usage, which the
+                # data plane behind baseURL does not. Written explicitly
+                # for the same reason Claude Code gets ROUTER_BASE_URL:
+                # the plugin cannot know a split-origin deployment's
+                # dashboard host from the data-plane URL alone.
+                "usageBaseURL": _statusline_origin(),
+                "apiKey": api_key,
+            },
+        ]
         existing["plugin"] = [
             entry
             for entry in plugins
             if not _is_router_plugin_entry(client, entry, package_path)
         ]
-        existing["plugin"].append(
-            [
-                package_path.as_uri(),
-                {
-                    "providerID": ROUTER_PROVIDER,
-                    "name": "Ramp Router",
-                    "baseURL": router_base_url(),
-                    "apiKey": api_key,
-                },
-            ]
-        )
+        existing["plugin"].append(plugin_entry)
         providers.pop(ROUTER_PROVIDER, None)
         if providers:
             existing["provider"] = providers
         else:
             existing.pop("provider", None)
         existing["model"] = f"{ROUTER_PROVIDER}/{default_model}"
-        writes = [(path, existing)]
+        if not tui_existed:
+            tui_config["$schema"] = "https://opencode.ai/tui.json"
+        tui_config["plugin"] = [
+            entry
+            for entry in tui_plugins
+            if not _is_router_plugin_entry(client, entry, package_path)
+        ]
+        tui_config["plugin"].append(plugin_entry)
+        writes = [(path, existing), (tui_path, tui_config)]
     else:
         settings = _read_json_config(client, path)
         packages = settings.get("packages", [])
@@ -2449,6 +2499,7 @@ def _configure_plugin_client(
         if state is not None:
             _write_private_file(state_path, state)
         for output_path, payload in writes:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
             _write_private_file(output_path, json.dumps(payload, indent=2) + "\n")
     except OSError as exc:
         raise click.ClickException(
@@ -2527,6 +2578,47 @@ def _unconfigure_json_client(client: str, path: Path) -> None:
                 state.get("model"),
             )
         writes = [(path, existing)]
+
+        # Undo the TUI registration too. A receipt from before configure
+        # wrote tui.json has no record of it, so those setups only strip the
+        # Router entries this CLI recognizes and leave the rest untouched.
+        tui_path = _opencode_tui_config_path()
+        if tui_path.exists():
+            tui_config = _read_json_config(client, tui_path)
+            tui_plugins = tui_config.get("plugin", [])
+            if not isinstance(tui_plugins, list):
+                raise click.ClickException(
+                    f"Could not restore OpenCode config {tui_path}: "
+                    "'plugin' must be an array."
+                )
+            previous_tui_plugins = state.get("tui_plugin_entries", [])
+            if not isinstance(previous_tui_plugins, list):
+                raise click.ClickException(
+                    f"Could not read Ramp Router setup state from {state_path}."
+                )
+            tui_plugins = [
+                entry
+                for entry in tui_plugins
+                if not _is_router_plugin_entry(client, entry, package_path)
+            ]
+            tui_plugins.extend(previous_tui_plugins)
+            if tui_plugins or state.get("tui_plugin_present") is True:
+                tui_config["plugin"] = tui_plugins
+            else:
+                tui_config.pop("plugin", None)
+            if state.get("tui_file_present") is False and set(tui_config) <= {
+                "$schema"
+            }:
+                # Configure created this file and nothing else moved in, so
+                # removing it restores exactly what the user had: no file.
+                try:
+                    tui_path.unlink()
+                except OSError as exc:
+                    raise click.ClickException(
+                        f"Could not restore OpenCode config {tui_path}: {exc}"
+                    ) from None
+            else:
+                writes.append((tui_path, tui_config))
     else:
         settings = _read_json_config(client, path)
         packages = settings.get("packages", [])
