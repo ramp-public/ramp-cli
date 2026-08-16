@@ -70,8 +70,23 @@ def _mock_models(
         assert headers["Authorization"] == f"Bearer {key}"
         assert set(headers) <= {"Authorization", "X-Gateway-Client"}
         if "X-Gateway-Client" in headers:
-            assert headers["X-Gateway-Client"] == "claude-code"
+            assert headers["X-Gateway-Client"] in {"claude-code", "codex"}
         assert timeout == 10
+        if headers.get("X-Gateway-Client") == "codex":
+            return httpx.Response(
+                200,
+                json={
+                    "models": [
+                        {
+                            "slug": model["id"],
+                            "display_name": model["router"]["display_name"],
+                            "base_instructions": "",
+                        }
+                        for model in models
+                    ]
+                },
+                request=httpx.Request("GET", url),
+            )
         return httpx.Response(
             200, json={"data": models}, request=httpx.Request("GET", url)
         )
@@ -216,6 +231,100 @@ def test_configure_cowork_rejects_an_explicit_key_with_a_setup_file(
     assert "cannot be combined" in result.output
     assert setup_file.exists()
     assert "explicit-secret" not in result.output
+
+
+def test_configure_codex_consumes_the_setup_file_and_pins_the_live_catalog(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv(router_module.CONFIGURE_KEY_ENV, "ambient-secret")
+    monkeypatch.setattr(router_module.shutil, "which", lambda _name: None)
+    setup_file = tmp_path / "ramp-router-setup-codex123.json"
+    setup_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "name": "Ramp Router",
+                "base_url": "https://router.example/v1",
+                "api_key": "router-secret",
+            }
+        )
+    )
+    _mock_models(
+        monkeypatch,
+        [{"id": "router-model-a"}, {"id": "router-model-b"}],
+        base_url="https://router.example/v1",
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--agent",
+            "router",
+            "configure",
+            "codex",
+            "--setup-file",
+            str(setup_file),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert not setup_file.exists()
+    assert "router-secret" not in result.output
+    assert "ambient-secret" not in result.output
+    config = tomllib.loads((codex_home / "config.toml").read_text())
+    assert config["model_providers"]["ramp-router"]["base_url"] == (
+        "https://router.example/v1"
+    )
+    catalog_path = codex_home / router_module.CODEX_ROUTER_CATALOG
+    assert config["model_catalog_json"] == str(catalog_path)
+    assert [
+        model["slug"] for model in json.loads(catalog_path.read_text())["models"]
+    ] == ["router-model-a", "router-model-b"]
+    payload = json.loads(result.output)["data"][0]
+    assert payload["setup_file_deleted"] is True
+
+
+def test_configure_codex_keeps_the_setup_file_when_configuration_fails(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    setup_file = tmp_path / "ramp-router-setup-codex123.json"
+    setup_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "name": "Ramp Router",
+                "base_url": "https://router.example/v1",
+                "api_key": "router-secret",
+            }
+        )
+    )
+    monkeypatch.setattr(
+        router_module,
+        "_fetch_models",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            click.ClickException("catalog unavailable")
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure",
+            "codex",
+            "--setup-file",
+            str(setup_file),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "catalog unavailable" in result.output
+    assert setup_file.exists()
+    assert "router-secret" not in result.output
 
 
 @pytest.mark.parametrize("source", ["flag", "environment"])
@@ -631,11 +740,12 @@ def test_refresh_fetches_models_once_per_api_key(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(router_module, "_configured_model", lambda _client, _path: None)
 
-    def fetch_models(api_key):
+    def fetch_models(api_key, **_kwargs):
         fetched_keys.append(api_key)
         return [object()]
 
-    def configure_client(client, _api_key, models, *, selected_model):
+    def configure_client(client, _api_key, models, *, base_url, selected_model):
+        assert base_url == ROUTER_BASE_URL
         assert selected_model is None
         configured_models[client] = models
         return tmp_path / client / "config", "model", False
@@ -668,6 +778,8 @@ def test_refresh_reapplies_codex_config_and_preserves_selected_model(
     outdated = config_path.read_text().replace('model = "a"', 'model = "b"')
     outdated = outdated.replace('wire_api = "responses"', 'wire_api = "chat"')
     config_path.write_text(outdated)
+    catalog_path = codex_home / router_module.CODEX_ROUTER_CATALOG
+    catalog_path.write_text(json.dumps({"models": [{"slug": "openai-only"}]}) + "\n")
 
     refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
 
@@ -676,6 +788,9 @@ def test_refresh_reapplies_codex_config_and_preserves_selected_model(
     config = tomllib.loads(config_path.read_text())
     assert config["model"] == "b"
     assert config["model_providers"]["ramp-router"]["wire_api"] == "responses"
+    assert [
+        model["slug"] for model in json.loads(catalog_path.read_text())["models"]
+    ] == ["a", "b"]
 
 
 def test_refresh_reapplies_claude_config_and_preserves_selected_model(
@@ -1545,13 +1660,15 @@ def test_refresh_agent_mode_does_not_emit_success_before_partial_failure(
     monkeypatch.setattr(
         router_module,
         "_fetch_models",
-        lambda _api_key: [router_module.RouterModel(id="model", metadata=None)],
+        lambda _api_key, **_kwargs: [
+            router_module.RouterModel(id="model", metadata=None)
+        ],
     )
     monkeypatch.setattr(router_module, "_configured_model", lambda _client, _path: None)
     monkeypatch.setattr(
         router_module,
         "_configure_client",
-        lambda client, _api_key, _models, selected_model=None: (
+        lambda client, _api_key, _models, base_url=None, selected_model=None: (
             tmp_path / client,
             "model",
             False,
@@ -1601,10 +1718,14 @@ def test_configure_codex_writes_router_provider(tmp_path, monkeypatch):
     }
     assert config["model_provider"] == "ramp-router"
     assert config["model"] == "a"
-    # No catalog file: Codex asks Router for the model list on every launch, so
-    # a file here would freeze it at setup time.
-    assert "model_catalog_json" not in config
-    assert not (codex_home / "ramp-router-models.json").exists()
+    catalog_path = codex_home / "ramp-router-models.json"
+    assert config["model_catalog_json"] == str(catalog_path)
+    assert [
+        model["slug"] for model in json.loads(catalog_path.read_text())["models"]
+    ] == [
+        "a",
+        "b",
+    ]
     assert key_path.read_text() == "router-secret"
     assert "Connecting Ramp Router to your coding agent" in result.output
     assert "Connected to: Codex" in result.output
@@ -1613,6 +1734,7 @@ def test_configure_codex_writes_router_provider(tmp_path, monkeypatch):
     assert "router-secret" not in result.output
     assert config_path.stat().st_mode & 0o777 == 0o600
     assert key_path.stat().st_mode & 0o777 == 0o600
+    assert catalog_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_listing_order_does_not_choose_the_default_model():
@@ -1718,6 +1840,55 @@ def test_fetch_models_reads_the_router_metadata_extension(monkeypatch):
     assert described.default_effort == "low"
 
 
+def test_codex_catalog_respects_the_desktop_limit_and_keeps_the_selected_model(
+    monkeypatch,
+):
+    models = [
+        {"slug": f"model-{number:03d}", "base_instructions": ""}
+        for number in range(101)
+    ]
+
+    def get(url, *, headers, timeout):
+        assert url == f"{ROUTER_BASE_URL}/models"
+        assert headers["X-Gateway-Client"] == "codex"
+        assert timeout == 10
+        return httpx.Response(
+            200,
+            json={"models": models},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(router_module.httpx, "get", get)
+
+    catalog = json.loads(
+        router_module._render_codex_catalog(
+            router_module._fetch_codex_catalog("router-secret"), "model-100"
+        )
+    )
+
+    assert len(catalog["models"]) == router_module.CODEX_CATALOG_MODEL_LIMIT
+    assert catalog["models"][-1]["slug"] == "model-100"
+    assert "model-099" not in {model["slug"] for model in catalog["models"]}
+
+
+def test_codex_catalog_refuses_a_selected_model_missing_from_its_projection(
+    monkeypatch,
+):
+    def get(url, *, headers, timeout):
+        return httpx.Response(
+            200,
+            json={"models": [{"slug": "codex-only", "base_instructions": ""}]},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(router_module.httpx, "get", get)
+
+    with pytest.raises(click.ClickException, match="generic-only"):
+        router_module._render_codex_catalog(
+            router_module._fetch_codex_catalog("router-secret"), "generic-only"
+        )
+
+
 def test_configure_codex_preserves_unrelated_config_and_is_idempotent(
     tmp_path, monkeypatch
 ):
@@ -1762,6 +1933,64 @@ web_search = true
     assert "https://stale.example.com" not in first_content
     assert first_content.count("[model_providers.ramp-router]") == 1
     assert "[features]\nweb_search = true" in first_content
+
+
+def test_configure_codex_reads_config_after_catalog_discovery(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    config_path.write_text('model = "before-discovery"\n')
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(router_module.shutil, "which", lambda _name: None)
+    _mock_models(monkeypatch)
+
+    def fetch_catalog(*_args, **_kwargs):
+        config_path.write_text(
+            'model = "edited-during-discovery"\n[features]\nweb_search = true\n'
+        )
+        return {"models": [{"slug": "gpt-5.4", "base_instructions": ""}]}
+
+    monkeypatch.setattr(router_module, "_fetch_codex_catalog", fetch_catalog)
+    runner = CliRunner()
+
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex"], input="router-secret\n"
+    )
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert configured.exit_code == removed.exit_code == 0
+    restored = tomllib.loads(config_path.read_text())
+    assert restored["model"] == "edited-during-discovery"
+    assert restored["features"]["web_search"] is True
+
+
+def test_refresh_preserves_a_model_changed_during_catalog_discovery(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(router_module.shutil, "which", lambda _name: None)
+    _mock_models(monkeypatch, [{"id": "a"}, {"id": "b"}])
+    runner = CliRunner()
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex"], input="router-secret\n"
+    )
+    assert configured.exit_code == 0, configured.output
+    config_path = codex_home / "config.toml"
+    real_fetch = router_module._fetch_codex_catalog
+
+    def fetch_catalog(*args, **kwargs):
+        config_path.write_text(
+            config_path.read_text().replace('model = "a"', 'model = "b"')
+        )
+        return real_fetch(*args, **kwargs)
+
+    monkeypatch.setattr(router_module, "_fetch_codex_catalog", fetch_catalog)
+
+    refreshed = runner.invoke(cli, ["--human", "router", "refresh"])
+
+    assert refreshed.exit_code == 0, refreshed.output
+    assert tomllib.loads(config_path.read_text())["model"] == "b"
 
 
 def test_configure_codex_replaces_quoted_router_provider(tmp_path, monkeypatch):
@@ -1834,6 +2063,34 @@ web_search = true
     assert (
         "Removed Ramp Router and restored your previous settings for: Codex."
         in unconfigure.output
+    )
+
+
+def test_unconfigure_preserves_a_router_catalog_the_user_modified(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    config_path.write_text('model_catalog_json = "/tmp/user-models.json"\n')
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex"], input="router-secret\n"
+    )
+    assert configured.exit_code == 0, configured.output
+    router_catalog = codex_home / router_module.CODEX_ROUTER_CATALOG
+    user_edit = '{"models":[{"slug":"user-edited"}]}\n'
+    router_catalog.write_text(user_edit)
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert removed.exit_code == 0, removed.output
+    assert router_catalog.read_text() == user_edit
+    assert tomllib.loads(config_path.read_text())["model_catalog_json"] == (
+        "/tmp/user-models.json"
     )
 
 
@@ -2273,7 +2530,10 @@ def test_configure_codex_requires_interactive_input(tmp_path, monkeypatch):
     result = CliRunner().invoke(cli, ["--agent", "router", "configure"])
 
     assert result.exit_code != 0
-    assert "Pass --api-key when using non-interactive mode" in result.output
+    assert (
+        "Pass --setup-file or --api-key when using non-interactive mode"
+        in result.output
+    )
     assert "https://router.ramp.com" in result.output
     assert not (tmp_path / "codex" / "config.toml").exists()
 
@@ -2496,7 +2756,7 @@ def test_configure_waits_for_a_browser_created_key_to_reach_the_data_plane(
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     monkeypatch.setattr(router_module.shutil, "which", lambda _name: None)
     sleeps = []
-    responses = [401, 401, 200]
+    responses = [401, 401, 200, 200]
 
     def get(url, **kwargs):
         status = responses.pop(0)
@@ -2509,6 +2769,8 @@ def test_configure_waits_for_a_browser_created_key_to_reach_the_data_plane(
                 }
             }
             if status == 401
+            else {"models": [{"slug": "gpt-5.4", "base_instructions": ""}]}
+            if kwargs.get("headers", {}).get("X-Gateway-Client") == "codex"
             else {
                 "data": [
                     {
@@ -4569,9 +4831,11 @@ def test_pi_models_json_keeps_its_required_providers_key(tmp_path, monkeypatch):
     assert written == {"providers": {}}, written
 
 
-def test_codex_drops_a_catalog_left_by_an_earlier_version(tmp_path, monkeypatch):
-    # A file left behind would keep overriding discovery forever, pinning the
-    # user to whatever models existed when they last configured.
+def test_codex_replaces_an_old_router_catalog_with_live_discovery(
+    tmp_path, monkeypatch
+):
+    # The managed snapshot is refreshed from Router rather than left pinned to
+    # whatever models existed when an earlier setup ran.
     codex_home = tmp_path / "codex"
     codex_home.mkdir()
     stale = codex_home / "ramp-router-models.json"
@@ -4584,10 +4848,10 @@ def test_codex_drops_a_catalog_left_by_an_earlier_version(tmp_path, monkeypatch)
     )
 
     assert result.exit_code == 0, result.output
-    assert not stale.exists()
-    assert "model_catalog_json" not in tomllib.loads(
-        (codex_home / "config.toml").read_text()
-    )
+    assert [model["slug"] for model in json.loads(stale.read_text())["models"]] == ["a"]
+    assert tomllib.loads((codex_home / "config.toml").read_text())[
+        "model_catalog_json"
+    ] == str(stale)
 
 
 def test_failed_codex_update_preserves_a_legacy_catalog(tmp_path, monkeypatch):

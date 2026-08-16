@@ -61,6 +61,10 @@ NEW_KEY_RETRY_DELAYS = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
 # it is. This selects a response format and nothing else.
 GATEWAY_CLIENT_HEADER = "X-Gateway-Client"
 CODEX_CLIENT_NAME = "codex"
+CODEX_ROUTER_CATALOG = "ramp-router-models.json"
+CODEX_ROUTER_CATALOG_DIGEST_KEY = "router_catalog_digest"
+CODEX_ROUTER_CATALOG_MANAGED_KEY = "router_catalog_managed"
+CODEX_CATALOG_MODEL_LIMIT = 100
 CLIENT_NAMES = {
     "claude-code": "Claude Code",
     "codex": "Codex",
@@ -330,7 +334,7 @@ def _codex_key_command(key_path: Path) -> tuple[str, list[str]]:
     return "/bin/cat", [str(key_path)]
 
 
-def _codex_provider(key_path: Path) -> str:
+def _codex_provider(key_path: Path, base_url: str | None = None) -> str:
     """Describe the Router provider to Codex.
 
     The credential is read by a command rather than written inline, because
@@ -347,7 +351,7 @@ def _codex_provider(key_path: Path) -> str:
     command, args = _codex_key_command(key_path)
     return f'''[model_providers.ramp-router]
 name = "Ramp Router"
-base_url = "{router_base_url()}"
+base_url = "{(base_url or router_base_url()).rstrip("/")}"
 wire_api = "responses"
 supports_websockets = false
 http_headers = {{ "{GATEWAY_CLIENT_HEADER}" = "{CODEX_CLIENT_NAME}" }}
@@ -914,6 +918,11 @@ def router_unconfigure_cowork(ctx: click.Context) -> None:
     nargs=-1,
 )
 @click.option(
+    "--setup-file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Router setup JSON downloaded by the Get started button.",
+)
+@click.option(
     "--api-key",
     metavar="KEY",
     envvar=CONFIGURE_KEY_ENV,
@@ -931,12 +940,20 @@ def router_unconfigure_cowork(ctx: click.Context) -> None:
 def router_configure(
     ctx: click.Context,
     clients: tuple[str, ...],
+    setup_file: Path | None,
     api_key: str | None,
     no_browser: bool,
 ) -> None:
-    if ctx.obj["no_input"] and api_key is None:
+    api_key_source = ctx.get_parameter_source("api_key")
+    if (
+        setup_file is not None
+        and api_key is not None
+        and api_key_source is ParameterSource.COMMANDLINE
+    ):
+        raise click.UsageError("--setup-file cannot be combined with --api-key.")
+    if ctx.obj["no_input"] and setup_file is None and api_key is None:
         raise click.UsageError(
-            "Pass --api-key when using non-interactive mode, or set "
+            "Pass --setup-file or --api-key when using non-interactive mode, or set "
             f"{CONFIGURE_KEY_ENV} to keep the key out of shell history "
             f"and process listings. Create a key at {router_ui_url()}."
         )
@@ -947,17 +964,26 @@ def router_configure(
     if not requested_clients and _can_prompt(ctx, fmt):
         requested_clients = _pick_installed_clients()
     clients = requested_clients or all_clients
+    if setup_file is not None and clients != ("codex",):
+        raise click.UsageError(
+            "--setup-file currently requires exactly one agent: "
+            "'ramp router configure codex --setup-file FILE'."
+        )
     restore_clients = (
         "" if clients == all_clients else "".join(f" {client}" for client in clients)
     )
     agent_label = "coding agent" if len(clients) == 1 else "coding agents"
     if fmt != "json":
         click.echo(f"Connecting Ramp Router to your {agent_label}")
-    if api_key is None and _can_prompt(ctx, fmt):
+    base_url = router_base_url()
+    browser_acquired_key = False
+    if setup_file is not None:
+        base_url, api_key = claude_cowork.read_setup_file(setup_file)
+    elif api_key is None and _can_prompt(ctx, fmt):
         api_key = _pick_stored_router_api_key()
-    browser_acquired_key = api_key is None
-    if api_key is None:
+    if setup_file is None and api_key is None:
         api_key = acquire_router_api_key(router_ui_url(), no_browser=no_browser)
+        browser_acquired_key = True
     api_key = api_key.strip()
     # Click has already copied the configured value into api_key. Do not leave
     # the secret in the environment inherited by Codex or any other child.
@@ -978,7 +1004,11 @@ def router_configure(
         models_by_client: dict[str, list[RouterModel]] = {}
         standard_clients = tuple(item for item in clients if item != "claude-code")
         if standard_clients:
-            models = _fetch_models(api_key, wait_for_key=browser_acquired_key)
+            models = _fetch_models(
+                api_key,
+                base_url=base_url,
+                wait_for_key=setup_file is not None or browser_acquired_key,
+            )
             models_by_client.update(dict.fromkeys(standard_clients, models))
         if "claude-code" in clients:
             models_by_client["claude-code"] = _fetch_models(
@@ -989,7 +1019,9 @@ def router_configure(
         for item in clients:
             models = models_by_client[item]
             try:
-                path, default_model, repaired = _configure_client(item, api_key, models)
+                path, default_model, repaired = _configure_client(
+                    item, api_key, models, base_url=base_url
+                )
             except click.ClickException as exc:
                 failures.append(f"{CLIENT_NAMES[item]}: {exc.message}")
                 continue
@@ -999,10 +1031,19 @@ def router_configure(
                 "provider": ROUTER_PROVIDER,
                 "default_model": default_model,
                 "models_available": len(models),
+                "setup_file_deleted": setup_file is not None,
                 "replaced_outdated_setup": repaired,
                 "original_setup_command": _original_setup_command(item, path),
             }
             results.append(result)
+        if setup_file is not None and not failures:
+            try:
+                setup_file.unlink()
+            except OSError as exc:
+                raise click.ClickException(
+                    f"Codex was configured, but the setup file {setup_file} "
+                    f"could not be deleted: {exc}"
+                ) from None
     finally:
         # Stopped on the way out too, so a failed key does not leave the
         # terminal spinning with the cursor hidden.
@@ -1058,19 +1099,24 @@ def router_refresh(ctx: click.Context) -> None:
     clients = configured_router_clients()
     results = []
     failures = []
-    models_by_request: dict[tuple[str, bool], list[RouterModel]] = {}
+    models_by_request: dict[tuple[str, bool, str], list[RouterModel]] = {}
     for client in clients:
         path = _client_config_path(client)
         try:
             api_key = _stored_router_api_key(client, path)
+            base_url = (
+                _stored_router_base_url(client, path) or router_base_url()
+                if client == "codex"
+                else router_base_url()
+            )
             claude_code_view = client == "claude-code"
-            request_key = (api_key, claude_code_view)
+            request_key = (api_key, claude_code_view, base_url)
             models = models_by_request.get(request_key)
             if models is None:
                 models = (
-                    _fetch_models(api_key, claude_code_view=True)
+                    _fetch_models(api_key, claude_code_view=True, base_url=base_url)
                     if claude_code_view
-                    else _fetch_models(api_key)
+                    else _fetch_models(api_key, base_url=base_url)
                 )
                 models_by_request[request_key] = models
             selected_model = _configured_model(client, path)
@@ -1078,6 +1124,7 @@ def router_refresh(ctx: click.Context) -> None:
                 client,
                 api_key,
                 models,
+                base_url=base_url,
                 selected_model=selected_model,
             )
         except click.ClickException as exc:
@@ -1485,6 +1532,8 @@ def _unconfigure_client(client: str, path: Path) -> None:
         original_digest = state.get(CODEX_ORIGINAL_PROFILE_DIGEST_KEY)
         original_catalog = state.get(CODEX_ORIGINAL_CATALOG_STATE_KEY)
         original_catalog_digest = state.get(CODEX_ORIGINAL_CATALOG_DIGEST_KEY)
+        router_catalog_managed = state.get(CODEX_ROUTER_CATALOG_MANAGED_KEY)
+        router_catalog_digest = state.get(CODEX_ROUTER_CATALOG_DIGEST_KEY)
         original_instructions = state.get(CODEX_ORIGINAL_INSTRUCTIONS_STATE_KEY)
         original_instructions_digest = state.get(CODEX_ORIGINAL_INSTRUCTIONS_DIGEST_KEY)
         preexisting_router_sessions = state.get(
@@ -1571,7 +1620,11 @@ def _unconfigure_client(client: str, path: Path) -> None:
             "Close Codex and run this command again to finish."
         ) from None
     try:
-        (path.parent / "ramp-router-models.json").unlink(missing_ok=True)
+        router_catalog = path.parent / CODEX_ROUTER_CATALOG
+        if router_catalog_managed is not False and _is_unmodified(
+            router_catalog, router_catalog_digest
+        ):
+            router_catalog.unlink(missing_ok=True)
         # The key outlives the config unless it is removed here, leaving a
         # live credential on disk after the user asked for it to be undone.
         (path.parent / "ramp-router-key").unlink(missing_ok=True)
@@ -2229,6 +2282,7 @@ def _configure_client(
     api_key: str,
     models: list[RouterModel],
     *,
+    base_url: str | None = None,
     selected_model: str | None = None,
 ) -> tuple[Path, str, bool]:
     """Configure one client, reporting whether it replaced an outdated setup."""
@@ -2248,7 +2302,11 @@ def _configure_client(
     if client == "codex":
         path = _codex_config_path()
         default_model, repaired = _configure_codex(
-            path, api_key, models, selected_model=selected_model
+            path,
+            api_key,
+            models,
+            base_url=base_url,
+            selected_model=selected_model,
         )
         return path, default_model, repaired
 
@@ -2854,6 +2912,76 @@ def _fetch_models(
     return list(discovered.values())
 
 
+def _fetch_codex_catalog(api_key: str, *, base_url: str | None = None) -> dict:
+    """Fetch Router's exact provider-specific catalog for Codex Desktop.
+
+    Codex stores every provider in one shared cache. Saving the same catalog
+    Router serves dynamically makes the active provider authoritative, so a
+    first-party refresh cannot replace Router's model picker with OpenAI's.
+    ``ramp router refresh`` rewrites this snapshot whenever Router changes.
+    """
+    url = f"{(base_url or router_base_url()).rstrip('/')}/models"
+    try:
+        response = httpx.get(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                GATEWAY_CLIENT_HEADER: CODEX_CLIENT_NAME,
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        catalog = response.json()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in (401, 403):
+            raise click.ClickException(
+                "That API key wasn't accepted by Ramp Router. "
+                f"Create or copy a key at {ROUTER_UI_URL} and try again."
+            ) from None
+        raise click.ClickException(
+            "Ramp Router couldn't load the Codex model catalog "
+            f"(HTTP {exc.response.status_code}). Please try again."
+        ) from None
+    except (httpx.HTTPError, ValueError):
+        raise click.ClickException(
+            "We couldn't load the Codex model catalog from Ramp Router. "
+            "Check your connection and try again."
+        ) from None
+
+    models = catalog.get("models") if isinstance(catalog, dict) else None
+    if not isinstance(models, list) or not models:
+        raise click.ClickException(
+            "Ramp Router returned an unexpected Codex model catalog. Please try again."
+        )
+    if any(
+        not isinstance(model, dict)
+        or not isinstance(model.get("slug"), str)
+        or not model["slug"].strip()
+        for model in models
+    ):
+        raise click.ClickException(
+            "Ramp Router returned an invalid Codex model catalog. Please try again."
+        )
+    return catalog
+
+
+def _render_codex_catalog(catalog: dict, selected_model: str) -> str:
+    """Bound a validated catalog while retaining Codex's current selection."""
+    models = catalog["models"]
+    limited = list(models[:CODEX_CATALOG_MODEL_LIMIT])
+    selected = next(
+        (model for model in models if model["slug"] == selected_model), None
+    )
+    if selected is None:
+        raise click.ClickException(
+            f"Ramp Router's Codex catalog does not include the selected model "
+            f"{selected_model!r}. Update the Ramp CLI and try again."
+        )
+    if selected is not None and selected not in limited:
+        limited[-1] = selected
+    return json.dumps({**catalog, "models": limited}, indent=2) + "\n"
+
+
 def _codex_provider_is_out_of_date(existing: dict) -> bool:
     """Report an existing Router block written before the client marker.
 
@@ -2879,31 +3007,39 @@ def _configure_codex(
     api_key: str,
     models: list[RouterModel],
     *,
+    base_url: str | None = None,
     selected_model: str | None = None,
 ) -> tuple[str, bool]:
-    """Point the Codex CLI at Ramp Router.
-
-    This configures the CLI and TUI. Codex inside the ChatGPT desktop app reads
-    the same file and its engine resolves our models correctly, but the app's
-    picker will not list them: the UI filters the engine's model list against a
-    server-controlled allowlist of first-party OpenAI slugs, so every Router
-    model is dropped before it is drawn. Nothing here can change that, and a
-    full restart does not help. See
-    https://github.com/openai/codex/issues/19694.
-
-    A desktop user can still reach a Router model by pinning `model` in this
-    file; the picker shows "Custom" but the correct slug is sent.
-    """
+    """Point the Codex CLI and Desktop app at Ramp Router."""
+    default_model = _preferred_model(models, selected_model)
+    # Finish remote discovery before taking the local config snapshot used by
+    # the read-modify-write below. Otherwise a user or Codex edit made while
+    # this request is in flight can be replaced by the stale pre-request copy.
+    router_catalog = _fetch_codex_catalog(api_key, base_url=base_url)
     existing, existing_data = _read_codex_config(path)
+    if selected_model is not None:
+        # Refresh captures a selection before discovery starts. Read it again
+        # from the post-discovery snapshot so a model change made while the
+        # request was in flight is preserved.
+        default_model = _preferred_model(models, existing_data.get("model"))
+    router_catalog_body = _render_codex_catalog(router_catalog, default_model)
     chunks = _config_chunks(existing)
     repaired = _codex_provider_is_out_of_date(existing_data)
 
     # Read before the receipt is assembled, because the escape profile is
     # recorded there along with what it was written to hold, and both depend
     # on the model this run settles on.
-    default_model = _preferred_model(models, selected_model)
+    instructions_path = path.parent / "ramp-router-instructions.md"
     harness_prompt = _codex_harness_prompt(default_model)
-
+    if (
+        harness_prompt is None
+        and existing_data.get("model_provider") == ROUTER_PROVIDER
+        and instructions_path.exists()
+    ):
+        try:
+            harness_prompt = instructions_path.read_text(encoding="utf-8") or None
+        except (OSError, UnicodeError):
+            harness_prompt = None
     state_path = path.parent / "ramp-router-state.json"
     previous_state = None
     # The receipt as it will be written, or None when this run changes nothing
@@ -2968,11 +3104,18 @@ def _configure_codex(
             saved_sessions = existing_state["sessions"]
             state_document = existing_state
 
-    # Removed rather than written: Codex now fetches the list from Router on
-    # each launch, so a file here would freeze it.
-    legacy_catalog_path = path.parent / "ramp-router-models.json"
+    # Codex 0.147+ still shares one cache across every provider. This snapshot
+    # prevents OpenAI's catalog refresh from replacing Router's Desktop picker;
+    # configure and refresh both rewrite it from Router's live response.
+    router_catalog_path = path.parent / CODEX_ROUTER_CATALOG
+    catalog_digest = _content_digest(router_catalog_body)
+    if receipt.get(CODEX_ROUTER_CATALOG_MANAGED_KEY) is not True:
+        receipt[CODEX_ROUTER_CATALOG_MANAGED_KEY] = True
+        state_document = receipt
+    if receipt.get(CODEX_ROUTER_CATALOG_DIGEST_KEY) != catalog_digest:
+        receipt[CODEX_ROUTER_CATALOG_DIGEST_KEY] = catalog_digest
+        state_document = receipt
     key_path = path.parent / "ramp-router-key"
-    instructions_path = path.parent / "ramp-router-instructions.md"
 
     # Router sets model_instructions_file only when it could read Codex's own
     # prompt, so exactly when the key needs answering in the profile, the
@@ -3074,6 +3217,7 @@ def _configure_codex(
             {
                 "model": default_model,
                 "model_provider": "ramp-router",
+                "model_catalog_json": str(router_catalog_path.resolve()),
                 # Restores the harness prompt Router cannot supply. Absent when
                 # Codex is not installed to read it from.
                 "model_instructions_file": str(instructions_path.resolve())
@@ -3088,7 +3232,7 @@ def _configure_codex(
         for chunk in chunks
         if not chunk or not _OWNED_CODEX_TABLE.match(chunk[0])
     ).rstrip()
-    provider = _codex_provider(key_path)
+    provider = _codex_provider(key_path, base_url)
     updated = f"{preserved}\n\n{provider}" if preserved else provider
 
     # Kept so a failure can put the file back. Without it the undo below
@@ -3103,6 +3247,9 @@ def _configure_codex(
     previous_instructions = (
         instructions_path.read_text() if instructions_path.exists() else None
     )
+    previous_router_catalog = (
+        router_catalog_path.read_text() if router_catalog_path.exists() else None
+    )
 
     previous_profile_body = None
     created_profile = False
@@ -3115,6 +3262,7 @@ def _configure_codex(
         path.parent.mkdir(parents=True, exist_ok=True)
         if state is not None:
             _write_private_file(state_path, state)
+        _write_private_file(router_catalog_path, router_catalog_body)
         # Written before the session rewrite because this is the write that
         # fails on a full or read-only disk. Succeeding here means a partial
         # failure afterwards still leaves a usable configuration.
@@ -3154,9 +3302,6 @@ def _configure_codex(
             instructions_path.unlink(missing_ok=True)
         _sync_codex_sessions(path.parent, saved_sessions)
         _update_codex_session_index(path.parent, saved_sessions, restore=False)
-        # A catalog written by an earlier version would keep overriding
-        # discovery, so it goes only after every fallible update succeeds.
-        legacy_catalog_path.unlink(missing_ok=True)
     except (OSError, tomllib.TOMLDecodeError, click.ClickException) as exc:
         # Only sessions discovered by this invocation can have changed here.
         # Restoring the cumulative receipt would retag sessions that belonged
@@ -3167,6 +3312,7 @@ def _configure_codex(
             # Already failing; a failed undo must not replace the real cause.
             pass
         _restore_private_file(path, previous_config)
+        _restore_private_file(router_catalog_path, previous_router_catalog)
         # Removed only when this run is what created them, so a file that
         # turned out to be the user's survives the failure it caused.
         if created_profile:

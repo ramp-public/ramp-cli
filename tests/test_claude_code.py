@@ -434,7 +434,7 @@ def test_non_interactive_configure_still_requires_an_explicit_key(monkeypatch):
     )
 
     assert result.exit_code == 2
-    assert "Pass --api-key" in result.output
+    assert "Pass --setup-file or --api-key" in result.output
 
 
 def test_reconfigure_upgrades_legacy_state_for_connector_setting(monkeypatch, tmp_path):
