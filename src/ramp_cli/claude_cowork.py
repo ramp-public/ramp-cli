@@ -299,6 +299,18 @@ def preflight() -> None:
     _ensure_claude_installed()
 
 
+def is_available() -> bool:
+    """Report whether this host can run automatic Cowork setup at all.
+
+    The configure picker uses this to decide whether Cowork is worth
+    offering. It answers quietly where preflight raises, because a missing
+    Claude Desktop is a reason to leave Cowork off a menu, not an error.
+    """
+    if sys.platform != "darwin":
+        return False
+    return _run_quiet(["open", "-Ra", "Claude"], timeout=5) == 0
+
+
 def _quit_claude() -> None:
     if not _claude_is_running():
         return

@@ -156,6 +156,7 @@ def test_agent_wallet_authentication_service_error_is_retryable(monkeypatch):
         "Agent Wallet request failed: The authentication service is temporarily "
         "unavailable. Try again shortly."
     )
+    assert "agent-wallet configure" not in result.output
     assert '{"detail"' not in result.output
 
 
@@ -298,6 +299,7 @@ def test_list__returns_recent_payments(monkeypatch):
         [
             "--agent",
             "agent-wallet",
+            "payments",
             "list",
             "--limit",
             "25",
@@ -311,6 +313,25 @@ def test_list__returns_recent_payments(monkeypatch):
         "data": payments,
         "pagination": None,
     }
+
+
+def test_top_level_list__is_removed():
+    result = CliRunner().invoke(cli, ["agent-wallet", "list"])
+
+    assert result.exit_code == 2
+    assert "No such command 'list'" in result.output
+
+
+def test_payments__is_canonical_help_surface():
+    group_help = CliRunner().invoke(cli, ["agent-wallet", "--help"])
+    payments_help = CliRunner().invoke(cli, ["agent-wallet", "payments", "--help"])
+
+    assert group_help.exit_code == 0, group_help.output
+    assert payments_help.exit_code == 0, payments_help.output
+    assert "  payments " in group_help.output
+    assert "  list " not in group_help.output
+    assert "  list " in payments_help.output
+    assert "  cancel " in payments_help.output
 
 
 def test_list__requests_server_side_payment_history(monkeypatch):
@@ -346,7 +367,14 @@ def test_list__rejects_invalid_success_response(monkeypatch, response):
         AgentWalletClient().list_payments(10)
 
 
-def test_cancel__posts_operation_to_production_wallet(monkeypatch):
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(["payments", "cancel"], id="canonical"),
+        pytest.param(["cancel"], id="legacy"),
+    ],
+)
+def test_cancel__posts_operation_to_production_wallet(monkeypatch, command):
     operation_id = uuid4()
     response = {
         "payment_operation_id": str(operation_id),
@@ -365,7 +393,7 @@ def test_cancel__posts_operation_to_production_wallet(monkeypatch):
 
     result = CliRunner().invoke(
         cli,
-        ["--agent", "agent-wallet", "cancel", str(operation_id)],
+        ["--agent", "agent-wallet", *command, str(operation_id)],
     )
 
     assert result.exit_code == 0, result.output
@@ -723,7 +751,7 @@ def test_pay__shows_safe_retry_guidance(monkeypatch, payment_command, payment_ar
         f"ramp agent-wallet pay {payment_command} --payment-id {payment_id} ..."
         in result.output
     )
-    assert "ramp agent-wallet list --limit 10" in result.output
+    assert "ramp agent-wallet payments list --limit 10" in result.output
 
 
 def test_pay__omits_retry_guidance_from_agent_output(monkeypatch):
@@ -831,7 +859,7 @@ def test_pay__preserves_agent_wallet_client_error(monkeypatch):
     operation_id = UUID(captured["body"]["payment_operation_id"])
     assert f"Payment ID: {operation_id}" in result.output
     assert f"--payment-id {operation_id}" in result.output
-    assert "ramp agent-wallet list --limit 10" in result.output
+    assert "ramp agent-wallet payments list --limit 10" in result.output
 
 
 @pytest.mark.parametrize("response", [b"secret", b"[]", b"null"])
@@ -868,3 +896,23 @@ def test_pay__wallet_authorization_failure_uses_wallet_guidance(monkeypatch):
 
     with pytest.raises(AgentWalletAuthRequiredError, match="agent-wallet configure"):
         AgentWalletClient().pay({})
+
+
+def test_pay__auth_service_outage_uses_wallet_guidance(monkeypatch):
+    monkeypatch.setenv("RAMP_AGENT_WALLET_API_KEY", "wallet-key")
+    monkeypatch.setattr(
+        BearerTokenTransport,
+        "request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            ApiError(503, '{"detail":"Authentication service unavailable"}')
+        ),
+    )
+
+    with pytest.raises(AgentWalletClientError) as exc_info:
+        AgentWalletClient().pay({})
+
+    assert str(exc_info.value) == (
+        "Agent Wallet request failed: The authentication service is temporarily "
+        "unavailable. Make sure your Agent Wallet API key is configured — run: "
+        "ramp agent-wallet configure. Then try again shortly."
+    )

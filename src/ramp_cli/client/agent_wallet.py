@@ -23,6 +23,12 @@ AGENT_WALLET_API_KEY_ENV_VAR = "RAMP_AGENT_WALLET_API_KEY"
 AGENT_WALLET_BASE_URL = "https://wallet.ramp.com"
 
 
+def _is_authentication_service_unavailable(error: ApiError) -> bool:
+    return error.status_code == 503 and error.detail.rstrip(".").casefold() == (
+        "authentication service unavailable"
+    )
+
+
 class AgentWalletClientError(RampCLIError):
     """Agent Wallet routing or response validation failed."""
 
@@ -36,9 +42,7 @@ class AgentWalletApiError(ApiError):
         self.error_code = error.error_code
 
         detail = error.detail
-        if error.status_code == 503 and detail.rstrip(".").casefold() == (
-            "authentication service unavailable"
-        ):
+        if _is_authentication_service_unavailable(error):
             detail = (
                 "The authentication service is temporarily unavailable. "
                 "Try again shortly."
@@ -133,6 +137,13 @@ class AgentWalletClient:
         except ApiError as error:
             if error.status_code in {401, 403}:
                 raise AgentWalletAuthRequiredError() from error
+            if _is_authentication_service_unavailable(error):
+                raise AgentWalletClientError(
+                    "Agent Wallet request failed: The authentication service is "
+                    "temporarily unavailable. Make sure your Agent Wallet API key "
+                    "is configured — run: ramp agent-wallet configure. Then try "
+                    "again shortly."
+                ) from error
             raise
         try:
             payload = json.loads(response)

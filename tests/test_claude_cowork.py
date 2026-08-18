@@ -45,6 +45,28 @@ def test_gateway_base_url_removes_only_the_final_v1():
         claude_cowork.gateway_base_url("https://router.example:not-a-port/v1")
 
 
+def test_is_available_answers_quietly_instead_of_raising(monkeypatch):
+    # The configure picker calls this to decide whether Cowork is worth
+    # offering, so a host that cannot run the setup must produce False
+    # rather than the error preflight would raise.
+    monkeypatch.setattr(claude_cowork.sys, "platform", "linux")
+    assert claude_cowork.is_available() is False
+
+    monkeypatch.setattr(claude_cowork.sys, "platform", "darwin")
+    checked = {}
+
+    def run_quiet(command, *, timeout):
+        checked["command"] = command
+        return 1
+
+    monkeypatch.setattr(claude_cowork, "_run_quiet", run_quiet)
+    assert claude_cowork.is_available() is False
+    assert checked["command"] == ["open", "-Ra", "Claude"]
+
+    monkeypatch.setattr(claude_cowork, "_run_quiet", lambda *_a, **_k: 0)
+    assert claude_cowork.is_available() is True
+
+
 def test_successful_configuration_requests_a_fresh_cowork_session(
     cowork_host, monkeypatch
 ):

@@ -105,7 +105,7 @@ def _submit_payment(
             "To retry safely, reuse this payment ID:\n"
             f"  ramp agent-wallet pay {payment_command} --payment-id {payment_id} ...\n\n"
             "If the request times out or credentials are unavailable, first run:\n"
-            "  ramp agent-wallet list --limit 10\n"
+            "  ramp agent-wallet payments list --limit 10\n"
             "before creating a new payment.",
             err=True,
         )
@@ -172,7 +172,15 @@ def configure(ctx: click.Context, api_key: str | None) -> None:
         click.secho("✓ Agent Wallet configured", fg="green")
 
 
-@agent_wallet_group.command("list", short_help="List recent payments")
+@agent_wallet_group.group(
+    "payments",
+    short_help="Manage Agent Wallet payments",
+)
+def payments_group() -> None:
+    """List and cancel Agent Wallet payments."""
+
+
+@payments_group.command("list", short_help="List recent payments")
 @click.option(
     "--limit",
     type=click.IntRange(min=1, max=100),
@@ -187,15 +195,27 @@ def list_payments(ctx: click.Context, limit: int) -> None:
     _render(payments, ctx)
 
 
-@agent_wallet_group.command("cancel", short_help="Cancel a payment")
-@click.argument("payment_id", type=click.UUID)
-@click.pass_context
-def cancel_payment(ctx: click.Context, payment_id: UUID) -> None:
-    """Disable future authority for a payment."""
+def _cancel_payment(ctx: click.Context, payment_id: UUID) -> None:
     result = AgentWalletClient().cancel(payment_id)
     if result.get("payment_operation_id") != str(payment_id):
         raise AgentWalletClientError("Agent Wallet returned an invalid response")
     _render(result, ctx)
+
+
+@payments_group.command("cancel", short_help="Cancel a payment")
+@click.argument("payment_id", type=click.UUID)
+@click.pass_context
+def cancel_payment(ctx: click.Context, payment_id: UUID) -> None:
+    """Disable future authority for a payment."""
+    _cancel_payment(ctx, payment_id)
+
+
+@agent_wallet_group.command("cancel", short_help="Cancel a payment")
+@click.argument("payment_id", type=click.UUID)
+@click.pass_context
+def legacy_cancel_payment(ctx: click.Context, payment_id: UUID) -> None:
+    """Disable future authority for a payment."""
+    _cancel_payment(ctx, payment_id)
 
 
 @agent_wallet_group.group(

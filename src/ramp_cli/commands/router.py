@@ -87,6 +87,12 @@ CLIENT_EXECUTABLES = {
     "opencode": "opencode",
     "pi": "pi",
 }
+# Claude Cowork joins the configure and unconfigure pickers but stays out of
+# CLIENT_NAMES: it has no config file of its own, exists only on macOS, and is
+# set up through Claude Desktop's profile library rather than through the
+# config-path machinery the coding agents share.
+COWORK_CLIENT = "cowork"
+AGENT_NAMES = {**CLIENT_NAMES, COWORK_CLIENT: "Claude Cowork"}
 ArtifactClaim = Literal["create", "replace"]
 
 
@@ -535,9 +541,9 @@ def _profile_notice(results: list[dict], restore_clients: str) -> list[str]:
         "the default with Ramp Router.",
     ]
     escapes = [
-        result["original_setup_command"]
+        result.get("original_setup_command")
         for result in results
-        if result["original_setup_command"]
+        if result.get("original_setup_command")
     ]
     if escapes:
         lines += ["", "Run your previous setup at any time in parallel:"]
@@ -744,8 +750,18 @@ def _can_prompt(ctx: click.Context, fmt: str) -> bool:
 
 
 def _pick_installed_clients() -> tuple[str, ...]:
-    """Ask which coding agents to configure, with every agent preselected."""
+    """Ask which coding agents to configure, with every agent preselected.
+
+    Cowork is deliberately not a line here: it is Claude Desktop's side of
+    the same Claude setup, so choosing Claude Code offers it as a follow-up,
+    the way choosing Codex covers both the Codex CLI and the Codex app.
+    """
     candidates = _installed_clients()
+    if claude_cowork.is_available() and "claude-code" not in candidates:
+        # The Claude follow-up is the only interactive road to Cowork, so an
+        # available Cowork earns the Claude entry a place even where Claude
+        # Code itself was not detected.
+        candidates = (*candidates, "claude-code")
     if not candidates:
         # Offering nothing would end the command on a machine where detection
         # simply missed, and configuring an agent before installing it is a
@@ -762,17 +778,43 @@ def _pick_clients(message: str, candidates: tuple[str, ...]) -> tuple[str, ...]:
     selected = questionary.checkbox(
         message,
         choices=[
-            questionary.Choice(title=CLIENT_NAMES[client], value=client, checked=True)
+            questionary.Choice(title=AGENT_NAMES[client], value=client, checked=True)
             for client in candidates
         ],
-        validate=lambda answer: bool(answer) or "Select at least one coding agent.",
+        validate=lambda answer: bool(answer) or "Select at least one agent.",
         style=_PICKER_STYLE,
         pointer=_PICKER_POINTER,
-        instruction="(enter to confirm, space to toggle)",
+        instruction="(enter to confirm, space to toggle, a to toggle all)",
     ).ask()
     if selected is None:
         raise click.Abort()
     return tuple(selected)
+
+
+def _pick_claude_setup() -> tuple[str, ...]:
+    """Ask which Claude surfaces the picked Claude entry should cover.
+
+    Offered only where Cowork setup can succeed, and only for a selection
+    made through the picker: naming agents on the command line means exactly
+    those agents, with no follow-up questions.
+    """
+    selected = questionary.select(
+        "Which Claude apps should use Ramp Router?",
+        choices=[
+            questionary.Choice(
+                title="Claude Code + Claude Cowork (recommended)",
+                value=("claude-code", COWORK_CLIENT),
+            ),
+            questionary.Choice(title="Claude Code only", value=("claude-code",)),
+            questionary.Choice(title="Claude Cowork only", value=(COWORK_CLIENT,)),
+        ],
+        style=_PICKER_STYLE,
+        pointer=_PICKER_POINTER,
+        instruction="(enter to confirm)",
+    ).ask()
+    if selected is None:
+        raise click.Abort()
+    return selected
 
 
 def _pick_claude_models(current: str = "compact") -> str:
@@ -799,7 +841,8 @@ def router_group() -> None:
 
 @router_group.command(
     "configure-cowork",
-    help="Configure Claude Desktop Cowork to use Ramp Router (macOS)",
+    hidden=True,
+    help="Deprecated alias for 'ramp router configure cowork'.",
 )
 @click.option(
     "--setup-file",
@@ -827,123 +870,37 @@ def router_configure_cowork(
     api_key: str | None,
     no_browser: bool,
 ) -> None:
-    """Configure the host app Cowork itself cannot reach from its VM."""
-    api_key_source = ctx.get_parameter_source("api_key")
-    if (
-        setup_file is not None
-        and api_key is not None
-        and api_key_source is ParameterSource.COMMANDLINE
-    ):
-        raise click.UsageError("--setup-file cannot be combined with --api-key.")
-    if ctx.obj["no_input"] and setup_file is None and api_key is None:
-        raise click.UsageError(
-            "Pass --setup-file or --api-key when using non-interactive mode, "
-            f"or set {CONFIGURE_KEY_ENV} to keep the key out of shell history."
-        )
-
-    base_url = router_base_url()
-    browser_acquired_key = False
-    host_preflight_done = False
-    if setup_file is not None:
-        base_url, api_key = claude_cowork.read_setup_file(setup_file)
-    elif api_key is None:
-        # Fail before opening a browser or creating a key for a host where
-        # automatic Cowork configuration cannot succeed.
-        claude_cowork.preflight()
-        host_preflight_done = True
-        api_key = acquire_router_api_key(router_ui_url(), no_browser=no_browser)
-        browser_acquired_key = True
-    # Validate before discovery puts the bearer credential on the wire.
-    claude_cowork.gateway_base_url(base_url)
-    api_key = api_key.strip()
-    os.environ.pop(CONFIGURE_KEY_ENV, None)
-    if not api_key:
-        if api_key_source in {
-            ParameterSource.COMMANDLINE,
-            ParameterSource.ENVIRONMENT,
-        }:
-            raise click.BadParameter(
-                "cannot be empty", param_hint="'--api-key'"
-            ) from None
-        raise click.ClickException("Ramp Router did not return an API key.")
-    if not host_preflight_done:
-        claude_cowork.preflight()
-
-    fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
-    stop_spinner = (
-        start_spinner("Setting up Claude Cowork")
-        if fmt != "json" and not ctx.obj["quiet"]
-        else (lambda: None)
+    """Kept for scripts and muscle memory; Cowork now lives in configure."""
+    _run_configure(
+        ctx,
+        clients=(COWORK_CLIENT,),
+        setup_file=setup_file,
+        api_key=api_key,
+        no_browser=no_browser,
+        claude_models=None,
+        api_key_source=ctx.get_parameter_source("api_key"),
+        legacy_cowork_alias=True,
     )
-    try:
-        models = _fetch_models(
-            api_key,
-            gateway_client=claude_cowork.GATEWAY_CLIENT,
-            base_url=base_url,
-            wait_for_key=setup_file is not None or browser_acquired_key,
-        )
-        profile_path = claude_cowork.configure(api_key, base_url)
-        if setup_file is not None:
-            try:
-                setup_file.unlink()
-            except OSError as exc:
-                raise click.ClickException(
-                    f"Claude Cowork was configured, but the setup file "
-                    f"{setup_file} could not be deleted: {exc}"
-                ) from None
-    finally:
-        stop_spinner()
-
-    preferred = next(
-        (model for model in models if model.metadata.request_name == DEFAULT_MODEL),
-        models[0],
-    )
-    payload = {
-        "client": "claude-cowork",
-        "config_path": str(profile_path),
-        "provider": ROUTER_PROVIDER,
-        "recommended_model": preferred.id,
-        "models_available": len(models),
-        "setup_file_deleted": setup_file is not None,
-    }
-    if fmt == "json":
-        print_agent_json(payload, pagination=None)
-        return
-    model_label = "model" if len(models) == 1 else "models"
-    click.echo("Connected to: Claude Cowork")
-    click.echo(f"{len(models)} {model_label} discovered. Claude Desktop was restarted.")
-    preferred_label = (
-        preferred.metadata.display_name
-        or preferred.metadata.request_name
-        or preferred.id
-    )
-    click.echo(
-        f"Pick {preferred_label} in Cowork and send a message to verify the connection."
-    )
-    click.echo("Run 'ramp router unconfigure-cowork' to restore the previous setup.")
 
 
 @router_group.command(
     "unconfigure-cowork",
-    help="Remove Ramp Router from Claude Desktop Cowork (macOS)",
+    hidden=True,
+    help="Deprecated alias for 'ramp router unconfigure cowork'.",
 )
 @click.pass_context
 def router_unconfigure_cowork(ctx: click.Context) -> None:
-    claude_cowork.unconfigure()
-    fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
-    if fmt == "json":
-        print_agent_json({"client": "claude-cowork", "restored": True}, pagination=None)
-    else:
-        click.echo("Removed Ramp Router and restored Claude Cowork's previous setup.")
+    """Kept for scripts and muscle memory; Cowork now lives in unconfigure."""
+    _run_unconfigure(ctx, clients=(COWORK_CLIENT,), legacy_cowork_alias=True)
 
 
 @router_group.command(
     "configure",
-    help="Configure coding agents; omit agent names to choose interactively",
+    help="Configure coding agents and Claude Cowork; omit names to choose interactively",
 )
 @click.argument(
     "clients",
-    type=click.Choice(tuple(CLIENT_NAMES), case_sensitive=False),
+    type=click.Choice(tuple(AGENT_NAMES), case_sensitive=False),
     nargs=-1,
 )
 @click.option(
@@ -979,25 +936,88 @@ def router_configure(
     no_browser: bool,
     claude_models: str | None,
 ) -> None:
-    api_key_source = ctx.get_parameter_source("api_key")
+    _run_configure(
+        ctx,
+        clients=clients,
+        setup_file=setup_file,
+        api_key=api_key,
+        no_browser=no_browser,
+        claude_models=claude_models,
+        api_key_source=ctx.get_parameter_source("api_key"),
+    )
+
+
+def _run_configure(
+    ctx: click.Context,
+    *,
+    clients: tuple[str, ...],
+    setup_file: Path | None,
+    api_key: str | None,
+    no_browser: bool,
+    claude_models: str | None,
+    api_key_source: ParameterSource | None,
+    legacy_cowork_alias: bool = False,
+) -> None:
     if (
         setup_file is not None
         and api_key is not None
         and api_key_source is ParameterSource.COMMANDLINE
     ):
         raise click.UsageError("--setup-file cannot be combined with --api-key.")
+    # Click has already copied any configured value into api_key. Drop the
+    # secret from the environment before anything here spawns a child: the
+    # Cowork availability probe behind the picker, the host preflight, and
+    # Codex itself all inherit what this process still carries.
+    os.environ.pop(CONFIGURE_KEY_ENV, None)
+    if setup_file is None and api_key is not None:
+        # A flag- or environment-supplied key is known now, so an empty one
+        # is named as the invalid input before the picker draws, any host
+        # check runs, or any network work happens.
+        api_key = api_key.strip()
+        if not api_key:
+            raise click.BadParameter(
+                "cannot be empty", param_hint="'--api-key'"
+            ) from None
     all_clients = tuple(CLIENT_NAMES)
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     requested_clients = tuple(dict.fromkeys(clients))
+    picked_from_menu = False
     if not requested_clients and _can_prompt(ctx, fmt):
         requested_clients = _pick_installed_clients()
+        picked_from_menu = True
+    if (
+        picked_from_menu
+        and "claude-code" in requested_clients
+        and claude_cowork.is_available()
+    ):
+        # Claude, like Codex, is one entry covering more than one app. The
+        # Codex files serve its CLI and its desktop app at once, while the
+        # Claude side needs Cowork's own setup, so the picker's Claude choice
+        # asks which of the two Claude surfaces to cover.
+        claude_targets = _pick_claude_setup()
+        requested_clients = tuple(
+            dict.fromkeys(
+                expanded
+                for client in requested_clients
+                for expanded in (
+                    claude_targets if client == "claude-code" else (client,)
+                )
+            )
+        )
     clients = requested_clients or all_clients
-    if setup_file is not None and clients != ("codex",):
+    if setup_file is not None and clients not in {("codex",), (COWORK_CLIENT,)}:
         raise click.UsageError(
             "--setup-file currently requires exactly one agent: "
-            "'ramp router configure codex --setup-file FILE'."
+            "'ramp router configure codex --setup-file FILE' or "
+            "'ramp router configure cowork --setup-file FILE'."
         )
-    if claude_models is not None and clients != ("claude-code",):
+    if (
+        claude_models is not None
+        and clients != ("claude-code",)
+        and not (picked_from_menu and "claude-code" in clients)
+    ):
+        # A picker selection that grew through the Claude follow-up still
+        # has exactly one Claude Code for the option to describe.
         raise click.UsageError(
             "--claude-models requires exactly one agent: "
             "'ramp router configure claude-code --claude-models compact|all'."
@@ -1064,37 +1084,54 @@ def router_configure(
     restore_clients = (
         "" if clients == all_clients else "".join(f" {client}" for client in clients)
     )
-    agent_label = "coding agent" if len(clients) == 1 else "coding agents"
+    target_phrase = (
+        "Claude Cowork"
+        if clients == (COWORK_CLIENT,)
+        else "your coding agent"
+        if len(clients) == 1
+        else "your coding agents"
+    )
     if fmt != "json":
-        click.echo(f"Connecting Ramp Router to your {agent_label}")
+        click.echo(f"Connecting Ramp Router to {target_phrase}")
     base_url = router_base_url()
     browser_acquired_key = False
     if setup_file is not None:
+        # Parsed before the host check so a malformed file is classified as
+        # the invalid input even where Cowork setup cannot run at all.
         base_url, api_key = claude_cowork.read_setup_file(setup_file)
-    elif api_key is None and _can_prompt(ctx, fmt):
+    if COWORK_CLIENT in clients:
+        # Reject a Router endpoint Cowork cannot safely call before the host
+        # check runs: what the user got wrong outranks what the host lacks,
+        # and both come before discovery puts the credential on the wire.
+        claude_cowork.gateway_base_url(base_url)
+        # Fail before a browser opens, a key is created, or discovery puts the
+        # credential on the wire for a host where Cowork setup cannot succeed.
+        claude_cowork.preflight()
+    if setup_file is None and api_key is None and _can_prompt(ctx, fmt):
         api_key = _pick_stored_router_api_key()
     if setup_file is None and api_key is None:
         api_key = acquire_router_api_key(router_ui_url(), no_browser=no_browser)
         browser_acquired_key = True
     api_key = api_key.strip()
-    # Click has already copied the configured value into api_key. Do not leave
-    # the secret in the environment inherited by Codex or any other child.
-    os.environ.pop(CONFIGURE_KEY_ENV, None)
     if not api_key:
-        raise click.UsageError("The API key cannot be empty.")
-
+        # A user-supplied key was validated above, so what is empty here came
+        # back from browser setup, a stored credential, or a setup file.
+        raise click.ClickException("Ramp Router did not return an API key.")
     results = []
     failures = []
+    cowork_note = None
     # Everything from here to the summary is silent work against the network
     # and each agent's files, so it is the stretch that needs to look alive.
     stop_spinner = (
-        start_spinner(f"Setting up your {agent_label}")
-        if fmt != "json"
+        start_spinner(f"Setting up {target_phrase}")
+        if fmt != "json" and not ctx.obj["quiet"]
         else (lambda: None)
     )
     try:
         models_by_client: dict[str, list[RouterModel]] = {}
-        standard_clients = tuple(item for item in clients if item != "claude-code")
+        standard_clients = tuple(
+            item for item in clients if item not in ("claude-code", COWORK_CLIENT)
+        )
         if standard_clients:
             models = _fetch_models(
                 api_key,
@@ -1102,6 +1139,15 @@ def router_configure(
                 wait_for_key=setup_file is not None or browser_acquired_key,
             )
             models_by_client.update(dict.fromkeys(standard_clients, models))
+        if COWORK_CLIENT in clients:
+            # Cowork accepts the ids from its own projection, same as every
+            # other client, so discovery asks for that projection by name.
+            models_by_client[COWORK_CLIENT] = _fetch_models(
+                api_key,
+                gateway_client=claude_cowork.GATEWAY_CLIENT,
+                base_url=base_url,
+                wait_for_key=setup_file is not None or browser_acquired_key,
+            )
         if "claude-code" in clients:
             # The --claude-models choice is a presentation preference for
             # Claude Code's own picker; it is honored below by what gets
@@ -1121,6 +1167,44 @@ def router_configure(
             )
         for item in clients:
             models = models_by_client[item]
+            if item == COWORK_CLIENT:
+                try:
+                    profile_path = claude_cowork.configure(api_key, base_url)
+                except click.ClickException as exc:
+                    failures.append(f"{AGENT_NAMES[item]}: {exc.message}")
+                    continue
+                preferred = next(
+                    (
+                        model
+                        for model in models
+                        if model.metadata.request_name == DEFAULT_MODEL
+                    ),
+                    models[0],
+                )
+                preferred_label = (
+                    preferred.metadata.display_name
+                    or preferred.metadata.request_name
+                    or preferred.id
+                )
+                cowork_note = (
+                    "Claude Desktop was restarted. "
+                    f"Pick {preferred_label} in Cowork and send a message to "
+                    "verify the connection."
+                )
+                results.append(
+                    {
+                        "client": item,
+                        "config_path": str(profile_path),
+                        "provider": ROUTER_PROVIDER,
+                        # Cowork keeps its own model selection, so configure
+                        # recommends a starting model rather than claiming to
+                        # have set a default.
+                        "recommended_model": preferred.id,
+                        "models_available": len(models),
+                        "setup_file_deleted": setup_file is not None,
+                    }
+                )
+                continue
             try:
                 configure_options = {"base_url": base_url}
                 if item == "claude-code":
@@ -1132,7 +1216,7 @@ def router_configure(
                     **configure_options,
                 )
             except click.ClickException as exc:
-                failures.append(f"{CLIENT_NAMES[item]}: {exc.message}")
+                failures.append(f"{AGENT_NAMES[item]}: {exc.message}")
                 continue
             result = {
                 "client": item,
@@ -1150,8 +1234,8 @@ def router_configure(
                 setup_file.unlink()
             except OSError as exc:
                 raise click.ClickException(
-                    f"Codex was configured, but the setup file {setup_file} "
-                    f"could not be deleted: {exc}"
+                    f"{AGENT_NAMES[clients[0]]} was configured, but the setup "
+                    f"file {setup_file} could not be deleted: {exc}"
                 ) from None
     finally:
         # Stopped on the way out too, so a failed key does not leave the
@@ -1167,17 +1251,27 @@ def router_configure(
             if len(requested_clients) == 1 and results
             else {"clients": results}
         )
+        if legacy_cowork_alias and results:
+            # The deprecated alias is kept precisely for existing scripts, so
+            # it keeps answering with the client name those scripts parse.
+            payload = {**payload, "client": claude_cowork.GATEWAY_CLIENT}
         print_agent_json(payload, pagination=None)
     elif not failures:
         connected_names = _human_join(
-            [CLIENT_NAMES[result["client"]] for result in results]
+            [AGENT_NAMES[result["client"]] for result in results]
         )
         model_count = results[0]["models_available"]
         model_label = "model" if model_count == 1 else "models"
         click.echo(f"Connected to: {connected_names}")
-        click.echo(
-            f"{model_count} {model_label} added. Start an agent and pick a model."
-        )
+        if all(result["client"] == COWORK_CLIENT for result in results):
+            # Cowork keeps its own model selection, so nothing was "added".
+            click.echo(f"{model_count} {model_label} discovered.")
+        else:
+            click.echo(
+                f"{model_count} {model_label} added. Start an agent and pick a model."
+            )
+        if cowork_note:
+            click.echo(cowork_note)
         remaining_credits = _fetch_remaining_credits(api_key, base_url=base_url)
         if remaining_credits is not None:
             click.echo(
@@ -1547,15 +1641,24 @@ def _resolve_subagent_model(value: str, models: list[RouterModel], flag: str) ->
 
 @router_group.command(
     "unconfigure",
-    help="Restore coding agents; omit agent names to choose interactively",
+    help="Restore coding agents and Claude Cowork; omit names to choose interactively",
 )
 @click.argument(
     "clients",
-    type=click.Choice(tuple(CLIENT_NAMES), case_sensitive=False),
+    type=click.Choice(tuple(AGENT_NAMES), case_sensitive=False),
     nargs=-1,
 )
 @click.pass_context
 def router_unconfigure(ctx: click.Context, clients: tuple[str, ...]) -> None:
+    _run_unconfigure(ctx, clients=clients)
+
+
+def _run_unconfigure(
+    ctx: click.Context,
+    *,
+    clients: tuple[str, ...],
+    legacy_cowork_alias: bool = False,
+) -> None:
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     requested_clients = tuple(dict.fromkeys(clients))
     if not requested_clients and _can_prompt(ctx, fmt):
@@ -1564,22 +1667,51 @@ def router_unconfigure(ctx: click.Context, clients: tuple[str, ...]) -> None:
         # exist. With none, the list would be empty and the command falls
         # through to saying Router is not configured anywhere.
         configured = _clients_with_a_receipt()
+        if claude_cowork.state_path().exists():
+            # A Cowork receipt is the same kind of evidence: this CLI set
+            # Cowork up, so removing that setup is a meaningful choice.
+            configured = (*configured, COWORK_CLIENT)
         if configured:
             requested_clients = _pick_clients(
                 "Which coding agents do you want to remove Ramp Router from?",
                 configured,
             )
+    # A run that names no agents keeps meaning the coding agents, exactly as
+    # it does for configure: Cowork restarts Claude Desktop, so it is removed
+    # only when picked or named. This also keeps every previously generated
+    # "run 'ramp router unconfigure'" recovery hint meaning what it meant
+    # when it was printed.
     clients = requested_clients or tuple(CLIENT_NAMES)
-    agent_label = "coding agent" if len(clients) == 1 else "coding agents"
+    target_phrase = (
+        "Claude Cowork"
+        if clients == (COWORK_CLIENT,)
+        else "your coding agent"
+        if len(clients) == 1
+        else "your coding agents"
+    )
     results = []
     failures = []
     stop_spinner = (
-        start_spinner(f"Restoring your {agent_label}")
-        if fmt != "json"
+        start_spinner(f"Restoring {target_phrase}")
+        if fmt != "json" and not ctx.obj["quiet"]
         else (lambda: None)
     )
     try:
         for item in clients:
+            if item == COWORK_CLIENT:
+                try:
+                    claude_cowork.unconfigure()
+                except click.ClickException as exc:
+                    failures.append(f"{AGENT_NAMES[item]}: {exc.message}")
+                    continue
+                results.append(
+                    {
+                        "client": item,
+                        "config_path": str(claude_cowork.state_path()),
+                        "removed": True,
+                    }
+                )
+                continue
             path = _client_config_path(item)
             if (
                 not requested_clients
@@ -1589,7 +1721,7 @@ def router_unconfigure(ctx: click.Context, clients: tuple[str, ...]) -> None:
             try:
                 _unconfigure_client(item, path)
             except click.ClickException as exc:
-                failures.append(f"{CLIENT_NAMES[item]}: {exc.message}")
+                failures.append(f"{AGENT_NAMES[item]}: {exc.message}")
                 continue
             results.append({"client": item, "config_path": str(path), "removed": True})
     finally:
@@ -1600,20 +1732,27 @@ def router_unconfigure(ctx: click.Context, clients: tuple[str, ...]) -> None:
     if failures and fmt == "json":
         raise click.ClickException("Could not unconfigure " + "; ".join(failures))
     if fmt == "json":
-        payload = (
-            results[0]
-            if len(requested_clients) == 1 and results
-            else {"clients": results}
-        )
+        if legacy_cowork_alias and results:
+            # The deprecated alias is kept precisely for existing scripts, so
+            # it keeps answering with the payload those scripts parse.
+            payload = {"client": claude_cowork.GATEWAY_CLIENT, "restored": True}
+        else:
+            payload = (
+                results[0]
+                if len(requested_clients) == 1 and results
+                else {"clients": results}
+            )
         print_agent_json(payload, pagination=None)
     elif results:
         restored_names = _human_join(
-            [CLIENT_NAMES[result["client"]] for result in results]
+            [AGENT_NAMES[result["client"]] for result in results]
         )
         click.echo(
             "Removed Ramp Router and restored your previous settings for: "
             f"{restored_names}."
         )
+        if any(result["client"] == COWORK_CLIENT for result in results):
+            click.echo("Claude Desktop was restarted.")
     if failures:
         raise click.ClickException("Could not unconfigure " + "; ".join(failures))
 
