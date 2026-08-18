@@ -7,8 +7,10 @@ import io
 import json
 import os
 import sqlite3
+import stat
 import subprocess
 import tomllib
+from decimal import Decimal
 
 import click
 import httpx
@@ -21,6 +23,7 @@ from ramp_cli import claude_cowork
 from ramp_cli.commands import claude_code
 from ramp_cli.commands.router import DEFAULT_ROUTER_BASE_URL as ROUTER_BASE_URL
 from ramp_cli.main import cli
+from ramp_cli.router_integrations.codex_cost_hook import CODEX_COST_HOOK_SCRIPT
 
 
 @pytest.fixture(autouse=True)
@@ -53,8 +56,14 @@ def _router_metadata(identifier, **overrides):
     return metadata
 
 
+_COST_HOOK_SCRIPT = CODEX_COST_HOOK_SCRIPT
+
+
 def _mock_models(
-    monkeypatch, models=None, key="router-secret", base_url=ROUTER_BASE_URL
+    monkeypatch,
+    models=None,
+    key="router-secret",
+    base_url=ROUTER_BASE_URL,
 ):
     models = models or [{"id": "gpt-5.4"}]
     models = [
@@ -65,6 +74,10 @@ def _mock_models(
         if url.endswith("/claude-code-statusline"):
             # The status line asset has its own tests in test_claude_code.py;
             # here it is simply unavailable, so configure skips it.
+            return httpx.Response(404, request=httpx.Request("GET", url))
+        if url.endswith("/session-usage/usage/balance"):
+            # The credits line has its own tests; here the endpoint is simply
+            # unavailable, so configure skips the line.
             return httpx.Response(404, request=httpx.Request("GET", url))
         assert url == f"{base_url}/models"
         assert headers["Authorization"] == f"Bearer {key}"
@@ -245,7 +258,13 @@ def test_configure_codex_consumes_the_setup_file_and_pins_the_live_catalog(
     codex_home = tmp_path / "codex"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     monkeypatch.setenv(router_module.CONFIGURE_KEY_ENV, "ambient-secret")
-    monkeypatch.setattr(router_module.shutil, "which", lambda _name: None)
+    # No codex binary to interrogate, but python3 stays so the cost hook
+    # install runs and keeps the agent-mode JSON below free of skip notices.
+    monkeypatch.setattr(
+        router_module.shutil,
+        "which",
+        lambda name: "/usr/bin/python3" if name == "python3" else None,
+    )
     setup_file = tmp_path / "ramp-router-setup-codex123.json"
     setup_file.write_text(
         json.dumps(
@@ -290,6 +309,85 @@ def test_configure_codex_consumes_the_setup_file_and_pins_the_live_catalog(
     ] == ["router-model-a", "router-model-b"]
     payload = json.loads(result.output)["data"][0]
     assert payload["setup_file_deleted"] is True
+
+
+def test_configure_setup_file_keeps_discovery_and_credits_on_its_router(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    setup_file = tmp_path / "ramp-router-setup-custom.json"
+    setup_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "name": "Ramp Router",
+                "base_url": "https://router.example/v1",
+                "api_key": "custom-secret",
+            }
+        )
+    )
+    requests = []
+
+    def get(url, *, headers, timeout):
+        requests.append((url, headers))
+        if url.endswith("/models"):
+            models = [
+                {
+                    "id": "gpt-5.6-sol",
+                    "router": _router_metadata("gpt-5.6-sol"),
+                }
+            ]
+            if headers.get("X-Gateway-Client") == "codex":
+                return httpx.Response(
+                    200,
+                    json={
+                        "models": [
+                            {
+                                "slug": "gpt-5.6-sol",
+                                "display_name": "GPT-5.6 Sol",
+                                "base_instructions": "",
+                            }
+                        ]
+                    },
+                    request=httpx.Request("GET", url),
+                )
+            return httpx.Response(
+                200,
+                json={"data": models},
+                request=httpx.Request("GET", url),
+            )
+        if url.endswith("/session-usage/usage/balance"):
+            return httpx.Response(
+                200,
+                json=_balance_payload("12.34"),
+                request=httpx.Request("GET", url),
+            )
+        return httpx.Response(404, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(router_module.httpx, "get", get)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure",
+            "codex",
+            "--setup-file",
+            str(setup_file),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Router credits remaining: $12.34" in result.output
+    authenticated_urls = [
+        url for url, headers in requests if "Authorization" in headers
+    ]
+    assert authenticated_urls == [
+        "https://router.example/v1/models",
+        "https://router.example/v1/models",
+        "https://router.example/session-usage/usage/balance",
+    ]
 
 
 def test_configure_codex_keeps_the_setup_file_when_configuration_fails(
@@ -902,13 +1000,15 @@ def test_refresh_does_not_add_subagent_overrides(tmp_path, monkeypatch):
     assert not set(claude_code.SUBAGENT_ENV_KEYS) & environment.keys()
 
 
-def test_configure_claude_fetches_only_its_model_projection(tmp_path, monkeypatch):
+def test_configure_claude_fetches_exhaustive_view_but_writes_compact(
+    tmp_path, monkeypatch
+):
     claude_home = tmp_path / "claude"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
     requests = []
 
     def get(url, *, headers, timeout):
-        requests.append(headers)
+        requests.append((url, headers))
         return httpx.Response(
             200,
             json={
@@ -931,14 +1031,22 @@ def test_configure_claude_fetches_only_its_model_projection(tmp_path, monkeypatc
     )
 
     assert configured.exit_code == 0, configured.output
-    # The status line download shares the mocked transport; only the
-    # authenticated model fetch matters here.
-    assert [headers for headers in requests if "Authorization" in headers] == [
+    # The status line download and the credits fetch share the mocked
+    # transport; only the authenticated model fetch matters here. The fetch
+    # asks for the exhaustive view even though the user kept the compact
+    # picker: the compact view can omit callable models, and the default model
+    # must be chosen from everything the key can call.
+    assert [headers for url, headers in requests if url.endswith("/models")] == [
         {
             "Authorization": "Bearer router-secret",
             "X-Gateway-Client": "claude-code",
+            "X-Gateway-Model-View": "all",
         }
     ]
+    # The picker preference is Claude Code's, not the fetch's: a compact
+    # configure leaves the settings without the expanded-view header.
+    environment = json.loads((claude_home / "settings.json").read_text())["env"]
+    assert "X-Gateway-Model-View" not in environment.get("ANTHROPIC_CUSTOM_HEADERS", "")
 
 
 def test_configure_claude_all_models_sets_wire_header(tmp_path, monkeypatch):
@@ -947,7 +1055,7 @@ def test_configure_claude_all_models_sets_wire_header(tmp_path, monkeypatch):
     requests = []
 
     def get(url, *, headers, timeout):
-        requests.append(headers)
+        requests.append((url, headers))
         return httpx.Response(
             200,
             json={"data": [{"id": "claude-router-a", "router": _router_metadata("a")}]},
@@ -970,7 +1078,7 @@ def test_configure_claude_all_models_sets_wire_header(tmp_path, monkeypatch):
     )
 
     assert configured.exit_code == 0, configured.output
-    assert [headers for headers in requests if "Authorization" in headers] == [
+    assert [headers for url, headers in requests if url.endswith("/models")] == [
         {
             "Authorization": "Bearer router-secret",
             "X-Gateway-Client": "claude-code",
@@ -985,7 +1093,7 @@ def test_configure_claude_all_models_sets_wire_header(tmp_path, monkeypatch):
     requests.clear()
     refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
     assert refreshed.exit_code == 0, refreshed.output
-    assert [headers for headers in requests if "Authorization" in headers] == [
+    assert [headers for url, headers in requests if url.endswith("/models")] == [
         {
             "Authorization": "Bearer router-secret",
             "X-Gateway-Client": "claude-code",
@@ -2176,6 +2284,469 @@ base_url = "https://stale.example.com"
     assert "https://stale.example.com" not in config_path.read_text()
 
 
+def _cost_hook_groups(codex_home):
+    config = tomllib.loads((codex_home / "config.toml").read_text())
+    hooks = config.get("hooks", {})
+    return hooks.get("Stop", [])
+
+
+def test_configure_codex_installs_the_cost_hook(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+
+    assert result.exit_code == 0, result.output
+    hook = codex_home / "codex-cost-hook"
+    assert hook.read_text() == _COST_HOOK_SCRIPT
+    assert hook.stat().st_mode & stat.S_IXUSR
+    groups = _cost_hook_groups(codex_home)
+    assert len(groups) == 1
+    (entry,) = groups[0]["hooks"]
+    assert entry["type"] == "command"
+    # The key is read at run time from the private file, never inline.
+    assert str(codex_home / "ramp-router-key") in entry["command"]
+    assert "router-secret" not in entry["command"]
+    assert "ROUTER_BASE_URL=https://router.ramp.com" in entry["command"]
+    assert entry["command"].endswith(str(hook))
+    state = json.loads((codex_home / "ramp-router-state.json").read_text())
+    assert state["cost_hook_managed"] is True
+
+
+def test_a_repeat_configure_keeps_one_cost_hook_beside_the_users_hooks(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    theirs = '[[hooks.Stop]]\nhooks = [{ type = "command", command = "/home/me/notify.sh" }]\n'
+    (codex_home / "config.toml").write_text(theirs)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+
+    for _ in range(2):
+        result = runner.invoke(
+            cli,
+            ["--human", "router", "configure", "codex", "--api-key", "router-secret"],
+        )
+        assert result.exit_code == 0, result.output
+
+    groups = _cost_hook_groups(codex_home)
+    commands = [group["hooks"][0]["command"] for group in groups]
+    assert commands.count("/home/me/notify.sh") == 1
+    assert sum("codex-cost-hook" in command for command in commands) == 1
+
+
+def test_a_repeat_configure_keeps_the_release_pinned_cost_hook(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    first = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert first.exit_code == 0, first.output
+
+    fixed = "#!/usr/bin/env python3\nprint('fixed')\n"
+    (codex_home / "codex-cost-hook").write_text(fixed)
+    refreshed = runner.invoke(cli, ["--human", "router", "refresh"])
+
+    assert refreshed.exit_code == 0, refreshed.output
+    assert (codex_home / "codex-cost-hook").read_text() == CODEX_COST_HOOK_SCRIPT
+
+
+def test_configure_never_fetches_an_executable_codex_hook(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    # The shared mock rejects unknown URLs, including the old executable asset
+    # endpoint. The installed script must come from this ramp-cli release.
+    _mock_models(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (codex_home / "codex-cost-hook").read_text() == CODEX_COST_HOOK_SCRIPT
+    assert len(_cost_hook_groups(codex_home)) == 1
+
+
+def test_a_missing_python3_skips_the_cost_hook(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    monkeypatch.setattr(router_module.shutil, "which", lambda name: None)
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "python3 was not found" in result.output
+    assert not (codex_home / "codex-cost-hook").exists()
+    assert _cost_hook_groups(codex_home) == []
+
+
+def test_a_manual_cost_hook_registration_is_not_duplicated(tmp_path, monkeypatch):
+    # The exploded spelling already answers Stop; a second group would too.
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    manual = (
+        "[[hooks.Stop]]\n"
+        "[[hooks.Stop.hooks]]\n"
+        'type = "command"\n'
+        'command = "~/.codex/codex-cost-hook"\n'
+    )
+    (codex_home / "config.toml").write_text(manual)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+
+    assert result.exit_code == 0, result.output
+    config_text = (codex_home / "config.toml").read_text()
+    assert 'command = "~/.codex/codex-cost-hook"' in config_text
+    assert "ROUTER_API_KEY" not in config_text
+    groups = _cost_hook_groups(codex_home)
+    assert (
+        sum("codex-cost-hook" in group["hooks"][0]["command"] for group in groups) == 1
+    )
+    # The script itself still refreshes so the manual setup gets fixes too.
+    assert (codex_home / "codex-cost-hook").read_text() == _COST_HOOK_SCRIPT
+
+
+_SHARED_STOP_GROUP = (
+    "[[hooks.Stop]]\n"
+    'hooks = [{ type = "command", command = "/home/me/notify.sh" }, '
+    '{ type = "command", command = "~/.codex/codex-cost-hook" }]\n'
+)
+
+
+def test_a_shared_stop_group_is_preserved_verbatim(tmp_path, monkeypatch):
+    # A group carrying the user's own hooks beside the cost hook is theirs.
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(_SHARED_STOP_GROUP)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+
+    assert result.exit_code == 0, result.output
+    config_text = (codex_home / "config.toml").read_text()
+    assert _SHARED_STOP_GROUP.strip() in config_text
+    # The preserved group already answers Stop; nothing is appended.
+    assert "ROUTER_API_KEY" not in config_text
+    groups = _cost_hook_groups(codex_home)
+    assert len(groups) == 1
+    # The script itself still refreshes so the shared setup gets fixes too.
+    assert (codex_home / "codex-cost-hook").read_text() == _COST_HOOK_SCRIPT
+
+
+def test_unconfigure_leaves_a_shared_stop_group_and_its_script(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(_SHARED_STOP_GROUP)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert configured.exit_code == 0, configured.output
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert removed.exit_code == 0, removed.output
+    assert _SHARED_STOP_GROUP.strip() in (codex_home / "config.toml").read_text()
+    # The user's group still runs the script, so the file stays.
+    assert (codex_home / "codex-cost-hook").exists()
+
+
+def test_a_solo_handwritten_cost_hook_group_is_replaced_in_place(tmp_path, monkeypatch):
+    # A solo cost-hook group is upgraded in place rather than duplicated.
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    solo = (
+        "[[hooks.Stop]]\n"
+        'hooks = [{ type = "command", command = "~/.codex/codex-cost-hook" }]\n'
+    )
+    (codex_home / "config.toml").write_text(solo)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+
+    assert configured.exit_code == 0, configured.output
+    groups = _cost_hook_groups(codex_home)
+    assert len(groups) == 1
+    (entry,) = groups[0]["hooks"]
+    assert str(codex_home / "ramp-router-key") in entry["command"]
+    assert (
+        'command = "~/.codex/codex-cost-hook"'
+        not in (codex_home / "config.toml").read_text()
+    )
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert removed.exit_code == 0, removed.output
+    assert _cost_hook_groups(codex_home) == []
+    assert not (codex_home / "codex-cost-hook").exists()
+
+
+def test_a_wrapper_hook_that_resembles_the_script_is_not_claimed(tmp_path, monkeypatch):
+    # The user's own script merely contains the managed name.
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    wrapper = (
+        "[[hooks.Stop]]\n"
+        'hooks = [{ type = "command", command = "/home/me/codex-cost-hook-wrapper" }]\n'
+    )
+    (codex_home / "config.toml").write_text(wrapper)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+
+    assert configured.exit_code == 0, configured.output
+    assert wrapper.strip() in (codex_home / "config.toml").read_text()
+    groups = _cost_hook_groups(codex_home)
+    commands = [group["hooks"][0]["command"] for group in groups]
+    assert commands.count("/home/me/codex-cost-hook-wrapper") == 1
+    # The wrapper is not a registration, so the real one is appended beside it.
+    assert sum(str(codex_home / "codex-cost-hook") in item for item in commands) == 1
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert removed.exit_code == 0, removed.output
+    groups = _cost_hook_groups(codex_home)
+    # Only the managed group is removed; the file-deletion guard errs broad.
+    assert [group["hooks"][0]["command"] for group in groups] == [
+        "/home/me/codex-cost-hook-wrapper"
+    ]
+    assert (codex_home / "codex-cost-hook").exists()
+
+
+def test_a_hook_passing_the_script_to_another_program_is_not_claimed(
+    tmp_path, monkeypatch
+):
+    # backup-tool references the script without executing it.
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    reference = (
+        "[[hooks.Stop]]\n"
+        'hooks = [{ type = "command", command = "backup-tool ~/.codex/codex-cost-hook" }]\n'
+    )
+    (codex_home / "config.toml").write_text(reference)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+
+    assert configured.exit_code == 0, configured.output
+    assert reference.strip() in (codex_home / "config.toml").read_text()
+    groups = _cost_hook_groups(codex_home)
+    commands = [group["hooks"][0]["command"] for group in groups]
+    assert commands.count("backup-tool ~/.codex/codex-cost-hook") == 1
+    assert (
+        sum(item.endswith(str(codex_home / "codex-cost-hook")) for item in commands)
+        == 1
+    )
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert removed.exit_code == 0, removed.output
+    assert reference.strip() in (codex_home / "config.toml").read_text()
+    assert (codex_home / "codex-cost-hook").exists()
+
+
+def test_command_runs_cost_hook_identifies_the_executable(tmp_path):
+    runs = router_module._command_runs_cost_hook
+    assert runs("~/.codex/codex-cost-hook")
+    assert runs(router_module._codex_cost_hook_command(tmp_path / ".codex"))
+    # env wrappers and their assignments are skipped through.
+    assert runs("env ROUTER_API_KEY=key ~/.codex/codex-cost-hook")
+    assert runs("/usr/bin/env ~/.codex/codex-cost-hook")
+    # An unparsed env option bails out as not-ours.
+    assert not runs("env -i ~/.codex/codex-cost-hook")
+    assert not runs("env")
+    # References are not executions, env-wrapped or not.
+    assert not runs("backup-tool ~/.codex/codex-cost-hook")
+    assert not runs("env backup-tool ~/.codex/codex-cost-hook")
+    assert not runs("/home/me/codex-cost-hook-wrapper")
+    # Nothing after the assignments, or nothing readable, is not ours.
+    assert not runs("ROUTER_BASE_URL=https://router.ramp.com")
+    assert not runs("")
+    assert not runs("'unbalanced")
+
+
+def test_an_env_wrapped_solo_registration_is_owned(tmp_path, monkeypatch):
+    # env plus assignments still executes the script, so the solo group is
+    # replaced in place rather than duplicated.
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    solo = (
+        "[[hooks.Stop]]\n"
+        'hooks = [{ type = "command", '
+        'command = "env ROUTER_API_KEY=key ~/.codex/codex-cost-hook" }]\n'
+    )
+    (codex_home / "config.toml").write_text(solo)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+
+    assert configured.exit_code == 0, configured.output
+    groups = _cost_hook_groups(codex_home)
+    assert len(groups) == 1
+    (entry,) = groups[0]["hooks"]
+    assert str(codex_home / "ramp-router-key") in entry["command"]
+    assert "env ROUTER_API_KEY=key" not in (codex_home / "config.toml").read_text()
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert removed.exit_code == 0, removed.output
+    assert _cost_hook_groups(codex_home) == []
+
+
+def test_an_env_option_hook_is_preserved_as_the_users(tmp_path, monkeypatch):
+    # env options are not parsed, so the group is conservatively unrecognized.
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    optioned = (
+        "[[hooks.Stop]]\n"
+        'hooks = [{ type = "command", command = "env -i ~/.codex/codex-cost-hook" }]\n'
+    )
+    (codex_home / "config.toml").write_text(optioned)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert optioned.strip() in (codex_home / "config.toml").read_text()
+    groups = _cost_hook_groups(codex_home)
+    commands = [group["hooks"][0]["command"] for group in groups]
+    assert commands.count("env -i ~/.codex/codex-cost-hook") == 1
+    # Unrecognized also means not registered, so the managed entry is added.
+    assert (
+        sum(item.endswith(str(codex_home / "codex-cost-hook")) for item in commands)
+        == 1
+    )
+
+
+def test_an_inline_hooks_table_skips_cost_hook_registration(tmp_path, monkeypatch):
+    # An inline Stop array cannot take another [[hooks.Stop]] group.
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    inline = (
+        "[hooks]\n"
+        'Stop = [{ hooks = [{ type = "command", command = "/home/me/notify.sh" }] }]\n'
+    )
+    (codex_home / "config.toml").write_text(inline)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Skipping the Codex Router cost hook" in result.output
+    groups = _cost_hook_groups(codex_home)
+    assert [group["hooks"][0]["command"] for group in groups] == ["/home/me/notify.sh"]
+
+
+def test_unconfigure_removes_the_cost_hook(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    theirs = '[[hooks.Stop]]\nhooks = [{ type = "command", command = "/home/me/notify.sh" }]\n'
+    (codex_home / "config.toml").write_text(theirs)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert configured.exit_code == 0, configured.output
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert removed.exit_code == 0, removed.output
+    assert not (codex_home / "codex-cost-hook").exists()
+    groups = _cost_hook_groups(codex_home)
+    # The user's own Stop hook survives; only the managed group is removed.
+    assert [group["hooks"][0]["command"] for group in groups] == ["/home/me/notify.sh"]
+
+
+def test_unconfigure_keeps_a_cost_hook_a_manual_registration_still_runs(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    manual = (
+        "[[hooks.Stop]]\n"
+        "[[hooks.Stop.hooks]]\n"
+        'type = "command"\n'
+        'command = "~/.codex/codex-cost-hook"\n'
+    )
+    (codex_home / "config.toml").write_text(manual)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert configured.exit_code == 0, configured.output
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert removed.exit_code == 0, removed.output
+    # The user's registration still points at the script, so the file stays.
+    assert (codex_home / "codex-cost-hook").exists()
+    assert (
+        'command = "~/.codex/codex-cost-hook"'
+        in (codex_home / "config.toml").read_text()
+    )
+
+
+def test_the_cost_hook_uses_the_overridden_router_origin(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("RAMP_ROUTER_BASE_URL", "http://router.example/v1")
+    _mock_models(monkeypatch, base_url="http://router.example/v1")
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+
+    assert result.exit_code == 0, result.output
+    (group,) = _cost_hook_groups(codex_home)
+    # A base-URL override names a single-origin deployment.
+    assert "ROUTER_BASE_URL=http://router.example" in group["hooks"][0]["command"]
+
+
 def test_unconfigure_restores_previous_codex_settings(tmp_path, monkeypatch):
     codex_home = tmp_path / "codex"
     codex_home.mkdir()
@@ -2919,6 +3490,10 @@ def test_configure_waits_for_a_browser_created_key_to_reach_the_data_plane(
     responses = [401, 401, 200, 200]
 
     def get(url, **kwargs):
+        if url.endswith("/session-usage/usage/balance"):
+            # The credits line is exercised elsewhere; here the endpoint is
+            # simply unavailable, so configure skips it.
+            return httpx.Response(404, request=httpx.Request("GET", url))
         status = responses.pop(0)
         payload = (
             {
@@ -4651,6 +5226,7 @@ def test_configure_json_output_bypasses_the_picker(tmp_path, monkeypatch):
     monkeypatch.setattr(
         router_module, "_install_claude_code_statusline", lambda _path: None
     )
+    monkeypatch.setattr(router_module, "_install_codex_cost_hook", lambda *_args: None)
     monkeypatch.setattr(router_module.shutil, "which", lambda _name: None)
     _mock_models(monkeypatch)
 
@@ -5520,3 +6096,157 @@ def test_a_failed_reconfigure_leaves_the_working_setup_intact(tmp_path, monkeypa
         == "ramp-router"
     )
     assert json.loads(new_session.read_text())["payload"]["model_provider"] == "openai"
+
+
+# ── Remaining-credits line ─────────────────────────────────────────────────
+
+
+def _mock_balance(monkeypatch, respond):
+    """Serve the balance endpoint on top of whatever _mock_models installed."""
+    inner = router_module.httpx.get
+
+    def get(url, *, headers, timeout):
+        if url.endswith("/session-usage/usage/balance"):
+            assert url == "https://router.ramp.com/session-usage/usage/balance"
+            assert headers == {"Authorization": "Bearer router-secret"}
+            assert timeout == 5
+            return respond(url)
+        return inner(url, headers=headers, timeout=timeout)
+
+    monkeypatch.setattr("ramp_cli.commands.router.httpx.get", get)
+
+
+def _balance_payload(remaining="23.77"):
+    return {
+        "billing_account_required": True,
+        "balance": {
+            "total_credits_usd": "25.00",
+            "total_usage_usd": "1.23",
+            "remaining_credit_usd": remaining,
+            "balance_observed_at": "2026-08-18T00:00:00Z",
+        },
+    }
+
+
+def test_configure_shows_remaining_credits_when_router_serves_a_balance(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / "opencode.json"
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
+    _mock_models(monkeypatch)
+    _mock_balance(
+        monkeypatch,
+        lambda url: httpx.Response(
+            200,
+            json=_balance_payload("1234.50"),
+            request=httpx.Request("GET", url),
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "opencode"], input="router-secret\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Router credits remaining: $1,234.50" in result.output
+
+
+def test_configure_skips_the_credits_line_when_router_does_not_serve_one(
+    tmp_path, monkeypatch
+):
+    """A Router without the balance endpoint must not degrade configure."""
+    config_path = tmp_path / "opencode.json"
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
+    # _mock_models answers the balance endpoint with a 404 by default.
+    _mock_models(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "opencode"], input="router-secret\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Router credits remaining" not in result.output
+    assert "Connected to: OpenCode" in result.output
+
+
+def test_configure_skips_the_credits_line_without_a_billing_account(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / "opencode.json"
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
+    _mock_models(monkeypatch)
+    _mock_balance(
+        monkeypatch,
+        lambda url: httpx.Response(
+            200,
+            json={"billing_account_required": False, "balance": None},
+            request=httpx.Request("GET", url),
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "opencode"], input="router-secret\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Router credits remaining" not in result.output
+
+
+def test_configure_agent_output_never_fetches_the_balance(tmp_path, monkeypatch):
+    """Machine output keeps its shape and makes no extra network calls."""
+    config_path = tmp_path / "opencode.json"
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
+    _mock_models(monkeypatch)
+
+    def refuse(url):
+        raise AssertionError("agent output must not fetch the balance")
+
+    _mock_balance(monkeypatch, refuse)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--agent", "router", "configure", "opencode", "--api-key", "router-secret"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["data"][0]["client"] == "opencode"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not json",
+        [],
+        {},
+        {"balance": None},
+        {"balance": "23.77"},
+        {"balance": {}},
+        {"balance": {"remaining_credit_usd": 23.77}},
+        {"balance": {"remaining_credit_usd": "not-a-number"}},
+        {"balance": {"remaining_credit_usd": "NaN"}},
+        {"balance": {"remaining_credit_usd": "Infinity"}},
+        {"balance": {"remaining_credit_usd": "-Infinity"}},
+    ],
+)
+def test_fetch_remaining_credits_tolerates_unexpected_payloads(monkeypatch, payload):
+    monkeypatch.setattr(
+        "ramp_cli.commands.router.httpx.get",
+        lambda url, *, headers, timeout: httpx.Response(
+            200, json=payload, request=httpx.Request("GET", url)
+        ),
+    )
+    assert router_module._fetch_remaining_credits("router-secret") is None
+
+
+def test_fetch_remaining_credits_swallows_network_errors(monkeypatch):
+    def get(url, *, headers, timeout):
+        raise httpx.ConnectError("boom")
+
+    monkeypatch.setattr("ramp_cli.commands.router.httpx.get", get)
+    assert router_module._fetch_remaining_credits("router-secret") is None
+
+
+def test_format_credits_usd():
+    assert router_module._format_credits_usd(Decimal("1234.5")) == "$1,234.50"
+    assert router_module._format_credits_usd(Decimal("0")) == "$0.00"
+    assert router_module._format_credits_usd(Decimal("-3.2")) == "-$3.20"

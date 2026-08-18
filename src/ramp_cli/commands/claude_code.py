@@ -26,10 +26,10 @@ except ImportError:  # pragma: no cover - POSIX fallback
 CLAUDE_SETTINGS_ENV = "CLAUDE_CONFIG_DIR"
 
 # Claude Code dispatches sub-agents with a tier alias (sonnet, opus, haiku,
-# fable)
-# that it resolves to a canonical Anthropic model id unless one of these
-# variables names a different model. Router serves no Anthropic models, so
-# these are how sub-agent tiers are pointed at models Router can serve.
+# fable) that it resolves to a canonical Anthropic model id unless one of
+# these variables names a different model. They are how sub-agent tiers are
+# pointed at any model Router serves, and how tier requests are kept from
+# defaulting to ids the caller's access policy may not let Router serve.
 # Claude Code reads them at each sub-agent spawn, not just at session start.
 SUBAGENT_TIER_ENV_KEYS = {
     "sonnet": "ANTHROPIC_DEFAULT_SONNET_MODEL",
@@ -681,10 +681,20 @@ def settings_lock(path: Path):
     Both files are rewritten whole from an in-memory snapshot, so two
     concurrent updates would each keep their own view and the last writer
     would silently drop the first one's change — and could pair a settings
-    document with a state receipt describing the other update. Same advisory
-    lock shape as the auth token refresh.
+    document with a state receipt describing the other update.
     """
-    lock_path = path.parent / ".ramp-router-settings.lock"
+    with advisory_lock(path.parent / ".ramp-router-settings.lock"):
+        yield
+
+
+@contextmanager
+def advisory_lock(lock_path: Path):
+    """Hold an exclusive advisory lock on a dedicated lock file.
+
+    Same lock shape as the auth token refresh: fcntl on POSIX, msvcrt on
+    Windows, and a lock file that is never replaced so the lock stays valid
+    while the guarded files are atomically swapped.
+    """
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as lock_file:
         if fcntl is not None:

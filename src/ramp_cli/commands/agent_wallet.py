@@ -142,24 +142,34 @@ def agent_wallet_group() -> None:
 )
 @click.pass_context
 def configure(ctx: click.Context, api_key: str | None) -> None:
+    output_format = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
+    prompted_for_api_key = api_key is None
     if api_key is None:
         if ctx.obj["no_input"]:
             raise click.UsageError(
                 f"Pass --api-key or set {CONFIGURE_KEY_ENV} in non-interactive mode."
             )
-        api_key = click.prompt("Agent Wallet API key", hide_input=True)
+        api_key = click.prompt(
+            "Agent Wallet API key",
+            hide_input=True,
+            err=output_format == "json",
+        )
 
     api_key = api_key.strip()
     os.environ.pop(CONFIGURE_KEY_ENV, None)
     if not api_key:
         raise click.UsageError("The Agent Wallet API key cannot be empty.")
 
+    if prompted_for_api_key and output_format != "json":
+        masked_key = f"••••{api_key[-4:]}" if len(api_key) > 8 else "••••••••"
+        click.secho(f"✓ API key captured ({masked_key})", fg="green")
+
     save_api_key(api_key)
     payload = {"configured": True}
-    if resolve_format(ctx.obj["format"], ctx.obj["config_format"]) == "json":
+    if output_format == "json":
         print_agent_json(payload, pagination=None)
     else:
-        click.echo("Configured Agent Wallet.")
+        click.secho("✓ Agent Wallet configured", fg="green")
 
 
 @agent_wallet_group.command("list", short_help="List recent payments")

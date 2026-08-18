@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -13,8 +14,10 @@ import sys
 import tempfile
 import time
 import tomllib
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from pathlib import Path, PurePath
 from typing import Literal
@@ -31,6 +34,7 @@ from ramp_cli.commands import claude_code
 from ramp_cli.output.formatter import print_agent_json, resolve_format
 from ramp_cli.output.style import show_notice, start_spinner
 from ramp_cli.router_integrations import integration_package_path
+from ramp_cli.router_integrations.codex_cost_hook import CODEX_COST_HOOK_SCRIPT
 from ramp_cli.router_setup import acquire_router_api_key
 
 DEFAULT_ROUTER_BASE_URL = "https://router-api.ramp.com/v1"
@@ -64,6 +68,9 @@ CODEX_CLIENT_NAME = "codex"
 CODEX_ROUTER_CATALOG = "ramp-router-models.json"
 CODEX_ROUTER_CATALOG_DIGEST_KEY = "router_catalog_digest"
 CODEX_ROUTER_CATALOG_MANAGED_KEY = "router_catalog_managed"
+# The name the Router dashboard serves; manual installs land on the same file.
+CODEX_COST_HOOK = "codex-cost-hook"
+CODEX_COST_HOOK_MANAGED_KEY = "cost_hook_managed"
 CODEX_CATALOG_MODEL_LIMIT = 100
 CLIENT_NAMES = {
     "claude-code": "Claude Code",
@@ -370,6 +377,11 @@ _OWNED_CODEX_TABLE = re.compile(
 )
 _OWNED_CODEX_ROOT_KEY = re.compile(
     r"^\s*(?:model|model_provider|model_catalog_json|model_instructions_file)\s*="
+)
+# A Stop group is not ours by header alone; see _is_owned_cost_hook_chunk.
+_CODEX_STOP_HOOK_TABLE = re.compile(
+    r"^\s*\[\[\s*(?:hooks|\"hooks\"|'hooks')\s*\.\s*"
+    r"(?:Stop|\"Stop\"|'Stop')\s*]]\s*(?:#.*)?$"
 )
 _OWNED_ROOT_KEYS = (
     "model",
@@ -1091,10 +1103,20 @@ def router_configure(
             )
             models_by_client.update(dict.fromkeys(standard_clients, models))
         if "claude-code" in clients:
+            # The --claude-models choice is a presentation preference for
+            # Claude Code's own picker; it is honored below by what gets
+            # written into the settings, not by this fetch. This list exists
+            # to choose and validate a default model id, so it must see every
+            # callable model: ids are identical across views, but the compact
+            # view can omit callable models (the GPT tiers, which duplicate
+            # Claude Code's own tier rows), and a fetch that missed
+            # DEFAULT_MODEL would silently hand fresh setups whatever model
+            # happens to be listed first.
             models_by_client["claude-code"] = _fetch_models(
                 api_key,
                 claude_code_view=True,
-                model_view_all=claude_models == "all",
+                model_view_all=True,
+                base_url=base_url,
                 wait_for_key=browser_acquired_key,
             )
         for item in clients:
@@ -1156,6 +1178,11 @@ def router_configure(
         click.echo(
             f"{model_count} {model_label} added. Start an agent and pick a model."
         )
+        remaining_credits = _fetch_remaining_credits(api_key, base_url=base_url)
+        if remaining_credits is not None:
+            click.echo(
+                f"Router credits remaining: {_format_credits_usd(remaining_credits)}"
+            )
         if notice:
             show_notice("NOTICE", notice)
 
@@ -1197,17 +1224,19 @@ def router_refresh(ctx: click.Context) -> None:
                 else router_base_url()
             )
             claude_code_view = client == "claude-code"
-            model_view_all = claude_code_view and _configured_claude_model_view_all(
-                path
-            )
-            request_key = (api_key, claude_code_view, base_url, model_view_all)
+            request_key = (api_key, claude_code_view, base_url)
             models = models_by_request.get(request_key)
             if models is None:
+                # Always the exhaustive view, whatever picker view the user
+                # chose: this list validates the configured default model id,
+                # ids are identical across views, and the compact view can
+                # omit callable models. The configured preference still flows
+                # into the settings via claude_model_view below.
                 models = (
                     _fetch_models(
                         api_key,
                         claude_code_view=True,
-                        model_view_all=model_view_all,
+                        model_view_all=True,
                         base_url=base_url,
                     )
                     if claude_code_view
@@ -1221,7 +1250,7 @@ def router_refresh(ctx: click.Context) -> None:
             }
             if client == "claude-code":
                 configure_options["claude_model_view"] = (
-                    "all" if model_view_all else "compact"
+                    "all" if _configured_claude_model_view_all(path) else "compact"
                 )
                 configure_options["preserve_model_view_ownership"] = True
             _, default_model, _ = _configure_client(
@@ -1320,10 +1349,17 @@ def router_subagents(
     models: list[RouterModel] = []
     if picks or not reset:
         api_key = _stored_router_api_key("claude-code", path)
+        # Tier overrides may point at any callable model, and the labels
+        # rendered below must recognize every id a tier could hold, so this
+        # fetch ignores the configured picker view and asks for the exhaustive
+        # one. The compact view can omit callable models (the GPT tiers, which
+        # duplicate Claude Code's own tier rows); resolving against it would
+        # reject those ids as not found and mislabel existing overrides as no
+        # longer served.
         models = _fetch_models(
             api_key,
             claude_code_view=True,
-            model_view_all=_configured_claude_model_view_all(path),
+            model_view_all=True,
             base_url=_configured_claude_code_router_url(path),
         )
     models_by_id = {model.id: model for model in models}
@@ -1589,6 +1625,11 @@ def _unconfigure_client(client: str, path: Path) -> None:
     if client != "codex":
         _unconfigure_json_client(client, path)
         return
+    with codex_config_lock(path):
+        _unconfigure_codex(path)
+
+
+def _unconfigure_codex(path: Path) -> None:
     state_path = path.parent / "ramp-router-state.json"
     if not state_path.exists():
         raise click.ClickException("Ramp Router is not configured in Codex.")
@@ -1607,6 +1648,7 @@ def _unconfigure_client(client: str, path: Path) -> None:
         router_catalog_digest = state.get(CODEX_ROUTER_CATALOG_DIGEST_KEY)
         original_instructions = state.get(CODEX_ORIGINAL_INSTRUCTIONS_STATE_KEY)
         original_instructions_digest = state.get(CODEX_ORIGINAL_INSTRUCTIONS_DIGEST_KEY)
+        cost_hook_managed = state.get(CODEX_COST_HOOK_MANAGED_KEY)
         preexisting_router_sessions = state.get(
             CODEX_PREEXISTING_ROUTER_SESSIONS_STATE_KEY
         )
@@ -1632,7 +1674,12 @@ def _unconfigure_client(client: str, path: Path) -> None:
     preserved = "".join(
         "".join(chunk)
         for chunk in chunks
-        if not chunk or not _OWNED_CODEX_TABLE.match(chunk[0])
+        if not chunk
+        or not (
+            _OWNED_CODEX_TABLE.match(chunk[0])
+            # Only the receipt makes a matching group ours to remove.
+            or (cost_hook_managed is True and _is_owned_cost_hook_chunk(chunk))
+        )
     ).rstrip()
     restored_provider = "".join(previous_provider).strip()
     updated = (
@@ -1700,6 +1747,10 @@ def _unconfigure_client(client: str, path: Path) -> None:
         # live credential on disk after the user asked for it to be undone.
         (path.parent / "ramp-router-key").unlink(missing_ok=True)
         (path.parent / "ramp-router-instructions.md").unlink(missing_ok=True)
+        # Keep the script while anything still references it. Substring on
+        # purpose: false positives just keep a small file on disk.
+        if cost_hook_managed is True and CODEX_COST_HOOK not in updated:
+            (path.parent / CODEX_COST_HOOK).unlink(missing_ok=True)
         # The values it holds are back at the root, so the profile would only
         # be a stale duplicate of the default. Removed by the name recorded at
         # configure time, and only while it still holds what was written then:
@@ -1733,16 +1784,27 @@ def _codex_config_path() -> Path:
     return codex_home.expanduser() / "config.toml"
 
 
-def _statusline_origin() -> str:
-    """The origin serving the status line script and its usage endpoint.
+@contextmanager
+def codex_config_lock(path: Path):
+    """Serialize every read-modify-write of the Codex config.toml.
 
-    The Router dashboard serves both /claude-code-statusline and the
-    /session-usage endpoint the script calls; the data plane behind
-    ANTHROPIC_BASE_URL serves neither, which is why ROUTER_BASE_URL is written
-    explicitly. A base-URL override names a single-origin deployment, so the
-    same host serves everything there.
+    The file is rewritten whole from an in-memory snapshot, so every writer —
+    `ramp router configure codex`/`refresh`/`unconfigure` and
+    `ramp codex compaction` — must share this one lock or the last replacement
+    silently drops the other writer's change.
     """
-    base = router_base_url()
+    with claude_code.advisory_lock(path.parent / ".ramp-codex-config.lock"):
+        yield
+
+
+def _statusline_origin(base_url: str | None = None) -> str:
+    """The origin serving the cost scripts and their session-usage endpoint.
+
+    The data plane behind the agents' base URLs serves neither, which is why
+    ROUTER_BASE_URL is written explicitly. A base-URL override names a
+    single-origin deployment, so the same host serves everything there.
+    """
+    base = (base_url or router_base_url()).rstrip("/")
     if base == DEFAULT_ROUTER_BASE_URL:
         return router_ui_url()
     return base.removesuffix("/v1").rstrip("/")
@@ -1753,45 +1815,56 @@ def router_ui_url() -> str:
     return os.environ.get(ROUTER_UI_URL_ENV, ROUTER_UI_URL).rstrip("/")
 
 
+def _fetch_remaining_credits(
+    api_key: str, *, base_url: str | None = None
+) -> Decimal | None:
+    """Fetch the key owner's remaining Router credits, or None.
+
+    The credits line is an extra, so every failure — a Router without the
+    balance endpoint yet, a network problem, an owner without a billing
+    account — reads as "no line" rather than an error at the end of an
+    otherwise successful configure.
+    """
+    url = f"{_statusline_origin(base_url)}/session-usage/usage/balance"
+    try:
+        response = httpx.get(
+            url, headers={"Authorization": f"Bearer {api_key}"}, timeout=5
+        )
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    balance = payload.get("balance") if isinstance(payload, dict) else None
+    if not isinstance(balance, dict):
+        return None
+    remaining = balance.get("remaining_credit_usd")
+    if not isinstance(remaining, str):
+        return None
+    try:
+        parsed = Decimal(remaining)
+    except InvalidOperation:
+        return None
+    # Decimal accepts "NaN" and "Infinity", which the formatter cannot
+    # compare or render; a balance that is not a finite number is no balance.
+    return parsed if parsed.is_finite() else None
+
+
+def _format_credits_usd(value: Decimal) -> str:
+    sign = "-" if value < 0 else ""
+    return f"{sign}${abs(value):,.2f}"
+
+
 def _install_claude_code_statusline(settings_file: Path) -> str | None:
     """Install Router's cost status line for Claude Code, when possible.
 
     Returns the command to configure, or None when the status line cannot be
-    installed here. The script is downloaded on every run so a repeat configure
-    picks up fixes, and a failure is a notice rather than an error: the status
+    installed here. A failure is a notice rather than an error: the status
     line is an extra, and it must never fail an otherwise working configure.
     """
-    if os.name == "nt":
-        # The script is run through its python3 shebang, which Windows'
-        # command interpreter does not understand.
-        _skip_statusline("it is not supported on Windows")
-        return None
-    if not shutil.which("python3"):
-        _skip_statusline("python3 was not found on PATH")
-        return None
     url = f"{_statusline_origin()}/claude-code-statusline"
-    try:
-        response = httpx.get(url, headers={"Accept": "text/plain"}, timeout=10)
-        response.raise_for_status()
-        script = response.text
-    except (httpx.HTTPError, ValueError):
-        script = ""
-    # A WAF block page or a misrouted response must not be installed as an
-    # executable, so anything that does not start like the script itself is
-    # treated as a failed download.
-    if not script.startswith("#!"):
-        _skip_statusline(f"it could not be downloaded from {url}")
-        return None
     script_path = claude_code.statusline_path(settings_file)
-    try:
-        script_path.parent.mkdir(parents=True, exist_ok=True)
-        _write_private_file(script_path, script)
-        # Claude Code executes it directly, and unlike the other files this
-        # command writes it holds no secret: the script reads the key from the
-        # environment Claude Code passes it and never persists it.
-        script_path.chmod(0o755)
-    except OSError as exc:
-        _skip_statusline(str(exc))
+    if not _install_cost_script(url, script_path, _skip_statusline):
         return None
     return claude_code.statusline_command(settings_file)
 
@@ -1799,6 +1872,178 @@ def _install_claude_code_statusline(settings_file: Path) -> str | None:
 def _skip_statusline(reason: str) -> None:
     # Written to stderr so agent-mode JSON on stdout stays parseable.
     click.echo(f"Skipping the Claude Code Router status line: {reason}.", err=True)
+
+
+def _install_cost_script(
+    url: str, script_path: Path, skip: Callable[[str], None]
+) -> bool:
+    """Download one Router cost script, refreshing it on every run.
+
+    A failure warns through the caller's skip notice and keeps the old copy.
+    """
+    if not _cost_script_runtime_available(skip):
+        return False
+    try:
+        response = httpx.get(url, headers={"Accept": "text/plain"}, timeout=10)
+        response.raise_for_status()
+        script = response.text
+    except (httpx.HTTPError, ValueError):
+        script = ""
+    # The shebang check rejects WAF block pages and misrouted responses.
+    if not script.startswith("#!"):
+        skip(f"it could not be downloaded from {url}")
+        return False
+    return _write_cost_script(script, script_path, skip)
+
+
+def _cost_script_runtime_available(skip: Callable[[str], None]) -> bool:
+    """Report whether this platform can execute the bundled Python scripts."""
+    if os.name == "nt":
+        # The python3 shebang means nothing to Windows' command interpreter.
+        skip("it is not supported on Windows")
+        return False
+    if not shutil.which("python3"):
+        skip("python3 was not found on PATH")
+        return False
+    return True
+
+
+def _write_cost_script(
+    script: str, script_path: Path, skip: Callable[[str], None]
+) -> bool:
+    """Atomically install a trusted cost script and make it executable."""
+    try:
+        script_path.parent.mkdir(parents=True, exist_ok=True)
+        # Temp file + rename, so a partial download can't clobber a working script.
+        _write_private_file(script_path, script)
+        script_path.chmod(0o755)
+    except OSError as exc:
+        skip(str(exc))
+        return False
+    return True
+
+
+def _install_codex_cost_hook(path: Path, base_url: str | None = None) -> str | None:
+    """Install the release-pinned Codex hook and return its Stop command."""
+    hook_path = path.parent / CODEX_COST_HOOK
+    if not _cost_script_runtime_available(_skip_codex_cost_hook):
+        return None
+    if not _write_cost_script(CODEX_COST_HOOK_SCRIPT, hook_path, _skip_codex_cost_hook):
+        return None
+    return _codex_cost_hook_command(path.parent, base_url)
+
+
+def _skip_codex_cost_hook(reason: str) -> None:
+    # Written to stderr so agent-mode JSON on stdout stays parseable.
+    click.echo(f"Skipping the Codex Router cost hook: {reason}.", err=True)
+
+
+def _codex_cost_hook_command(home: Path, base_url: str | None = None) -> str:
+    """The shell command Codex runs on Stop, with Router credentials wired in."""
+    command, args = _codex_key_command(home / "ramp-router-key")
+    read_key = " ".join(shlex.quote(part) for part in (command, *args))
+    # The key is read at run time from the private key file, never written
+    # into config.toml; a missing file degrades to the hook's silent path.
+    return (
+        f'ROUTER_API_KEY="$({read_key} 2>/dev/null)" '
+        f"ROUTER_BASE_URL={shlex.quote(_statusline_origin(base_url))} "
+        f"{shlex.quote(str(home / CODEX_COST_HOOK))}"
+    )
+
+
+def _render_codex_cost_hook_group(command: str) -> str:
+    """Render the [[hooks.Stop]] matcher group that registers the cost hook."""
+    return f"""[[hooks.Stop]]
+hooks = [{{ type = "command", command = {json.dumps(command)} }}]
+"""
+
+
+# A leading NAME= word is an environment assignment, not the executable.
+_ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _command_runs_cost_hook(command: str) -> bool:
+    """Report whether a hook command's executable is the managed script."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    for token in tokens:
+        # Skip env wrappers and their assignments; an unparsed env option
+        # bails out as not-ours rather than risk claiming a user hook.
+        if _ENV_ASSIGNMENT.match(token) or os.path.basename(token) == "env":
+            continue
+        if token.startswith("-"):
+            return False
+        # Only the executable counts: a path passed as an argument, or a
+        # wrapper that merely resembles the name, is a reference.
+        return os.path.basename(token) == CODEX_COST_HOOK
+    return False
+
+
+def _stop_group_commands(group: object) -> Iterator[str | None]:
+    """Yield each hook entry's command in one parsed Stop group, None if unreadable."""
+    entries = group.get("hooks") if isinstance(group, dict) else None
+    if not isinstance(entries, list):
+        return
+    for entry in entries:
+        command = entry.get("command") if isinstance(entry, dict) else None
+        yield command if isinstance(command, str) else None
+
+
+def _is_owned_cost_hook_chunk(chunk: list[str]) -> bool:
+    """Report whether one config chunk is a Stop group holding only the hook."""
+    if not chunk or not _CODEX_STOP_HOOK_TABLE.match(chunk[0]):
+        return False
+    try:
+        # The header line makes the chunk standalone-valid TOML.
+        parsed = tomllib.loads("".join(chunk))
+    except tomllib.TOMLDecodeError:
+        return False
+    hooks = parsed.get("hooks")
+    groups = hooks.get("Stop") if isinstance(hooks, dict) else None
+    if not isinstance(groups, list) or len(groups) != 1:
+        return False
+    commands = list(_stop_group_commands(groups[0]))
+    # Shared groups are the user's; solo ones are replaceable, ours or
+    # hand-written, because a duplicate would answer every Stop event twice.
+    return bool(commands) and all(
+        command is not None and _command_runs_cost_hook(command) for command in commands
+    )
+
+
+def _codex_cost_hook_registered(config: dict) -> bool:
+    """Report whether any Stop hook in the parsed config runs the script."""
+    hooks = config.get("hooks")
+    groups = hooks.get("Stop") if isinstance(hooks, dict) else None
+    if not isinstance(groups, list):
+        return False
+    return any(
+        command is not None and _command_runs_cost_hook(command)
+        for group in groups
+        for command in _stop_group_commands(group)
+    )
+
+
+def _register_codex_cost_hook(path: Path, config: str, command: str) -> str:
+    """Append the hook's Stop group unless something already registers it."""
+    try:
+        if _codex_cost_hook_registered(tomllib.loads(config)):
+            return config
+    except tomllib.TOMLDecodeError:
+        # The caller validates and reports against the document it writes.
+        return config
+    registered = f"{config}\n{_render_codex_cost_hook_group(command)}"
+    try:
+        tomllib.loads(registered)
+    except tomllib.TOMLDecodeError:
+        # E.g. an inline hooks table cannot take another [[hooks.Stop]] group;
+        # the hook is an extra, so the user's layout wins.
+        _skip_codex_cost_hook(
+            f"the existing hooks in {path} could not take another entry"
+        )
+        return config
+    return registered
 
 
 def _configure_claude_code(
@@ -3015,11 +3260,37 @@ def _configure_codex(
     selected_model: str | None = None,
 ) -> tuple[str, bool]:
     """Point the Codex CLI and Desktop app at Ramp Router."""
-    default_model = _preferred_model(models, selected_model)
-    # Finish remote discovery before taking the local config snapshot used by
-    # the read-modify-write below. Otherwise a user or Codex edit made while
-    # this request is in flight can be replaced by the stale pre-request copy.
+    # Finish remote discovery before taking the lock and the local config
+    # snapshot used by the read-modify-write below. Otherwise a slow request
+    # would stall every other config.toml writer, and a user or Codex edit
+    # made while this request is in flight can be replaced by the stale
+    # pre-request copy.
     router_catalog = _fetch_codex_catalog(api_key, base_url=base_url)
+    # None means nothing to (re)register; existing registrations stay as-is.
+    cost_hook_command = _install_codex_cost_hook(path, base_url)
+    with codex_config_lock(path):
+        return _configure_codex_in_lock(
+            path,
+            api_key,
+            models,
+            router_catalog,
+            base_url=base_url,
+            selected_model=selected_model,
+            cost_hook_command=cost_hook_command,
+        )
+
+
+def _configure_codex_in_lock(
+    path: Path,
+    api_key: str,
+    models: list[RouterModel],
+    router_catalog: dict,
+    *,
+    base_url: str | None,
+    selected_model: str | None,
+    cost_hook_command: str | None,
+) -> tuple[str, bool]:
+    default_model = _preferred_model(models, selected_model)
     existing, existing_data = _read_codex_config(path)
     if selected_model is not None:
         # Refresh captures a selection before discovery starts. Read it again
@@ -3118,6 +3389,13 @@ def _configure_codex(
         state_document = receipt
     if receipt.get(CODEX_ROUTER_CATALOG_DIGEST_KEY) != catalog_digest:
         receipt[CODEX_ROUTER_CATALOG_DIGEST_KEY] = catalog_digest
+        state_document = receipt
+    # Lets unconfigure know the script and its Stop group are ours to remove.
+    if (
+        cost_hook_command is not None
+        and receipt.get(CODEX_COST_HOOK_MANAGED_KEY) is not True
+    ):
+        receipt[CODEX_COST_HOOK_MANAGED_KEY] = True
         state_document = receipt
     key_path = path.parent / "ramp-router-key"
 
@@ -3234,10 +3512,17 @@ def _configure_codex(
     preserved = "".join(
         "".join(chunk)
         for chunk in chunks
-        if not chunk or not _OWNED_CODEX_TABLE.match(chunk[0])
+        if not chunk
+        or not (
+            _OWNED_CODEX_TABLE.match(chunk[0])
+            # Dropped only when a fresh registration is about to replace it.
+            or (cost_hook_command is not None and _is_owned_cost_hook_chunk(chunk))
+        )
     ).rstrip()
     provider = _codex_provider(key_path, base_url)
     updated = f"{preserved}\n\n{provider}" if preserved else provider
+    if cost_hook_command is not None:
+        updated = _register_codex_cost_hook(path, updated, cost_hook_command)
 
     # Kept so a failure can put the file back. Without it the undo below
     # deletes the key this config points at and leaves Codex configured for a

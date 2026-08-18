@@ -176,6 +176,7 @@ def test_configure__stores_and_uses_wallet_key(isolated_config, monkeypatch):
     )
     assert result.exit_code == 0, result.output
     assert "wallet-key" not in result.output
+    assert "API key captured" not in result.output
     assert "RAMP_AGENT_WALLET_CONFIGURE_API_KEY" not in os.environ
     assert agent_wallet_store.get_api_key() == "wallet-key"
     if os.name != "nt":
@@ -187,14 +188,42 @@ def test_configure__stores_and_uses_wallet_key(isolated_config, monkeypatch):
     assert captured == {"payment_key": "wallet-key"}
 
 
-def test_configure__prompts_for_api_key(isolated_config, monkeypatch):
+@pytest.mark.parametrize(
+    ("api_key", "masked_key"),
+    [
+        pytest.param("wallet-key", "••••-key", id="normal_key"),
+        pytest.param("12345", "••••••••", id="short_key"),
+    ],
+)
+def test_configure__prompts_for_api_key(
+    isolated_config, monkeypatch, api_key, masked_key
+):
     result = CliRunner().invoke(
         cli,
         ["--human", "agent-wallet", "configure"],
+        input=f"{api_key}\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert f"✓ API key captured ({masked_key})" in result.output
+    assert "✓ Agent Wallet configured" in result.output
+    assert api_key not in result.output
+    assert agent_wallet_store.get_api_key() == api_key
+
+
+def test_configure__prompted_json_output_stays_machine_readable(
+    isolated_config, monkeypatch
+):
+    result = CliRunner().invoke(
+        cli,
+        ["--output", "json", "agent-wallet", "configure"],
         input="wallet-key\n",
     )
 
     assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["data"] == [{"configured": True}]
+    assert "API key captured" not in result.stdout
+    assert "Agent Wallet API key:" in result.stderr
     assert "wallet-key" not in result.output
     assert agent_wallet_store.get_api_key() == "wallet-key"
 
