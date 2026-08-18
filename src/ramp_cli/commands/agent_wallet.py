@@ -10,20 +10,64 @@ from uuid import UUID, uuid4
 import click
 
 from ramp_cli.auth.agent_wallet import save_api_key
-from ramp_cli.client.agent_wallet import AgentWalletClient, AgentWalletClientError
-from ramp_cli.commands.agent_wallet_validation import (
-    build_structured_vic_body,
-    validate_vic_json_body,
+from ramp_cli.client.agent_wallet import (
+    AgentWalletApiError,
+    AgentWalletClient,
+    AgentWalletClientError,
 )
+from ramp_cli.commands.agent_wallet_validation import (
+    build_structured_card_body,
+    validate_card_json_body,
+)
+from ramp_cli.errors import ApiError
 from ramp_cli.output.formatter import (
     canonical_to_display,
     print_agent_json,
     print_json,
     resolve_format,
 )
-from ramp_cli.tools.commands import GeneratedToolGroup
+from ramp_cli.tools.commands import GeneratedToolGroup, build_tool_command
+from ramp_cli.tools.parser import ToolDef
 
 CONFIGURE_KEY_ENV = "RAMP_AGENT_WALLET_CONFIGURE_API_KEY"
+
+
+def _build_policy_group(tool: ToolDef) -> click.Group:
+    group = click.Group(
+        "policy",
+        help="Publish or update an Agent Wallet policy.",
+        no_args_is_help=True,
+    )
+
+    for name, help_text in (
+        ("publish", "Publish a policy and make it active."),
+        ("update", "Update the active policy by publishing a new version."),
+    ):
+        command = build_tool_command(
+            tool,
+            group_name="agent-wallet",
+            command_name="policy",
+        )
+        command.help = help_text
+        command.short_help = help_text
+        group.add_command(command, name)
+
+    return group
+
+
+class _AgentWalletGroup(GeneratedToolGroup):
+    def invoke(self, ctx: click.Context) -> Any:
+        try:
+            return super().invoke(ctx)
+        except ApiError as error:
+            raise AgentWalletApiError(error) from error
+
+    def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
+        if cmd_name == "policy":
+            for command_name, tool in self._generated_commands(ctx):
+                if command_name == cmd_name:
+                    return _build_policy_group(tool)
+        return super().get_command(ctx, cmd_name)
 
 
 def _parse_json_body(raw_json: str) -> dict[str, Any]:
@@ -51,13 +95,21 @@ def _submit_payment(
     ctx: click.Context,
     payment_id: UUID,
     body: dict[str, Any],
+    payment_command: str,
     display_amount: str | None = None,
 ) -> None:
     click.echo(f"Payment ID: {payment_id}", err=True)
-    if (
-        display_amount
-        and resolve_format(ctx.obj["format"], ctx.obj["config_format"]) != "json"
-    ):
+    is_human = resolve_format(ctx.obj["format"], ctx.obj["config_format"]) != "json"
+    if is_human:
+        click.echo(
+            "To retry safely, reuse this payment ID:\n"
+            f"  ramp agent-wallet pay {payment_command} --payment-id {payment_id} ...\n\n"
+            "If the request times out or credentials are unavailable, first run:\n"
+            "  ramp agent-wallet list --limit 10\n"
+            "before creating a new payment.",
+            err=True,
+        )
+    if display_amount and is_human:
         click.echo(f"Amount: {display_amount}", err=True)
     result = AgentWalletClient().pay(body)
     if result.get("payment_operation_id") != str(payment_id):
@@ -67,7 +119,7 @@ def _submit_payment(
 
 @click.group(
     "agent-wallet",
-    cls=GeneratedToolGroup,
+    cls=_AgentWalletGroup,
     tool_category="agent-wallet",
     help="Manage Agent Wallet policy and payments",
 )
@@ -181,7 +233,7 @@ def pay_cards(
 ) -> None:
     """Submit a virtual card payment."""
     payment_id = payment_id or uuid4()
-    body = build_structured_vic_body(
+    body = build_structured_card_body(
         payment_id,
         merchant_name,
         merchant_url,
@@ -194,6 +246,7 @@ def pay_cards(
         ctx,
         payment_id,
         body,
+        "cards",
         display_amount=(
             f"{request_amount['currency']} "
             f"{canonical_to_display(request_amount['value'], request_amount['currency'])}"
@@ -230,5 +283,5 @@ def pay_json(
     if "method" not in body:
         raise click.UsageError("--json must include method.")
     body = {"payment_operation_id": str(payment_id), **body}
-    body = validate_vic_json_body(body)
-    _submit_payment(ctx, payment_id, body)
+    body = validate_card_json_body(body)
+    _submit_payment(ctx, payment_id, body, "json")

@@ -16,6 +16,7 @@ from ramp_cli.auth import refresh as refresh_helper
 from ramp_cli.auth import store
 from ramp_cli.auth.oauth import TokenResponse
 from ramp_cli.client.agent_wallet import (
+    AgentWalletApiError,
     AgentWalletAuthRequiredError,
     AgentWalletClient,
     AgentWalletClientError,
@@ -23,6 +24,8 @@ from ramp_cli.client.agent_wallet import (
 from ramp_cli.client.transport import BearerTokenTransport
 from ramp_cli.errors import ApiError
 from ramp_cli.main import cli
+from ramp_cli.specs import AGENT_TOOL_SPEC
+from ramp_cli.tools.parser import ToolDef, parse_spec
 
 
 def _card_args() -> list[str]:
@@ -38,6 +41,122 @@ def _card_args() -> list[str]:
         "--expires-at",
         (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
     ]
+
+
+POLICY_PATH = "/developer/v1/agent-wallet/agents/{agent_id}/policies"
+
+
+def _use_bundled_spec(monkeypatch) -> list[ToolDef]:
+    bundled_tools = parse_spec(AGENT_TOOL_SPEC)
+    monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
+    monkeypatch.setattr(
+        "ramp_cli.tools.commands.maybe_sync", lambda env, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "ramp_cli.tools.commands.list_tool_defs", lambda env: bundled_tools
+    )
+    return bundled_tools
+
+
+def _policy_body() -> dict:
+    return {
+        "configurations": [
+            {"configuration_id": "default", "method": "merchant-authorization"}
+        ],
+        "constraints": {
+            "currency": "USD",
+            "ends_at": "2027-01-01T00:00:00Z",
+            "max_amount": 5000,
+            "max_amount_per_payment": 1000,
+            "max_payments": 5,
+            "starts_at": "2026-01-01T00:00:00Z",
+        },
+        "policy_version": "00000000-0000-0000-0000-000000000001",
+        "schema_version": 1,
+    }
+
+
+def test_policy_actions_are_available_from_bundled_spec(monkeypatch) -> None:
+    bundled_tools = _use_bundled_spec(monkeypatch)
+    matches = [tool for tool in bundled_tools if tool.path == POLICY_PATH]
+
+    assert len(matches) == 1
+    assert (matches[0].alias, matches[0].category, matches[0].http_method) == (
+        "policy",
+        "agent-wallet",
+        "post",
+    )
+    assert matches[0].required_scopes == ["agent_wallet_policy:write"]
+
+    result = CliRunner().invoke(cli, ["agent-wallet", "policy", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "update" in result.output
+    assert "Update the active policy by publishing a new version." in result.output
+
+
+@pytest.mark.parametrize("command", ["publish", "update"])
+def test_policy_commands_use_existing_publication_endpoint(monkeypatch, command):
+    _use_bundled_spec(monkeypatch)
+    agent_id = "00000000-0000-0000-0000-000000000000"
+    policy = _policy_body()
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--agent",
+            "agent-wallet",
+            "policy",
+            command,
+            agent_id,
+            "--json",
+            json.dumps(policy),
+            "--dry_run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["data"][0] == {
+        "dry_run": True,
+        "method": "POST",
+        "url": (
+            f"https://api.ramp.com/developer/v1/agent-wallet/agents/{agent_id}/policies"
+        ),
+        "body": policy,
+        "headers": {"X-Ramp-Agent-Mode": "agent"},
+    }
+
+
+def test_agent_wallet_authentication_service_error_is_retryable(monkeypatch):
+    _use_bundled_spec(monkeypatch)
+
+    def fail(*args, **kwargs):
+        raise ApiError(503, '{"detail":"Authentication service unavailable"}')
+
+    monkeypatch.setattr("ramp_cli.client.api.RampClient.post", fail)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "agent-wallet",
+            "policy",
+            "update",
+            "00000000-0000-0000-0000-000000000000",
+            "--json",
+            json.dumps(_policy_body()),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, AgentWalletApiError)
+    assert result.exception.status_code == 503
+    assert str(result.exception) == (
+        "Agent Wallet request failed: The authentication service is temporarily "
+        "unavailable. Try again shortly."
+    )
+    assert '{"detail"' not in result.output
 
 
 def test_configure__stores_and_uses_wallet_key(isolated_config, monkeypatch):
@@ -130,7 +249,7 @@ def test_list__returns_recent_payments(monkeypatch):
     payments = [
         {
             "payment_operation_id": str(operation_id),
-            "method": "vic",
+            "method": "card",
             "amount": "12.50",
             "currency": "USD",
             "decision": "allow",
@@ -202,7 +321,7 @@ def test_cancel__posts_operation_to_production_wallet(monkeypatch):
     operation_id = uuid4()
     response = {
         "payment_operation_id": str(operation_id),
-        "method": "vic",
+        "method": "card",
         "new_authority_disabled_at": "2026-08-12T12:00:00Z",
         "remaining_authority": "absent",
     }
@@ -274,7 +393,7 @@ def test_pay__posts_structured_request_to_production_wallet(monkeypatch):
     assert captured == {
         "body": {
             "payment_operation_id": str(operation_id),
-            "method": "vic",
+            "method": "card",
             "method_request": {
                 "merchant": {
                     "name": "Acme",
@@ -394,7 +513,7 @@ def test_pay__uses_production_wallet_url():
 
 def test_pay__accepts_complete_json_body(monkeypatch):
     body = {
-        "method": "vic",
+        "method": "card",
         "future_core_field": {"preserve": True},
         "method_request": {
             "merchant": {
@@ -433,7 +552,7 @@ def test_pay__accepts_complete_json_body(monkeypatch):
     assert captured["body"] == {"payment_operation_id": str(operation_id), **body}
 
 
-def test_pay__rejects_non_vic_json():
+def test_pay__rejects_non_card_json():
     body = {
         "method": "mpp_stripe_spt",
         "method_request": {},
@@ -457,7 +576,7 @@ def test_pay__rejects_non_vic_json():
 def test_pay__rejects_caller_supplied_json_payment_id():
     body = {
         "payment_operation_id": str(uuid4()),
-        "method": "vic",
+        "method": "card",
         "method_request": {},
     }
     result = CliRunner().invoke(
@@ -542,6 +661,59 @@ def test_pay__does_not_expose_dry_run():
         assert "--dry_run" not in result.output
 
 
+@pytest.mark.parametrize(
+    ("payment_command", "payment_args"),
+    [
+        ("cards", _card_args()),
+        ("json", ["--json", json.dumps({"method": "card", "method_request": {}})]),
+    ],
+)
+def test_pay__shows_safe_retry_guidance(monkeypatch, payment_command, payment_args):
+    payment_id = uuid4()
+    monkeypatch.setattr(
+        AgentWalletClient,
+        "pay",
+        lambda client, body: {"payment_operation_id": body["payment_operation_id"]},
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "agent-wallet",
+            "pay",
+            payment_command,
+            "--payment-id",
+            str(payment_id),
+            *payment_args,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (
+        f"ramp agent-wallet pay {payment_command} --payment-id {payment_id} ..."
+        in result.output
+    )
+    assert "ramp agent-wallet list --limit 10" in result.output
+
+
+def test_pay__omits_retry_guidance_from_agent_output(monkeypatch):
+    monkeypatch.setattr(
+        AgentWalletClient,
+        "pay",
+        lambda client, body: {"payment_operation_id": body["payment_operation_id"]},
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["--agent", "agent-wallet", "pay", "cards", *_card_args()],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "To retry safely" not in result.output
+    assert "ramp agent-wallet list" not in result.output
+
+
 def test_pay__reuses_explicit_payment_id(monkeypatch):
     operation_id = uuid4()
     captured = {}
@@ -587,7 +759,7 @@ def test_pay_json__reuses_explicit_payment_id(monkeypatch):
             "--payment-id",
             str(payment_id),
             "--json",
-            json.dumps({"method": "vic", "method_request": {}}),
+            json.dumps({"method": "card", "method_request": {}}),
         ],
     )
 
@@ -629,6 +801,8 @@ def test_pay__preserves_agent_wallet_client_error(monkeypatch):
     assert str(result.exception) == "wallet failed"
     operation_id = UUID(captured["body"]["payment_operation_id"])
     assert f"Payment ID: {operation_id}" in result.output
+    assert f"--payment-id {operation_id}" in result.output
+    assert "ramp agent-wallet list --limit 10" in result.output
 
 
 @pytest.mark.parametrize("response", [b"secret", b"[]", b"null"])

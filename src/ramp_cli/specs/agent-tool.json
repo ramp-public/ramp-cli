@@ -6197,6 +6197,57 @@
         ],
         "x-read-only": false
       }
+    },
+    "/developer/v1/agent-wallet/agents/{agent_id}/policies": {
+      "parameters": [
+        {
+          "description": "Standalone agent ID returned by the list agents tool.",
+          "in": "path",
+          "name": "agent_id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          },
+          "style": "simple"
+        }
+      ],
+      "post": {
+        "operationId": "post_agent_wallet_policy_publication_resource",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CanonicalPolicyRequestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Agent Wallet policy published"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "agent_wallet_policy:write"
+            ]
+          }
+        ],
+        "summary": "Publish the active policy for a standalone Agent Wallet",
+        "tags": [
+          "Agent Wallet",
+          "agent-wallet"
+        ],
+        "x-alias": "policy",
+        "x-gated-by": "agent_wallet_enabled",
+        "x-platforms": [
+          "cli",
+          "mcp"
+        ],
+        "x-read-only": false
+      }
     }
   },
   "info": {
@@ -33882,6 +33933,256 @@
           "loyalty_program_id"
         ],
         "title": "ApplicableTravelerLoyaltyProgram",
+        "type": "object"
+      },
+      "CanonicalPolicyRequestBody": {
+        "additionalProperties": false,
+        "properties": {
+          "approval_mode": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalModeRequestBody"
+              }
+            ],
+            "default": "every_payment"
+          },
+          "approval_validity_seconds": {
+            "default": 86400,
+            "exclusiveMinimum": true,
+            "minimum": 0,
+            "title": "Approval Validity Seconds",
+            "type": "integer"
+          },
+          "configurations": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/CardPolicyConfigurationRequestBody"
+                },
+                {
+                  "$ref": "#/components/schemas/PolicyConfigurationRequestBody"
+                }
+              ]
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "Configurations",
+            "type": "array"
+          },
+          "constraints": {
+            "$ref": "#/components/schemas/WalletConstraintsRequestBody"
+          },
+          "policy_version": {
+            "format": "uuid",
+            "title": "Policy Version",
+            "type": "string"
+          },
+          "schema_version": {
+            "maximum": 1,
+            "minimum": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "configurations",
+          "constraints",
+          "policy_version",
+          "schema_version"
+        ],
+        "title": "CanonicalPolicy",
+        "type": "object"
+      },
+      "ApprovalModeRequestBody": {
+        "enum": [
+          "every_payment",
+          "none"
+        ],
+        "title": "ApprovalMode",
+        "type": "string"
+      },
+      "PolicyConfigurationRequestBody": {
+        "additionalProperties": false,
+        "properties": {
+          "configuration_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Configuration Id",
+            "type": "string"
+          },
+          "method": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Method",
+            "type": "string"
+          }
+        },
+        "required": [
+          "configuration_id",
+          "method"
+        ],
+        "title": "PolicyConfiguration",
+        "type": "object"
+      },
+      "CardPolicyConfigurationRequestBody": {
+        "additionalProperties": false,
+        "description": "Ramp merchant/category policy accepted only by card payments.",
+        "properties": {
+          "configuration_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Configuration Id",
+            "type": "string"
+          },
+          "merchant_category_policy": {
+            "discriminator": {
+              "mapping": {
+                "allowlist": "#/components/schemas/CardMerchantCategoryAllowlistRequestBody",
+                "unrestricted": "#/components/schemas/CardMerchantCategoryUnrestrictedRequestBody"
+              },
+              "propertyName": "mode"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CardMerchantCategoryAllowlistRequestBody"
+              },
+              {
+                "$ref": "#/components/schemas/CardMerchantCategoryUnrestrictedRequestBody"
+              }
+            ],
+            "title": "Merchant Category Policy"
+          },
+          "method": {
+            "enum": [
+              "card"
+            ],
+            "title": "Method",
+            "type": "string"
+          }
+        },
+        "required": [
+          "configuration_id",
+          "merchant_category_policy",
+          "method"
+        ],
+        "title": "CardPolicyConfiguration",
+        "type": "object"
+      },
+      "WalletConstraintsRequestBody": {
+        "additionalProperties": false,
+        "properties": {
+          "currency": {
+            "pattern": "^[A-Z][A-Z0-9_]{2,31}$",
+            "title": "Currency",
+            "type": "string"
+          },
+          "ends_at": {
+            "format": "date-time",
+            "title": "Ends At",
+            "type": "string"
+          },
+          "max_amount": {
+            "exclusiveMinimum": true,
+            "minimum": 0,
+            "oneOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "title": "Max Amount"
+          },
+          "max_amount_per_payment": {
+            "exclusiveMinimum": true,
+            "minimum": 0,
+            "oneOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "title": "Max Amount Per Payment"
+          },
+          "max_payments": {
+            "exclusiveMinimum": true,
+            "minimum": 0,
+            "title": "Max Payments",
+            "type": "integer"
+          },
+          "starts_at": {
+            "format": "date-time",
+            "title": "Starts At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "currency",
+          "ends_at",
+          "max_amount",
+          "max_amount_per_payment",
+          "max_payments",
+          "starts_at"
+        ],
+        "title": "WalletConstraints",
+        "type": "object"
+      },
+      "CardMerchantCategoryAllowlistRequestBody": {
+        "additionalProperties": false,
+        "description": "Allow merchants or categories using SpendAllocation union semantics.",
+        "properties": {
+          "allowed_category_codes": {
+            "default": [],
+            "items": {
+              "exclusiveMinimum": true,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "title": "Allowed Category Codes",
+            "type": "array"
+          },
+          "allowed_merchant_uuids": {
+            "default": [],
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Allowed Merchant Uuids",
+            "type": "array"
+          },
+          "mode": {
+            "enum": [
+              "allowlist"
+            ],
+            "title": "Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "title": "CardMerchantCategoryAllowlist",
+        "type": "object"
+      },
+      "CardMerchantCategoryUnrestrictedRequestBody": {
+        "additionalProperties": false,
+        "description": "Explicitly allow any merchant or category.",
+        "properties": {
+          "mode": {
+            "enum": [
+              "unrestricted"
+            ],
+            "title": "Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "title": "CardMerchantCategoryUnrestricted",
         "type": "object"
       }
     },

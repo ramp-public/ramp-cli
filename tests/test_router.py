@@ -68,9 +68,15 @@ def _mock_models(
             return httpx.Response(404, request=httpx.Request("GET", url))
         assert url == f"{base_url}/models"
         assert headers["Authorization"] == f"Bearer {key}"
-        assert set(headers) <= {"Authorization", "X-Gateway-Client"}
+        assert set(headers) <= {
+            "Authorization",
+            "X-Gateway-Client",
+            "X-Gateway-Model-View",
+        }
         if "X-Gateway-Client" in headers:
             assert headers["X-Gateway-Client"] in {"claude-code", "codex"}
+        if "X-Gateway-Model-View" in headers:
+            assert headers["X-Gateway-Model-View"] == "all"
         assert timeout == 10
         if headers.get("X-Gateway-Client") == "codex":
             return httpx.Response(
@@ -823,7 +829,41 @@ def test_refresh_reapplies_claude_config_and_preserves_selected_model(
     assert settings["env"]["ANTHROPIC_BASE_URL"] == "https://router-api.ramp.com"
 
 
-def test_refresh_replaces_retired_router_owned_subagent_models(tmp_path, monkeypatch):
+def test_refresh_does_not_claim_a_user_selected_claude_model_view(
+    tmp_path, monkeypatch
+):
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    _mock_models(monkeypatch)
+    configured = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure",
+            "claude-code",
+            "--api-key",
+            "router-secret",
+        ],
+    )
+    assert configured.exit_code == 0, configured.output
+    settings_path = claude_home / "settings.json"
+    settings = json.loads(settings_path.read_text())
+    settings["env"]["ANTHROPIC_CUSTOM_HEADERS"] += "\nX-Gateway-Model-View: all"
+    settings_path.write_text(json.dumps(settings))
+
+    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+    assert refreshed.exit_code == 0, refreshed.output
+    removed = CliRunner().invoke(
+        cli, ["--human", "router", "unconfigure", "claude-code"]
+    )
+    assert removed.exit_code == 0, removed.output
+
+    restored = json.loads(settings_path.read_text())
+    assert restored["env"]["ANTHROPIC_CUSTOM_HEADERS"] == ("X-Gateway-Model-View: all")
+
+
+def test_refresh_does_not_add_subagent_overrides(tmp_path, monkeypatch):
     claude_home = tmp_path / "claude"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
     _mock_models(
@@ -859,15 +899,7 @@ def test_refresh_replaces_retired_router_owned_subagent_models(tmp_path, monkeyp
 
     assert refreshed.exit_code == 0, refreshed.output
     environment = json.loads((claude_home / "settings.json").read_text())["env"]
-    for tier in router_module.SUBAGENT_TIERS:
-        assert (
-            environment[claude_code.SUBAGENT_TIER_ENV_KEYS[tier]]
-            == "claude-router-current"
-        )
-        assert (
-            environment[claude_code.SUBAGENT_TIER_NAME_ENV_KEYS[tier]]
-            == "Current Model"
-        )
+    assert not set(claude_code.SUBAGENT_ENV_KEYS) & environment.keys()
 
 
 def test_configure_claude_fetches_only_its_model_projection(tmp_path, monkeypatch):
@@ -907,6 +939,153 @@ def test_configure_claude_fetches_only_its_model_projection(tmp_path, monkeypatc
             "X-Gateway-Client": "claude-code",
         }
     ]
+
+
+def test_configure_claude_all_models_sets_wire_header(tmp_path, monkeypatch):
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    requests = []
+
+    def get(url, *, headers, timeout):
+        requests.append(headers)
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "claude-router-a", "router": _router_metadata("a")}]},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(router_module.httpx, "get", get)
+    configured = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure",
+            "claude-code",
+            "--api-key",
+            "router-secret",
+            "--claude-models",
+            "all",
+        ],
+    )
+
+    assert configured.exit_code == 0, configured.output
+    assert [headers for headers in requests if "Authorization" in headers] == [
+        {
+            "Authorization": "Bearer router-secret",
+            "X-Gateway-Client": "claude-code",
+            "X-Gateway-Model-View": "all",
+        }
+    ]
+    headers = json.loads((claude_home / "settings.json").read_text())["env"][
+        "ANTHROPIC_CUSTOM_HEADERS"
+    ]
+    assert "X-Gateway-Model-View: all" in headers
+
+    requests.clear()
+    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+    assert refreshed.exit_code == 0, refreshed.output
+    assert [headers for headers in requests if "Authorization" in headers] == [
+        {
+            "Authorization": "Bearer router-secret",
+            "X-Gateway-Client": "claude-code",
+            "X-Gateway-Model-View": "all",
+        }
+    ]
+
+
+def test_reconfigure_claude_only_updates_model_view(tmp_path, monkeypatch):
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    _mock_models(monkeypatch)
+    configured = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure",
+            "claude-code",
+            "--api-key",
+            "router-secret",
+        ],
+    )
+    assert configured.exit_code == 0, configured.output
+    settings_path = claude_home / "settings.json"
+    settings = json.loads(settings_path.read_text())
+    settings["userSetting"] = "keep"
+    settings["env"]["ANTHROPIC_CUSTOM_HEADERS"] += "\nX-Unrelated: keep"
+    settings_path.write_text(json.dumps(settings))
+
+    monkeypatch.setattr(
+        router_module.httpx,
+        "get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("local preference update must not call Router")
+        ),
+    )
+    expanded = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "--no-input",
+            "router",
+            "configure",
+            "claude-code",
+            "--claude-models",
+            "all",
+        ],
+    )
+
+    assert expanded.exit_code == 0, expanded.output
+    updated = json.loads(settings_path.read_text())
+    assert updated["userSetting"] == "keep"
+    assert updated["env"]["ANTHROPIC_AUTH_TOKEN"] == "router-secret"
+    assert "X-Unrelated: keep" in updated["env"]["ANTHROPIC_CUSTOM_HEADERS"]
+    assert "X-Gateway-Model-View: all" in updated["env"]["ANTHROPIC_CUSTOM_HEADERS"]
+
+    machine = CliRunner().invoke(
+        cli,
+        [
+            "--agent",
+            "--no-input",
+            "router",
+            "configure",
+            "claude-code",
+            "--claude-models",
+            "all",
+        ],
+    )
+    assert machine.exit_code == 0, machine.output
+    payload = json.loads(machine.output)["data"][0]
+    original_setup_command = payload.pop("original_setup_command")
+    assert original_setup_command.startswith("claude --settings ")
+    assert payload == {
+        "client": "claude-code",
+        "config_path": str(settings_path),
+        "provider": "ramp-router",
+        "default_model": updated["model"],
+        "models_available": None,
+        "setup_file_deleted": False,
+        "replaced_outdated_setup": False,
+        "model_view": "all",
+    }
+
+    compact = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "--no-input",
+            "router",
+            "configure",
+            "claude-code",
+            "--claude-models",
+            "compact",
+        ],
+    )
+    assert compact.exit_code == 0, compact.output
+    headers = json.loads(settings_path.read_text())["env"]["ANTHROPIC_CUSTOM_HEADERS"]
+    assert "X-Unrelated: keep" in headers
+    assert "X-Gateway-Model-View" not in headers
 
 
 def test_configure_claude_rejects_versions_that_mislabel_gateway_models(
@@ -984,9 +1163,7 @@ def test_subagent_writes_reject_old_claude_but_reset_still_works(tmp_path, monke
     assert reset.exit_code == 0, reset.output
 
 
-def test_configure_claude_sets_tasteful_subagent_defaults_and_restores_them(
-    tmp_path, monkeypatch
-):
+def test_configure_claude_does_not_set_subagent_defaults(tmp_path, monkeypatch):
     settings_path = _configure_claude_for_subagents(
         monkeypatch,
         tmp_path,
@@ -1019,20 +1196,7 @@ def test_configure_claude_sets_tasteful_subagent_defaults_and_restores_them(
     )
 
     environment = json.loads(settings_path.read_text())["env"]
-    assert environment["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "claude-router-terra"
-    assert environment["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "claude-router-sol"
-    assert environment["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "claude-router-luna"
-    assert environment["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-router-sol"
-    assert environment["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] == "GPT-5.6 Terra"
-    assert environment["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"] == "GPT-5.6 Sol (Opus tier)"
-    assert environment["ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME"] == "GPT-5.6 Luna"
-    assert (
-        environment["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"] == "GPT-5.6 Sol (Fable tier)"
-    )
-    assert (
-        environment["ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION"]
-        == "Balanced GPT-5.6 model"
-    )
+    assert not set(claude_code.SUBAGENT_ENV_KEYS) & environment.keys()
 
     removed = CliRunner().invoke(
         cli, ["--human", "router", "unconfigure", "claude-code"]
@@ -1042,7 +1206,7 @@ def test_configure_claude_sets_tasteful_subagent_defaults_and_restores_them(
     assert not set(claude_code.SUBAGENT_ENV_KEYS) & restored.get("env", {}).keys()
 
 
-def test_configure_claude_replaces_unsupported_tiers_then_restores_them(
+def test_configure_claude_preserves_existing_tiers_then_restores_them(
     tmp_path, monkeypatch
 ):
     claude_home = tmp_path / "claude"
@@ -1062,11 +1226,11 @@ def test_configure_claude_replaces_unsupported_tiers_then_restores_them(
 
     assert configured.exit_code == 0, configured.output
     environment = json.loads(settings_path.read_text())["env"]
-    assert environment["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "gpt-5.4"
-    assert environment["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "gpt-5.4"
-    assert environment["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "gpt-5.4"
-    assert environment["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "gpt-5.4"
-    assert environment["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] == "gpt-5.4"
+    assert environment["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "user-selected-model"
+    assert (
+        not (set(claude_code.SUBAGENT_ENV_KEYS) - {"ANTHROPIC_DEFAULT_SONNET_MODEL"})
+        & environment.keys()
+    )
 
     removed = CliRunner().invoke(
         cli, ["--human", "router", "unconfigure", "claude-code"]
@@ -1105,16 +1269,11 @@ def test_configure_claude_keeps_an_existing_router_tier_choice(tmp_path, monkeyp
     settings = json.loads(settings_path.read_text())
     assert settings["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "claude-router-custom"
     state = json.loads((claude_home / "ramp-router-state.json").read_text())
-    assert (
-        state["written"]["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"]
-        == "claude-router-custom"
-    )
-    assert settings["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] == "custom-model"
+    assert "ANTHROPIC_DEFAULT_SONNET_MODEL" not in state["written"]["env"]
+    assert "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME" not in settings["env"]
 
 
-def test_reconfigure_adds_truthful_names_to_legacy_tier_overrides(
-    tmp_path, monkeypatch
-):
+def test_reconfigure_preserves_legacy_manual_tier_overrides(tmp_path, monkeypatch):
     claude_home = tmp_path / "claude"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
     claude_home.mkdir()
@@ -1172,9 +1331,10 @@ def test_reconfigure_adds_truthful_names_to_legacy_tier_overrides(
 
     assert result.exit_code == 0, result.output
     environment = json.loads(settings_path.read_text())["env"]
-    assert environment["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] == "GPT-5.6 Terra"
-    assert environment["ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME"] == "GPT-5 Mini"
-    assert environment["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-router-terra"
+    assert environment["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "claude-router-terra"
+    assert environment["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "claude-router-mini"
+    assert "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME" not in environment
+    assert "ANTHROPIC_DEFAULT_FABLE_MODEL" not in environment
 
 
 def test_reconfigure_migrates_unchanged_router_owned_tier_defaults(
@@ -1207,11 +1367,17 @@ def test_reconfigure_migrates_unchanged_router_owned_tier_defaults(
             "haiku": "GPT-5 Mini",
             "fable": "GPT-5.6 Terra",
         },
-        descriptions={
-            tier: "Old automatic default" for tier in router_module.SUBAGENT_TIERS
-        },
         automatic_tiers=set(router_module.SUBAGENT_TIERS),
     )
+    # Persist the presentation metadata written by the previous CLI release.
+    for tier in router_module.SUBAGENT_TIERS:
+        description_key = claude_code.SUBAGENT_TIER_DESCRIPTION_ENV_KEYS[tier]
+        configured["env"][description_key] = "Old automatic default"
+        state["written"]["env"][description_key] = "Old automatic default"
+    for tier in ("opus", "fable"):
+        name_key = claude_code.SUBAGENT_TIER_NAME_ENV_KEYS[tier]
+        configured["env"][name_key] += f" ({tier.title()} tier)"
+        state["written"]["env"][name_key] = configured["env"][name_key]
     settings_path.write_text(json.dumps(configured))
     claude_code.state_path(settings_path).write_text(json.dumps(state))
     _mock_models(
@@ -1238,6 +1404,13 @@ def test_reconfigure_migrates_unchanged_router_owned_tier_defaults(
         ],
     )
 
+    # Values changed after configure are no longer Router-owned and must stay.
+    opus_name_key = claude_code.SUBAGENT_TIER_NAME_ENV_KEYS["opus"]
+    opus_description_key = claude_code.SUBAGENT_TIER_DESCRIPTION_ENV_KEYS["opus"]
+    configured["env"][opus_name_key] = "My custom Opus name"
+    configured["env"][opus_description_key] = "My custom Opus description"
+    settings_path.write_text(json.dumps(configured))
+
     result = CliRunner().invoke(
         cli,
         ["--human", "router", "configure", "claude-code"],
@@ -1246,33 +1419,23 @@ def test_reconfigure_migrates_unchanged_router_owned_tier_defaults(
 
     assert result.exit_code == 0, result.output
     environment = json.loads(settings_path.read_text())["env"]
-    assert environment["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "claude-router-terra"
-    assert environment["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "claude-router-sol"
-    assert environment["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "claude-router-luna"
-    assert environment["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-router-sol"
-    assert environment["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"] == "GPT-5.6 Sol (Opus tier)"
+    automatic_keys = {
+        key
+        for tier in router_module.SUBAGENT_TIERS
+        for key in (
+            claude_code.SUBAGENT_TIER_ENV_KEYS[tier],
+            claude_code.SUBAGENT_TIER_NAME_ENV_KEYS[tier],
+            claude_code.SUBAGENT_TIER_DESCRIPTION_ENV_KEYS[tier],
+        )
+    }
     assert (
-        environment["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"] == "GPT-5.6 Sol (Fable tier)"
+        not (automatic_keys - {opus_name_key, opus_description_key})
+        & environment.keys()
     )
-
-    settings = json.loads(settings_path.read_text())
-    state_path = claude_code.state_path(settings_path)
-    state = json.loads(state_path.read_text())
-    for tier in ("opus", "fable"):
-        name_key = claude_code.SUBAGENT_TIER_NAME_ENV_KEYS[tier]
-        settings["env"][name_key] = "GPT-5.6 Sol"
-        state["written"]["env"][name_key] = "GPT-5.6 Sol"
-    opus_description_key = claude_code.SUBAGENT_TIER_DESCRIPTION_ENV_KEYS["opus"]
-    settings["env"][opus_description_key] = "My custom Opus description"
-    settings_path.write_text(json.dumps(settings))
-    state_path.write_text(json.dumps(state))
-
-    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
-
-    assert refreshed.exit_code == 0, refreshed.output
-    environment = json.loads(settings_path.read_text())["env"]
-    assert environment["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"] == "GPT-5.6 Sol (Opus tier)"
+    assert environment["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"] == "My custom Opus name"
     assert environment[opus_description_key] == "My custom Opus description"
+    state = json.loads(claude_code.state_path(settings_path).read_text())
+    assert state[claude_code.SUBAGENT_DEFAULTS_STATE_KEY] == {}
 
 
 def test_reconfigure_preserves_a_manually_pinned_previous_default(
@@ -1330,7 +1493,7 @@ def test_subagents_uses_the_router_saved_by_nonproduction_configure(
     result = CliRunner().invoke(cli, ["--human", "router", "subagents"])
 
     assert result.exit_code == 0, result.output
-    assert "gpt-5.4" in result.output
+    assert "not set" in result.output
 
 
 def _configure_claude_for_subagents(monkeypatch, tmp_path, models):
@@ -1416,7 +1579,7 @@ def test_subagents_set_resolves_fragments_and_unconfigure_restores(
     assert (
         environment["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "claude-router-kimi-k3-bbbbbb"
     )
-    assert environment["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "claude-router-gpt-5-4-aaaaaa"
+    assert "ANTHROPIC_DEFAULT_OPUS_MODEL" not in environment
     assert "GPT-5.4" in result.output
     assert "Kimi K3" in result.output
 
@@ -1455,10 +1618,7 @@ def test_subagents_show_reports_tiers_in_agent_mode(tmp_path, monkeypatch):
         "model": "claude-router-gpt-5-4-aaaaaa",
         "display_name": "GPT-5.4",
     }
-    assert payload["tiers"]["sonnet"] == {
-        "model": "claude-router-gpt-5-4-aaaaaa",
-        "display_name": "GPT-5.4",
-    }
+    assert payload["tiers"]["sonnet"] == {"model": None}
 
 
 def test_subagents_rejects_an_ambiguous_fragment(tmp_path, monkeypatch):
@@ -4391,6 +4551,28 @@ def test_client_picker_offers_everything_when_no_agent_is_found(monkeypatch, cap
         "pi",
     ]
     assert "No coding agents found" in capsys.readouterr().out
+
+
+def test_claude_model_picker_offers_recommended_and_all(monkeypatch):
+    captured = {}
+
+    class Prompt:
+        def ask(self):
+            return "all"
+
+    def select(message, **kwargs):
+        captured["message"] = message
+        captured.update(kwargs)
+        return Prompt()
+
+    monkeypatch.setattr(router_module.questionary, "select", select)
+
+    assert router_module._pick_claude_models() == "all"
+    assert captured["default"] == "compact"
+    assert [choice.title for choice in captured["choices"]] == [
+        "Recommended models (default)",
+        "All available models",
+    ]
 
 
 def test_installed_clients_finds_agents_on_path_or_with_a_config_dir(

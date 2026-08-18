@@ -68,7 +68,7 @@ def _validate_expires_at(value: str) -> str:
     return expires_at.isoformat()
 
 
-def build_structured_vic_body(
+def build_structured_card_body(
     payment_operation_id: UUID,
     merchant_name: str | None,
     merchant_url: str | None,
@@ -99,7 +99,7 @@ def build_structured_vic_body(
     amount_cents = _usd_to_cents(amount or "")
     return {
         "payment_operation_id": str(payment_operation_id),
-        "method": "vic",
+        "method": "card",
         "method_request": {
             "merchant": {
                 "name": name,
@@ -112,7 +112,7 @@ def build_structured_vic_body(
     }
 
 
-def validate_vic_json_body(body: dict[str, Any]) -> dict[str, Any]:
-    if body.get("method") != "vic":
-        raise click.BadParameter("method must be 'vic'", param_hint="'--json'")
+def validate_card_json_body(body: dict[str, Any]) -> dict[str, Any]:
+    if body.get("method") != "card":
+        raise click.BadParameter("method must be 'card'", param_hint="'--json'")
     return body

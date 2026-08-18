@@ -27,6 +27,27 @@ class AgentWalletClientError(RampCLIError):
     """Agent Wallet routing or response validation failed."""
 
 
+class AgentWalletApiError(ApiError):
+    """API failure enriched with Agent Wallet command context."""
+
+    def __init__(self, error: ApiError) -> None:
+        self.status_code = error.status_code
+        self.body = error.body
+        self.error_code = error.error_code
+
+        detail = error.detail
+        if error.status_code == 503 and detail.rstrip(".").casefold() == (
+            "authentication service unavailable"
+        ):
+            detail = (
+                "The authentication service is temporarily unavailable. "
+                "Try again shortly."
+            )
+
+        self.detail = detail
+        RampCLIError.__init__(self, f"Agent Wallet request failed: {detail}")
+
+
 class AgentWalletAuthRequiredError(AgentWalletClientError):
     def __init__(self) -> None:
         super().__init__(

@@ -142,26 +142,73 @@ def test_subagent_update_writes_tiers_and_unconfigure_restores_them(tmp_path):
         state,
         {"sonnet": "claude-router-a", "haiku": "claude-router-b"},
         display_names={"sonnet": "GPT-5.6 Terra", "haiku": "GPT-5 Mini"},
-        descriptions={
-            "sonnet": "Balanced Router model",
-            "haiku": "Fast Router model",
-        },
     )
 
     assert updated["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "claude-router-a"
     assert updated["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "claude-router-b"
     assert updated["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"] == "GPT-5.6 Terra"
     assert updated["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME"] == "GPT-5 Mini"
-    assert (
-        updated["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION"]
-        == "Balanced Router model"
-    )
+    assert "ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION" not in updated["env"]
     assert "ANTHROPIC_DEFAULT_OPUS_MODEL" not in updated["env"]
 
     # A tier override naming a Router-served model is meaningless once Router
     # is unconfigured, so restoration puts back exactly what was there before.
     restored = claude_code.plan_restoration(updated, path, state)
     assert restored == original
+
+
+def test_automatic_cleanup_only_removes_unchanged_router_values(tmp_path):
+    path = tmp_path / "settings.json"
+    original = {
+        "env": {
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "pre-router-opus",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "My original name",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION": "My original description",
+        }
+    }
+    configured, state = claude_code.plan_configuration(
+        original, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+    configured, state = claude_code.plan_subagent_update(
+        configured,
+        path,
+        state,
+        {"opus": "claude-router-sol", "fable": "claude-router-sol"},
+        display_names={
+            "opus": "GPT-5.6 Sol (Opus tier)",
+            "fable": "GPT-5.6 Sol (Fable tier)",
+        },
+        automatic_tiers={"opus", "fable"},
+    )
+    # Simulate descriptions written by the previous CLI release.
+    for tier in ("opus", "fable"):
+        key = claude_code.SUBAGENT_TIER_DESCRIPTION_ENV_KEYS[tier]
+        state["env"][key] = {
+            "present": key in original["env"],
+            "value": original["env"].get(key),
+        }
+        configured["env"][key] = "Router catalog description"
+        state["written"]["env"][key] = "Router catalog description"
+    configured["env"]["ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION"] = "My edit"
+    configured["env"]["ANTHROPIC_DEFAULT_FABLE_MODEL"] = "my-model-edit"
+
+    cleaned, state = claude_code.plan_automatic_subagent_cleanup(
+        configured, path, state
+    )
+
+    assert cleaned["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"] == "My original name"
+    assert "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME" not in cleaned["env"]
+    assert "ANTHROPIC_DEFAULT_OPUS_MODEL" not in cleaned["env"]
+    assert cleaned["env"]["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "my-model-edit"
+    assert "ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION" not in cleaned["env"]
+    assert cleaned["env"]["ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION"] == "My edit"
+    restored = claude_code.plan_restoration(cleaned, path, state)
+    assert restored["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION"] == (
+        "My original description"
+    )
+    assert restored["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "pre-router-opus"
+    assert restored["env"]["ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION"] == "My edit"
+    assert restored["env"]["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "my-model-edit"
 
 
 def test_first_tier_write_snapshots_the_current_hand_set_value(tmp_path):
@@ -559,6 +606,69 @@ def test_discovery_is_enabled_with_the_projection_marker(monkeypatch, tmp_path):
     # The default model has to come from the list Claude Code itself will see,
     # or the id written here is one its picker does not recognize.
     assert any(headers.get("X-Gateway-Client") == "claude-code" for headers in seen)
+
+
+def test_configuration_merges_custom_headers_and_restores_them(tmp_path):
+    path = tmp_path / "settings.json"
+    original = {
+        "env": {
+            "ANTHROPIC_CUSTOM_HEADERS": ("X-Unrelated: keep\nX-Gateway-Model-View: all")
+        }
+    }
+
+    configured, state = claude_code.plan_configuration(
+        original, path, "https://router.example", "secret", "model"
+    )
+
+    assert configured["env"]["ANTHROPIC_CUSTOM_HEADERS"] == (
+        "X-Unrelated: keep\nX-Gateway-Client: claude-code"
+    )
+    assert claude_code.plan_restoration(configured, path, state) == original
+
+
+def test_model_view_update_preserves_unrelated_header_edits(tmp_path):
+    path = tmp_path / "settings.json"
+    configured, state = claude_code.plan_configuration(
+        {"env": {"ANTHROPIC_CUSTOM_HEADERS": "X-Unrelated: old"}},
+        path,
+        "https://router.example",
+        "secret",
+        "model",
+    )
+    configured["env"]["ANTHROPIC_CUSTOM_HEADERS"] = (
+        "X-Unrelated: new\nX-Added-Later: keep\nX-Gateway-Client: claude-code"
+    )
+
+    expanded, state = claude_code.plan_model_view_update(configured, path, state, "all")
+
+    assert expanded["env"]["ANTHROPIC_CUSTOM_HEADERS"].endswith(
+        "X-Gateway-Model-View: all"
+    )
+    restored = claude_code.plan_restoration(expanded, path, state)
+    assert restored["env"]["ANTHROPIC_CUSTOM_HEADERS"] == (
+        "X-Unrelated: new\nX-Added-Later: keep"
+    )
+
+
+def test_refresh_does_not_claim_a_user_edited_model_view(tmp_path):
+    path = tmp_path / "settings.json"
+    configured, state = claude_code.plan_configuration(
+        {}, path, "https://router.example", "secret", "model"
+    )
+    configured["env"]["ANTHROPIC_CUSTOM_HEADERS"] += "\nX-Gateway-Model-View: all"
+    refreshed, fresh = claude_code.plan_configuration(
+        configured,
+        path,
+        "https://router.example",
+        "secret",
+        "model",
+        model_view_all=True,
+    )
+    state = claude_code.merge_states(state, fresh, preserve_model_view_ownership=True)
+
+    restored = claude_code.plan_restoration(refreshed, path, state)
+
+    assert restored["env"]["ANTHROPIC_CUSTOM_HEADERS"] == ("X-Gateway-Model-View: all")
 
 
 def test_capability_overrides_are_not_written(monkeypatch, tmp_path):

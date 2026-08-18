@@ -84,7 +84,7 @@ def test_resource_not_found_does_not_claim_auth_is_missing() -> None:
     )
 
     message = str(error)
-    assert "API error 404: Session not found" in message
+    assert message == "API error 404: Session not found"
     assert "No valid auth token was found" not in message
     assert "ramp auth login" not in message
     assert error.code == EXIT_RUNTIME
@@ -97,7 +97,27 @@ def test_invalid_schema_error_hints_at_missing_field() -> None:
     )
 
     message = str(error)
-    assert "API error 422" in message
+    assert "There was an error." in message
     assert "failed validation" in message
     assert "--help" in message
     assert "auth login" not in message
+
+
+def test_detail_field_is_parsed() -> None:
+    error = ApiError(503, '{"detail":"Authentication service unavailable"}')
+
+    assert str(error) == "API error 503: Authentication service unavailable"
+    assert error.status_code == 503
+    assert error.body == '{"detail":"Authentication service unavailable"}'
+
+
+def test_empty_api_error_has_readable_fallback() -> None:
+    error = ApiError(503, "")
+
+    assert str(error) == "API error 503: Service Unavailable"
+
+
+def test_empty_api_error_with_unknown_status_has_generic_fallback() -> None:
+    error = ApiError(599, "")
+
+    assert str(error) == "API error 599: Request failed."

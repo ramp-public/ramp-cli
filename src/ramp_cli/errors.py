@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from http import HTTPStatus
 
 EXIT_SUCCESS = 0
 EXIT_RUNTIME = 1
@@ -84,7 +85,11 @@ class RampCLIError(Exception):
 
 class ApiError(RampCLIError):
     def __init__(
-        self, status_code: int, body: str, *, contextual_hint: str | None = None
+        self,
+        status_code: int,
+        body: str,
+        *,
+        contextual_hint: str | None = None,
     ) -> None:
         self.status_code = status_code
         self.body = body.strip()
@@ -108,8 +113,11 @@ class ApiError(RampCLIError):
                 parsed.get("message")
                 or error_v2.get("message")
                 or error_obj.get("message")
+                or parsed.get("detail")
                 or self.body[:500]
             )
+            if not isinstance(detail, str):
+                detail = self.body[:500]
             validation_details = (
                 parsed.get("errors")
                 or parsed.get("details")
@@ -132,6 +140,12 @@ class ApiError(RampCLIError):
             detail = self.body[:500]
             error_code = None
 
+        if not detail:
+            try:
+                detail = HTTPStatus(status_code).phrase
+            except ValueError:
+                detail = "Request failed."
+
         self.error_code = error_code
 
         # Error codes can be reused in responses with different HTTP semantics.
@@ -145,6 +159,7 @@ class ApiError(RampCLIError):
         if hint:
             detail += f"\n\n  {hint}"
 
+        self.detail = detail
         super().__init__(f"API error {status_code}: {detail}")
 
 

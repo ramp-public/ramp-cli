@@ -49,6 +49,7 @@ SUBAGENT_ENV_KEYS = (
     *SUBAGENT_TIER_DESCRIPTION_ENV_KEYS.values(),
 )
 SUBAGENT_DEFAULTS_STATE_KEY = "automatic_subagent_tiers"
+CUSTOM_HEADERS_STATE_KEY = "managed_custom_headers"
 _CLAUDE_AI_CONNECTORS_ENV = "ENABLE_CLAUDEAI_MCP_SERVERS"
 
 # Router keys are bearer tokens, so ANTHROPIC_AUTH_TOKEN is correct and
@@ -101,7 +102,9 @@ _ROUTER_MODEL_PREFIX = "claude-router-"
 # Selects Router's Claude Code view of /v1/models, where models whose ids are
 # not Claude-shaped appear under compatibility aliases. Presentation only; it
 # grants no additional access.
-_GATEWAY_CLIENT_HEADER = "X-Gateway-Client: claude-code"
+GATEWAY_CLIENT_HEADER = "X-Gateway-Client"
+GATEWAY_CLIENT_HEADER_VALUE = "claude-code"
+MODEL_VIEW_HEADER = "X-Gateway-Model-View"
 
 _STATE_FILENAME = "ramp-router-state.json"
 _ORIGINAL_SETTINGS_FILENAME = "original.settings.json"
@@ -157,6 +160,45 @@ def _environment(settings: dict, path: Path) -> dict:
     return environment
 
 
+def _custom_header_value(headers: object, name: str) -> str | None:
+    if not isinstance(headers, str):
+        return None
+    expected = name.casefold()
+    for line in headers.splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip().casefold() == expected:
+            return value.strip()
+    return None
+
+
+def _set_custom_header(headers: object, name: str, value: str | None) -> str | None:
+    """Set one Claude custom header without disturbing unrelated lines."""
+    lines = headers.splitlines() if isinstance(headers, str) else []
+    expected = name.casefold()
+    retained = []
+    for line in lines:
+        key, separator, _ = line.partition(":")
+        if separator and key.strip().casefold() == expected:
+            continue
+        retained.append(line)
+    if value is not None:
+        retained.append(f"{name}: {value}")
+    rendered = "\n".join(retained)
+    return rendered or None
+
+
+def model_view(settings: dict, path: Path) -> str:
+    environment = _environment(settings, path)
+    return (
+        "all"
+        if _custom_header_value(
+            environment.get("ANTHROPIC_CUSTOM_HEADERS"), MODEL_VIEW_HEADER
+        )
+        == "all"
+        else "compact"
+    )
+
+
 def statusline_path(path: Path) -> Path:
     """Where the managed status line script lives, beside the settings file."""
     return path.parent / "ramp-router-statusline"
@@ -197,6 +239,7 @@ def plan_configuration(
     *,
     usage_base_url: str | None = None,
     statusline: str | None = None,
+    model_view_all: bool = False,
 ) -> tuple[dict, dict]:
     """Return the settings to write and the state needed to undo them.
 
@@ -224,16 +267,31 @@ def plan_configuration(
             for key in _OWNED_ENV_KEYS
         },
         "top_level": top_level,
+        CUSTOM_HEADERS_STATE_KEY: {
+            GATEWAY_CLIENT_HEADER: GATEWAY_CLIENT_HEADER_VALUE,
+            MODEL_VIEW_HEADER: "all" if model_view_all else None,
+        },
     }
+    custom_headers = _set_custom_header(
+        environment.get("ANTHROPIC_CUSTOM_HEADERS"),
+        GATEWAY_CLIENT_HEADER,
+        GATEWAY_CLIENT_HEADER_VALUE,
+    )
+    custom_headers = _set_custom_header(
+        custom_headers, MODEL_VIEW_HEADER, "all" if model_view_all else None
+    )
     updated = dict(settings)
     updated["env"] = {
         **environment,
         "ANTHROPIC_BASE_URL": base_url,
         "ANTHROPIC_AUTH_TOKEN": api_key,
-        "ANTHROPIC_CUSTOM_HEADERS": _GATEWAY_CLIENT_HEADER,
         "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
         _CLAUDE_AI_CONNECTORS_ENV: "false",
     }
+    if custom_headers is None:
+        updated["env"].pop("ANTHROPIC_CUSTOM_HEADERS", None)
+    else:
+        updated["env"]["ANTHROPIC_CUSTOM_HEADERS"] = custom_headers
     # Two auth variables at once is ambiguous to Claude Code, so the one we do
     # not own is cleared rather than left to compete. It is restored on
     # unconfigure like every other owned key.
@@ -320,16 +378,15 @@ def plan_subagent_update(
     tiers: dict[str, str | None],
     *,
     display_names: dict[str, str] | None = None,
-    descriptions: dict[str, str] | None = None,
     automatic_tiers: set[str] | None = None,
 ) -> tuple[dict, dict]:
     """Return the settings and state after pointing sub-agent tiers at models.
 
     A string points the tier's variable at that model and writes its real
-    display name and description. Claude Code otherwise labels the tier as
-    Sonnet, Opus, Haiku, or Fable even when a gateway runs a different model.
-    None removes the model and presentation overrides so the tier falls back
-    to Claude Code's own default.
+    display name. Claude Code otherwise labels the tier as Sonnet, Opus, Haiku,
+    or Fable even when a gateway runs a different model. None removes the model
+    and Router-owned name override so the tier falls back to Claude Code's own
+    default.
 
     ``automatic_tiers`` records which writes came from configure defaults.
     Passing an empty set marks every tier in this update as a manual choice.
@@ -349,18 +406,26 @@ def plan_subagent_update(
     }
     updated_environment = dict(environment)
     display_names = display_names or {}
-    descriptions = descriptions or {}
     for tier, model in tiers.items():
         values = {
             SUBAGENT_TIER_ENV_KEYS[tier]: model,
             SUBAGENT_TIER_NAME_ENV_KEYS[tier]: (
                 display_names.get(tier) if model is not None else None
             ),
-            SUBAGENT_TIER_DESCRIPTION_ENV_KEYS[tier]: (
-                descriptions.get(tier) if model is not None else None
-            ),
         }
         for key, value in values.items():
+            is_name = key == SUBAGENT_TIER_NAME_ENV_KEYS[tier]
+            if is_name and (
+                (
+                    key in updated_state["written"]["env"]
+                    and environment.get(key) != updated_state["written"]["env"][key]
+                )
+                or (key not in updated_state["written"]["env"] and key in environment)
+            ):
+                # A claimed name changed since Router wrote it, or an older
+                # receipt never claimed the existing name. Either is the
+                # user's label and must survive configure, refresh, and reset.
+                continue
             # Snapshot on the first write of this key, not the first sighting.
             # A snapshot taken at configure time cannot speak for a value the
             # user hand-set between configure and the first subagents write:
@@ -387,6 +452,75 @@ def plan_subagent_update(
     return updated, updated_state
 
 
+def plan_automatic_subagent_cleanup(
+    settings: dict, path: Path, state: dict
+) -> tuple[dict, dict]:
+    """Remove only unchanged tier overrides recorded as configure defaults."""
+    automatic = state.get(SUBAGENT_DEFAULTS_STATE_KEY, {})
+    if not automatic:
+        return settings, state
+    environment = dict(_environment(settings, path))
+    updated_state = {
+        **state,
+        "written": {**state["written"], "env": dict(state["written"]["env"])},
+        SUBAGENT_DEFAULTS_STATE_KEY: {},
+    }
+    written = updated_state["written"]["env"]
+    for tier, automatic_model in automatic.items():
+        keys = (
+            SUBAGENT_TIER_ENV_KEYS[tier],
+            SUBAGENT_TIER_NAME_ENV_KEYS[tier],
+            SUBAGENT_TIER_DESCRIPTION_ENV_KEYS[tier],
+        )
+        for key in keys:
+            current = environment.get(key)
+            if key not in written or current != written[key]:
+                continue
+            if key == SUBAGENT_TIER_ENV_KEYS[tier] and current != automatic_model:
+                continue
+            environment.pop(key, None)
+            # Preserve the original snapshot and record the absence we now own,
+            # so unconfigure can still restore the pre-Router value.
+            written[key] = None
+    return {**settings, "env": environment}, updated_state
+
+
+def plan_model_view_update(
+    settings: dict, path: Path, state: dict, view: str
+) -> tuple[dict, dict]:
+    environment = dict(_environment(settings, path))
+    current_headers = environment.get("ANTHROPIC_CUSTOM_HEADERS")
+    managed = dict(state.get(CUSTOM_HEADERS_STATE_KEY, {}))
+    if GATEWAY_CLIENT_HEADER not in managed:
+        old_written = state["written"]["env"].get("ANTHROPIC_CUSTOM_HEADERS")
+        old_gateway = _custom_header_value(old_written, GATEWAY_CLIENT_HEADER)
+        if (
+            old_gateway == GATEWAY_CLIENT_HEADER_VALUE
+            and _custom_header_value(current_headers, GATEWAY_CLIENT_HEADER)
+            == old_gateway
+        ):
+            managed[GATEWAY_CLIENT_HEADER] = old_gateway
+    desired = "all" if view == "all" else None
+    rendered = _set_custom_header(current_headers, MODEL_VIEW_HEADER, desired)
+    if rendered is None:
+        environment.pop("ANTHROPIC_CUSTOM_HEADERS", None)
+    else:
+        environment["ANTHROPIC_CUSTOM_HEADERS"] = rendered
+    managed[MODEL_VIEW_HEADER] = desired
+    updated_state = {
+        **state,
+        CUSTOM_HEADERS_STATE_KEY: managed,
+        "written": {
+            **state["written"],
+            "env": {
+                **state["written"]["env"],
+                "ANTHROPIC_CUSTOM_HEADERS": rendered,
+            },
+        },
+    }
+    return {**settings, "env": environment}, updated_state
+
+
 def plan_restoration(settings: dict, path: Path, state: dict) -> dict:
     """Return the settings with every owned key put back as it was.
 
@@ -399,12 +533,31 @@ def plan_restoration(settings: dict, path: Path, state: dict) -> dict:
     written = state["written"]
     environment = dict(_environment(settings, path))
     for key, previous in state["env"].items():
+        if key == "ANTHROPIC_CUSTOM_HEADERS" and isinstance(
+            state.get(CUSTOM_HEADERS_STATE_KEY), dict
+        ):
+            continue
         if not _still_ours(environment, key, written["env"]):
             continue
         if previous.get("present"):
             environment[key] = previous.get("value")
         else:
             environment.pop(key, None)
+    managed_headers = state.get(CUSTOM_HEADERS_STATE_KEY)
+    if isinstance(managed_headers, dict):
+        current_headers = environment.get("ANTHROPIC_CUSTOM_HEADERS")
+        previous = state["env"]["ANTHROPIC_CUSTOM_HEADERS"]
+        original_headers = previous.get("value") if previous.get("present") else None
+        for name, managed_value in managed_headers.items():
+            if _custom_header_value(current_headers, name) != managed_value:
+                continue
+            current_headers = _set_custom_header(
+                current_headers, name, _custom_header_value(original_headers, name)
+            )
+        if current_headers is None:
+            environment.pop("ANTHROPIC_CUSTOM_HEADERS", None)
+        else:
+            environment["ANTHROPIC_CUSTOM_HEADERS"] = current_headers
     restored = dict(settings)
     if environment:
         restored["env"] = environment
@@ -457,7 +610,9 @@ def restore_legacy_connector_preference(settings: dict, state: dict) -> dict:
     return updated
 
 
-def merge_states(previous: dict, fresh: dict) -> dict:
+def merge_states(
+    previous: dict, fresh: dict, *, preserve_model_view_ownership: bool = False
+) -> dict:
     """Carry an existing snapshot forward through a repeat configure.
 
     The original snapshot is what unconfigure restores, so it is kept, while
@@ -481,6 +636,18 @@ def merge_states(previous: dict, fresh: dict) -> dict:
             "env": {**previous["written"]["env"], **fresh["written"]["env"]},
         },
     }
+    fresh_managed_headers = dict(fresh.get(CUSTOM_HEADERS_STATE_KEY, {}))
+    if preserve_model_view_ownership:
+        # Refresh mirrors the user's current view into the rewritten settings;
+        # it does not make a direct edit their own value. Keep the prior claim
+        # (or lack of one) so unconfigure removes only a view Router selected.
+        fresh_managed_headers.pop(MODEL_VIEW_HEADER, None)
+    managed_headers = {
+        **previous.get(CUSTOM_HEADERS_STATE_KEY, {}),
+        **fresh_managed_headers,
+    }
+    if managed_headers:
+        merged[CUSTOM_HEADERS_STATE_KEY] = managed_headers
     if "statusLine" in fresh:
         record = previous.get("statusLine")
         merged["statusLine"] = (
@@ -582,6 +749,7 @@ def _valid_state(state: object) -> bool:
     written = state.get("written")
     record = state.get("statusLine")
     automatic_defaults = state.get(SUBAGENT_DEFAULTS_STATE_KEY, {})
+    managed_headers = state.get(CUSTOM_HEADERS_STATE_KEY, {})
     top_level_keys = set(top_level) if isinstance(top_level, dict) else set()
     written_top_level = written.get("top_level") if isinstance(written, dict) else None
     written_top_level_keys = (
@@ -601,6 +769,12 @@ def _valid_state(state: object) -> bool:
         or not isinstance(automatic_defaults, dict)
         or not set(automatic_defaults) <= set(SUBAGENT_TIER_ENV_KEYS)
         or not all(isinstance(model, str) for model in automatic_defaults.values())
+        or not isinstance(managed_headers, dict)
+        or not set(managed_headers) <= {GATEWAY_CLIENT_HEADER, MODEL_VIEW_HEADER}
+        or not all(
+            value is None or isinstance(value, str)
+            for value in managed_headers.values()
+        )
     ):
         return False
     # The status line record exists only for a slot Router actually took.
