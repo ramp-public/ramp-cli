@@ -1054,6 +1054,10 @@ def _run_configure(
             claude_models = _pick_claude_models(current_view, clients)
         view = claude_models or current_view
         _write_claude_model_view(claude_path, view)
+        # The stale Fable denial hides a row from the very picker this
+        # preference configures, so the repeat-configure shortcut clears it
+        # like a full configure would.
+        _scrub_stale_fable_verdict()
         if fmt == "json":
             settings = claude_code.read_settings(claude_path)
             print_agent_json(
@@ -2577,7 +2581,24 @@ def _configure_claude_code(
                     f"{original_settings}: {exc}.",
                     err=True,
                 )
+    # Outside the settings lock: this touches Claude Code's separate user
+    # config, not the settings file the lock guards.
+    _scrub_stale_fable_verdict()
     return model
+
+
+def _scrub_stale_fable_verdict() -> None:
+    """Clear the cached first-party Fable denial that hides Router's Fable row.
+
+    Printed to stderr so a --json caller's stdout stays parseable.
+    """
+    if claude_code.scrub_stale_fable_access(claude_code.user_config_path()):
+        click.echo(
+            "Removed Claude Code's cached not-entitled Fable 5 verdict; it was "
+            "hiding Fable 5 from the /model picker even though Router serves "
+            "it. Restart open Claude Code sessions to see the row.",
+            err=True,
+        )
 
 
 def _require_truthful_claude_code_model_names() -> None:

@@ -59,6 +59,190 @@ def test_settings_live_in_the_user_directory(monkeypatch, tmp_path):
     assert claude_code.settings_path() == tmp_path / "elsewhere" / "settings.json"
 
 
+def test_user_config_sits_beside_the_configured_settings(monkeypatch, tmp_path):
+    # Claude Code keeps ~/.claude.json in the home directory itself, not under
+    # ~/.claude where the settings live.
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert claude_code.user_config_path() == tmp_path / ".claude.json"
+
+    # With an isolated config directory, the file moves to that root.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "elsewhere"))
+    assert claude_code.user_config_path() == tmp_path / "elsewhere" / ".claude.json"
+
+
+def test_scrub_removes_only_stale_fable_verdicts(tmp_path):
+    path = tmp_path / ".claude.json"
+    path.write_text(
+        json.dumps(
+            {
+                "modelAccessCache": [
+                    {"apiName": "claude-fable-5", "entitled": False},
+                    {"apiName": "claude-fable-5-20260801", "entitled": False},
+                    {"apiName": "claude-opus-5", "entitled": True},
+                    {"apiName": "claude-fable-5", "entitled": True},
+                ],
+                "numStartups": 7,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert claude_code.scrub_stale_fable_access(path)
+
+    config = json.loads(path.read_text(encoding="utf-8"))
+    # Entitled records and other families survive; only the "not entitled"
+    # Fable verdicts that hide the picker row are gone.
+    assert config["modelAccessCache"] == [
+        {"apiName": "claude-opus-5", "entitled": True},
+        {"apiName": "claude-fable-5", "entitled": True},
+    ]
+    # The rest of Claude Code's config is not disturbed.
+    assert config["numStartups"] == 7
+
+
+def test_scrub_leaves_clean_and_unexpected_user_configs_alone(tmp_path):
+    path = tmp_path / ".claude.json"
+
+    # Nothing to do without the file.
+    assert not claude_code.scrub_stale_fable_access(path)
+
+    # Nothing to do without a stale verdict, and the file is not rewritten.
+    path.write_text(
+        json.dumps(
+            {"modelAccessCache": [{"apiName": "claude-opus-5", "entitled": True}]}
+        ),
+        encoding="utf-8",
+    )
+    before = path.read_text(encoding="utf-8")
+    assert not claude_code.scrub_stale_fable_access(path)
+    assert path.read_text(encoding="utf-8") == before
+
+    # A file this CLI cannot parse belongs to Claude Code to repair; it must
+    # survive untouched.
+    path.write_text("{not json", encoding="utf-8")
+    assert not claude_code.scrub_stale_fable_access(path)
+    assert path.read_text(encoding="utf-8") == "{not json"
+
+    # An unexpected shape under the cache key is equally not this CLI's to fix.
+    path.write_text(json.dumps({"modelAccessCache": "nope"}), encoding="utf-8")
+    assert not claude_code.scrub_stale_fable_access(path)
+
+
+def test_scrub_updates_a_symlinked_user_config_through_the_link(tmp_path):
+    # Dotfiles-managed setups symlink ~/.claude.json at a managed target. The
+    # scrub must land in the target and leave the link itself in place.
+    target = tmp_path / "dotfiles" / "claude.json"
+    target.parent.mkdir()
+    target.write_text(
+        json.dumps(
+            {"modelAccessCache": [{"apiName": "claude-fable-5", "entitled": False}]}
+        ),
+        encoding="utf-8",
+    )
+    link = tmp_path / ".claude.json"
+    link.symlink_to(target)
+
+    assert claude_code.scrub_stale_fable_access(link)
+
+    assert link.is_symlink()
+    assert json.loads(target.read_text(encoding="utf-8"))["modelAccessCache"] == []
+
+
+def test_scrub_yields_to_a_concurrent_claude_code_write(monkeypatch, tmp_path):
+    path = tmp_path / ".claude.json"
+    stale = json.dumps(
+        {"modelAccessCache": [{"apiName": "claude-fable-5", "entitled": False}]}
+    )
+    path.write_text(stale, encoding="utf-8")
+    # A concurrent Claude Code session lands a different document between
+    # every read this scrub makes and its rename.
+    startups = iter(range(8, 100))
+    original = claude_code._replace_user_config_if_unchanged
+
+    def lose_the_race(target, expected, content):
+        path.write_text(
+            json.dumps(
+                {
+                    "modelAccessCache": [
+                        {"apiName": "claude-fable-5", "entitled": False}
+                    ],
+                    "numStartups": next(startups),
+                }
+            ),
+            encoding="utf-8",
+        )
+        return original(target, expected, content)
+
+    monkeypatch.setattr(claude_code, "_replace_user_config_if_unchanged", lose_the_race)
+
+    # The scrub gives up rather than clobbering the newer document.
+    assert not claude_code.scrub_stale_fable_access(path)
+    config = json.loads(path.read_text(encoding="utf-8"))
+    # The concurrent session's document survives verbatim, verdict and all.
+    assert config["modelAccessCache"] == [
+        {"apiName": "claude-fable-5", "entitled": False}
+    ]
+    assert config["numStartups"] >= 8
+
+
+def test_configure_scrubs_the_stale_fable_verdict(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    _mock_models(monkeypatch)
+    (tmp_path / "settings.json").write_text("{}", encoding="utf-8")
+    user_config = tmp_path / ".claude.json"
+    user_config.write_text(
+        json.dumps(
+            {"modelAccessCache": [{"apiName": "claude-fable-5", "entitled": False}]}
+        ),
+        encoding="utf-8",
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["--human", "router", "configure", "claude-code", "--api-key", "router-key"],
+    )
+    assert result.exit_code == 0, result.output
+
+    config = json.loads(user_config.read_text(encoding="utf-8"))
+    assert config["modelAccessCache"] == []
+    assert "Fable 5" in result.output
+
+
+def test_repeat_configure_scrubs_the_stale_fable_verdict(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    _mock_models(monkeypatch)
+    (tmp_path / "settings.json").write_text("{}", encoding="utf-8")
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["--human", "router", "configure", "claude-code", "--api-key", "router-key"],
+    )
+    assert result.exit_code == 0, result.output
+
+    # The verdict lands after the first configure — the shape of a machine
+    # that used Claude directly before moving to Router.
+    user_config = tmp_path / ".claude.json"
+    user_config.write_text(
+        json.dumps(
+            {"modelAccessCache": [{"apiName": "claude-fable-5", "entitled": False}]}
+        ),
+        encoding="utf-8",
+    )
+
+    # A keyless repeat configure takes the existing-setup shortcut and must
+    # still clear it.
+    result = runner.invoke(
+        cli,
+        ["router", "configure", "claude-code", "--claude-models", "compact"],
+        obj=None,
+    )
+    assert result.exit_code == 0, result.output
+    config = json.loads(user_config.read_text(encoding="utf-8"))
+    assert config["modelAccessCache"] == []
+
+
 def test_base_url_is_the_host_root():
     # Claude Code appends /v1/messages itself, so a base URL ending in /v1
     # produces /v1/v1/messages and every request 404s.

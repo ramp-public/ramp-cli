@@ -8,6 +8,8 @@ writing the documented environment values and being able to put them back.
 import json
 import os
 import shlex
+import stat
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -149,6 +151,134 @@ def read_settings(path: Path) -> dict:
             "the top-level value must be an object."
         )
     return data
+
+
+# Claude Code's user config (distinct from settings.json). It carries caches
+# Claude Code maintains for itself, including the Anthropic account's
+# per-model entitlements under this key.
+USER_CONFIG_FILENAME = ".claude.json"
+_MODEL_ACCESS_CACHE_KEY = "modelAccessCache"
+# Matches every Fable-family model id ("claude-fable-5", dated variants, and
+# future Fable releases) without touching any other family.
+_FABLE_MODEL_ID_MARKER = "claude-fable"
+# One re-read after a lost race with a concurrent Claude Code write. More
+# attempts would only matter under sustained rewriting, where next configure
+# or refresh gets another chance anyway.
+_SCRUB_ATTEMPTS = 2
+
+
+def user_config_path() -> Path:
+    """Locate Claude Code's user config (~/.claude.json).
+
+    Claude Code keeps this file at the root of CLAUDE_CONFIG_DIR when that is
+    set, and directly in the home directory otherwise — unlike settings.json,
+    which lives under ~/.claude by default.
+    """
+    configured = os.environ.get(CLAUDE_SETTINGS_ENV)
+    if configured:
+        return Path(configured).expanduser() / USER_CONFIG_FILENAME
+    return Path.home() / USER_CONFIG_FILENAME
+
+
+def scrub_stale_fable_access(path: Path) -> bool:
+    """Drop cached not-entitled Fable verdicts that hide Router's Fable row.
+
+    When Claude Code talks to Anthropic directly it caches the account's
+    per-model entitlements in its user config, and its /model picker keeps
+    trusting a cached ``claude-fable-5: entitled=false`` verdict after the
+    session is pointed at Router: the Fable row this setup provides through
+    ANTHROPIC_DEFAULT_FABLE_MODEL disappears from the picker while the model
+    stays perfectly callable. Router sessions never refresh the entitlement
+    cache, so without this the stale verdict persists indefinitely.
+
+    Only Fable-family records claiming no entitlement are removed. The rest
+    of the cache is Anthropic-owned state that direct Anthropic use rebuilds
+    on its own, and nothing here is snapshotted for unconfigure: restoring a
+    stale verdict would hide the row again. A missing, unreadable, or
+    unexpectedly shaped file is left alone — the file belongs to Claude Code,
+    and a best-effort cleanup must not break it.
+
+    Returns whether the file changed.
+    """
+    # Follow a dotfiles-style symlink so the replacement lands in the link's
+    # target and the link itself survives.
+    try:
+        target = path.resolve(strict=True)
+    except OSError:
+        return False
+    for _ in range(_SCRUB_ATTEMPTS):
+        try:
+            raw = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return False
+        try:
+            config = json.loads(raw)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(config, dict):
+            return False
+        records = config.get(_MODEL_ACCESS_CACHE_KEY)
+        if not isinstance(records, list):
+            return False
+
+        def stale_fable_verdict(record: object) -> bool:
+            return (
+                isinstance(record, dict)
+                and isinstance(record.get("apiName"), str)
+                and _FABLE_MODEL_ID_MARKER in record["apiName"]
+                and record.get("entitled") is False
+            )
+
+        retained = [record for record in records if not stale_fable_verdict(record)]
+        if len(retained) == len(records):
+            return False
+        config[_MODEL_ACCESS_CACHE_KEY] = retained
+        try:
+            replaced = _replace_user_config_if_unchanged(
+                target, raw, json.dumps(config, indent=2) + "\n"
+            )
+        except OSError:
+            # The row stays hidden until a later run gets to write, which
+            # beats failing a configure whose settings writes already landed.
+            return False
+        if replaced:
+            return True
+        # Claude Code persisted a newer document while this one was being
+        # prepared; its writes must win, so retry against what it wrote.
+    return False
+
+
+def _replace_user_config_if_unchanged(path: Path, expected: str, content: str) -> bool:
+    """Atomically replace a file Claude Code also rewrites, keeping its mode.
+
+    The file is re-read just before the rename and left alone when it no
+    longer matches ``expected``: a concurrent Claude Code session persisted a
+    newer document, and discarding its writes to remove a cache record would
+    be a bad trade. The remaining check-to-rename window is the same
+    last-writer-wins race Claude Code's own concurrent sessions already have,
+    with a whole document winning either way — never a torn file.
+
+    Returns whether the replacement happened.
+    """
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(tmp_name, mode)
+        if path.read_text(encoding="utf-8") != expected:
+            os.unlink(tmp_name)
+            return False
+        os.replace(tmp_name, path)
+        return True
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _is_router_model(value: object) -> bool:
