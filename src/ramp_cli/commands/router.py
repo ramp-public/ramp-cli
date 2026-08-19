@@ -45,7 +45,6 @@ from ramp_cli.commands.router_sync import (
 from ramp_cli.output.formatter import print_agent_json, resolve_format
 from ramp_cli.output.style import show_notice, start_spinner
 from ramp_cli.router_integrations import integration_package_path
-from ramp_cli.router_integrations.codex_cost_hook import CODEX_COST_HOOK_SCRIPT
 from ramp_cli.router_setup import acquire_router_api_key
 from ramp_cli.version_check import (
     refresh_version_cache,
@@ -2231,11 +2230,19 @@ def _write_cost_script(
 
 
 def _install_codex_cost_hook(path: Path, base_url: str | None = None) -> str | None:
-    """Install the release-pinned Codex hook and return its Stop command."""
+    """Download Router's Codex cost hook, when possible, and return its Stop command.
+
+    Returns None when the hook cannot be installed here, which registers
+    nothing and leaves any existing registration and installed copy alone: a
+    refresh that cannot download keeps the working script, and a fresh
+    configure that cannot download never registers a Stop hook pointing at a
+    missing file — the next successful refresh completes the setup.
+
+    Downloaded from the dashboard origin, same as the statusline installer.
+    """
+    url = f"{_statusline_origin(base_url)}/codex-cost-hook"
     hook_path = path.parent / CODEX_COST_HOOK
-    if not _cost_script_runtime_available(_skip_codex_cost_hook):
-        return None
-    if not _write_cost_script(CODEX_COST_HOOK_SCRIPT, hook_path, _skip_codex_cost_hook):
+    if not _install_cost_script(url, hook_path, _skip_codex_cost_hook):
         return None
     return _codex_cost_hook_command(path.parent, base_url)
 

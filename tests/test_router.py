@@ -23,7 +23,6 @@ from ramp_cli import claude_cowork
 from ramp_cli.commands import claude_code
 from ramp_cli.commands.router import DEFAULT_ROUTER_BASE_URL as ROUTER_BASE_URL
 from ramp_cli.main import cli
-from ramp_cli.router_integrations.codex_cost_hook import CODEX_COST_HOOK_SCRIPT
 
 
 @pytest.fixture(autouse=True)
@@ -64,7 +63,10 @@ def _router_metadata(identifier, **overrides):
     return metadata
 
 
-_COST_HOOK_SCRIPT = CODEX_COST_HOOK_SCRIPT
+# What the mocked dashboard origin serves at /codex-cost-hook. The script's
+# own behavior belongs to the router repo; the CLI only installs what is
+# served, so the tests only care that this exact content lands on disk.
+_COST_HOOK_SCRIPT = "#!/usr/bin/env python3\nprint('served cost hook')\n"
 
 
 def _mock_models(
@@ -72,6 +74,7 @@ def _mock_models(
     models=None,
     key="router-secret",
     base_url=ROUTER_BASE_URL,
+    cost_hook=_COST_HOOK_SCRIPT,
 ):
     models = models or [{"id": "gpt-5.4"}]
     models = [
@@ -83,6 +86,14 @@ def _mock_models(
             # The status line asset has its own tests in test_claude_code.py;
             # here it is simply unavailable, so configure skips it.
             return httpx.Response(404, request=httpx.Request("GET", url))
+        if url.endswith("/codex-cost-hook"):
+            # The Codex cost hook downloads from the same dashboard origin;
+            # cost_hook=None makes the download fail so configure skips it.
+            if cost_hook is None:
+                return httpx.Response(404, request=httpx.Request("GET", url))
+            return httpx.Response(
+                200, text=cost_hook, request=httpx.Request("GET", url)
+            )
         if url.endswith("/session-usage/usage/balance"):
             # The credits line has its own tests; here the endpoint is simply
             # unavailable, so configure skips the line.
@@ -2962,7 +2973,7 @@ def test_a_repeat_configure_keeps_one_cost_hook_beside_the_users_hooks(
     assert sum("codex-cost-hook" in command for command in commands) == 1
 
 
-def test_a_repeat_configure_keeps_the_release_pinned_cost_hook(tmp_path, monkeypatch):
+def test_refresh_replaces_a_stale_installed_cost_hook(tmp_path, monkeypatch):
     codex_home = tmp_path / "codex"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     _mock_models(monkeypatch)
@@ -2972,28 +2983,65 @@ def test_a_repeat_configure_keeps_the_release_pinned_cost_hook(tmp_path, monkeyp
     )
     assert first.exit_code == 0, first.output
 
-    fixed = "#!/usr/bin/env python3\nprint('fixed')\n"
-    (codex_home / "codex-cost-hook").write_text(fixed)
+    stale = "#!/usr/bin/env python3\nprint('stale')\n"
+    (codex_home / "codex-cost-hook").write_text(stale)
     refreshed = runner.invoke(cli, ["--human", "router", "refresh"])
 
     assert refreshed.exit_code == 0, refreshed.output
-    assert (codex_home / "codex-cost-hook").read_text() == CODEX_COST_HOOK_SCRIPT
+    assert (codex_home / "codex-cost-hook").read_text() == _COST_HOOK_SCRIPT
 
 
-def test_configure_never_fetches_an_executable_codex_hook(tmp_path, monkeypatch):
+def test_a_failed_hook_download_on_refresh_keeps_the_installed_hook(
+    tmp_path, monkeypatch
+):
     codex_home = tmp_path / "codex"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
-    # The shared mock rejects unknown URLs, including the old executable asset
-    # endpoint. The installed script must come from this ramp-cli release.
     _mock_models(monkeypatch)
+    runner = CliRunner()
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert configured.exit_code == 0, configured.output
 
-    result = CliRunner().invoke(
+    _mock_models(monkeypatch, cost_hook=None)
+    refreshed = runner.invoke(cli, ["--human", "router", "refresh"])
+
+    assert refreshed.exit_code == 0, refreshed.output
+    assert (
+        "Skipping the Codex Router cost hook: it could not be downloaded from "
+        "https://router.ramp.com/codex-cost-hook." in refreshed.output
+    )
+    # The working copy and its registration survive the failed download.
+    assert (codex_home / "codex-cost-hook").read_text() == _COST_HOOK_SCRIPT
+    assert len(_cost_hook_groups(codex_home)) == 1
+
+
+def test_a_failed_hook_download_on_configure_defers_to_the_next_refresh(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch, cost_hook=None)
+    runner = CliRunner()
+
+    configured = runner.invoke(
         cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
     )
 
-    assert result.exit_code == 0, result.output
-    assert (codex_home / "codex-cost-hook").read_text() == CODEX_COST_HOOK_SCRIPT
+    assert configured.exit_code == 0, configured.output
+    assert "Skipping the Codex Router cost hook" in configured.output
+    assert not (codex_home / "codex-cost-hook").exists()
+    # Never register a Stop hook pointing at a file that was not installed.
+    assert _cost_hook_groups(codex_home) == []
+
+    _mock_models(monkeypatch)
+    refreshed = runner.invoke(cli, ["--human", "router", "refresh"])
+
+    assert refreshed.exit_code == 0, refreshed.output
+    assert (codex_home / "codex-cost-hook").read_text() == _COST_HOOK_SCRIPT
     assert len(_cost_hook_groups(codex_home)) == 1
+    state = json.loads((codex_home / "ramp-router-state.json").read_text())
+    assert state["cost_hook_managed"] is True
 
 
 def test_a_missing_python3_skips_the_cost_hook(tmp_path, monkeypatch):
