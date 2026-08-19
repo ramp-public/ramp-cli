@@ -852,7 +852,9 @@ def test_configure_clears_the_environment_key_before_cowork_detection(
     )
     monkeypatch.setattr(router_module, "_can_draw_picker", lambda _ctx: True)
     _capture_picker(monkeypatch, ["claude-code"])
-    monkeypatch.setattr(router_module, "_pick_claude_models", lambda current: "compact")
+    monkeypatch.setattr(
+        router_module, "_pick_claude_models", lambda current, clients: "compact"
+    )
     _mock_models(monkeypatch)
 
     result = CliRunner().invoke(cli, ["--human", "router", "configure"])
@@ -861,7 +863,11 @@ def test_configure_clears_the_environment_key_before_cowork_detection(
     assert seen == {"env": None}
 
 
-def test_configure_rejects_a_setup_file_for_more_than_one_agent(tmp_path, monkeypatch):
+def test_a_setup_file_covers_every_selected_agent(tmp_path, monkeypatch):
+    # A setup file is a key-and-URL handoff, so it serves whatever the run
+    # selects and is deleted only after all of it succeeded.
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
     setup_file = tmp_path / "ramp-router-setup-abc123.json"
     setup_file.write_text(
         json.dumps(
@@ -873,10 +879,14 @@ def test_configure_rejects_a_setup_file_for_more_than_one_agent(tmp_path, monkey
             }
         )
     )
+    _mock_models(monkeypatch, base_url="https://router.example/v1")
+    captured = {}
     monkeypatch.setattr(
-        router_module,
-        "_fetch_models",
-        lambda *_args, **_kwargs: pytest.fail("discovery should not run"),
+        claude_cowork,
+        "configure",
+        lambda api_key, base_url: (
+            captured.update(cowork=(api_key, base_url)) or tmp_path / "profile.json"
+        ),
     )
 
     result = CliRunner().invoke(
@@ -892,9 +902,53 @@ def test_configure_rejects_a_setup_file_for_more_than_one_agent(tmp_path, monkey
         ],
     )
 
-    assert result.exit_code != 0
-    assert "requires exactly one agent" in result.output
-    assert setup_file.exists()
+    assert result.exit_code == 0, result.output
+    assert captured["cowork"] == ("router-secret", "https://router.example/v1")
+    assert (codex_home / "config.toml").exists()
+    assert not setup_file.exists()
+
+
+def test_a_claude_setup_file_key_waits_for_data_plane_propagation(
+    tmp_path, monkeypatch
+):
+    # A setup-file key can be as fresh as a browser-created one, so the
+    # Claude Code fetch retries the propagation-window 401 the same way.
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    setup_file = tmp_path / "ramp-router-setup-abc123.json"
+    setup_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "name": "Ramp Router",
+                "base_url": "https://router.example/v1",
+                "api_key": "router-secret",
+            }
+        )
+    )
+    captured = {}
+
+    def fetch_models(api_key, *args, **kwargs):
+        captured["fetch"] = (api_key, kwargs)
+        return [_router_model("claude-router-a")]
+
+    monkeypatch.setattr(router_module, "_fetch_models", fetch_models)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure",
+            "claude-code",
+            "--setup-file",
+            str(setup_file),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["fetch"][0] == "router-secret"
+    assert captured["fetch"][1]["wait_for_key"] is True
 
 
 def test_configure_without_arguments_leaves_cowork_alone(tmp_path, monkeypatch):
@@ -5357,7 +5411,7 @@ def test_client_picker_preselects_every_installed_agent(monkeypatch):
         (choice.title, choice.value, choice.checked) for choice in captured["choices"]
     ] == [
         ("Claude Code", "claude-code", True),
-        ("Codex", "codex", True),
+        ("Codex (CLI + desktop app)", "codex", True),
         ("Pi", "pi", True),
     ]
     assert captured["validate"](["codex"]) is True
@@ -5366,18 +5420,21 @@ def test_client_picker_preselects_every_installed_agent(monkeypatch):
 
 def test_client_picker_never_lists_cowork_as_its_own_line(monkeypatch):
     # Cowork is Claude Desktop's side of the Claude setup, so the main menu
-    # stays at the coding agents and Claude Code offers Cowork as a
-    # follow-up, the way Codex covers its CLI and app with one entry.
+    # stays at the coding agents: one Claude entry covers both Claude apps,
+    # the way the Codex entry covers the Codex CLI and app, and the titles
+    # say so instead of asking anything.
     captured = _capture_picker(monkeypatch, ["claude-code"])
     monkeypatch.setattr(
         router_module, "_installed_clients", lambda: ("claude-code", "codex")
     )
     monkeypatch.setattr(claude_cowork, "is_available", lambda: True)
 
-    assert router_module._pick_installed_clients() == ("claude-code",)
-    assert [choice.value for choice in captured["choices"]] == [
-        "claude-code",
-        "codex",
+    # The selection leaves the picker already covering both Claude apps, so
+    # the label's promise and the configured set can never drift apart.
+    assert router_module._pick_installed_clients() == ("claude-code", "cowork")
+    assert [(choice.title, choice.value) for choice in captured["choices"]] == [
+        ("Claude (CLI + desktop app)", "claude-code"),
+        ("Codex (CLI + desktop app)", "codex"),
     ]
 
 
@@ -5385,14 +5442,14 @@ def test_an_available_cowork_alone_prevents_the_show_everything_fallback(
     monkeypatch, capsys
 ):
     # A Mac with only Claude Desktop has exactly one meaningful entry: the
-    # Claude choice, whose follow-up reaches Cowork. Falling back to every
+    # Claude choice, which covers Cowork. Falling back to every
     # coding agent there would preselect four agents that were never
     # installed.
     captured = _capture_picker(monkeypatch, ["claude-code"])
     monkeypatch.setattr(router_module, "_installed_clients", lambda: ())
     monkeypatch.setattr(claude_cowork, "is_available", lambda: True)
 
-    assert router_module._pick_installed_clients() == ("claude-code",)
+    assert router_module._pick_installed_clients() == ("claude-code", "cowork")
     assert [choice.value for choice in captured["choices"]] == ["claude-code"]
     assert "No coding agents found" not in capsys.readouterr().out
 
@@ -5412,18 +5469,15 @@ def test_an_available_cowork_earns_the_claude_entry_a_place(monkeypatch):
     ]
 
 
-def test_claude_models_option_survives_the_claude_follow_up(tmp_path, monkeypatch):
+def test_claude_models_option_survives_the_merged_claude_entry(tmp_path, monkeypatch):
     # --claude-models describes the one Claude Code in the selection, and a
-    # picker choice that grew through the follow-up still has exactly one.
+    # picker choice that grew to cover Cowork still has exactly one.
     claude_home = tmp_path / "claude"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
     _mock_models(monkeypatch)
     monkeypatch.setattr(router_module, "_can_draw_picker", lambda _ctx: True)
     _capture_picker(monkeypatch, ["claude-code"])
     monkeypatch.setattr(claude_cowork, "is_available", lambda: True)
-    monkeypatch.setattr(
-        router_module, "_pick_claude_setup", lambda: ("claude-code", "cowork")
-    )
     monkeypatch.setattr(router_module, "_pick_stored_router_api_key", lambda: None)
     monkeypatch.setattr(
         claude_cowork,
@@ -5439,30 +5493,11 @@ def test_claude_models_option_survives_the_claude_follow_up(tmp_path, monkeypatc
     assert "Connected to: Claude Code and Claude Cowork" in result.output
 
 
-def test_pick_claude_setup_recommends_covering_both_claude_apps(monkeypatch):
-    captured = {}
-
-    class Prompt:
-        def ask(self):
-            return ("claude-code", "cowork")
-
-    def select(message, **kwargs):
-        captured["message"] = message
-        captured.update(kwargs)
-        return Prompt()
-
-    monkeypatch.setattr(router_module.questionary, "select", select)
-
-    assert router_module._pick_claude_setup() == ("claude-code", "cowork")
-    assert captured["message"] == "Which Claude apps should use Ramp Router?"
-    assert [(choice.title, choice.value) for choice in captured["choices"]] == [
-        ("Claude Code + Claude Cowork (recommended)", ("claude-code", "cowork")),
-        ("Claude Code only", ("claude-code",)),
-        ("Claude Cowork only", ("cowork",)),
-    ]
-
-
-def test_picking_claude_in_the_menu_offers_cowork_as_a_follow_up(tmp_path, monkeypatch):
+def test_picking_claude_in_the_menu_sets_up_cowork_without_a_question(
+    tmp_path, monkeypatch
+):
+    # One Claude entry covers both Claude apps, the way the Codex entry
+    # covers the Codex CLI and app, so there is no Claude-specific question.
     claude_home = tmp_path / "claude"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
     _mock_models(monkeypatch)
@@ -5470,9 +5505,8 @@ def test_picking_claude_in_the_menu_offers_cowork_as_a_follow_up(tmp_path, monke
     _capture_picker(monkeypatch, ["claude-code"])
     monkeypatch.setattr(claude_cowork, "is_available", lambda: True)
     monkeypatch.setattr(
-        router_module, "_pick_claude_setup", lambda: ("claude-code", "cowork")
+        router_module, "_pick_claude_models", lambda current, clients: "compact"
     )
-    monkeypatch.setattr(router_module, "_pick_claude_models", lambda current: "compact")
     monkeypatch.setattr(router_module, "_pick_stored_router_api_key", lambda: None)
     monkeypatch.setattr(
         claude_cowork,
@@ -5487,67 +5521,121 @@ def test_picking_claude_in_the_menu_offers_cowork_as_a_follow_up(tmp_path, monke
     assert (claude_home / "settings.json").exists()
 
 
-def test_cowork_only_follow_up_choice_configures_just_cowork(tmp_path, monkeypatch):
+def test_the_claude_entry_covers_only_claude_code_where_cowork_cannot_run(
+    tmp_path, monkeypatch
+):
     claude_home = tmp_path / "claude"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
     _mock_models(monkeypatch)
     monkeypatch.setattr(router_module, "_can_draw_picker", lambda _ctx: True)
+    captured = _capture_picker(monkeypatch, ["claude-code"])
+    monkeypatch.setattr(router_module, "_installed_clients", lambda: ("claude-code",))
+    monkeypatch.setattr(
+        claude_cowork,
+        "configure",
+        lambda *_args, **_kwargs: pytest.fail(
+            "an unavailable Cowork cannot be configured"
+        ),
+    )
+    monkeypatch.setattr(
+        router_module, "_pick_claude_models", lambda current, clients: "compact"
+    )
+    monkeypatch.setattr(router_module, "_pick_stored_router_api_key", lambda: None)
+
+    result = CliRunner().invoke(cli, ["--human", "router", "configure"])
+
+    assert result.exit_code == 0, result.output
+    assert "Connected to: Claude Code" in result.output
+    # Without Cowork there is nothing extra to explain in the entry's title.
+    assert [choice.title for choice in captured["choices"]][0] == "Claude Code"
+
+
+def test_a_setup_file_run_covers_the_picked_claude_entry(tmp_path, monkeypatch):
+    # Selecting Claude with a downloaded setup file keeps the one-entry
+    # promise: both Claude apps are configured with the file's key.
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    setup_file = tmp_path / "ramp-router-setup-abc123.json"
+    setup_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "name": "Ramp Router",
+                "base_url": "https://router.example/v1",
+                "api_key": "router-secret",
+            }
+        )
+    )
+    _mock_models(monkeypatch, base_url="https://router.example/v1")
+    monkeypatch.setattr(router_module, "_can_draw_picker", lambda _ctx: True)
     _capture_picker(monkeypatch, ["claude-code"])
     monkeypatch.setattr(claude_cowork, "is_available", lambda: True)
-    monkeypatch.setattr(router_module, "_pick_claude_setup", lambda: ("cowork",))
-    monkeypatch.setattr(router_module, "_pick_stored_router_api_key", lambda: None)
+    monkeypatch.setattr(
+        router_module, "_pick_claude_models", lambda current, clients: "compact"
+    )
     monkeypatch.setattr(
         claude_cowork,
         "configure",
         lambda *_args, **_kwargs: tmp_path / "profile.json",
     )
 
-    result = CliRunner().invoke(cli, ["--human", "router", "configure"])
-
-    assert result.exit_code == 0, result.output
-    assert "Connected to: Claude Cowork" in result.output
-    assert not (claude_home / "settings.json").exists()
-
-
-def test_the_claude_follow_up_is_skipped_where_cowork_cannot_run(tmp_path, monkeypatch):
-    claude_home = tmp_path / "claude"
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
-    _mock_models(monkeypatch)
-    monkeypatch.setattr(router_module, "_can_draw_picker", lambda _ctx: True)
-    _capture_picker(monkeypatch, ["claude-code"])
-    monkeypatch.setattr(
-        router_module,
-        "_pick_claude_setup",
-        lambda: pytest.fail("an unavailable Cowork asks no follow-up"),
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "--setup-file", str(setup_file)]
     )
-    monkeypatch.setattr(router_module, "_pick_claude_models", lambda current: "compact")
-    monkeypatch.setattr(router_module, "_pick_stored_router_api_key", lambda: None)
-
-    result = CliRunner().invoke(cli, ["--human", "router", "configure"])
 
     assert result.exit_code == 0, result.output
-    assert "Connected to: Claude Code" in result.output
+    assert "Connected to: Claude Code and Claude Cowork" in result.output
+    assert (claude_home / "settings.json").exists()
+    assert not setup_file.exists()
 
 
-def test_an_explicit_claude_code_argument_asks_no_follow_up(tmp_path, monkeypatch):
-    # Naming agents on the command line means exactly those agents.
+def test_an_explicit_claude_code_argument_stays_exactly_claude_code(
+    tmp_path, monkeypatch
+):
+    # Naming agents on the command line means exactly those agents; the
+    # silent Cowork expansion belongs to the picker's merged Claude entry.
     claude_home = tmp_path / "claude"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
     _mock_models(monkeypatch)
     monkeypatch.setattr(router_module, "_can_draw_picker", lambda _ctx: True)
     monkeypatch.setattr(claude_cowork, "is_available", lambda: True)
     monkeypatch.setattr(
-        router_module,
-        "_pick_claude_setup",
-        lambda: pytest.fail("explicit arguments ask no follow-up"),
+        claude_cowork,
+        "configure",
+        lambda *_args, **_kwargs: pytest.fail(
+            "explicit arguments configure exactly the named agents"
+        ),
     )
-    monkeypatch.setattr(router_module, "_pick_claude_models", lambda current: "compact")
+    monkeypatch.setattr(
+        router_module, "_pick_claude_models", lambda current, clients: "compact"
+    )
     monkeypatch.setattr(router_module, "_pick_stored_router_api_key", lambda: None)
 
     result = CliRunner().invoke(cli, ["--human", "router", "configure", "claude-code"])
 
     assert result.exit_code == 0, result.output
     assert "Connected to: Claude Code" in result.output
+
+
+def test_an_explicit_codex_argument_skips_the_model_view_picker(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    _mock_models(monkeypatch)
+    monkeypatch.setattr(router_module, "_can_draw_picker", lambda _ctx: True)
+    monkeypatch.setattr(
+        router_module,
+        "_pick_claude_models",
+        lambda *_args: pytest.fail(
+            "an explicit Codex setup asks no model-view question"
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "codex", "--api-key", "router-secret"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Connected to: Codex" in result.output
 
 
 def test_configure_rejects_an_empty_supplied_key_before_the_picker(monkeypatch):
@@ -5631,7 +5719,15 @@ def test_client_picker_offers_everything_when_no_agent_is_found(monkeypatch, cap
     assert "No coding agents found" in capsys.readouterr().out
 
 
-def test_claude_model_picker_offers_recommended_and_all(monkeypatch):
+@pytest.mark.parametrize(
+    ("clients", "subject"),
+    [
+        (("codex",), "Codex"),
+        (("claude-code",), "Claude Code"),
+        (("claude-code", "codex"), "Claude Code and Codex"),
+    ],
+)
+def test_model_picker_names_the_selected_agents(monkeypatch, clients, subject):
     captured = {}
 
     class Prompt:
@@ -5645,7 +5741,8 @@ def test_claude_model_picker_offers_recommended_and_all(monkeypatch):
 
     monkeypatch.setattr(router_module.questionary, "select", select)
 
-    assert router_module._pick_claude_models() == "all"
+    assert router_module._pick_claude_models(clients=clients) == "all"
+    assert captured["message"] == f"Which models should {subject} show?"
     assert captured["default"] == "compact"
     assert [choice.title for choice in captured["choices"]] == [
         "Recommended models (default)",
@@ -5693,6 +5790,17 @@ def test_configure_picker_targets_only_selected_clients(tmp_path, monkeypatch):
         router_module, "_pick_installed_clients", lambda: ("codex", "pi")
     )
     monkeypatch.setattr(router_module, "_can_draw_picker", lambda _ctx: True)
+    prompt = {}
+
+    class ModelPicker:
+        def ask(self):
+            return "compact"
+
+    def select(message, **_kwargs):
+        prompt["message"] = message
+        return ModelPicker()
+
+    monkeypatch.setattr(router_module.questionary, "select", select)
     _mock_models(monkeypatch)
 
     configure = CliRunner().invoke(
@@ -5701,6 +5809,7 @@ def test_configure_picker_targets_only_selected_clients(tmp_path, monkeypatch):
     )
 
     assert configure.exit_code == 0, configure.output
+    assert prompt["message"] == "Which models should Codex show?"
     assert "Connected to: Codex and Pi" in configure.output
     notice = _notice_lines(configure.output)
     # Pi keeps its own default, so the notice speaks only for Codex.
@@ -6647,11 +6756,16 @@ def test_configure_shows_remaining_credits_when_router_serves_a_balance(
     )
 
     result = CliRunner().invoke(
-        cli, ["--human", "router", "configure", "opencode"], input="router-secret\n"
+        cli,
+        ["--human", "router", "configure", "opencode"],
+        input="router-secret\n",
+        color=True,
     )
 
     assert result.exit_code == 0, result.output
-    assert "Router credits remaining: $1,234.50" in result.output
+    credits_line = "Router credits remaining: $1,234.50"
+    assert click.unstyle(result.output).splitlines()[-1] == credits_line
+    assert click.style(credits_line, fg=(228, 242, 33)) in result.output
 
 
 def test_configure_skips_the_credits_line_when_router_does_not_serve_one(

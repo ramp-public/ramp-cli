@@ -429,6 +429,7 @@ CODEX_PREEXISTING_ROUTER_SESSIONS_STATE_KEY = "preexisting_router_sessions"
 # whole list into one indistinguishable block. Each class is therefore stated
 # outright, and the checked rows carry the brand color the rest of the CLI uses
 # for a current selection.
+_RAMP_YELLOW = (228, 242, 33)
 _PICKER_YELLOW = "#e4f221"
 _PICKER_POINTER = "\u25b6"
 _PICKER_STYLE = questionary.Style(
@@ -752,15 +753,17 @@ def _can_prompt(ctx: click.Context, fmt: str) -> bool:
 def _pick_installed_clients() -> tuple[str, ...]:
     """Ask which coding agents to configure, with every agent preselected.
 
-    Cowork is deliberately not a line here: it is Claude Desktop's side of
-    the same Claude setup, so choosing Claude Code offers it as a follow-up,
-    the way choosing Codex covers both the Codex CLI and the Codex app.
+    Cowork is deliberately not a line here and asks no question of its own:
+    it is Claude Desktop's side of the same Claude setup, so the one Claude
+    entry covers both Claude apps, the way the one Codex entry covers the
+    Codex CLI and the Codex app.
     """
     candidates = _installed_clients()
-    if claude_cowork.is_available() and "claude-code" not in candidates:
-        # The Claude follow-up is the only interactive road to Cowork, so an
-        # available Cowork earns the Claude entry a place even where Claude
-        # Code itself was not detected.
+    cowork_available = claude_cowork.is_available()
+    if cowork_available and "claude-code" not in candidates:
+        # The Claude entry is the only interactive road to Cowork, so an
+        # available Cowork earns it a place even where Claude Code itself
+        # was not detected.
         candidates = (*candidates, "claude-code")
     if not candidates:
         # Offering nothing would end the command on a machine where detection
@@ -768,17 +771,47 @@ def _pick_installed_clients() -> tuple[str, ...]:
         # supported thing to do.
         click.echo("No coding agents found. Showing every agent Router supports.")
         candidates = tuple(CLIENT_NAMES)
-    return _pick_clients(
-        "Choose the agents you want to configure with Ramp Router", candidates
+    # The list says which apps an entry covers, so nobody has to think of
+    # Claude Code and Claude Desktop as two separate things to configure.
+    titles = dict(AGENT_NAMES)
+    titles["codex"] = "Codex (CLI + desktop app)"
+    if cowork_available:
+        titles["claude-code"] = "Claude (CLI + desktop app)"
+    selected = _pick_clients(
+        "Choose the agents you want to configure with Ramp Router",
+        candidates,
+        titles=titles,
     )
+    if cowork_available and "claude-code" in selected:
+        # The Claude entry covers both Claude apps without another question,
+        # the way the Codex entry covers the Codex CLI and app. The same
+        # availability answer that rendered the label expands the selection,
+        # so what was promised on screen is exactly what happens.
+        selected = tuple(
+            dict.fromkeys(
+                expanded
+                for client in selected
+                for expanded in (
+                    ("claude-code", COWORK_CLIENT)
+                    if client == "claude-code"
+                    else (client,)
+                )
+            )
+        )
+    return selected
 
 
-def _pick_clients(message: str, candidates: tuple[str, ...]) -> tuple[str, ...]:
+def _pick_clients(
+    message: str,
+    candidates: tuple[str, ...],
+    titles: dict[str, str] | None = None,
+) -> tuple[str, ...]:
     """Ask which of ``candidates`` to act on, with every one preselected."""
+    labels = titles or AGENT_NAMES
     selected = questionary.checkbox(
         message,
         choices=[
-            questionary.Choice(title=AGENT_NAMES[client], value=client, checked=True)
+            questionary.Choice(title=labels[client], value=client, checked=True)
             for client in candidates
         ],
         validate=lambda answer: bool(answer) or "Select at least one agent.",
@@ -791,35 +824,13 @@ def _pick_clients(message: str, candidates: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(selected)
 
 
-def _pick_claude_setup() -> tuple[str, ...]:
-    """Ask which Claude surfaces the picked Claude entry should cover.
-
-    Offered only where Cowork setup can succeed, and only for a selection
-    made through the picker: naming agents on the command line means exactly
-    those agents, with no follow-up questions.
-    """
+def _pick_claude_models(
+    current: str = "compact", clients: tuple[str, ...] = ("claude-code",)
+) -> str:
+    model_clients = tuple(client for client in clients if client in _PROFILE_CLIENTS)
+    subject = _human_join([CLIENT_NAMES[client] for client in model_clients])
     selected = questionary.select(
-        "Which Claude apps should use Ramp Router?",
-        choices=[
-            questionary.Choice(
-                title="Claude Code + Claude Cowork (recommended)",
-                value=("claude-code", COWORK_CLIENT),
-            ),
-            questionary.Choice(title="Claude Code only", value=("claude-code",)),
-            questionary.Choice(title="Claude Cowork only", value=(COWORK_CLIENT,)),
-        ],
-        style=_PICKER_STYLE,
-        pointer=_PICKER_POINTER,
-        instruction="(enter to confirm)",
-    ).ask()
-    if selected is None:
-        raise click.Abort()
-    return selected
-
-
-def _pick_claude_models(current: str = "compact") -> str:
-    selected = questionary.select(
-        "Which models should Claude Code show?",
+        f"Which models should {subject} show?",
         choices=[
             questionary.Choice(title="Recommended models (default)", value="compact"),
             questionary.Choice(title="All available models", value="all"),
@@ -985,39 +996,14 @@ def _run_configure(
     if not requested_clients and _can_prompt(ctx, fmt):
         requested_clients = _pick_installed_clients()
         picked_from_menu = True
-    if (
-        picked_from_menu
-        and "claude-code" in requested_clients
-        and claude_cowork.is_available()
-    ):
-        # Claude, like Codex, is one entry covering more than one app. The
-        # Codex files serve its CLI and its desktop app at once, while the
-        # Claude side needs Cowork's own setup, so the picker's Claude choice
-        # asks which of the two Claude surfaces to cover.
-        claude_targets = _pick_claude_setup()
-        requested_clients = tuple(
-            dict.fromkeys(
-                expanded
-                for client in requested_clients
-                for expanded in (
-                    claude_targets if client == "claude-code" else (client,)
-                )
-            )
-        )
     clients = requested_clients or all_clients
-    if setup_file is not None and clients not in {("codex",), (COWORK_CLIENT,)}:
-        raise click.UsageError(
-            "--setup-file currently requires exactly one agent: "
-            "'ramp router configure codex --setup-file FILE' or "
-            "'ramp router configure cowork --setup-file FILE'."
-        )
     if (
         claude_models is not None
         and clients != ("claude-code",)
         and not (picked_from_menu and "claude-code" in clients)
     ):
-        # A picker selection that grew through the Claude follow-up still
-        # has exactly one Claude Code for the option to describe.
+        # A picker selection that grew to cover Cowork still has exactly one
+        # Claude Code for the option to describe.
         raise click.UsageError(
             "--claude-models requires exactly one agent: "
             "'ramp router configure claude-code --claude-models compact|all'."
@@ -1039,7 +1025,7 @@ def _run_configure(
             claude_code.read_settings(claude_path), claude_path
         )
         if claude_models is None and _can_prompt(ctx, fmt):
-            claude_models = _pick_claude_models(current_view)
+            claude_models = _pick_claude_models(current_view, clients)
         view = claude_models or current_view
         _write_claude_model_view(claude_path, view)
         if fmt == "json":
@@ -1072,14 +1058,19 @@ def _run_configure(
             f"{CONFIGURE_KEY_ENV} to keep the key out of shell history "
             f"and process listings. Create a key at {router_ui_url()}."
         )
-    if "claude-code" in clients and claude_models is None:
+    asks_model_view = "claude-code" in clients or (
+        picked_from_menu and "codex" in clients
+    )
+    if asks_model_view and claude_models is None:
         current_view = (
             claude_code.model_view(claude_code.read_settings(claude_path), claude_path)
             if existing_claude
             else "compact"
         )
         claude_models = (
-            _pick_claude_models(current_view) if _can_prompt(ctx, fmt) else current_view
+            _pick_claude_models(current_view, clients)
+            if _can_prompt(ctx, fmt)
+            else current_view
         )
     restore_clients = (
         "" if clients == all_clients else "".join(f" {client}" for client in clients)
@@ -1163,7 +1154,7 @@ def _run_configure(
                 claude_code_view=True,
                 model_view_all=True,
                 base_url=base_url,
-                wait_for_key=browser_acquired_key,
+                wait_for_key=setup_file is not None or browser_acquired_key,
             )
         for item in clients:
             models = models_by_client[item]
@@ -1233,9 +1224,12 @@ def _run_configure(
             try:
                 setup_file.unlink()
             except OSError as exc:
+                configured_names = _human_join(
+                    [AGENT_NAMES[result["client"]] for result in results]
+                )
                 raise click.ClickException(
-                    f"{AGENT_NAMES[clients[0]]} was configured, but the setup "
-                    f"file {setup_file} could not be deleted: {exc}"
+                    f"Ramp Router was configured for {configured_names}, but "
+                    f"the setup file {setup_file} could not be deleted: {exc}"
                 ) from None
     finally:
         # Stopped on the way out too, so a failed key does not leave the
@@ -1272,11 +1266,6 @@ def _run_configure(
             )
         if cowork_note:
             click.echo(cowork_note)
-        remaining_credits = _fetch_remaining_credits(api_key, base_url=base_url)
-        if remaining_credits is not None:
-            click.echo(
-                f"Router credits remaining: {_format_credits_usd(remaining_credits)}"
-            )
         if notice:
             show_notice("NOTICE", notice)
 
@@ -1296,6 +1285,13 @@ def _run_configure(
             f"Run 'ramp router unconfigure{restore_clients}' to restore the previous "
             "settings."
         )
+    if fmt != "json":
+        remaining_credits = _fetch_remaining_credits(api_key, base_url=base_url)
+        if remaining_credits is not None:
+            click.secho(
+                f"Router credits remaining: {_format_credits_usd(remaining_credits)}",
+                fg=_RAMP_YELLOW,
+            )
 
 
 @router_group.command(
