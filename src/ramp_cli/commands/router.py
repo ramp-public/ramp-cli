@@ -65,7 +65,7 @@ PI_PLUGIN_CONFIG_FILE = "ramp-router-config.json"
 PI_PLUGIN_MODEL_CACHE_FILE = "ramp-router-model-cache.json"
 PI_PLUGIN_MODEL_CACHE_KEY_FILE = "ramp-router-model-cache-key"
 PI_PLUGIN_RUNTIME_MODELS_FILE = "ramp-router-runtime-models.json"
-ROUTER_UI_URL = "https://router.ramp.com"
+ROUTER_UI_URL = "https://app.router.com"
 ROUTER_UI_URL_ENV = "RAMP_ROUTER_UI_URL"
 ROUTER_PROVIDER = "ramp-router"
 # Read instead of --api-key so the secret stays out of shell history and out

@@ -633,7 +633,7 @@ def test_configure_acquires_a_missing_key_through_browser_setup(monkeypatch, tmp
     result = CliRunner().invoke(cli, ["--human", "router", "configure", "claude-code"])
 
     assert result.exit_code == 0, result.output
-    assert seen == {"url": "https://router.ramp.com", "no_browser": False}
+    assert seen == {"url": "https://app.router.com", "no_browser": False}
     assert "browser-returned-key" not in result.output
     settings = json.loads((tmp_path / "settings.json").read_text())
     assert settings["env"]["ANTHROPIC_AUTH_TOKEN"] == "browser-returned-key"
@@ -1045,7 +1045,7 @@ def test_configure_installs_the_status_line(monkeypatch, tmp_path):
 
     assert result.exit_code == 0, result.output
     # Served by the dashboard origin, not the data plane the gateway URL names.
-    assert "https://router.ramp.com/claude-code-statusline" in urls
+    assert "https://app.router.com/claude-code-statusline" in urls
     script = tmp_path / "ramp-router-statusline"
     assert script.read_text() == _STATUSLINE_SCRIPT
     assert script.stat().st_mode & stat.S_IXUSR
@@ -1057,7 +1057,7 @@ def test_configure_installs_the_status_line(monkeypatch, tmp_path):
     # The script's ANTHROPIC_BASE_URL fallback points at the data plane, which
     # does not serve the session-usage endpoint, so the control-plane origin
     # has to be written explicitly.
-    assert settings["env"]["ROUTER_BASE_URL"] == "https://router.ramp.com"
+    assert settings["env"]["ROUTER_BASE_URL"] == "https://app.router.com"
 
 
 def test_a_status_line_the_user_configured_is_left_alone(monkeypatch, tmp_path):
@@ -1246,7 +1246,7 @@ def test_a_reconfigure_over_legacy_state_keeps_values_set_since(monkeypatch, tmp
     # usage origin is Router's to overwrite.
     settings = json.loads(settings_path.read_text())
     assert settings["statusLine"] == theirs
-    assert settings["env"]["ROUTER_BASE_URL"] == "https://router.ramp.com"
+    assert settings["env"]["ROUTER_BASE_URL"] == "https://app.router.com"
 
     unconfigured = runner.invoke(
         cli, ["--human", "router", "unconfigure", "claude-code"]
@@ -1329,7 +1329,7 @@ def test_a_slot_taken_since_the_first_configure_is_freed_again(monkeypatch, tmp_
 
 def test_the_status_line_origin_follows_a_base_url_override(monkeypatch):
     monkeypatch.delenv("RAMP_ROUTER_BASE_URL", raising=False)
-    assert router_module._statusline_origin() == "https://router.ramp.com"
+    assert router_module._statusline_origin() == "https://app.router.com"
 
     # A base-URL override names a single-origin deployment, so the same host
     # serves the script and the usage endpoint.

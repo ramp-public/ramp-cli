@@ -1,7 +1,7 @@
 import { normalizeBaseURL } from "./discovery.ts"
 
 /** The dashboard origin paired with the production data plane. */
-const DEFAULT_USAGE_BASE_URL = "https://router.ramp.com"
+const DEFAULT_USAGE_BASE_URL = "https://app.router.com"
 const DEFAULT_DATA_PLANE_BASE_URL = "https://router-api.ramp.com/v1"
 const DEFAULT_USAGE_TIMEOUT_MS = 3_000
 

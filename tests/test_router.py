@@ -1395,7 +1395,7 @@ def test_refresh_reapplies_only_clients_with_router_receipts(tmp_path, monkeypat
             "providerID": "ramp-router",
             "name": "Ramp Router",
             "baseURL": ROUTER_BASE_URL,
-            "usageBaseURL": "https://router.ramp.com",
+            "usageBaseURL": "https://app.router.com",
             "apiKey": "keep-me",
         },
     ]
@@ -2943,7 +2943,7 @@ def test_configure_codex_installs_the_cost_hook(tmp_path, monkeypatch):
     # The key is read at run time from the private file, never inline.
     assert str(codex_home / "ramp-router-key") in entry["command"]
     assert "router-secret" not in entry["command"]
-    assert "ROUTER_BASE_URL=https://router.ramp.com" in entry["command"]
+    assert "ROUTER_BASE_URL=https://app.router.com" in entry["command"]
     assert entry["command"].endswith(str(hook))
     state = json.loads((codex_home / "ramp-router-state.json").read_text())
     assert state["cost_hook_managed"] is True
@@ -3009,7 +3009,7 @@ def test_a_failed_hook_download_on_refresh_keeps_the_installed_hook(
     assert refreshed.exit_code == 0, refreshed.output
     assert (
         "Skipping the Codex Router cost hook: it could not be downloaded from "
-        "https://router.ramp.com/codex-cost-hook." in refreshed.output
+        "https://app.router.com/codex-cost-hook." in refreshed.output
     )
     # The working copy and its registration survive the failed download.
     assert (codex_home / "codex-cost-hook").read_text() == _COST_HOOK_SCRIPT
@@ -3261,7 +3261,7 @@ def test_command_runs_cost_hook_identifies_the_executable(tmp_path):
     assert not runs("env backup-tool ~/.codex/codex-cost-hook")
     assert not runs("/home/me/codex-cost-hook-wrapper")
     # Nothing after the assignments, or nothing readable, is not ours.
-    assert not runs("ROUTER_BASE_URL=https://router.ramp.com")
+    assert not runs("ROUTER_BASE_URL=https://app.router.com")
     assert not runs("")
     assert not runs("'unbalanced")
 
@@ -4207,7 +4207,7 @@ def test_configure_codex_requires_interactive_input(tmp_path, monkeypatch):
         "Pass --setup-file or --api-key when using non-interactive mode"
         in result.output
     )
-    assert "https://router.ramp.com" in result.output
+    assert "https://app.router.com" in result.output
     assert not (tmp_path / "codex" / "config.toml").exists()
 
 
@@ -4286,7 +4286,7 @@ def test_configure_does_not_reuse_a_key_from_another_router_endpoint(
     result = CliRunner().invoke(cli, ["--human", "router", "configure", "pi"])
 
     assert result.exit_code == 0, result.output
-    assert browser_calls == [("https://router.ramp.com", False)]
+    assert browser_calls == [("https://app.router.com", False)]
     assert json.loads((pi_home / "auth.json").read_text())["ramp-router"]["key"] == (
         "browser-key"
     )
@@ -4342,7 +4342,7 @@ def test_configure_uses_browser_when_existing_router_keys_disagree(
         "Reuse existing key used by Pi",
         "Create a new key",
     ]
-    assert browser_calls == [("https://router.ramp.com", False)]
+    assert browser_calls == [("https://app.router.com", False)]
     assert (codex_home / "ramp-router-key").read_text() == "browser-key"
 
 
@@ -4417,7 +4417,7 @@ def test_configure_codex_rejects_invalid_key_without_writing(tmp_path, monkeypat
 
     assert result.exit_code != 0
     assert "wasn't accepted by Ramp Router" in result.output
-    assert "https://router.ramp.com" in result.output
+    assert "https://app.router.com" in result.output
     assert "router-secret" not in result.output
     assert not (codex_home / "config.toml").exists()
 
@@ -4528,7 +4528,7 @@ def test_configure_opencode_installs_plugin_and_preserves_config(tmp_path, monke
             "baseURL": "https://router-api.ramp.com/v1",
             # The dashboard origin the plugin's session-usage status
             # display queries; the data plane does not serve it.
-            "usageBaseURL": "https://router.ramp.com",
+            "usageBaseURL": "https://app.router.com",
             "apiKey": "router-secret",
         },
     ]
@@ -6630,7 +6630,7 @@ def test_configure_and_unconfigure_accept_multiple_clients(tmp_path, monkeypatch
     assert configure.output.splitlines()[:4] == [
         "Connecting Ramp Router to your coding agents",
         "Skipping the Claude Code Router status line: it could not be "
-        "downloaded from https://router.ramp.com/claude-code-statusline.",
+        "downloaded from https://app.router.com/claude-code-statusline.",
         "Connected to: Claude Code and Codex",
         "1 model added. Start an agent and pick a model.",
     ]
@@ -6737,7 +6737,7 @@ def test_configure_and_unconfigure_without_client_targets_everything(
         # _mock_models serves no status line asset, so configure says why the
         # extra was skipped without failing anything.
         "Skipping the Claude Code Router status line: it could not be "
-        "downloaded from https://router.ramp.com/claude-code-statusline.",
+        "downloaded from https://app.router.com/claude-code-statusline.",
         "Connected to: Claude Code, Codex, OpenCode, and Pi",
         "1 model added. Start an agent and pick a model.",
     ]
@@ -7309,7 +7309,7 @@ def _mock_balance(monkeypatch, respond):
 
     def get(url, *, headers, timeout):
         if url.endswith("/session-usage/usage/balance"):
-            assert url == "https://router.ramp.com/session-usage/usage/balance"
+            assert url == "https://app.router.com/session-usage/usage/balance"
             assert headers == {"Authorization": "Bearer router-secret"}
             assert timeout == 5
             return respond(url)

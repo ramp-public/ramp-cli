@@ -26,10 +26,6 @@ jobs:
           - os: linux
             arch: arm64
             runner: ubuntu-22.04-arm
-          - os: windows
-            arch: amd64
-            runner: windows-2022
-
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -83,6 +79,56 @@ jobs:
             build/ramp-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
             build/ramp-${{ matrix.os }}-${{ matrix.arch }}.tar.gz.sha256
 
+  build-windows:
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        shell: bash
+        run: uv sync --frozen
+
+      - name: Build with Nuitka
+        shell: bash
+        run: |
+          uv run python -m nuitka \
+            --standalone \
+            --output-filename="ramp-windows-amd64" \
+            --output-dir=build \
+            --include-package=ramp_cli \
+            --include-data-files=src/ramp_cli/specs/*.json=ramp_cli/specs/ \
+            --include-data-dir=src/ramp_cli/router_integrations/packages=ramp_cli/router_integrations/packages \
+            --python-flag=no_site \
+            --assume-yes-for-downloads \
+            src/ramp_cli/main.py
+
+      - name: Package standalone directory
+        shell: bash
+        run: |
+          cd build
+          tar -czf ramp-windows-amd64.tar.gz main.dist/
+
+      - name: Generate checksum
+        shell: bash
+        run: |
+          cd build
+          sha256sum ramp-windows-amd64.tar.gz > ramp-windows-amd64.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ramp-windows-amd64
+          path: |
+            build/ramp-windows-amd64.tar.gz
+            build/ramp-windows-amd64.tar.gz.sha256
+
   release:
     needs: build
     runs-on: ubuntu-latest
@@ -94,18 +140,19 @@ jobs:
 
       - name: Verify expected artifacts
         run: |
-          for platform in darwin-arm64 darwin-amd64 linux-amd64 linux-arm64 windows-amd64; do
+          for platform in darwin-arm64 darwin-amd64 linux-amd64 linux-arm64; do
             test -f "ramp-${platform}.tar.gz" || { echo "Missing ramp-${platform}.tar.gz"; exit 1; }
             test -f "ramp-${platform}.tar.gz.sha256" || { echo "Missing ramp-${platform}.tar.gz.sha256"; exit 1; }
           done
 
-      - name: Create GitHub Release
+      - name: Create GitHub prerelease
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${{ github.ref_name }}" \
             --repo "${{ github.repository }}" \
             --generate-notes \
+            --prerelease \
             ramp-darwin-arm64.tar.gz \
             ramp-darwin-arm64.tar.gz.sha256 \
             ramp-darwin-amd64.tar.gz \
@@ -113,9 +160,34 @@ jobs:
             ramp-linux-amd64.tar.gz \
             ramp-linux-amd64.tar.gz.sha256 \
             ramp-linux-arm64.tar.gz \
-            ramp-linux-arm64.tar.gz.sha256 \
+            ramp-linux-arm64.tar.gz.sha256
+
+  upload-windows:
+    needs: [build-windows, release]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ramp-windows-amd64
+
+      - name: Add Windows binary to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
             ramp-windows-amd64.tar.gz \
             ramp-windows-amd64.tar.gz.sha256
+
+      - name: Promote GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --prerelease=false \
+            --latest
 
   update-homebrew:
     needs: release

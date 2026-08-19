@@ -10,7 +10,7 @@ import pytest
 import ramp_cli.router_setup as router_setup
 from ramp_cli.router_setup import start_router_key_callback
 
-ROUTER_UI_URL = "https://router.ramp.com"
+ROUTER_UI_URL = "https://app.router.com"
 
 
 def _post(callback, fields, *, content_type="application/x-www-form-urlencoded"):
@@ -138,7 +138,9 @@ def test_handshake_proves_the_listener_holds_the_pkce_verifier():
         assert '"type": "ramp-cli-ready"' in page
         assert '"code_verifier"' in page
         assert callback.code_challenge not in page
-        assert "https://router.ramp.com" in page
+        assert "https://app.router.com" in page
+        assert "postMessage(" in page
+        assert '"https://app.router.com"' in page
         # The verification step is visible while Router creates the key, so it
         # uses the same dark terminal chrome as the final callback instead of
         # flashing a bare white page.

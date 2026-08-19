@@ -42,6 +42,26 @@ ramp transactions list --transactions_to_retrieve my_transactions --from_date 20
 ramp transactions list --agent               # JSON output for scripting
 ```
 
+### Standalone agent authentication
+
+Standalone agents authenticate without a browser by exchanging OAuth client
+credentials for a production access token with a server-reported lifetime. Configure `RAMP_CLIENT_SECRET`
+in your agent runtime or CI secret store instead of exporting a literal secret from an
+interactive shell. For example, in GitHub Actions:
+
+```yaml
+env:
+  RAMP_CLIENT_ID: ${{ vars.RAMP_CLIENT_ID }}
+  RAMP_CLIENT_SECRET: ${{ secrets.RAMP_CLIENT_SECRET }}
+steps:
+  - run: ramp --env production auth login --client-id "$RAMP_CLIENT_ID"
+```
+
+`RAMP_CLIENT_SECRET` is read automatically. Client-credentials tokens cannot be
+refreshed. Use the `expires_in` value from the login output to schedule the next full
+login before the access token expires. Human users should use `ramp auth login` and
+the browser-based PKCE flow instead.
+
 ## Commands
 
 | Command        | Description                                        |

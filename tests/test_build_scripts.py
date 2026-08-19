@@ -45,6 +45,20 @@ def test_release_build_does_not_need_node():
     assert "--include-package-data=ramp_cli" not in workflow
 
 
+def test_windows_build_does_not_block_release():
+    workflow = (ROOT / ".github" / "workflows" / "build-binaries.yml").read_text()
+    release_job = workflow.split("  release:", 1)[1].split("  upload-windows:", 1)[0]
+    windows_job = workflow.split("  build-windows:", 1)[1].split("  release:", 1)[0]
+
+    assert "    needs: build" in release_job.splitlines()
+    assert "windows-amd64" not in release_job
+    assert "--prerelease" in release_job
+    assert "needs: [build-windows, release]" in workflow
+    assert "ramp-windows-amd64" in windows_job
+    assert "--prerelease=false" in workflow
+    assert "--latest" in workflow
+
+
 def test_generated_router_integration_outputs_remain_ignored():
     gitignore = (ROOT / ".gitignore").read_text()
 

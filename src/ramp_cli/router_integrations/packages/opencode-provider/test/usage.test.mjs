@@ -55,11 +55,11 @@ describe("usageOriginFromBaseURL", () => {
   it("pairs the production data plane with the production dashboard", () => {
     assert.equal(
       usageOriginFromBaseURL("https://router-api.ramp.com/v1"),
-      "https://router.ramp.com",
+      "https://app.router.com",
     )
     assert.equal(
       usageOriginFromBaseURL("https://router-api.ramp.com"),
-      "https://router.ramp.com",
+      "https://app.router.com",
     )
   })
 
@@ -71,7 +71,7 @@ describe("usageOriginFromBaseURL", () => {
   })
 
   it("falls back to the production dashboard for an unparseable URL", () => {
-    assert.equal(usageOriginFromBaseURL("not a url"), "https://router.ramp.com")
+    assert.equal(usageOriginFromBaseURL("not a url"), "https://app.router.com")
   })
 })
 
@@ -88,7 +88,7 @@ describe("resolveUsageOrigin", () => {
       resolveUsageOrigin({ baseURL: "http://localhost:8002/v1" }),
       "http://localhost:8002",
     )
-    assert.equal(resolveUsageOrigin({}), "https://router.ramp.com")
+    assert.equal(resolveUsageOrigin({}), "https://app.router.com")
   })
 })
 
@@ -112,7 +112,7 @@ describe("fetchSessionUsage", () => {
     )
 
     const fetched = await fetchSessionUsage({
-      usageOrigin: "https://router.ramp.com",
+      usageOrigin: "https://app.router.com",
       apiKey: "usage-secret",
       sessionID: "ses_123",
       fetch: fetcher,
@@ -130,7 +130,7 @@ describe("fetchSessionUsage", () => {
     assert.equal(fetcher.mock.callCount(), 1)
     assert.equal(
       fetcher.mock.calls[0].arguments[0],
-      "https://router.ramp.com/session-usage/usage/session" +
+      "https://app.router.com/session-usage/usage/session" +
         "?client_session_id=ses_123" +
         "&include_switchyard_routing_enabled=true" +
         "&include_last_model=true",
@@ -151,7 +151,7 @@ describe("fetchSessionUsage", () => {
     )
 
     const fetched = await fetchSessionUsage({
-      usageOrigin: "https://router.ramp.com",
+      usageOrigin: "https://app.router.com",
       apiKey: "usage-secret",
       sessionID: "ses_123",
       fetch: fetcher,
@@ -173,7 +173,7 @@ describe("fetchSessionUsage", () => {
 
     assert.deepEqual(
       await fetchSessionUsage({
-        usageOrigin: "https://router.ramp.com",
+        usageOrigin: "https://app.router.com",
         apiKey: "usage-secret",
         sessionID: "ses_123",
         fetch: fetcher,
@@ -193,7 +193,7 @@ describe("fetchSessionUsage", () => {
     ]) {
       assert.equal(
         await fetchSessionUsage({
-          usageOrigin: "https://router.ramp.com",
+          usageOrigin: "https://app.router.com",
           apiKey: "usage-secret",
           sessionID: "ses_123",
           fetch: mock.fn(respond),
