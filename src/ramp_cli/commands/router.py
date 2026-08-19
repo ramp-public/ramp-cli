@@ -2601,17 +2601,8 @@ def _configure_claude_code(
 
 
 def _scrub_stale_fable_verdict() -> None:
-    """Clear the cached first-party Fable denial that hides Router's Fable row.
-
-    Printed to stderr so a --json caller's stdout stays parseable.
-    """
-    if claude_code.scrub_stale_fable_access(claude_code.user_config_path()):
-        click.echo(
-            "Removed Claude Code's cached not-entitled Fable 5 verdict; it was "
-            "hiding Fable 5 from the /model picker even though Router serves "
-            "it. Restart open Claude Code sessions to see the row.",
-            err=True,
-        )
+    """Clear the cached first-party Fable denial that hides Router's Fable row."""
+    claude_code.scrub_stale_fable_access(claude_code.user_config_path())
 
 
 def _require_truthful_claude_code_model_names() -> None:

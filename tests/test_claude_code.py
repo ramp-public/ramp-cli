@@ -207,7 +207,9 @@ def test_configure_scrubs_the_stale_fable_verdict(monkeypatch, tmp_path):
 
     config = json.loads(user_config.read_text(encoding="utf-8"))
     assert config["modelAccessCache"] == []
-    assert "Fable 5" in result.output
+    assert (
+        "Removed Claude Code's cached not-entitled Fable 5 verdict" not in result.output
+    )
 
 
 def test_repeat_configure_scrubs_the_stale_fable_verdict(monkeypatch, tmp_path):
