@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import pytest
 
+import ramp_cli.version_check as vc
 from ramp_cli.version_check import (
     _COOLDOWN_SECONDS,
     _cache_path,
@@ -155,3 +156,25 @@ class TestEmitUpdateNotice:
         emit_update_notice(agent_mode=True)
         second = capsys.readouterr()
         assert json.loads(second.err)["update_available"]["latest"] == "0.2.0"
+
+
+class TestUpdateNoticeFile:
+    @pytest.fixture()
+    def notice_file(self, tmp_path, monkeypatch) -> Path:
+        path = tmp_path / "notice" / "update-notice.json"
+        monkeypatch.setattr(vc, "update_notice_path", lambda: path)
+        return path
+
+    @patch("ramp_cli.version_check.__version__", "0.1.0")
+    def test_exists_exactly_while_pending(self, notice_file: Path, cache_file: Path):
+        _write_cache("0.2.0")
+        vc.sync_update_notice_file()
+        payload = json.loads(notice_file.read_text())
+        assert payload["latest_version"] == "0.2.0"
+        assert payload["current_version"] == "0.1.0"
+        assert payload["schema_version"] == 1
+
+        # An upgrade makes the install current; the next reconcile clears it.
+        with patch("ramp_cli.version_check.__version__", "0.2.0"):
+            vc.sync_update_notice_file()
+        assert not notice_file.exists()

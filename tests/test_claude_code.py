@@ -1149,3 +1149,136 @@ def test_the_status_line_origin_follows_a_base_url_override(monkeypatch):
     # serves the script and the usage endpoint.
     monkeypatch.setenv("RAMP_ROUTER_BASE_URL", "https://qa-router.ramp.dev/v1")
     assert router_module._statusline_origin() == "https://qa-router.ramp.dev"
+
+
+_SYNC_COMMAND = (
+    "[ -x /opt/ramp-cli/bin/ramp ] && /opt/ramp-cli/bin/ramp "
+    "router sync --hook --client claude-code || true"
+)
+
+
+def test_plan_session_start_hook_is_idempotent_and_repairs_the_command():
+    settings, state = claude_code.plan_session_start_hook({}, {}, _SYNC_COMMAND)
+    again, state = claude_code.plan_session_start_hook(settings, state, _SYNC_COMMAND)
+
+    assert again == settings
+    (entry,) = again["hooks"]["SessionStart"]
+    assert entry["hooks"][0]["command"] == _SYNC_COMMAND
+    assert state[claude_code.SESSION_START_HOOK_STATE_KEY] == entry
+
+    moved = "[ -x /new/ramp ] && /new/ramp router sync --hook || true"
+    repaired, state = claude_code.plan_session_start_hook(again, state, moved)
+
+    (entry,) = repaired["hooks"]["SessionStart"]
+    assert entry["hooks"][0]["command"] == moved
+    assert state[claude_code.SESSION_START_HOOK_STATE_KEY] == entry
+
+
+def test_plan_session_start_hook_leaves_an_unreadable_layout_alone():
+    for hooks in ("not-an-object", {"SessionStart": "not-a-list"}):
+        settings = {"hooks": hooks}
+        updated, state = claude_code.plan_session_start_hook(
+            settings, {}, _SYNC_COMMAND
+        )
+        assert updated == settings
+        assert claude_code.SESSION_START_HOOK_STATE_KEY not in state
+
+
+def test_removal_requires_the_receipt_and_spares_mixed_entries():
+    ours = claude_code.session_start_hook_entry(_SYNC_COMMAND)
+    settings = {"hooks": {"SessionStart": [ours]}}
+    # Without the state key the entry was authored by the user and stays.
+    assert claude_code.plan_session_start_hook_removal(settings, {}) == settings
+
+    mixed = {
+        "matcher": "startup",
+        "hooks": [
+            {"type": "command", "command": _SYNC_COMMAND},
+            {"type": "command", "command": "/home/me/context.sh"},
+        ],
+    }
+    settings = {"hooks": {"SessionStart": [mixed, ours]}}
+    state = {claude_code.SESSION_START_HOOK_STATE_KEY: ours}
+
+    restored = claude_code.plan_session_start_hook_removal(settings, state)
+
+    # The user's arrangement — even one that invokes the sync — survives.
+    assert restored == {"hooks": {"SessionStart": [mixed]}}
+
+
+def test_hook_ownership_consumes_only_one_identical_entry():
+    ours = claude_code.session_start_hook_entry(_SYNC_COMMAND)
+    settings = {"hooks": {"SessionStart": [ours, ours]}}
+    state = {claude_code.SESSION_START_HOOK_STATE_KEY: ours}
+
+    refreshed, refreshed_state = claude_code.plan_session_start_hook(
+        settings, state, _SYNC_COMMAND
+    )
+
+    assert refreshed == {"hooks": {"SessionStart": [ours]}}
+    assert refreshed_state[claude_code.SESSION_START_HOOK_STATE_KEY] == "user-managed"
+    assert claude_code.plan_session_start_hook_removal(settings, state) == {
+        "hooks": {"SessionStart": [ours]}
+    }
+
+
+def test_hook_removal_restores_preexisting_empty_containers():
+    for original in ({"hooks": {}}, {"hooks": {"SessionStart": []}}):
+        configured, state = claude_code.plan_session_start_hook(
+            original, {}, _SYNC_COMMAND
+        )
+
+        assert (
+            claude_code.plan_session_start_hook_removal(configured, state) == original
+        )
+
+
+def test_hook_detection_ignores_commands_that_only_mention_sync():
+    for command in ("echo 'router sync --hook'", "ramp router sync --hooked"):
+        mentioned = {
+            "matcher": "startup",
+            "hooks": [{"type": "command", "command": command}],
+        }
+        updated, state = claude_code.plan_session_start_hook(
+            {"hooks": {"SessionStart": [mentioned]}}, {}, _SYNC_COMMAND
+        )
+
+        assert updated["hooks"]["SessionStart"] == [
+            mentioned,
+            claude_code.session_start_hook_entry(_SYNC_COMMAND),
+        ]
+        assert state[claude_code.SESSION_START_HOOK_STATE_KEY] != "user-managed"
+
+
+def test_plan_session_start_hook_defers_to_a_user_wrapper():
+    wrapper = {
+        "matcher": "startup",
+        "hooks": [
+            {"type": "command", "command": "nice /custom/ramp router sync --hook"}
+        ],
+    }
+    settings = {"hooks": {"SessionStart": [wrapper]}}
+
+    updated, state = claude_code.plan_session_start_hook(settings, {}, _SYNC_COMMAND)
+
+    assert updated == settings
+    assert state[claude_code.SESSION_START_HOOK_STATE_KEY] == "user-managed"
+
+    # A wrapper added after ours supersedes it: keeping both would run the
+    # sync twice per session start.
+    ours = claude_code.session_start_hook_entry(_SYNC_COMMAND)
+    settings = {"hooks": {"SessionStart": [ours, wrapper]}}
+    state = {claude_code.SESSION_START_HOOK_STATE_KEY: ours}
+
+    updated, state = claude_code.plan_session_start_hook(settings, state, _SYNC_COMMAND)
+
+    assert updated["hooks"]["SessionStart"] == [wrapper]
+    assert state[claude_code.SESSION_START_HOOK_STATE_KEY] == "user-managed"
+
+    # And once the user removes their wrapper, registration resumes.
+    updated, state = claude_code.plan_session_start_hook(
+        {"hooks": {"SessionStart": []}}, state, _SYNC_COMMAND
+    )
+
+    assert updated["hooks"]["SessionStart"] == [ours]
+    assert state[claude_code.SESSION_START_HOOK_STATE_KEY] == ours

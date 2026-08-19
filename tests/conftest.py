@@ -35,6 +35,15 @@ def isolated_config(
     ):
         monkeypatch.delenv(leaked, raising=False)
     monkeypatch.setenv("RAMP_NO_TOOL_AVAILABILITY", "1")
+    # Pin the resolved ramp entrypoint so hook commands in fixtures are
+    # deterministic regardless of how the tests were launched.
+    monkeypatch.setattr(
+        "ramp_cli.commands.router_sync.ramp_executable",
+        lambda: Path("/opt/ramp-cli/bin/ramp"),
+    )
+    # Hook-mode sync suppresses the shutdown update notice; only main() —
+    # which CliRunner never reaches — resets the flag, so clear it here.
+    monkeypatch.setattr("ramp_cli.version_check._SUPPRESS_NEXT_UPDATE_NOTICE", False)
     if "tests/private" not in str(request.node.path):
         monkeypatch.setattr("ramp_cli.config.settings.default_environment", lambda: "")
     yield tmp_path

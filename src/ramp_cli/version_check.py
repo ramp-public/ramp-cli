@@ -86,16 +86,35 @@ def _cooldown_expired() -> bool:
 
 
 def _do_check() -> None:
-    """Fetch latest version and write to cache. Runs in background thread."""
+    """The passive check's background-thread body."""
+    refresh_version_cache()
+
+
+def refresh_version_cache() -> None:
+    """Fetch and cache the latest release version, synchronously.
+
+    The session-start hook never touches the network, and the passive check's
+    daemon thread dies with its process — often before the fetch completes in
+    short-lived commands. A machine where ramp only ever runs through hooks
+    would therefore keep a permanently stale "latest" and the update notice
+    could silently never fire. The detached background sync calls this, where
+    blocking on the network is fine.
+    """
+    if os.environ.get("RAMP_NO_UPDATE_CHECK"):
+        return
     version = latest_version()
     if version:
         _write_cache(version)
+    sync_update_notice_file()
 
 
 def check_for_update() -> None:
     """Kick off a background version check if cooldown has expired."""
     if os.environ.get("RAMP_NO_UPDATE_CHECK"):
         return
+    # Cached-state reconcile on every start, so the statusline's pending file
+    # clears right after any upgrade — `ramp update` or out-of-band via brew.
+    sync_update_notice_file()
     if not _cooldown_expired():
         return
     t = threading.Thread(target=_do_check, daemon=True)
@@ -116,6 +135,49 @@ def get_update_info() -> dict[str, str] | None:
     except (ValueError, TypeError):
         pass
     return None
+
+
+def update_notice_path() -> Path:
+    return config_dir() / "update-notice.json"
+
+
+def sync_update_notice_file() -> None:
+    """Keep the pending-update notice file in step with the cached state.
+
+    Contract with the Claude statusline, which renders a persistent nudge
+    from it: the file exists exactly while the install is older than the
+    latest cached release, holds at least {"latest_version": ...}, and is
+    removed the moment the install is current. Reconciled from cached state
+    only — never the network — and fail-open on both sides.
+    """
+    try:
+        path = update_notice_path()
+        info = get_update_info()
+        if info is None:
+            path.unlink(missing_ok=True)
+            return
+        rendered = (
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "latest_version": info["latest"],
+                    "current_version": info["current"],
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        try:
+            if path.read_text() == rendered:
+                return
+        except OSError:
+            pass
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(rendered)
+        tmp.replace(path)  # atomic on POSIX
+    except OSError:
+        pass
 
 
 def get_update_warning() -> str | None:

@@ -31,11 +31,27 @@ from click.core import ParameterSource
 
 from ramp_cli import claude_cowork
 from ramp_cli.commands import claude_code
+from ramp_cli.commands.router_sync import (
+    SYNC_HOOK_USER_MANAGED,
+    SYNC_OPT_OUT_ENV,
+    claim_sync_slot,
+    command_runs_session_sync,
+    log_failure,
+    session_sync_hook_command,
+    spawn_detached_refresh,
+    sync_is_due,
+    update_notice,
+)
 from ramp_cli.output.formatter import print_agent_json, resolve_format
 from ramp_cli.output.style import show_notice, start_spinner
 from ramp_cli.router_integrations import integration_package_path
 from ramp_cli.router_integrations.codex_cost_hook import CODEX_COST_HOOK_SCRIPT
 from ramp_cli.router_setup import acquire_router_api_key
+from ramp_cli.version_check import (
+    refresh_version_cache,
+    suppress_next_update_notice,
+    sync_update_notice_file,
+)
 
 DEFAULT_ROUTER_BASE_URL = "https://router-api.ramp.com/v1"
 
@@ -71,6 +87,10 @@ CODEX_ROUTER_CATALOG_MANAGED_KEY = "router_catalog_managed"
 # The name the Router dashboard serves; manual installs land on the same file.
 CODEX_COST_HOOK = "codex-cost-hook"
 CODEX_COST_HOOK_MANAGED_KEY = "cost_hook_managed"
+# The digest of the exact SessionStart group this CLI rendered — or the
+# user-managed sentinel when a user group already invokes the sync — so only
+# that group is ever replaced or removed.
+CODEX_SYNC_HOOK_STATE_KEY = "session_sync_hook"
 CODEX_CATALOG_MODEL_LIMIT = 100
 CLIENT_NAMES = {
     "claude-code": "Claude Code",
@@ -388,6 +408,12 @@ _OWNED_CODEX_ROOT_KEY = re.compile(
 _CODEX_STOP_HOOK_TABLE = re.compile(
     r"^\s*\[\[\s*(?:hooks|\"hooks\"|'hooks')\s*\.\s*"
     r"(?:Stop|\"Stop\"|'Stop')\s*]]\s*(?:#.*)?$"
+)
+# A SessionStart group is not ours by header alone; see
+# _is_recorded_sync_hook_chunk.
+_CODEX_SESSION_START_HOOK_TABLE = re.compile(
+    r"^\s*\[\[\s*(?:hooks|\"hooks\"|'hooks')\s*\.\s*"
+    r"(?:SessionStart|\"SessionStart\"|'SessionStart')\s*]]\s*(?:#.*)?$"
 )
 _OWNED_ROOT_KEYS = (
     "model",
@@ -1308,11 +1334,11 @@ def router_refresh(ctx: click.Context) -> None:
         path = _client_config_path(client)
         try:
             api_key = _stored_router_api_key(client, path)
-            base_url = (
-                _stored_router_base_url(client, path) or router_base_url()
-                if client == "codex"
-                else router_base_url()
-            )
+            # The endpoint paired with the stored credential wins for every
+            # client, so a refresh run under a different environment — such
+            # as one spawned by session sync — cannot rewrite a
+            # non-production setup to the default Router.
+            base_url = _stored_router_base_url(client, path) or router_base_url()
             claude_code_view = client == "claude-code"
             request_key = (api_key, claude_code_view, base_url)
             models = models_by_request.get(request_key)
@@ -1372,6 +1398,103 @@ def router_refresh(ctx: click.Context) -> None:
 
     if failures:
         raise click.ClickException("Could not refresh " + "; ".join(failures))
+
+
+@router_group.command(
+    "sync",
+    hidden=True,
+)
+@click.option(
+    "--hook",
+    "hook_mode",
+    is_flag=True,
+    help="Session-start hook mode: quiet, cooldown-gated, and fail-open.",
+)
+@click.option(
+    "--client",
+    type=click.Choice(("claude-code", "codex")),
+    default=None,
+    help="Hosting agent; selects the structured hook output in --hook mode.",
+)
+@click.option(
+    "--detached",
+    "detached_mode",
+    is_flag=True,
+    hidden=True,
+    help="Internal: the spawned background half of --hook.",
+)
+@click.pass_context
+def router_sync(
+    ctx: click.Context, hook_mode: bool, client: str | None, detached_mode: bool
+) -> None:
+    """Keep locally installed Router artifacts fresh.
+
+    --hook is the session-start mode: cooldown-gated, detached, and fail-open.
+    """
+    if detached_mode:
+        # The background half of --hook, off the session-start path, so
+        # blocking on the network is fine here. The synchronous cache fetch
+        # is what keeps "latest" fresh — and the update notice able to fire —
+        # on machines where ramp only ever runs through hooks; the passive
+        # daemon-thread check dies with short-lived processes.
+        refresh_version_cache()
+        ctx.invoke(router_refresh)
+        return
+    if hook_mode:
+        _run_hook_sync(client)
+        return
+    raise click.UsageError("Use --hook for session-start sync or 'router refresh'.")
+
+
+def _run_hook_sync(client: str | None) -> None:
+    """The session-start path: never block, never fail, no model-visible output.
+
+    Plain SessionStart stdout is injected into the model's context by both
+    agents — which must never see the update notice, lest it run `ramp update`
+    itself — so the only output ever emitted is Codex's notice as a
+    structured systemMessage. The shutdown update notice is suppressed for
+    the same reason, and failures go to the state-dir log.
+    """
+    suppress_next_update_notice()
+    try:
+        if os.environ.get(SYNC_OPT_OUT_ENV):
+            return
+        # claim_sync_slot re-checks dueness and advances the cooldown under
+        # an exclusive lock, so concurrent session starts cannot stampede;
+        # losers fall through silently. Spawned before the notice because the
+        # spawn truncates the log to this run.
+        if sync_is_due() and claim_sync_slot():
+            spawn_detached_refresh()
+        # Every session start, fast path included: these are user-only
+        # channels reading cached state, so recurring per session is nudging,
+        # not context spam, and it stops the moment the install is current.
+        _emit_hook_update_notice(client)
+    except Exception as exc:  # fail-open is this mode's contract
+        log_failure(f"session sync failed: {exc!r}")
+
+
+def _emit_hook_update_notice(client: str | None) -> None:
+    """Surface a pending CLI update to the user, never the model."""
+    # Keeps the statusline's pending-update file in step on every session
+    # start, so an out-of-band upgrade clears the nudge immediately.
+    sync_update_notice_file()
+    notice = update_notice()
+    if not notice:
+        return
+    if client != "codex":
+        # claude-code emits nothing on any channel: its statusline renders a
+        # persistent nudge from the pending-update file instead. An absent
+        # --client also withholds — the registered commands always pass it,
+        # and guessing a host's output contract risks plain text reaching
+        # the model.
+        if client is None:
+            log_failure("hook invoked without --client; update notice withheld")
+        return
+    # systemMessage is a SessionStart output field Codex shows to the user —
+    # with a "warning:" prefix, so the text must read naturally as one — and
+    # never adds to model context. Never additionalContext or plain stdout,
+    # which the model would see.
+    click.echo(json.dumps({"systemMessage": notice}))
 
 
 SUBAGENT_TIERS = ("sonnet", "opus", "haiku", "fable")
@@ -1662,16 +1785,49 @@ def _run_unconfigure(
         # removes a setup, so the only meaningful choices are the setups that
         # exist. With none, the list would be empty and the command falls
         # through to saying Router is not configured anywhere.
-        configured = _clients_with_a_receipt()
-        if claude_cowork.state_path().exists():
+        receipted = _clients_with_a_receipt()
+        cowork_configured = claude_cowork.state_path().exists()
+        candidates = receipted
+        if cowork_configured and "claude-code" not in candidates:
             # A Cowork receipt is the same kind of evidence: this CLI set
-            # Cowork up, so removing that setup is a meaningful choice.
-            configured = (*configured, COWORK_CLIENT)
-        if configured:
-            requested_clients = _pick_clients(
+            # Cowork up, so removing that setup is a meaningful choice. The
+            # Claude entry is the only interactive road to it, so the entry
+            # is offered even where Claude Code itself holds no receipt.
+            candidates = ("claude-code", *candidates)
+        if candidates:
+            # One Claude entry covers both Claude apps and the Codex entry
+            # covers the Codex CLI and app, exactly as the configure picker
+            # promises: the two menus show the same lines with the same
+            # titles, so nobody meets Cowork as a separate thing to remove.
+            titles = dict(AGENT_NAMES)
+            titles["codex"] = "Codex (CLI + desktop app)"
+            if cowork_configured:
+                titles["claude-code"] = "Claude (CLI + desktop app)"
+            selected = _pick_clients(
                 "Which coding agents do you want to remove Ramp Router from?",
-                configured,
+                candidates,
+                titles=titles,
             )
+            if cowork_configured and "claude-code" in selected:
+                # The Claude entry removes both Claude setups without another
+                # question, but only the setups that exist: a Claude Code
+                # without a receipt has nothing to restore, and expanding to
+                # it would end the run with a failure it did not earn.
+                claude_targets = (
+                    ("claude-code", COWORK_CLIENT)
+                    if "claude-code" in receipted
+                    else (COWORK_CLIENT,)
+                )
+                selected = tuple(
+                    dict.fromkeys(
+                        expanded
+                        for client in selected
+                        for expanded in (
+                            claude_targets if client == "claude-code" else (client,)
+                        )
+                    )
+                )
+            requested_clients = selected
     # A run that names no agents keeps meaning the coding agents, exactly as
     # it does for configure: Cowork restarts Claude Desktop, so it is removed
     # only when picked or named. This also keeps every previously generated
@@ -1784,6 +1940,7 @@ def _unconfigure_codex(path: Path) -> None:
         original_instructions = state.get(CODEX_ORIGINAL_INSTRUCTIONS_STATE_KEY)
         original_instructions_digest = state.get(CODEX_ORIGINAL_INSTRUCTIONS_DIGEST_KEY)
         cost_hook_managed = state.get(CODEX_COST_HOOK_MANAGED_KEY)
+        recorded_sync_hook = state.get(CODEX_SYNC_HOOK_STATE_KEY)
         preexisting_router_sessions = state.get(
             CODEX_PREEXISTING_ROUTER_SESSIONS_STATE_KEY
         )
@@ -1804,7 +1961,9 @@ def _unconfigure_codex(path: Path) -> None:
             f"Could not read Ramp Router setup state from {state_path}."
         ) from None
 
-    chunks = _config_chunks(existing)
+    chunks = _drop_recorded_sync_hook_chunk(
+        _config_chunks(existing), recorded_sync_hook
+    )
     chunks[0] = [_render_root_config(chunks[0], root_values)]
     preserved = "".join(
         "".join(chunk)
@@ -1812,7 +1971,8 @@ def _unconfigure_codex(path: Path) -> None:
         if not chunk
         or not (
             _OWNED_CODEX_TABLE.match(chunk[0])
-            # Only the receipt makes a matching group ours to remove.
+            # Only the receipt makes a matching group ours to remove; the
+            # sync group must match its recorded rendering exactly.
             or (cost_hook_managed is True and _is_owned_cost_hook_chunk(chunk))
         )
     ).rstrip()
@@ -1990,14 +2150,16 @@ def _format_credits_usd(value: Decimal) -> str:
     return f"{sign}${abs(value):,.2f}"
 
 
-def _install_claude_code_statusline(settings_file: Path) -> str | None:
+def _install_claude_code_statusline(
+    settings_file: Path, base_url: str | None = None
+) -> str | None:
     """Install Router's cost status line for Claude Code, when possible.
 
     Returns the command to configure, or None when the status line cannot be
     installed here. A failure is a notice rather than an error: the status
     line is an extra, and it must never fail an otherwise working configure.
     """
-    url = f"{_statusline_origin()}/claude-code-statusline"
+    url = f"{_statusline_origin(base_url)}/claude-code-statusline"
     script_path = claude_code.statusline_path(settings_file)
     if not _install_cost_script(url, script_path, _skip_statusline):
         return None
@@ -2116,8 +2278,8 @@ def _command_runs_cost_hook(command: str) -> bool:
     return False
 
 
-def _stop_group_commands(group: object) -> Iterator[str | None]:
-    """Yield each hook entry's command in one parsed Stop group, None if unreadable."""
+def _hook_group_commands(group: object) -> Iterator[str | None]:
+    """Yield each hook entry's command in one parsed hook group, None if unreadable."""
     entries = group.get("hooks") if isinstance(group, dict) else None
     if not isinstance(entries, list):
         return
@@ -2127,7 +2289,10 @@ def _stop_group_commands(group: object) -> Iterator[str | None]:
 
 
 def _is_owned_cost_hook_chunk(chunk: list[str]) -> bool:
-    """Report whether one config chunk is a Stop group holding only the hook."""
+    """Report whether one config chunk is a Stop group holding only the hook.
+
+    TODO(ramp-cli#519 review): receipt-record the rendering like the sync group.
+    """
     if not chunk or not _CODEX_STOP_HOOK_TABLE.match(chunk[0]):
         return False
     try:
@@ -2139,7 +2304,7 @@ def _is_owned_cost_hook_chunk(chunk: list[str]) -> bool:
     groups = hooks.get("Stop") if isinstance(hooks, dict) else None
     if not isinstance(groups, list) or len(groups) != 1:
         return False
-    commands = list(_stop_group_commands(groups[0]))
+    commands = list(_hook_group_commands(groups[0]))
     # Shared groups are the user's; solo ones are replaceable, ours or
     # hand-written, because a duplicate would answer every Stop event twice.
     return bool(commands) and all(
@@ -2156,7 +2321,7 @@ def _codex_cost_hook_registered(config: dict) -> bool:
     return any(
         command is not None and _command_runs_cost_hook(command)
         for group in groups
-        for command in _stop_group_commands(group)
+        for command in _hook_group_commands(group)
     )
 
 
@@ -2181,11 +2346,121 @@ def _register_codex_cost_hook(path: Path, config: str, command: str) -> str:
     return registered
 
 
+def _render_codex_sync_hook_group(command: str) -> str:
+    """Render the [[hooks.SessionStart]] group that keeps artifacts fresh.
+
+    Deliberately no feature flag: hooks are stable and enabled by default
+    since Codex 0.124.0, and older builds ignore an unflagged [[hooks.*]]
+    group — the same exposure as the [[hooks.Stop]] cost hook. Writing
+    `features.codex_hooks` ourselves would opt pre-0.124 users into an engine
+    Codex marked under development, so a too-old Codex simply ignores this.
+    """
+    return f"""[[hooks.SessionStart]]
+matcher = "startup|resume"
+hooks = [{{ type = "command", command = {json.dumps(command)} }}]
+"""
+
+
+def _command_runs_session_sync(command: str) -> bool:
+    return command_runs_session_sync(command)
+
+
+def _sync_hook_chunk_digest(chunk_text: str) -> str:
+    """Digest one hook group, ignoring the blank lines chunking absorbs."""
+    return _content_digest(chunk_text.strip() + "\n")
+
+
+def _is_recorded_sync_hook_chunk(chunk: list[str], recorded: object) -> bool:
+    """Report whether one chunk is exactly the sync group the receipt records.
+
+    Only that rendering is ours; user-authored or user-edited groups never
+    match, and the user-managed sentinel matches nothing.
+    """
+    if not chunk or not _CODEX_SESSION_START_HOOK_TABLE.match(chunk[0]):
+        return False
+    if not isinstance(recorded, str) or not recorded:
+        return False
+    return _sync_hook_chunk_digest("".join(chunk)) == recorded
+
+
+def _drop_recorded_sync_hook_chunk(
+    chunks: list[list[str]], recorded: object
+) -> list[list[str]]:
+    """Drop one receipt-owned group, preserving byte-identical user copies."""
+    preserved = []
+    consumed = False
+    for chunk in chunks:
+        if not consumed and _is_recorded_sync_hook_chunk(chunk, recorded):
+            consumed = True
+            continue
+        preserved.append(chunk)
+    return preserved
+
+
+def _codex_sync_hook_registered(config: dict) -> bool:
+    """Report whether any SessionStart hook in the parsed config runs the sync."""
+    hooks = config.get("hooks")
+    groups = hooks.get("SessionStart") if isinstance(hooks, dict) else None
+    if not isinstance(groups, list):
+        return False
+    # Any command actually invoking the sync makes registration stand down.
+    # Ownership is only the receipt-recorded rendering; see
+    # _is_recorded_sync_hook_chunk.
+    return any(
+        command is not None and _command_runs_session_sync(command)
+        for group in groups
+        for command in _hook_group_commands(group)
+    )
+
+
+def _register_codex_sync_hook(
+    path: Path, config: str, command: str, receipt: dict
+) -> tuple[str, bool]:
+    """Register the managed SessionStart group; return (config, receipt changed).
+
+    The recorded group was already dropped, so an ordinary run appends a fresh
+    rendering and records its digest — which is what repairs a stale ramp
+    path. A surviving group that already invokes the sync is user-authored (or
+    user-edited): it is left untouched, nothing is added, and the skip is
+    recorded as user-managed.
+    """
+    try:
+        already_registered = _codex_sync_hook_registered(tomllib.loads(config))
+    except tomllib.TOMLDecodeError:
+        # The caller validates and reports against the document it writes.
+        return config, False
+    if already_registered:
+        if receipt.get(CODEX_SYNC_HOOK_STATE_KEY) == SYNC_HOOK_USER_MANAGED:
+            return config, False
+        receipt[CODEX_SYNC_HOOK_STATE_KEY] = SYNC_HOOK_USER_MANAGED
+        return config, True
+    rendered = _render_codex_sync_hook_group(command)
+    registered = f"{config}\n{rendered}"
+    try:
+        tomllib.loads(registered)
+    except tomllib.TOMLDecodeError:
+        # E.g. an inline hooks table cannot take another group; the hook is
+        # an extra, so the user's layout wins. Stderr keeps agent-mode JSON
+        # on stdout parseable.
+        click.echo(
+            f"Skipping the Codex session sync hook: the existing hooks in "
+            f"{path} could not take another entry.",
+            err=True,
+        )
+        return config, False
+    digest = _sync_hook_chunk_digest(rendered)
+    if receipt.get(CODEX_SYNC_HOOK_STATE_KEY) == digest:
+        return registered, False
+    receipt[CODEX_SYNC_HOOK_STATE_KEY] = digest
+    return registered, True
+
+
 def _configure_claude_code(
     path: Path,
     api_key: str,
     models: list[RouterModel],
     *,
+    base_url: str | None = None,
     selected_model: str | None = None,
     model_view: str = "compact",
     preserve_model_view_ownership: bool = False,
@@ -2198,7 +2473,7 @@ def _configure_claude_code(
     """
     _require_truthful_claude_code_model_names()
     model = _claude_code_default_model(models, selected_model=selected_model)
-    statusline = _install_claude_code_statusline(path)
+    statusline = _install_claude_code_statusline(path, base_url)
     # Read after the network calls, not before. The settings are rewritten as a
     # whole document, so anything Claude Code or the user changed while the
     # requests were in flight would be silently discarded by a stale snapshot.
@@ -2212,10 +2487,10 @@ def _configure_claude_code(
         updated, state = claude_code.plan_configuration(
             settings,
             path,
-            _router_host(),
+            _router_host(base_url),
             api_key,
             model,
-            usage_base_url=_statusline_origin(),
+            usage_base_url=_statusline_origin(base_url),
             statusline=statusline,
             model_view_all=model_view == "all",
         )
@@ -2235,6 +2510,14 @@ def _configure_claude_code(
         updated, state = claude_code.plan_automatic_subagent_cleanup(
             updated, path, state
         )
+        # In the shared configure/refresh path so existing setups gain the
+        # hook and refresh repairs a stale ramp path. None (Windows or no
+        # resolvable entrypoint) registers nothing.
+        sync_hook_command = session_sync_hook_command("claude-code")
+        if sync_hook_command is not None:
+            updated, state = claude_code.plan_session_start_hook(
+                updated, state, sync_hook_command
+            )
         # Rendered before the receipt is written so the receipt can record
         # what the overlay holds, which is what lets unconfigure tell its own
         # file from one the user has edited. Planned from the merged state, so
@@ -2353,6 +2636,7 @@ def _unconfigure_claude_code(path: Path) -> None:
         state = claude_code.read_state(path)
         settings = claude_code.read_settings(path)
         restored = claude_code.plan_restoration(settings, path, state)
+        restored = claude_code.plan_session_start_hook_removal(restored, state)
         _write_private_file(path, json.dumps(restored, indent=2) + "\n")
         # The script lives under a name this command manages, so it goes even
         # when the statusLine setting itself was the user's and stays.
@@ -2389,9 +2673,9 @@ def _claude_code_default_model(
     return preferred
 
 
-def _router_host() -> str:
+def _router_host(base_url: str | None = None) -> str:
     """Return the host root, since Claude Code appends /v1 itself."""
-    return router_base_url().removesuffix("/v1").rstrip("/")
+    return (base_url or router_base_url()).removesuffix("/v1").rstrip("/")
 
 
 def _configured_claude_code_router_url(path: Path) -> str:
@@ -2672,6 +2956,7 @@ def _configure_client(
                 path,
                 api_key,
                 models,
+                base_url=base_url,
                 selected_model=selected_model,
                 model_view=claude_model_view or "compact",
                 preserve_model_view_ownership=preserve_model_view_ownership,
@@ -2692,7 +2977,7 @@ def _configure_client(
 
     path = _json_config_path(client)
     default_model = _preferred_model(models, selected_model)
-    _configure_plugin_client(client, path, api_key, default_model)
+    _configure_plugin_client(client, path, api_key, default_model, base_url=base_url)
     return path, default_model, False
 
 
@@ -2757,6 +3042,7 @@ def _configure_plugin_client(
     path: Path,
     api_key: str,
     default_model: str,
+    base_url: str | None = None,
 ) -> None:
     package_path = _bundled_plugin_path(client)
     state_path = path.parent / "ramp-router-state.json"
@@ -2821,13 +3107,13 @@ def _configure_plugin_client(
             {
                 "providerID": ROUTER_PROVIDER,
                 "name": "Ramp Router",
-                "baseURL": router_base_url(),
+                "baseURL": base_url or router_base_url(),
                 # The dashboard origin serving /session-usage, which the
                 # data plane behind baseURL does not. Written explicitly
                 # for the same reason Claude Code gets ROUTER_BASE_URL:
                 # the plugin cannot know a split-origin deployment's
                 # dashboard host from the data-plane URL alone.
-                "usageBaseURL": _statusline_origin(),
+                "usageBaseURL": _statusline_origin(base_url),
                 "apiKey": api_key,
             },
         ]
@@ -2927,7 +3213,10 @@ def _configure_plugin_client(
         writes = [
             (path, settings),
             (auth_path, auth),
-            (path.parent / PI_PLUGIN_CONFIG_FILE, {"baseUrl": router_base_url()}),
+            (
+                path.parent / PI_PLUGIN_CONFIG_FILE,
+                {"baseUrl": base_url or router_base_url()},
+            ),
         ]
         if models_path.exists():
             writes.append((models_path, models_config))
@@ -3403,6 +3692,8 @@ def _configure_codex(
     router_catalog = _fetch_codex_catalog(api_key, base_url=base_url)
     # None means nothing to (re)register; existing registrations stay as-is.
     cost_hook_command = _install_codex_cost_hook(path, base_url)
+    # None (Windows or no resolvable ramp entrypoint) registers nothing.
+    sync_hook_command = session_sync_hook_command("codex")
     with codex_config_lock(path):
         return _configure_codex_in_lock(
             path,
@@ -3412,6 +3703,7 @@ def _configure_codex(
             base_url=base_url,
             selected_model=selected_model,
             cost_hook_command=cost_hook_command,
+            sync_hook_command=sync_hook_command,
         )
 
 
@@ -3424,6 +3716,7 @@ def _configure_codex_in_lock(
     base_url: str | None,
     selected_model: str | None,
     cost_hook_command: str | None,
+    sync_hook_command: str | None,
 ) -> tuple[str, bool]:
     default_model = _preferred_model(models, selected_model)
     existing, existing_data = _read_codex_config(path)
@@ -3532,6 +3825,9 @@ def _configure_codex_in_lock(
     ):
         receipt[CODEX_COST_HOOK_MANAGED_KEY] = True
         state_document = receipt
+    # Read before registration advances it; identifies the one group a
+    # previous run wrote and may now replace.
+    recorded_sync_hook = receipt.get(CODEX_SYNC_HOOK_STATE_KEY)
     key_path = path.parent / "ramp-router-key"
 
     # Router sets model_instructions_file only when it could read Codex's own
@@ -3620,11 +3916,6 @@ def _configure_codex_in_lock(
             CODEX_ORIGINAL_INSTRUCTIONS_DIGEST_KEY,
         ):
             state_document = receipt
-    state = (
-        json.dumps(state_document, indent=2) + "\n"
-        if state_document is not None
-        else None
-    )
     chunks[0] = [
         _render_root_config(
             chunks[0],
@@ -3644,13 +3935,17 @@ def _configure_codex_in_lock(
         )
     ]
 
+    if sync_hook_command is not None:
+        chunks = _drop_recorded_sync_hook_chunk(chunks, recorded_sync_hook)
     preserved = "".join(
         "".join(chunk)
         for chunk in chunks
         if not chunk
         or not (
             _OWNED_CODEX_TABLE.match(chunk[0])
-            # Dropped only when a fresh registration is about to replace it.
+            # Dropped only when a fresh registration is about to replace it,
+            # which is also what repairs a stale ramp path. For the sync group
+            # only the receipt-recorded rendering is dropped.
             or (cost_hook_command is not None and _is_owned_cost_hook_chunk(chunk))
         )
     ).rstrip()
@@ -3658,6 +3953,18 @@ def _configure_codex_in_lock(
     updated = f"{preserved}\n\n{provider}" if preserved else provider
     if cost_hook_command is not None:
         updated = _register_codex_cost_hook(path, updated, cost_hook_command)
+    if sync_hook_command is not None:
+        updated, receipt_changed = _register_codex_sync_hook(
+            path, updated, sync_hook_command, receipt
+        )
+        if receipt_changed:
+            state_document = receipt
+    # Serialized after the sync registration, the receipt's last write.
+    state = (
+        json.dumps(state_document, indent=2) + "\n"
+        if state_document is not None
+        else None
+    )
 
     # Kept so a failure can put the file back. Without it the undo below
     # deletes the key this config points at and leaves Codex configured for a

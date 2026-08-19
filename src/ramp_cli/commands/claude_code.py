@@ -13,6 +13,11 @@ from pathlib import Path
 
 import click
 
+from ramp_cli.commands.router_sync import (
+    SYNC_HOOK_USER_MANAGED,
+    command_runs_session_sync,
+)
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows fallback
@@ -228,6 +233,138 @@ def _statusline_slot_is_ours(settings: dict, path: Path) -> bool:
         statusline_command(path),
         str(statusline_path(path)),
     }
+
+
+# The exact SessionStart entry this CLI registered — or the user-managed
+# sentinel when a user hook already invokes the sync — so only that entry is
+# ever replaced or removed.
+SESSION_START_HOOK_STATE_KEY = "session_start_hook"
+SESSION_START_HOOKS_PRESENT_STATE_KEY = "session_start_hooks_present"
+SESSION_START_PRESENT_STATE_KEY = "session_start_present"
+# Headroom for interpreter startup; the hook itself only stats a file or
+# spawns a detached refresh. Set explicitly because Claude's default hook
+# timeout (60s) could stall session start that long; Codex's group sets no
+# timeout since its default is already acceptable there.
+SESSION_START_HOOK_TIMEOUT_SECONDS = 20
+# Fresh and resumed sessions both read the installed artifacts.
+_SESSION_START_MATCHER = "startup|resume"
+
+
+def session_start_hook_entry(command: str) -> dict:
+    """The SessionStart entry this CLI registers for the given sync command."""
+    return {
+        "matcher": _SESSION_START_MATCHER,
+        "hooks": [
+            {
+                "type": "command",
+                "command": command,
+                "timeout": SESSION_START_HOOK_TIMEOUT_SECONDS,
+            }
+        ],
+    }
+
+
+def _entry_invokes_sync(entry: object) -> bool:
+    """Report whether one SessionStart entry runs the managed sync at all.
+
+    Any-command on purpose: a user hook wrapping the sync already keeps the
+    artifacts fresh, so registration stands down. This never establishes
+    ownership — only the receipt-recorded entry is ours to touch.
+    """
+    if not isinstance(entry, dict):
+        return False
+    hooks = entry.get("hooks")
+    if not isinstance(hooks, list):
+        return False
+    return any(
+        isinstance(hook, dict)
+        and isinstance(hook.get("command"), str)
+        and command_runs_session_sync(hook["command"])
+        for hook in hooks
+    )
+
+
+def plan_session_start_hook(
+    settings: dict, state: dict, command: str
+) -> tuple[dict, dict]:
+    """Merge the receipt-owned SessionStart sync hook into the settings.
+
+    Replaces only the exact entry the receipt records, which still repairs a
+    stale ramp path. A user-authored entry that already invokes the sync is
+    left untouched, no managed entry is added, and the skip is recorded as
+    user-managed. An unreadable hooks layout is the user's; nothing is
+    registered.
+    """
+    hooks = settings.get("hooks", {})
+    if not isinstance(hooks, dict):
+        return settings, state
+    session_start = hooks.get("SessionStart", [])
+    if not isinstance(session_start, list):
+        return settings, state
+    state = dict(state)
+    state.setdefault(SESSION_START_HOOKS_PRESENT_STATE_KEY, "hooks" in settings)
+    state.setdefault(SESSION_START_PRESENT_STATE_KEY, "SessionStart" in hooks)
+    recorded = state.get(SESSION_START_HOOK_STATE_KEY)
+    owned_index = next(
+        (index for index, item in enumerate(session_start) if item == recorded), None
+    )
+    if any(
+        _entry_invokes_sync(item)
+        for index, item in enumerate(session_start)
+        if index != owned_index
+    ):
+        # Two registrations would run the sync twice; the user's supersedes.
+        retained = [
+            item for index, item in enumerate(session_start) if index != owned_index
+        ]
+        updated_state = {**state, SESSION_START_HOOK_STATE_KEY: SYNC_HOOK_USER_MANAGED}
+        if retained == session_start:
+            return settings, updated_state
+        return {**settings, "hooks": {**hooks, "SessionStart": retained}}, updated_state
+    entry = session_start_hook_entry(command)
+    if owned_index is not None:
+        updated_list = list(session_start)
+        updated_list[owned_index] = entry
+    else:
+        updated_list = [*session_start, entry]
+    updated = {**settings, "hooks": {**hooks, "SessionStart": updated_list}}
+    return updated, {**state, SESSION_START_HOOK_STATE_KEY: entry}
+
+
+def plan_session_start_hook_removal(settings: dict, state: dict) -> dict:
+    """Remove exactly the SessionStart entry the receipt records.
+
+    User hooks that also invoke the sync — including ones added after Router
+    was configured — are never touched; the user-managed sentinel removes
+    nothing.
+    """
+    recorded = state.get(SESSION_START_HOOK_STATE_KEY)
+    if not isinstance(recorded, dict):
+        return settings
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return settings
+    session_start = hooks.get("SessionStart")
+    if not isinstance(session_start, list):
+        return settings
+    try:
+        owned_index = session_start.index(recorded)
+    except ValueError:
+        return settings
+    retained = session_start[:owned_index] + session_start[owned_index + 1 :]
+    updated_hooks = dict(hooks)
+    if retained:
+        updated_hooks["SessionStart"] = retained
+    elif state.get(SESSION_START_PRESENT_STATE_KEY) is True:
+        updated_hooks["SessionStart"] = []
+    else:
+        updated_hooks.pop("SessionStart")
+    restored = dict(settings)
+    if updated_hooks or state.get(SESSION_START_HOOKS_PRESENT_STATE_KEY) is True:
+        restored["hooks"] = updated_hooks
+    else:
+        restored.pop("hooks", None)
+    return restored
 
 
 def plan_configuration(

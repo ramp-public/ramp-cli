@@ -951,6 +951,43 @@ def test_a_claude_setup_file_key_waits_for_data_plane_propagation(
     assert captured["fetch"][1]["wait_for_key"] is True
 
 
+def test_configure_accepts_a_setup_file_for_claude_code(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    setup_file = tmp_path / "setup.json"
+    setup_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "name": "Ramp Router",
+                "base_url": "https://router.example/v1",
+                "api_key": "router-secret",
+            }
+        )
+    )
+    captured = {}
+
+    def fetch_models(api_key, *args, **kwargs):
+        captured.update(api_key=api_key, options=kwargs)
+        return [_router_model("claude-router-a")]
+
+    monkeypatch.setattr(router_module, "_fetch_models", fetch_models)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure",
+            "claude-code",
+            "--setup-file",
+            str(setup_file),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["api_key"] == "router-secret"
+    assert captured["options"]["wait_for_key"] is True
+
+
 def test_configure_without_arguments_leaves_cowork_alone(tmp_path, monkeypatch):
     # A run that names no agents means every coding agent, and only ever
     # meant that. Restarting Claude Desktop is opt-in: Cowork joins through
@@ -1026,15 +1063,85 @@ def test_unconfigure_picker_offers_a_configured_cowork(monkeypatch):
     state_path.write_text("{}")
     monkeypatch.setattr(router_module, "_clients_with_a_receipt", lambda: ("codex",))
     monkeypatch.setattr(router_module, "_can_draw_picker", lambda _ctx: True)
-    captured = _capture_picker(monkeypatch, ["cowork"])
+    captured = _capture_picker(monkeypatch, ["claude-code"])
     events = []
     monkeypatch.setattr(claude_cowork, "unconfigure", lambda: events.append("undone"))
 
     result = CliRunner().invoke(cli, ["--human", "router", "unconfigure"])
 
     assert result.exit_code == 0, result.output
-    assert [choice.value for choice in captured["choices"]] == ["codex", "cowork"]
+    # Cowork never appears as its own line: the Claude entry is the
+    # interactive road to it, exactly as it is in the configure picker,
+    # and it earns a place even though Claude Code holds no receipt.
+    assert [(choice.title, choice.value) for choice in captured["choices"]] == [
+        ("Claude (CLI + desktop app)", "claude-code"),
+        ("Codex (CLI + desktop app)", "codex"),
+    ]
+    # Claude Code has no receipt, so the Claude pick resolves to exactly
+    # the Claude setup that exists instead of failing on the one that
+    # does not.
     assert events == ["undone"]
+    assert "Claude Cowork" in result.output
+
+
+def test_unconfigure_picker_merges_cowork_into_the_claude_entry(monkeypatch):
+    # Configure and unconfigure draw the same menu: picking Claude removes
+    # both Claude apps' setups without another question, the way picking
+    # Claude configures both.
+    state_path = claude_cowork.state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("{}")
+    monkeypatch.setattr(
+        router_module, "_clients_with_a_receipt", lambda: ("claude-code", "codex")
+    )
+    monkeypatch.setattr(router_module, "_can_draw_picker", lambda _ctx: True)
+    captured = _capture_picker(monkeypatch, ["claude-code"])
+    removed = []
+    monkeypatch.setattr(
+        router_module,
+        "_unconfigure_client",
+        lambda client, _path: removed.append(client),
+    )
+    monkeypatch.setattr(claude_cowork, "unconfigure", lambda: removed.append("cowork"))
+
+    result = CliRunner().invoke(cli, ["--human", "router", "unconfigure"])
+
+    assert result.exit_code == 0, result.output
+    assert [(choice.title, choice.value) for choice in captured["choices"]] == [
+        ("Claude (CLI + desktop app)", "claude-code"),
+        ("Codex (CLI + desktop app)", "codex"),
+    ]
+    assert removed == ["claude-code", "cowork"]
+
+
+def test_unconfigure_picker_without_cowork_keeps_the_plain_claude_title(monkeypatch):
+    # Without a Cowork receipt only the CLI setup would be removed, so the
+    # entry says Claude Code and the pick expands to nothing extra — the
+    # same promise the configure picker makes on a Cowork-less machine.
+    monkeypatch.setattr(
+        router_module, "_clients_with_a_receipt", lambda: ("claude-code",)
+    )
+    monkeypatch.setattr(router_module, "_can_draw_picker", lambda _ctx: True)
+    captured = _capture_picker(monkeypatch, ["claude-code"])
+    removed = []
+    monkeypatch.setattr(
+        router_module,
+        "_unconfigure_client",
+        lambda client, _path: removed.append(client),
+    )
+    monkeypatch.setattr(
+        claude_cowork,
+        "unconfigure",
+        lambda: pytest.fail("cowork must be configured to be removed"),
+    )
+
+    result = CliRunner().invoke(cli, ["--human", "router", "unconfigure"])
+
+    assert result.exit_code == 0, result.output
+    assert [(choice.title, choice.value) for choice in captured["choices"]] == [
+        ("Claude Code", "claude-code"),
+    ]
+    assert removed == ["claude-code"]
 
 
 def test_cowork_commands_are_hidden_deprecated_aliases():
@@ -1265,9 +1372,17 @@ def test_refresh_reapplies_claude_config_and_preserves_selected_model(
     settings_path = claude_home / "settings.json"
     settings = json.loads(settings_path.read_text())
     settings["model"] = "claude-router-b"
-    settings["env"]["ANTHROPIC_BASE_URL"] = "https://stale.example"
+    settings["env"]["ANTHROPIC_BASE_URL"] = "https://stored.example"
     settings_path.write_text(json.dumps(settings) + "\n")
 
+    # Refresh follows the endpoint paired with the stored credential: the
+    # mock rejects any other host, so a fetch against the default Router
+    # would fail this refresh.
+    _mock_models(
+        monkeypatch,
+        [{"id": "claude-router-a"}, {"id": "claude-router-b"}],
+        base_url="https://stored.example/v1",
+    )
     refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
 
     assert refreshed.exit_code == 0, refreshed.output
@@ -1276,7 +1391,47 @@ def test_refresh_reapplies_claude_config_and_preserves_selected_model(
     )
     settings = json.loads(settings_path.read_text())
     assert settings["model"] == "claude-router-b"
-    assert settings["env"]["ANTHROPIC_BASE_URL"] == "https://router-api.ramp.com"
+    assert settings["env"]["ANTHROPIC_BASE_URL"] == "https://stored.example"
+
+
+def test_refresh_without_the_configure_environment_keeps_stored_endpoints(
+    tmp_path, monkeypatch
+):
+    # The session-sync hook spawns `router refresh` with whatever environment
+    # the agent happened to have, so a setup configured against a non-default
+    # Router must be refreshed from its stored endpoint, never rewritten to
+    # production.
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    monkeypatch.setenv("RAMP_ROUTER_BASE_URL", "https://qa-router.example/v1")
+    _mock_models(monkeypatch, base_url="https://qa-router.example/v1")
+    configured = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure",
+            "claude-code",
+            "opencode",
+            "--api-key",
+            "router-secret",
+        ],
+    )
+    assert configured.exit_code == 0, configured.output
+
+    monkeypatch.delenv("RAMP_ROUTER_BASE_URL")
+    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+
+    assert refreshed.exit_code == 0, refreshed.output
+    settings = json.loads((claude_home / "settings.json").read_text())
+    assert settings["env"]["ANTHROPIC_BASE_URL"] == "https://qa-router.example"
+    opencode_config = json.loads((tmp_path / "opencode" / "opencode.json").read_text())
+    (entry,) = [
+        item
+        for item in opencode_config["plugin"]
+        if isinstance(item, list) and len(item) > 1
+    ]
+    assert entry[1]["baseURL"] == "https://qa-router.example/v1"
 
 
 def test_refresh_does_not_claim_a_user_selected_claude_model_view(
@@ -3097,6 +3252,278 @@ def test_the_cost_hook_uses_the_overridden_router_origin(tmp_path, monkeypatch):
     (group,) = _cost_hook_groups(codex_home)
     # A base-URL override names a single-origin deployment.
     assert "ROUTER_BASE_URL=http://router.example" in group["hooks"][0]["command"]
+
+
+def _sync_hook_groups(codex_home):
+    config = tomllib.loads((codex_home / "config.toml").read_text())
+    return config.get("hooks", {}).get("SessionStart", [])
+
+
+def _configure_agent(client):
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", client, "--api-key", "router-secret"]
+    )
+    assert result.exit_code == 0, result.output
+    return result
+
+
+def _unconfigure_agent(client):
+    result = CliRunner().invoke(cli, ["--human", "router", "unconfigure", client])
+    assert result.exit_code == 0, result.output
+    return result
+
+
+def _refresh_agents():
+    result = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+    assert result.exit_code == 0, result.output
+    return result
+
+
+def test_configure_codex_registers_the_session_sync_hook(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+
+    _configure_agent("codex")
+
+    (group,) = _sync_hook_groups(codex_home)
+    assert group["matcher"] == "startup|resume"
+    (entry,) = group["hooks"]
+    assert entry["type"] == "command"
+    assert entry["command"] == router_module.session_sync_hook_command("codex")
+    assert entry["command"].endswith("--client codex || true")
+    # The Stop cost hook and the SessionStart sync hook coexist in one file.
+    assert len(_cost_hook_groups(codex_home)) == 1
+    state = json.loads((codex_home / "ramp-router-state.json").read_text())
+    # The receipt records the exact rendering, which is what makes this group
+    # — and no user-authored one — replaceable and removable later.
+    assert state["session_sync_hook"] == router_module._sync_hook_chunk_digest(
+        router_module._render_codex_sync_hook_group(entry["command"])
+    )
+
+
+def test_refresh_repairs_a_stale_codex_sync_hook_path(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    _configure_agent("codex")
+
+    moved = "[ -x /new/home/ramp ] && /new/home/ramp router sync --hook || true"
+    monkeypatch.setattr(
+        router_module, "session_sync_hook_command", lambda _client: moved
+    )
+    _refresh_agents()
+
+    (group,) = _sync_hook_groups(codex_home)
+    assert group["hooks"][0]["command"] == moved
+
+
+def test_a_manual_sync_hook_registration_is_not_duplicated(tmp_path, monkeypatch):
+    # The exploded spelling already answers SessionStart; a second group
+    # would run the sync twice per session start.
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    manual = (
+        "[[hooks.SessionStart]]\n"
+        "[[hooks.SessionStart.hooks]]\n"
+        'type = "command"\n'
+        'command = "~/.local/bin/ramp router sync --hook"\n'
+    )
+    (codex_home / "config.toml").write_text(manual)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+
+    _configure_agent("codex")
+
+    (group,) = _sync_hook_groups(codex_home)
+    assert group["hooks"][0]["command"] == "~/.local/bin/ramp router sync --hook"
+    state = json.loads((codex_home / "ramp-router-state.json").read_text())
+    assert state["session_sync_hook"] == "user-managed"
+
+    # And the user's registration survives unconfigure untouched.
+    _unconfigure_agent("codex")
+    (group,) = _sync_hook_groups(codex_home)
+    assert group["hooks"][0]["command"] == "~/.local/bin/ramp router sync --hook"
+
+
+@pytest.mark.parametrize(
+    "command", ["echo 'router sync --hook'", "ramp router sync --hooked"]
+)
+def test_codex_hook_detection_ignores_commands_that_only_mention_sync(command):
+    config = {"hooks": {"SessionStart": [{"hooks": [{"command": command}]}]}}
+
+    assert not router_module._codex_sync_hook_registered(config)
+
+
+def test_unconfigure_spares_a_sync_group_the_user_added_after_configure(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    _configure_agent("codex")
+    config_path = codex_home / "config.toml"
+    theirs = (
+        "\n[[hooks.SessionStart]]\n"
+        'matcher = "resume"\n'
+        'hooks = [{ type = "command", command = "/theirs/ramp router sync --hook" }]\n'
+    )
+    config_path.write_text(config_path.read_text() + theirs)
+
+    _unconfigure_agent("codex")
+
+    # Only the receipt-recorded group is removed; the one the user authored
+    # after Router was configured stays, marker and all.
+    (group,) = _sync_hook_groups(codex_home)
+    assert group["hooks"][0]["command"] == "/theirs/ramp router sync --hook"
+
+
+def test_codex_hook_ownership_consumes_only_one_identical_group(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert configured.exit_code == 0, configured.output
+    config_path = codex_home / "config.toml"
+    (managed,) = _sync_hook_groups(codex_home)
+    duplicate = router_module._render_codex_sync_hook_group(
+        managed["hooks"][0]["command"]
+    )
+    config_path.write_text(config_path.read_text() + "\n" + duplicate)
+
+    refreshed = runner.invoke(cli, ["--human", "router", "refresh"])
+
+    assert refreshed.exit_code == 0, refreshed.output
+    assert len(_sync_hook_groups(codex_home)) == 1
+    state = json.loads((codex_home / "ramp-router-state.json").read_text())
+    assert state["session_sync_hook"] == "user-managed"
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+    assert removed.exit_code == 0, removed.output
+    assert len(_sync_hook_groups(codex_home)) == 1
+
+
+def test_an_edited_managed_sync_group_becomes_the_users(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    _configure_agent("codex")
+    config_path = codex_home / "config.toml"
+    edited = config_path.read_text().replace(
+        'matcher = "startup|resume"', 'matcher = "startup"'
+    )
+    config_path.write_text(edited)
+
+    _refresh_agents()
+    (group,) = _sync_hook_groups(codex_home)
+    # The edit no longer matches the recorded rendering, so refresh neither
+    # replaces the group nor adds a duplicate.
+    assert group["matcher"] == "startup"
+
+    _unconfigure_agent("codex")
+    (group,) = _sync_hook_groups(codex_home)
+    assert group["matcher"] == "startup"
+
+
+def test_no_ramp_entrypoint_skips_codex_sync_hook_registration(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    monkeypatch.setattr(
+        router_module, "session_sync_hook_command", lambda _client: None
+    )
+
+    _configure_agent("codex")
+
+    assert _sync_hook_groups(codex_home) == []
+    state = json.loads((codex_home / "ramp-router-state.json").read_text())
+    assert "session_sync_hook" not in state
+
+
+def test_unconfigure_removes_the_codex_sync_hook(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    theirs = (
+        "[[hooks.SessionStart]]\n"
+        'hooks = [{ type = "command", command = "/home/me/context.sh" }]\n'
+    )
+    (codex_home / "config.toml").write_text(theirs)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    _configure_agent("codex")
+
+    _unconfigure_agent("codex")
+
+    groups = _sync_hook_groups(codex_home)
+    # The user's own SessionStart hook survives; only the managed group goes.
+    assert [group["hooks"][0]["command"] for group in groups] == ["/home/me/context.sh"]
+
+
+def test_configure_claude_registers_the_session_start_sync_hook(tmp_path, monkeypatch):
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    _mock_models(monkeypatch)
+
+    _configure_agent("claude-code")
+
+    settings = json.loads((claude_home / "settings.json").read_text())
+    (entry,) = settings["hooks"]["SessionStart"]
+    assert entry["matcher"] == "startup|resume"
+    (hook,) = entry["hooks"]
+    assert hook["type"] == "command"
+    assert hook["command"] == router_module.session_sync_hook_command("claude-code")
+    assert hook["command"].endswith("--client claude-code || true")
+    assert hook["timeout"] == claude_code.SESSION_START_HOOK_TIMEOUT_SECONDS
+    state = json.loads((claude_home / "ramp-router-state.json").read_text())
+    assert state["session_start_hook"] == entry
+
+
+def test_unconfigure_claude_removes_only_the_sync_hook(tmp_path, monkeypatch):
+    claude_home = tmp_path / "claude"
+    claude_home.mkdir()
+    theirs = {
+        "matcher": "startup",
+        "hooks": [{"type": "command", "command": "/home/me/context.sh"}],
+    }
+    (claude_home / "settings.json").write_text(
+        json.dumps({"hooks": {"SessionStart": [theirs]}})
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    configured = runner.invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure",
+            "claude-code",
+            "--api-key",
+            "router-secret",
+        ],
+    )
+    assert configured.exit_code == 0, configured.output
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "claude-code"])
+
+    assert removed.exit_code == 0, removed.output
+    settings = json.loads((claude_home / "settings.json").read_text())
+    assert settings["hooks"] == {"SessionStart": [theirs]}
+
+
+def test_unconfigure_claude_removes_the_hooks_object_it_created(tmp_path, monkeypatch):
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    _mock_models(monkeypatch)
+    _configure_agent("claude-code")
+
+    _unconfigure_agent("claude-code")
+
+    settings = json.loads((claude_home / "settings.json").read_text())
+    assert "hooks" not in settings
 
 
 def test_unconfigure_restores_previous_codex_settings(tmp_path, monkeypatch):
@@ -5836,7 +6263,7 @@ def test_configure_json_output_bypasses_the_picker(tmp_path, monkeypatch):
         lambda: pytest.fail("JSON output cannot draw an interactive picker"),
     )
     monkeypatch.setattr(
-        router_module, "_install_claude_code_statusline", lambda _path: None
+        router_module, "_install_claude_code_statusline", lambda *_args: None
     )
     monkeypatch.setattr(router_module, "_install_codex_cost_hook", lambda *_args: None)
     monkeypatch.setattr(router_module.shutil, "which", lambda _name: None)

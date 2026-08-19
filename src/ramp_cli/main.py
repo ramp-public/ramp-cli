@@ -563,8 +563,24 @@ def _emit_error(code: int, message: str) -> None:
         click.echo(f"Error: {message}", err=True)
 
 
+def _is_session_sync_invocation() -> bool:
+    """Report whether this run is `ramp router sync --hook` or `--detached`.
+
+    The hook's fast path must be zero-network, and the passive version check
+    would otherwise start a GitHub request before dispatch; the detached
+    background half fetches the version cache itself, synchronously, so the
+    racy daemon-thread check is redundant there. Token containment because
+    root flags may appear anywhere; these flags exist only on `router sync`.
+    """
+    arguments = set(sys.argv[1:])
+    if not {"router", "sync"} <= arguments:
+        return False
+    return "--hook" in arguments or "--detached" in arguments
+
+
 def main() -> None:
-    check_for_update()
+    if not _is_session_sync_invocation():
+        check_for_update()
     try:
         cli(standalone_mode=False)
     except click.exceptions.Abort:
