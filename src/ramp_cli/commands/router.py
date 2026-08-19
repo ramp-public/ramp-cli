@@ -1784,13 +1784,17 @@ def _run_unconfigure(
 ) -> None:
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     requested_clients = tuple(dict.fromkeys(clients))
+    # The machine-readable output contract follows what the caller named, not
+    # what the Claude expansion below grows the request into: a script that
+    # names one client keeps reading one top-level result object.
+    named_clients = requested_clients
+    cowork_configured = claude_cowork.state_path().exists()
     if not requested_clients and _can_prompt(ctx, fmt):
         # Offered from the receipts rather than the installed agents: this
         # removes a setup, so the only meaningful choices are the setups that
         # exist. With none, the list would be empty and the command falls
         # through to saying Router is not configured anywhere.
         receipted = _clients_with_a_receipt()
-        cowork_configured = claude_cowork.state_path().exists()
         candidates = receipted
         if cowork_configured and "claude-code" not in candidates:
             # A Cowork receipt is the same kind of evidence: this CLI set
@@ -1805,39 +1809,36 @@ def _run_unconfigure(
             # titles, so nobody meets Cowork as a separate thing to remove.
             titles = dict(AGENT_NAMES)
             titles["codex"] = "Codex (CLI + desktop app)"
-            if cowork_configured:
-                titles["claude-code"] = "Claude (CLI + desktop app)"
-            selected = _pick_clients(
+            titles["claude-code"] = "Claude (CLI + desktop app)"
+            requested_clients = _pick_clients(
                 "Which coding agents do you want to remove Ramp Router from?",
                 candidates,
                 titles=titles,
             )
-            if cowork_configured and "claude-code" in selected:
-                # The Claude entry removes both Claude setups without another
-                # question, but only the setups that exist: a Claude Code
-                # without a receipt has nothing to restore, and expanding to
-                # it would end the run with a failure it did not earn.
-                claude_targets = (
-                    ("claude-code", COWORK_CLIENT)
-                    if "claude-code" in receipted
-                    else (COWORK_CLIENT,)
-                )
-                selected = tuple(
-                    dict.fromkeys(
-                        expanded
-                        for client in selected
-                        for expanded in (
-                            claude_targets if client == "claude-code" else (client,)
-                        )
-                    )
-                )
-            requested_clients = selected
-    # A run that names no agents keeps meaning the coding agents, exactly as
-    # it does for configure: Cowork restarts Claude Desktop, so it is removed
-    # only when picked or named. This also keeps every previously generated
-    # "run 'ramp router unconfigure'" recovery hint meaning what it meant
-    # when it was printed.
+    # A run that names no agents keeps meaning every coding agent.
     clients = requested_clients or tuple(CLIENT_NAMES)
+    if cowork_configured and "claude-code" in clients:
+        # Unconfiguring Claude Code always unconfigures both Claude apps,
+        # whether Claude was picked from the menu, named on the command line,
+        # or reached by a bare run — but only the setups that exist: a named
+        # Claude Code without a receipt has nothing to restore, and expanding
+        # to it would end the run with a failure it did not earn. A bare run
+        # keeps Claude Code in the list because the removal loop already
+        # skips receiptless agents there.
+        claude_targets = (
+            ("claude-code", COWORK_CLIENT)
+            if not requested_clients or "claude-code" in _clients_with_a_receipt()
+            else (COWORK_CLIENT,)
+        )
+        clients = tuple(
+            dict.fromkeys(
+                expanded
+                for client in clients
+                for expanded in (
+                    claude_targets if client == "claude-code" else (client,)
+                )
+            )
+        )
     target_phrase = (
         "Claude Cowork"
         if clients == (COWORK_CLIENT,)
@@ -1892,12 +1893,17 @@ def _run_unconfigure(
             # The deprecated alias is kept precisely for existing scripts, so
             # it keeps answering with the payload those scripts parse.
             payload = {"client": claude_cowork.GATEWAY_CLIENT, "restored": True}
-        else:
-            payload = (
-                results[0]
-                if len(requested_clients) == 1 and results
-                else {"clients": results}
+        elif len(named_clients) == 1 and results:
+            # One named client keeps its established single-result object even
+            # when the Claude entry expanded to both Claude apps: the named
+            # client's result answers, and the Cowork result stands in only
+            # when it was the one Claude setup that existed to remove.
+            payload = next(
+                (result for result in results if result["client"] == named_clients[0]),
+                results[0],
             )
+        else:
+            payload = {"clients": results}
         print_agent_json(payload, pagination=None)
     elif results:
         restored_names = _human_join(

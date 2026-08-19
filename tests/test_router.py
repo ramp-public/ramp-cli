@@ -1028,10 +1028,11 @@ def test_unconfigure_cowork_through_the_consolidated_command(monkeypatch):
     assert "Claude Desktop was restarted." in result.output
 
 
-def test_unconfigure_without_arguments_leaves_cowork_alone(tmp_path, monkeypatch):
-    # Bare unconfigure keeps meaning the coding agents, so every recovery
-    # hint configure ever printed still means what it meant, and Claude
-    # Desktop is never restarted without Cowork being picked or named.
+def test_unconfigure_without_arguments_removes_a_configured_cowork(
+    tmp_path, monkeypatch
+):
+    # Unconfiguring Claude Code always unconfigures both Claude apps, so a
+    # bare run that covers Claude Code takes the Cowork setup with it.
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
     _mock_models(monkeypatch)
     runner = CliRunner()
@@ -1045,10 +1046,37 @@ def test_unconfigure_without_arguments_leaves_cowork_alone(tmp_path, monkeypatch
     state_path = claude_cowork.state_path()
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text("{}")
+    events = []
+    monkeypatch.setattr(claude_cowork, "unconfigure", lambda: events.append("undone"))
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure"])
+
+    assert removed.exit_code == 0, removed.output
+    assert not (tmp_path / "codex" / "ramp-router-state.json").exists()
+    assert events == ["undone"]
+    assert "Claude Cowork" in removed.output
+    assert "Claude Desktop was restarted." in removed.output
+
+
+def test_unconfigure_without_arguments_and_without_cowork_skips_it(
+    tmp_path, monkeypatch
+):
+    # Without a Cowork setup there is nothing on the desktop side to remove,
+    # so a bare run never touches Claude Desktop.
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    assert (
+        runner.invoke(
+            cli,
+            ["--human", "router", "configure", "codex", "--api-key", "router-secret"],
+        ).exit_code
+        == 0
+    )
     monkeypatch.setattr(
         claude_cowork,
         "unconfigure",
-        lambda: pytest.fail("cowork must be picked or named to be removed"),
+        lambda: pytest.fail("cowork must be configured to be removed"),
     )
 
     removed = runner.invoke(cli, ["--human", "router", "unconfigure"])
@@ -1114,10 +1142,12 @@ def test_unconfigure_picker_merges_cowork_into_the_claude_entry(monkeypatch):
     assert removed == ["claude-code", "cowork"]
 
 
-def test_unconfigure_picker_without_cowork_keeps_the_plain_claude_title(monkeypatch):
-    # Without a Cowork receipt only the CLI setup would be removed, so the
-    # entry says Claude Code and the pick expands to nothing extra — the
-    # same promise the configure picker makes on a Cowork-less machine.
+def test_unconfigure_picker_without_cowork_keeps_the_combined_claude_title(
+    monkeypatch,
+):
+    # The Claude entry always names both Claude apps, exactly like the Codex
+    # entry: it is one Claude setup to remove, and without a Cowork receipt
+    # the pick expands to nothing extra.
     monkeypatch.setattr(
         router_module, "_clients_with_a_receipt", lambda: ("claude-code",)
     )
@@ -1139,9 +1169,94 @@ def test_unconfigure_picker_without_cowork_keeps_the_plain_claude_title(monkeypa
 
     assert result.exit_code == 0, result.output
     assert [(choice.title, choice.value) for choice in captured["choices"]] == [
-        ("Claude Code", "claude-code"),
+        ("Claude (CLI + desktop app)", "claude-code"),
     ]
     assert removed == ["claude-code"]
+
+
+def test_unconfigure_named_claude_removes_both_claude_setups(monkeypatch):
+    # Naming Claude Code means the same thing as picking the Claude entry:
+    # Router leaves both Claude apps, not just the CLI.
+    state_path = claude_cowork.state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("{}")
+    monkeypatch.setattr(
+        router_module, "_clients_with_a_receipt", lambda: ("claude-code",)
+    )
+    removed = []
+    monkeypatch.setattr(
+        router_module,
+        "_unconfigure_client",
+        lambda client, _path: removed.append(client),
+    )
+    monkeypatch.setattr(claude_cowork, "unconfigure", lambda: removed.append("cowork"))
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "unconfigure", "claude-code"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert removed == ["claude-code", "cowork"]
+    assert "Claude Code" in result.output
+    assert "Claude Cowork" in result.output
+    assert "Claude Desktop was restarted." in result.output
+
+
+def test_unconfigure_named_claude_keeps_its_single_agent_result(monkeypatch):
+    # --agent scripts that name one client keep reading one top-level result
+    # object with client/config_path/removed, even when the Claude entry
+    # also removes the Cowork setup.
+    state_path = claude_cowork.state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("{}")
+    monkeypatch.setattr(
+        router_module, "_clients_with_a_receipt", lambda: ("claude-code",)
+    )
+    removed = []
+    monkeypatch.setattr(
+        router_module,
+        "_unconfigure_client",
+        lambda client, _path: removed.append(client),
+    )
+    monkeypatch.setattr(claude_cowork, "unconfigure", lambda: removed.append("cowork"))
+
+    result = CliRunner().invoke(
+        cli, ["--agent", "router", "unconfigure", "claude-code"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert removed == ["claude-code", "cowork"]
+    payload = json.loads(result.output)["data"][0]
+    assert payload["client"] == "claude-code"
+    assert payload["removed"] is True
+    assert "clients" not in payload
+
+
+def test_unconfigure_named_claude_resolves_to_the_claude_setup_that_exists(
+    monkeypatch,
+):
+    # A named Claude Code without a receipt resolves to exactly the Claude
+    # setup that exists instead of failing on the one that does not, the
+    # same way the picker's Claude entry does.
+    state_path = claude_cowork.state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("{}")
+    monkeypatch.setattr(router_module, "_clients_with_a_receipt", lambda: ())
+    monkeypatch.setattr(
+        router_module,
+        "_unconfigure_client",
+        lambda client, _path: pytest.fail("claude-code holds no receipt to remove"),
+    )
+    events = []
+    monkeypatch.setattr(claude_cowork, "unconfigure", lambda: events.append("undone"))
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "unconfigure", "claude-code"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert events == ["undone"]
+    assert "Claude Cowork" in result.output
 
 
 def test_cowork_commands_are_hidden_deprecated_aliases():
