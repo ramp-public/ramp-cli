@@ -49,7 +49,11 @@ from ramp_cli.tools.registry import (
     get_tool,
     list_categories,
 )
-from ramp_cli.version_check import check_for_update, emit_update_notice
+from ramp_cli.version_check import (
+    check_for_update,
+    emit_update_notice,
+    record_installed_version,
+)
 
 # ── Enums & data ─────────────────────────────────────────────────────────────
 
@@ -579,6 +583,9 @@ def _is_session_sync_invocation() -> bool:
 
 
 def main() -> None:
+    # Every invocation, session-sync hooks included; the Router-served
+    # statusline reads this file.
+    record_installed_version()
     if not _is_session_sync_invocation():
         check_for_update()
     try:

@@ -194,6 +194,42 @@ def test_list__returns_recent_payments(monkeypatch):
     }
 
 
+def test_list__shows_human_readable_empty_state(monkeypatch):
+    monkeypatch.setattr(
+        AgentWalletClient,
+        "list_payments",
+        lambda client, limit: [],
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "agent-wallet", "payments", "list", "--limit", "1"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.output == "No Agent Wallet payments found.\n"
+
+
+def test_list__preserves_machine_readable_empty_state(monkeypatch):
+    monkeypatch.setattr(
+        AgentWalletClient,
+        "list_payments",
+        lambda client, limit: [],
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["--agent", "agent-wallet", "payments", "list", "--limit", "1"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {
+        "schema_version": "1.0",
+        "data": [],
+        "pagination": None,
+    }
+
+
 def test_top_level_list__is_removed():
     result = CliRunner().invoke(cli, ["agent-wallet", "list"])
 

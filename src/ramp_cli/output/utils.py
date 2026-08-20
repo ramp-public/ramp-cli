@@ -38,6 +38,21 @@ def currency_symbol(code: str) -> str:
     return _CURRENCY_SYMBOLS.get(code, f"{code} ")
 
 
+def format_duration(seconds: int) -> str:
+    """Format an exact duration using the largest whole unit."""
+    for unit, unit_seconds in (
+        ("day", 24 * 60 * 60),
+        ("hour", 60 * 60),
+        ("minute", 60),
+    ):
+        if seconds >= unit_seconds and seconds % unit_seconds == 0:
+            value = seconds // unit_seconds
+            suffix = "" if value == 1 else "s"
+            return f"{value} {unit}{suffix}"
+    suffix = "" if seconds == 1 else "s"
+    return f"{seconds} second{suffix}"
+
+
 def fmt_amount(amount: Any, currency: str = "USD") -> str:
     """Format amount — int (cents), float (dollars), dict, or string."""
     sym = currency_symbol(currency)

@@ -1104,7 +1104,7 @@ class TestStandaloneAgentLogin:
             assert client_secret == "secret-from-flag"
             return TokenResponse(
                 access_token="standalone-access",
-                expires_in=3600,
+                expires_in=604800,
                 scope="transactions:read",
             )
 
@@ -1137,8 +1137,10 @@ class TestStandaloneAgentLogin:
 
         assert result.exit_code == 0
         assert "Warning: --client-secret overrides RAMP_CLIENT_SECRET." in result.output
-        assert "Authenticated standalone agent" in result.output
-        assert "cannot be refreshed" in result.output
+        assert "\u2713 Standalone agent authenticated" in result.output
+        assert "  Environment  " not in result.output
+        assert "default environment" not in result.output
+        assert "ramp env production" not in result.output
         assert "secret-from-env" not in result.output
         assert "secret-from-flag" not in result.output
 

@@ -50,6 +50,59 @@ def _cache_path() -> Path:
     return config_dir() / "latest-version.txt"
 
 
+def installed_version_path() -> Path:
+    override = os.environ.get("RAMP_INSTALLED_VERSION_FILE")
+    return Path(override) if override else config_dir() / "installed-version"
+
+
+def record_installed_version() -> None:
+    """Keep the installed-version file naming this binary's own version.
+
+    Contract with the Router-served Claude statusline: it compares the
+    server-reported recommended CLI version against this plain-text file,
+    with zero subprocess calls. Runs on every CLI invocation but writes only
+    when the content differs — the fast path is one read — so it self-heals
+    right after `ramp update`: the new binary rewrites it on its first run.
+    """
+    try:
+        path = installed_version_path()
+        try:
+            if path.read_text() == __version__:
+                return
+        except OSError:
+            pass
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(__version__)
+        tmp.replace(path)  # atomic on POSIX
+    except OSError:
+        pass
+
+
+def server_recommended_version_path() -> Path:
+    override = os.environ.get("RAMP_SERVER_RECOMMENDED_VERSION_FILE")
+    return Path(override) if override else config_dir() / "server-recommended-version"
+
+
+def _read_server_recommended() -> str | None:
+    """The CLI version the Router server last recommended, or None.
+
+    The Router-served Codex cost hook records the session-usage endpoint's
+    `recommended_cli_version` here after each turn. This side only ever reads
+    the file — never the network — and fails open: a missing file is treated
+    as absent.
+    """
+    # The opt-out's observed contract has always been "no update nudges" (it
+    # starves the cache); the Router-served cost hook writes this file
+    # out-of-band, so it must not resurrect nudges for opted-out users.
+    if os.environ.get("RAMP_NO_UPDATE_CHECK"):
+        return None
+    try:
+        return server_recommended_version_path().read_text().strip()
+    except OSError:
+        return None
+
+
 def _read_cache() -> str | None:
     """Read cached latest version, or None if cache doesn't exist."""
     path = _cache_path()
@@ -122,16 +175,28 @@ def check_for_update() -> None:
 
 
 def get_update_info() -> dict[str, str] | None:
-    """Return update info if a newer version is cached, else None.
+    """Return update info if a newer version is known, else None.
+
+    "Newer" is judged against the max of the two local sources: the cached
+    GitHub latest release and the server-recommended version the Codex cost
+    hook records. Both are plain reads — never a fetch.
 
     Returns {"current": "0.1.3", "latest": "0.1.4"} or None.
     """
-    cached = _read_cache()
-    if not cached:
+    candidates: list[tuple[tuple[int, ...], str]] = []
+    for candidate in (_read_cache(), _read_server_recommended()):
+        if not candidate:
+            continue
+        try:
+            candidates.append((parse_version(candidate), candidate))
+        except (ValueError, TypeError):
+            continue
+    if not candidates:
         return None
+    parsed_latest, latest = max(candidates)
     try:
-        if parse_version(cached) > parse_version(__version__):
-            return {"current": __version__, "latest": cached}
+        if parsed_latest > parse_version(__version__):
+            return {"current": __version__, "latest": latest}
     except (ValueError, TypeError):
         pass
     return None

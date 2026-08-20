@@ -47,7 +47,9 @@ from ramp_cli.output.style import show_notice, start_spinner
 from ramp_cli.router_integrations import integration_package_path
 from ramp_cli.router_setup import acquire_router_api_key
 from ramp_cli.version_check import (
+    installed_version_path,
     refresh_version_cache,
+    server_recommended_version_path,
     suppress_next_update_notice,
     sync_update_notice_file,
 )
@@ -1883,6 +1885,17 @@ def _run_unconfigure(
     finally:
         stop_spinner()
 
+    setup_remains = bool(_clients_with_a_receipt()) or (
+        claude_cowork.state_path().exists()
+    )
+    if results and not setup_remains:
+        # Ramp-owned version-nudge state leaves with the last Router setup; a
+        # failed removal keeps its receipt, so its state stays.
+        for stale in (installed_version_path(), server_recommended_version_path()):
+            try:
+                stale.unlink(missing_ok=True)
+            except OSError:
+                pass
     if not results and not failures:
         raise click.ClickException("Ramp Router is not configured in any coding agent.")
     if failures and fmt == "json":

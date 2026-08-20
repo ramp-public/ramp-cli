@@ -143,6 +143,12 @@ def payments_group() -> None:
 def list_payments(ctx: click.Context, limit: int) -> None:
     """List recent Agent Wallet payments."""
     payments = AgentWalletClient(ctx.obj["env"]).list_payments(limit)
+    if (
+        not payments
+        and resolve_format(ctx.obj["format"], ctx.obj["config_format"]) != "json"
+    ):
+        click.echo("No Agent Wallet payments found.")
+        return
     _render(payments, ctx)
 
 

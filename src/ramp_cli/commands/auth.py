@@ -299,12 +299,7 @@ def _login_standalone_agent(
         )
         return
 
-    click.echo(f"Authenticated standalone agent for {label}.")
-    click.echo(
-        f"  Access token expires in {token_resp.expires_in} seconds and cannot be refreshed."
-    )
-    click.echo("  Run the same auth login command again after it expires.")
-    _show_default_env_hint(env)
+    click.secho("\u2713 Standalone agent authenticated", fg="green", bold=True)
 
 
 @auth_group.command()

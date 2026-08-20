@@ -16,6 +16,7 @@ from click.testing import CliRunner
 import ramp_cli.commands.router as router_module
 import ramp_cli.commands.router_sync as sync_module
 import ramp_cli.main as main_module
+from ramp_cli import __version__
 from ramp_cli.config.settings import config_dir
 from ramp_cli.main import cli
 
@@ -355,6 +356,32 @@ def test_two_back_to_back_session_starts_both_emit_the_notice(monkeypatch):
     assert first.stderr == second.stderr == ""
     # Only the first invocation crossed the cooldown and spawned a refresh.
     assert spawned == [True]
+
+
+def test_the_codex_notice_names_a_newer_server_recommended_version(monkeypatch):
+    _write_cooldown()
+    _cache_update("99.0.0")
+    (config_dir() / "server-recommended-version").write_text("100.0.0\n")
+
+    result = _sync("--hook", "--client", "codex")
+
+    assert result.exit_code == 0
+    message = json.loads(result.stdout)["systemMessage"]
+    assert "v100.0.0" in message
+
+
+def test_every_invocation_records_the_installed_version(monkeypatch):
+    monkeypatch.setattr(main_module, "check_for_update", lambda: None)
+    monkeypatch.setattr(router_module, "spawn_detached_refresh", lambda: None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["ramp", "--quiet", "router", "sync", "--hook", "--client", "codex"],
+    )
+
+    main_module.main()
+
+    assert (config_dir() / "installed-version").read_text() == __version__
 
 
 def test_a_lock_losing_invocation_still_emits_the_notice(monkeypatch):

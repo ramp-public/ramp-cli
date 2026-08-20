@@ -22,6 +22,7 @@ import ramp_cli.commands.router as router_module
 from ramp_cli import claude_cowork
 from ramp_cli.commands import claude_code
 from ramp_cli.commands.router import DEFAULT_ROUTER_BASE_URL as ROUTER_BASE_URL
+from ramp_cli.config.settings import config_dir
 from ramp_cli.main import cli
 
 
@@ -3368,6 +3369,85 @@ def test_unconfigure_removes_the_cost_hook(tmp_path, monkeypatch):
     groups = _cost_hook_groups(codex_home)
     # The user's own Stop hook survives; only the managed group is removed.
     assert [group["hooks"][0]["command"] for group in groups] == ["/home/me/notify.sh"]
+
+
+def test_unconfigure_removes_the_version_nudge_state(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert configured.exit_code == 0, configured.output
+    state_dir = config_dir()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "installed-version").write_text("0.1.0")
+    (state_dir / "server-recommended-version").write_text("9.9.9")
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert removed.exit_code == 0, removed.output
+    assert not (state_dir / "installed-version").exists()
+    assert not (state_dir / "server-recommended-version").exists()
+
+
+def test_unconfigure_keeps_the_version_nudge_state_while_a_setup_remains(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    for client, args in (
+        ("codex", ["--api-key", "router-secret"]),
+        ("claude-code", ["--api-key", "router-secret"]),
+    ):
+        configured = runner.invoke(
+            cli, ["--human", "router", "configure", client, *args]
+        )
+        assert configured.exit_code == 0, configured.output
+    state_dir = config_dir()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "installed-version").write_text("0.1.0")
+    (state_dir / "server-recommended-version").write_text("9.9.9")
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert removed.exit_code == 0, removed.output
+    # Claude Code still has a Router setup: its next session-start notice
+    # reads the server recommendation from this file before any cost-hook
+    # turn could re-record it, so removing Codex must leave it in place.
+    assert (state_dir / "installed-version").read_text() == "0.1.0"
+    assert (state_dir / "server-recommended-version").read_text() == "9.9.9"
+
+
+def test_unconfigure_keeps_the_version_nudge_state_while_cowork_remains(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert configured.exit_code == 0, configured.output
+    # A Cowork setup leaves no client receipt; its state file is the evidence.
+    cowork_state = claude_cowork.state_path()
+    cowork_state.parent.mkdir(parents=True, exist_ok=True)
+    cowork_state.write_text("{}")
+    state_dir = config_dir()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "installed-version").write_text("0.1.0")
+    (state_dir / "server-recommended-version").write_text("9.9.9")
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert removed.exit_code == 0, removed.output
+    assert (state_dir / "installed-version").read_text() == "0.1.0"
+    assert (state_dir / "server-recommended-version").read_text() == "9.9.9"
 
 
 def test_unconfigure_keeps_a_cost_hook_a_manual_registration_still_runs(
