@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import json
-import os
 from typing import Any
 from uuid import UUID, uuid4
 
 import click
 
-from ramp_cli.auth.agent_wallet import save_api_key
 from ramp_cli.client.agent_wallet import (
     AgentWalletApiError,
     AgentWalletClient,
@@ -28,8 +26,6 @@ from ramp_cli.output.formatter import (
 )
 from ramp_cli.tools.commands import GeneratedToolGroup, build_tool_command
 from ramp_cli.tools.parser import ToolDef
-
-CONFIGURE_KEY_ENV = "RAMP_AGENT_WALLET_CONFIGURE_API_KEY"
 
 
 def _build_policy_group(tool: ToolDef) -> click.Group:
@@ -111,7 +107,7 @@ def _submit_payment(
         )
     if display_amount and is_human:
         click.echo(f"Amount: {display_amount}", err=True)
-    result = AgentWalletClient().pay(body)
+    result = AgentWalletClient(ctx.obj["env"]).pay(body)
     if result.get("payment_operation_id") != str(payment_id):
         raise AgentWalletClientError("Agent Wallet returned an invalid response")
     _render(result, ctx)
@@ -125,51 +121,6 @@ def _submit_payment(
 )
 def agent_wallet_group() -> None:
     pass
-
-
-@agent_wallet_group.command(
-    "configure",
-    help="Configure this CLI with a standalone agent's Agent Wallet API key",
-)
-@click.option(
-    "--api-key",
-    metavar="KEY",
-    envvar=CONFIGURE_KEY_ENV,
-    help=(
-        "Agent Wallet API key. Prompts securely when omitted. "
-        f"Set {CONFIGURE_KEY_ENV} to keep it out of shell history."
-    ),
-)
-@click.pass_context
-def configure(ctx: click.Context, api_key: str | None) -> None:
-    output_format = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
-    prompted_for_api_key = api_key is None
-    if api_key is None:
-        if ctx.obj["no_input"]:
-            raise click.UsageError(
-                f"Pass --api-key or set {CONFIGURE_KEY_ENV} in non-interactive mode."
-            )
-        api_key = click.prompt(
-            "Agent Wallet API key",
-            hide_input=True,
-            err=output_format == "json",
-        )
-
-    api_key = api_key.strip()
-    os.environ.pop(CONFIGURE_KEY_ENV, None)
-    if not api_key:
-        raise click.UsageError("The Agent Wallet API key cannot be empty.")
-
-    if prompted_for_api_key and output_format != "json":
-        masked_key = f"••••{api_key[-4:]}" if len(api_key) > 8 else "••••••••"
-        click.secho(f"✓ API key captured ({masked_key})", fg="green")
-
-    save_api_key(api_key)
-    payload = {"configured": True}
-    if output_format == "json":
-        print_agent_json(payload, pagination=None)
-    else:
-        click.secho("✓ Agent Wallet configured", fg="green")
 
 
 @agent_wallet_group.group(
@@ -191,12 +142,12 @@ def payments_group() -> None:
 @click.pass_context
 def list_payments(ctx: click.Context, limit: int) -> None:
     """List recent Agent Wallet payments."""
-    payments = AgentWalletClient().list_payments(limit)
+    payments = AgentWalletClient(ctx.obj["env"]).list_payments(limit)
     _render(payments, ctx)
 
 
 def _cancel_payment(ctx: click.Context, payment_id: UUID) -> None:
-    result = AgentWalletClient().cancel(payment_id)
+    result = AgentWalletClient(ctx.obj["env"]).cancel(payment_id)
     if result.get("payment_operation_id") != str(payment_id):
         raise AgentWalletClientError("Agent Wallet returned an invalid response")
     _render(result, ctx)

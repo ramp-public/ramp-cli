@@ -3,25 +3,18 @@
 from __future__ import annotations
 
 import json
-import os
-import threading
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 import pytest
 from click.testing import CliRunner
 
-from ramp_cli.auth import agent_wallet as agent_wallet_store
-from ramp_cli.auth import refresh as refresh_helper
-from ramp_cli.auth import store
-from ramp_cli.auth.oauth import TokenResponse
 from ramp_cli.client.agent_wallet import (
     AgentWalletApiError,
-    AgentWalletAuthRequiredError,
     AgentWalletClient,
     AgentWalletClientError,
 )
-from ramp_cli.client.transport import BearerTokenTransport
+from ramp_cli.client.transport import AuthenticatedRampTransport
 from ramp_cli.errors import ApiError
 from ramp_cli.main import cli
 from ramp_cli.specs import AGENT_TOOL_SPEC
@@ -160,120 +153,6 @@ def test_agent_wallet_authentication_service_error_is_retryable(monkeypatch):
     assert '{"detail"' not in result.output
 
 
-def test_configure__stores_and_uses_wallet_key(isolated_config, monkeypatch):
-    captured = {}
-    store.save_tokens("production", "general-cli-token", "")
-    monkeypatch.setenv("RAMP_AGENT_WALLET_CONFIGURE_API_KEY", "wallet-key")
-
-    def fake_request(transport, method, url, body=None, request_headers=None):
-        captured["payment_key"] = transport._static_access_token
-        return b"{}"
-
-    monkeypatch.setattr(BearerTokenTransport, "request", fake_request)
-
-    result = CliRunner().invoke(
-        cli,
-        ["--agent", "agent-wallet", "configure"],
-    )
-    assert result.exit_code == 0, result.output
-    assert "wallet-key" not in result.output
-    assert "API key captured" not in result.output
-    assert "RAMP_AGENT_WALLET_CONFIGURE_API_KEY" not in os.environ
-    assert agent_wallet_store.get_api_key() == "wallet-key"
-    if os.name != "nt":
-        assert agent_wallet_store._api_key_path().stat().st_mode & 0o077 == 0
-    assert store.get_tokens("production") == ("general-cli-token", "")
-
-    AgentWalletClient().pay({})
-
-    assert captured == {"payment_key": "wallet-key"}
-
-
-@pytest.mark.parametrize(
-    ("api_key", "masked_key"),
-    [
-        pytest.param("wallet-key", "••••-key", id="normal_key"),
-        pytest.param("12345", "••••••••", id="short_key"),
-    ],
-)
-def test_configure__prompts_for_api_key(
-    isolated_config, monkeypatch, api_key, masked_key
-):
-    result = CliRunner().invoke(
-        cli,
-        ["--human", "agent-wallet", "configure"],
-        input=f"{api_key}\n",
-    )
-
-    assert result.exit_code == 0, result.output
-    assert f"✓ API key captured ({masked_key})" in result.output
-    assert "✓ Agent Wallet configured" in result.output
-    assert api_key not in result.output
-    assert agent_wallet_store.get_api_key() == api_key
-
-
-def test_configure__prompted_json_output_stays_machine_readable(
-    isolated_config, monkeypatch
-):
-    result = CliRunner().invoke(
-        cli,
-        ["--output", "json", "agent-wallet", "configure"],
-        input="wallet-key\n",
-    )
-
-    assert result.exit_code == 0, result.output
-    assert json.loads(result.stdout)["data"] == [{"configured": True}]
-    assert "API key captured" not in result.stdout
-    assert "Agent Wallet API key:" in result.stderr
-    assert "wallet-key" not in result.output
-    assert agent_wallet_store.get_api_key() == "wallet-key"
-
-
-def test_save_wallet_key__does_not_overwrite_concurrent_production_token_rotation(
-    isolated_config,
-    monkeypatch,
-):
-    store.save_tokens("production", "access-old", "refresh-old")
-    write_started = threading.Event()
-    allow_wallet_write = threading.Event()
-    original_atomic_write = agent_wallet_store._atomic_write
-
-    def delayed_wallet_write(path, value):
-        write_started.set()
-        allow_wallet_write.wait(timeout=2)
-        original_atomic_write(path, value)
-
-    def rotate_production_token(env: str, token: str) -> TokenResponse:
-        assert env == "production"
-        assert token == "refresh-old"
-        return TokenResponse(
-            access_token="access-new",
-            refresh_token="refresh-new",
-        )
-
-    monkeypatch.setattr(agent_wallet_store, "_atomic_write", delayed_wallet_write)
-    monkeypatch.setattr(
-        refresh_helper,
-        "refresh_tokens",
-        rotate_production_token,
-    )
-    configure_thread = threading.Thread(
-        target=agent_wallet_store.save_api_key,
-        args=("wallet-key",),
-        daemon=True,
-    )
-    configure_thread.start()
-    assert write_started.wait(timeout=2)
-
-    assert refresh_helper.try_refresh("production") == "access-new"
-    allow_wallet_write.set()
-
-    configure_thread.join(timeout=2)
-    assert not configure_thread.is_alive()
-    assert store.get_tokens("production") == ("access-new", "refresh-new")
-    assert agent_wallet_store.get_api_key() == "wallet-key"
-
-
 def test_list__returns_recent_payments(monkeypatch):
     operation_id = uuid4()
     payments = [
@@ -335,16 +214,17 @@ def test_payments__is_canonical_help_surface():
 
 
 def test_list__requests_server_side_payment_history(monkeypatch):
-    monkeypatch.setenv("RAMP_AGENT_WALLET_API_KEY", "wallet-key")
     captured = {}
 
-    def fake_request(transport, method, url, body=None, request_headers=None):
+    def fake_request(
+        transport, method, url, body=None, request_headers=None, proxied=False
+    ):
         captured.update(method=method, url=url, body=body)
         return b"[]"
 
-    monkeypatch.setattr(BearerTokenTransport, "request", fake_request)
+    monkeypatch.setattr(AuthenticatedRampTransport, "request", fake_request)
 
-    assert AgentWalletClient().list_payments(10) == []
+    assert AgentWalletClient("production").list_payments(10) == []
     assert captured == {
         "method": "GET",
         "url": (
@@ -356,15 +236,14 @@ def test_list__requests_server_side_payment_history(monkeypatch):
 
 @pytest.mark.parametrize("response", [b"{}", b"[1]"])
 def test_list__rejects_invalid_success_response(monkeypatch, response):
-    monkeypatch.setenv("RAMP_AGENT_WALLET_API_KEY", "wallet-key")
     monkeypatch.setattr(
-        BearerTokenTransport,
+        AuthenticatedRampTransport,
         "request",
         lambda *args, **kwargs: response,
     )
 
     with pytest.raises(AgentWalletClientError, match="invalid response"):
-        AgentWalletClient().list_payments(10)
+        AgentWalletClient("production").list_payments(10)
 
 
 @pytest.mark.parametrize(
@@ -384,12 +263,13 @@ def test_cancel__posts_operation_to_production_wallet(monkeypatch, command):
     }
     captured = {}
 
-    def fake_request(transport, method, url, body=None, request_headers=None):
+    def fake_request(
+        transport, method, url, body=None, request_headers=None, proxied=False
+    ):
         captured.update(method=method, url=url, body=body)
         return json.dumps(response).encode()
 
-    monkeypatch.setenv("RAMP_AGENT_WALLET_API_KEY", "wallet-key")
-    monkeypatch.setattr(BearerTokenTransport, "request", fake_request)
+    monkeypatch.setattr(AuthenticatedRampTransport, "request", fake_request)
 
     result = CliRunner().invoke(
         cli,
@@ -519,14 +399,15 @@ def test_pay__rejects_invalid_usd_amounts(amount, message):
 def test_pay__base_url_override_wins(monkeypatch):
     captured = {}
     monkeypatch.setenv("RAMP_AGENT_WALLET_API_URL", "https://wallet.example.test/")
-    monkeypatch.setenv("RAMP_AGENT_WALLET_API_KEY", "wallet-key")
-    client = AgentWalletClient()
+    client = AgentWalletClient("production")
 
-    def fake_request(transport, method, url, body=None, request_headers=None):
+    def fake_request(
+        transport, method, url, body=None, request_headers=None, proxied=False
+    ):
         captured["url"] = url
         return b"{}"
 
-    monkeypatch.setattr(BearerTokenTransport, "request", fake_request)
+    monkeypatch.setattr(AuthenticatedRampTransport, "request", fake_request)
 
     client.pay({})
 
@@ -537,7 +418,7 @@ def test_pay__base_url_override_wins(monkeypatch):
 
 def test_pay__rejects_non_tls_remote_base_url_override(monkeypatch):
     monkeypatch.setenv("RAMP_AGENT_WALLET_API_URL", "http://wallet.example.test")
-    client = AgentWalletClient()
+    client = AgentWalletClient("production")
 
     with pytest.raises(AgentWalletClientError) as exc_info:
         client.pay({})
@@ -547,24 +428,66 @@ def test_pay__rejects_non_tls_remote_base_url_override(monkeypatch):
 
 def test_pay__allows_loopback_http_base_url_override(monkeypatch):
     monkeypatch.setenv("RAMP_AGENT_WALLET_API_URL", "http://127.0.0.1:8080")
-    monkeypatch.setenv("RAMP_AGENT_WALLET_API_KEY", "wallet-key")
-    client = AgentWalletClient()
+    client = AgentWalletClient("production")
     captured = {}
 
-    def fake_request(transport, method, url, body=None, request_headers=None):
+    def fake_request(
+        transport, method, url, body=None, request_headers=None, proxied=False
+    ):
         captured["url"] = url
         return b"{}"
 
-    monkeypatch.setattr(BearerTokenTransport, "request", fake_request)
+    monkeypatch.setattr(AuthenticatedRampTransport, "request", fake_request)
 
     client.pay({})
 
     assert captured["url"] == "http://127.0.0.1:8080/developer/v1/agent-wallet/pay"
 
 
-def test_pay__uses_production_wallet_url():
-    assert AgentWalletClient().payment_url == (
-        "https://wallet.ramp.com/developer/v1/agent-wallet/pay"
+def test_pay__uses_production_vault_proxy_url():
+    assert AgentWalletClient("production").payment_url == (
+        "https://vault-wallet.ramp.com/developer/v1/agent-wallet/pay"
+    )
+
+
+def test_pay__marks_vault_request_as_proxied(monkeypatch):
+    captured = {}
+
+    def fake_request(
+        transport, method, url, body=None, request_headers=None, proxied=False
+    ):
+        captured["proxied"] = proxied
+        return b"{}"
+
+    monkeypatch.setattr(AuthenticatedRampTransport, "request", fake_request)
+
+    AgentWalletClient("production").pay({})
+
+    assert captured["proxied"]
+
+
+def test_pay__does_not_mark_base_url_override_as_proxied(monkeypatch):
+    monkeypatch.setenv("RAMP_AGENT_WALLET_API_URL", "https://wallet.example.test")
+    captured = {}
+
+    def fake_request(
+        transport, method, url, body=None, request_headers=None, proxied=False
+    ):
+        captured["proxied"] = proxied
+        return b"{}"
+
+    monkeypatch.setattr(AuthenticatedRampTransport, "request", fake_request)
+
+    AgentWalletClient("production").pay({})
+
+    assert not captured["proxied"]
+
+
+def test_pay__preserves_base_url_override(monkeypatch):
+    monkeypatch.setenv("RAMP_AGENT_WALLET_API_URL", "https://demo-wallet.ramp.com")
+
+    assert AgentWalletClient("production").payment_url == (
+        "https://demo-wallet.ramp.com/developer/v1/agent-wallet/pay"
     )
 
 
@@ -864,10 +787,9 @@ def test_pay__preserves_agent_wallet_client_error(monkeypatch):
 
 @pytest.mark.parametrize("response", [b"secret", b"[]", b"null"])
 def test_pay__rejects_invalid_success_response(monkeypatch, response):
-    monkeypatch.setenv("RAMP_AGENT_WALLET_API_KEY", "wallet-key")
-    client = AgentWalletClient()
+    client = AgentWalletClient("production")
     monkeypatch.setattr(
-        BearerTokenTransport,
+        AuthenticatedRampTransport,
         "request",
         lambda *args, **kwargs: response,
     )
@@ -879,40 +801,36 @@ def test_pay__rejects_invalid_success_response(monkeypatch, response):
     assert "secret" not in str(exc_info.value)
 
 
-def test_pay__never_falls_back_to_general_cli_token(isolated_config):
-    store.save_tokens("production", "general-cli-token", "")
-
-    with pytest.raises(AgentWalletAuthRequiredError, match="agent-wallet configure"):
-        AgentWalletClient().pay({})
-
-
-def test_pay__wallet_authorization_failure_uses_wallet_guidance(monkeypatch):
-    monkeypatch.setenv("RAMP_AGENT_WALLET_API_KEY", "invalid-wallet-key")
+def test_pay__surfaces_authorization_failures_as_api_errors(monkeypatch):
     monkeypatch.setattr(
-        BearerTokenTransport,
+        AuthenticatedRampTransport,
         "request",
         lambda *args, **kwargs: (_ for _ in ()).throw(ApiError(403, "forbidden")),
     )
 
-    with pytest.raises(AgentWalletAuthRequiredError, match="agent-wallet configure"):
-        AgentWalletClient().pay({})
+    with pytest.raises(ApiError) as exc_info:
+        AgentWalletClient("production").pay({})
+
+    assert exc_info.value.status_code == 403
 
 
-def test_pay__auth_service_outage_uses_wallet_guidance(monkeypatch):
-    monkeypatch.setenv("RAMP_AGENT_WALLET_API_KEY", "wallet-key")
+def test_pay__auth_service_outage_is_reported_as_retryable(monkeypatch):
     monkeypatch.setattr(
-        BearerTokenTransport,
+        AuthenticatedRampTransport,
         "request",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             ApiError(503, '{"detail":"Authentication service unavailable"}')
         ),
     )
 
-    with pytest.raises(AgentWalletClientError) as exc_info:
-        AgentWalletClient().pay({})
-
-    assert str(exc_info.value) == (
-        "Agent Wallet request failed: The authentication service is temporarily "
-        "unavailable. Make sure your Agent Wallet API key is configured — run: "
-        "ramp agent-wallet configure. Then try again shortly."
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "agent-wallet", "pay", "cards", *_card_args()],
     )
+
+    assert isinstance(result.exception, AgentWalletApiError)
+    assert str(result.exception) == (
+        "Agent Wallet request failed: The authentication service is temporarily "
+        "unavailable. Try again shortly."
+    )
+    assert "agent-wallet configure" not in result.output

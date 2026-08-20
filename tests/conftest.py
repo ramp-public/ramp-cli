@@ -8,9 +8,7 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def isolated_config(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
-):
+def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Redirect config to a temp directory so tests don't touch real config.
 
     Every coding agent this CLI configures keeps its files somewhere under the
@@ -29,8 +27,7 @@ def isolated_config(
         "RAMP_ROUTER_BASE_URL",
         "LLM_GATEWAY_BASE_URL",
         "RAMP_ROUTER_CONFIGURE_API_KEY",
-        "RAMP_AGENT_WALLET_API_KEY",
-        "RAMP_AGENT_WALLET_CONFIGURE_API_KEY",
+        "RAMP_ACCESS_TOKEN",
         "RAMP_AGENT_WALLET_API_URL",
     ):
         monkeypatch.delenv(leaked, raising=False)
@@ -44,6 +41,5 @@ def isolated_config(
     # Hook-mode sync suppresses the shutdown update notice; only main() —
     # which CliRunner never reaches — resets the flag, so clear it here.
     monkeypatch.setattr("ramp_cli.version_check._SUPPRESS_NEXT_UPDATE_NOTICE", False)
-    if "tests/private" not in str(request.node.path):
-        monkeypatch.setattr("ramp_cli.config.settings.default_environment", lambda: "")
+    monkeypatch.setattr("ramp_cli.config.settings.default_environment", lambda: "")
     yield tmp_path

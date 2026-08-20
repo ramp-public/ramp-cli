@@ -31,33 +31,6 @@ from ramp_cli.errors import (
 _REQUEST_TIMEOUT = 75.0
 
 
-class BearerTokenTransport:
-    """Send requests authenticated by one caller-supplied bearer token."""
-
-    def __init__(self, access_token: str) -> None:
-        self._static_access_token = access_token
-
-    def request(
-        self,
-        method: str,
-        url: str,
-        body: bytes | None = None,
-    ) -> bytes:
-        headers = {
-            "Authorization": f"Bearer {self._static_access_token}",
-            "User-Agent": user_agent_string(),
-            "Accept": "application/json",
-            **agent_headers(infer_harness_name()),
-        }
-        if body is not None:
-            headers["Content-Type"] = "application/json"
-        with httpx.Client(timeout=_REQUEST_TIMEOUT) as http:
-            response = http.request(method, url, headers=headers, content=body)
-        if response.is_error:
-            raise ApiError(response.status_code, response.text)
-        return response.content
-
-
 class AuthenticatedRampTransport:
     """Send authenticated requests without owning service URLs or operations."""
 

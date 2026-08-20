@@ -62,9 +62,9 @@ PUBLIC_ENVIRONMENTS: dict[str, EnvironmentDefinition] = {
 
 
 try:
-    from ramp_cli.config.local_environments import build_local_environments
+    from ramp_cli_private.local_environments import build_local_environments
 except ModuleNotFoundError as e:
-    if e.name != "ramp_cli.config.local_environments":
+    if e.name != "ramp_cli_private":
         raise
     LOCAL_ENVIRONMENTS = ()
 else:

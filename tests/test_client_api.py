@@ -13,7 +13,7 @@ from ramp_cli.client.api import (
     user_agent_string,
 )
 from ramp_cli.client.headers import agent_headers
-from ramp_cli.client.transport import AuthenticatedRampTransport, BearerTokenTransport
+from ramp_cli.client.transport import AuthenticatedRampTransport
 from ramp_cli.errors import (
     EXIT_AUTH_REQUIRED,
     ApiError,
@@ -458,28 +458,6 @@ def test_request__does_not_refresh_static_token_after_401(monkeypatch):
         client.request("GET", "https://example.test/things")
 
     assert attempted_tokens == ["Bearer access-static"]
-
-
-def test_bearer_token_transport__does_not_refresh_or_replay_after_401(monkeypatch):
-    client = BearerTokenTransport("wallet-key")
-    attempted_tokens = []
-
-    def handler(request):
-        attempted_tokens.append(request.headers["Authorization"])
-        return httpx.Response(401)
-
-    http = httpx.Client(transport=httpx.MockTransport(handler))
-    monkeypatch.setattr("ramp_cli.client.transport.httpx.Client", lambda **kwargs: http)
-    monkeypatch.setattr(
-        "ramp_cli.client.transport.try_refresh",
-        lambda env: pytest.fail("static bearer tokens must not be refreshed"),
-    )
-
-    with pytest.raises(ApiError) as exc_info:
-        client.request("GET", "https://wallet.ramp.com/things")
-
-    assert exc_info.value.status_code == 401
-    assert attempted_tokens == ["Bearer wallet-key"]
 
 
 def test_request_multipart__refreshes_and_replays_after_401(monkeypatch):

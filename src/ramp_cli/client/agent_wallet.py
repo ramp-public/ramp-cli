@@ -9,18 +9,16 @@ from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from ramp_cli.auth.agent_wallet import get_api_key
-from ramp_cli.client.transport import BearerTokenTransport
+from ramp_cli.client.transport import AuthenticatedRampTransport
 from ramp_cli.errors import (
-    EXIT_AUTH_REQUIRED,
     ApiError,
     RampCLIError,
 )
 
 PAYMENT_PATH = "/developer/v1/agent-wallet/pay"
 PAYMENT_HISTORY_PATH = "/developer/v1/agent-wallet/operations"
-AGENT_WALLET_API_KEY_ENV_VAR = "RAMP_AGENT_WALLET_API_KEY"
 AGENT_WALLET_BASE_URL = "https://wallet.ramp.com"
+AGENT_WALLET_PAYMENT_BASE_URL = "https://vault-wallet.ramp.com"
 
 
 def _is_authentication_service_unavailable(error: ApiError) -> bool:
@@ -52,14 +50,6 @@ class AgentWalletApiError(ApiError):
         RampCLIError.__init__(self, f"Agent Wallet request failed: {detail}")
 
 
-class AgentWalletAuthRequiredError(AgentWalletClientError):
-    def __init__(self) -> None:
-        super().__init__(
-            "Agent Wallet is not configured — run: ramp agent-wallet configure",
-            code=EXIT_AUTH_REQUIRED,
-        )
-
-
 def agent_wallet_base_url() -> str:
     """Resolve the Agent Wallet service origin."""
     override = os.environ.get("RAMP_AGENT_WALLET_API_URL", "").strip()
@@ -82,18 +72,32 @@ def agent_wallet_base_url() -> str:
     return AGENT_WALLET_BASE_URL
 
 
+def agent_wallet_payment_base_url() -> str:
+    """Resolve the vault-proxied endpoint used for Agent Wallet payments."""
+    service_base_url = agent_wallet_base_url()
+    if service_base_url == AGENT_WALLET_BASE_URL:
+        return AGENT_WALLET_PAYMENT_BASE_URL
+    return service_base_url
+
+
 class AgentWalletClient:
     """Client for public Agent Wallet payments."""
 
+    def __init__(self, env: str, access_token: str | None = None) -> None:
+        self.env = env
+        self._transport = AuthenticatedRampTransport(env, access_token)
+
     @property
     def payment_url(self) -> str:
-        return f"{agent_wallet_base_url()}{PAYMENT_PATH}"
+        return f"{agent_wallet_payment_base_url()}{PAYMENT_PATH}"
 
     def pay(self, body: dict[str, Any]) -> dict[str, Any]:
+        payment_base_url = agent_wallet_payment_base_url()
         payload = self._request_json(
             "POST",
-            self.payment_url,
+            f"{payment_base_url}{PAYMENT_PATH}",
             body=json.dumps(body).encode(),
+            proxied=payment_base_url == AGENT_WALLET_PAYMENT_BASE_URL,
         )
         if not isinstance(payload, dict):
             raise AgentWalletClientError("Agent Wallet returned an invalid response")
@@ -123,28 +127,9 @@ class AgentWalletClient:
         method: str,
         url: str,
         body: bytes | None = None,
+        proxied: bool = False,
     ) -> Any:
-        api_key = os.environ.get(AGENT_WALLET_API_KEY_ENV_VAR, "").strip()
-        api_key = api_key or get_api_key()
-        if not api_key:
-            raise AgentWalletAuthRequiredError()
-        try:
-            response = BearerTokenTransport(api_key).request(
-                method,
-                url,
-                body=body,
-            )
-        except ApiError as error:
-            if error.status_code in {401, 403}:
-                raise AgentWalletAuthRequiredError() from error
-            if _is_authentication_service_unavailable(error):
-                raise AgentWalletClientError(
-                    "Agent Wallet request failed: The authentication service is "
-                    "temporarily unavailable. Make sure your Agent Wallet API key "
-                    "is configured — run: ramp agent-wallet configure. Then try "
-                    "again shortly."
-                ) from error
-            raise
+        response = self._transport.request(method, url, body=body, proxied=proxied)
         try:
             payload = json.loads(response)
         except (json.JSONDecodeError, UnicodeDecodeError) as error:

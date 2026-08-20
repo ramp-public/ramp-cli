@@ -45,6 +45,19 @@ def test_release_build_does_not_need_node():
     assert "--include-package-data=ramp_cli" not in workflow
 
 
+def test_public_release_build_uses_standalone_layout():
+    workflow = (ROOT / ".github" / "workflows" / "build-binaries.yml").read_text()
+
+    assert "uv sync --frozen" in workflow
+    assert "--include-data-files=src/ramp_cli/specs/" in workflow
+    assert "--include-data-dir=src/ramp_cli/router_integrations/" in workflow
+    assert "src/ramp_cli/main.py" in workflow
+    assert "hashFiles('uv.lock')" in workflow
+    assert "--project private" not in workflow
+    assert "ramp_cli_private" not in workflow
+    assert "public/src/ramp_cli" not in workflow
+
+
 def test_windows_build_does_not_block_release():
     workflow = (ROOT / ".github" / "workflows" / "build-binaries.yml").read_text()
     release_job = workflow.split("  release:", 1)[1].split("  upload-windows:", 1)[0]
