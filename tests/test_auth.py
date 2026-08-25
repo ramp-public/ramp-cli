@@ -25,6 +25,7 @@ from ramp_cli.auth.oauth import (
     _generate_verifier,
 )
 from ramp_cli.commands import auth as auth_command_module
+from ramp_cli.config import settings
 from ramp_cli.errors import RefreshFailedError
 from ramp_cli.main import BoxHelpFormatter, cli, main
 from ramp_cli.onboarding import record_first_login
@@ -327,6 +328,59 @@ def test_try_refresh__rotates_refresh_token(isolated_config, monkeypatch):
 
     assert refresh_helper.try_refresh("sandbox") == "access-new"
     assert store.get_tokens("sandbox") == ("access-new", "refresh-new")
+
+
+@pytest.mark.parametrize(
+    "refresh_outcome",
+    [
+        pytest.param("success", id="successful-stale-refresh"),
+        pytest.param("invalid_grant", id="stale-invalid-grant"),
+    ],
+)
+def test_try_refresh__preserves_concurrent_profile_login(
+    isolated_config, monkeypatch, refresh_outcome
+):
+    store.save_tokens("sandbox", "access-old", "refresh-old", profile="human")
+
+    def concurrent_login(env: str, refresh_token: str) -> TokenResponse:
+        store.save_tokens("sandbox", "login-access", "login-refresh", profile="human")
+        if refresh_outcome == "invalid_grant":
+            raise OAuthTokenError("invalid_grant", "refresh token expired")
+        return TokenResponse(access_token="stale-access", refresh_token="stale-refresh")
+
+    monkeypatch.setattr(refresh_helper, "refresh_tokens", concurrent_login)
+
+    assert refresh_helper.try_refresh("sandbox", profile="human") == "login-access"
+    assert store.get_tokens("sandbox", profile="human") == (
+        "login-access",
+        "login-refresh",
+    )
+
+
+def test_try_refresh__rotates_only_selected_profile(isolated_config, monkeypatch):
+    store.save_tokens("sandbox", "human-access", "human-refresh", profile="human")
+    store.save_tokens("sandbox", "agent-access", "agent-refresh", profile="agent")
+
+    def fake_refresh_tokens(env: str, refresh_token: str) -> TokenResponse:
+        assert env == "sandbox"
+        assert refresh_token == "agent-refresh"
+        return TokenResponse(
+            access_token="agent-access-new", refresh_token="agent-refresh-new"
+        )
+
+    monkeypatch.setattr(refresh_helper, "refresh_tokens", fake_refresh_tokens)
+
+    assert refresh_helper.try_refresh("sandbox", profile="agent") == (
+        "agent-access-new"
+    )
+    assert store.get_tokens("sandbox", profile="agent") == (
+        "agent-access-new",
+        "agent-refresh-new",
+    )
+    assert store.get_tokens("sandbox", profile="human") == (
+        "human-access",
+        "human-refresh",
+    )
 
 
 def test_try_refresh__uses_newly_rotated_tokens_from_other_process(
@@ -917,7 +971,7 @@ class TestAuthLoginSpecRefresh:
 
         assert result.exit_code == 0
         assert calls == [("fetch", "sandbox"), ("login", "sandbox")]
-        assert store.get_granted_scopes("sandbox") == {"tasks:read"}
+        assert store.get_granted_scopes("sandbox", profile="human") == {"tasks:read"}
 
     def test_login_continues_if_spec_refresh_fails(self, isolated_config, monkeypatch):
         self._patch_success_ui(monkeypatch)
@@ -945,7 +999,7 @@ class TestAuthLoginSpecRefresh:
 
         assert result.exit_code == 0
         assert "Could not refresh tool definitions before login" in result.output
-        assert store.get_granted_scopes("sandbox") == {"users:read"}
+        assert store.get_granted_scopes("sandbox", profile="human") == {"users:read"}
 
     def test_login_passes_explicit_oauth_options(self, isolated_config, monkeypatch):
         self._patch_success_ui(monkeypatch)
@@ -990,7 +1044,9 @@ class TestAuthLoginSpecRefresh:
         )
 
         assert result.exit_code == 0
-        assert store.get_granted_scopes("sandbox") == set(requested_scopes)
+        assert store.get_granted_scopes("sandbox", profile="human") == set(
+            requested_scopes
+        )
 
     def test_refresh_skips_when_custom_scopes_configured(
         self, isolated_config, monkeypatch
@@ -1019,6 +1075,7 @@ class TestStandaloneAgentLogin:
             "old-refresh",
             granted_scopes="old:scope",
             agent_key_uuid="old-agent-key",
+            profile="agent",
         )
         monkeypatch.setenv("RAMP_CLIENT_SECRET", "secret-from-env")
         monkeypatch.setattr(
@@ -1077,19 +1134,21 @@ class TestStandaloneAgentLogin:
         assert output["data"][0] == {
             "message": "Authenticated standalone agent for Sandbox.",
             "environment": "sandbox",
+            "profile": "agent",
             "scopes": ["transactions:read", "users:read"],
             "expires_in": 604800,
         }
-        state = store.get_token_state("sandbox")
+        state = store.get_token_state("sandbox", profile="agent")
         assert state.access_token == "standalone-access"
         assert state.refresh_token == ""
         assert state.access_token_expires_in == 604800
         assert state.refresh_token_expires_in == 0
-        assert store.get_granted_scopes("sandbox") == {
+        assert store.get_granted_scopes("sandbox", profile="agent") == {
             "transactions:read",
             "users:read",
         }
-        assert store.get_agent_key_uuid("sandbox") == ""
+        assert store.get_agent_key_uuid("sandbox", profile="agent") == ""
+        assert settings.load().profile == "agent"
 
     def test_flag_secret_wins_over_env_and_warns(self, isolated_config, monkeypatch):
         monkeypatch.setenv("RAMP_CLIENT_SECRET", "secret-from-env")
@@ -1177,7 +1236,11 @@ class TestStandaloneAgentLogin:
         )
 
         assert result.exit_code == 0
-        assert store.get_tokens("sandbox") == ("human-access", "human-refresh")
+        assert store.get_tokens("sandbox", profile="human") == (
+            "human-access",
+            "human-refresh",
+        )
+        assert settings.load().profile == "human"
 
     @pytest.mark.parametrize(
         ("args", "message"),
@@ -1253,6 +1316,12 @@ class TestPostLoginEnvHint:
         )
         assert result.exit_code == 0
         assert "ramp env production" in result.output
+        assert settings.load().profile == "human"
+        assert store.get_tokens("production", profile="human") == (
+            "new-token",
+            "",
+        )
+        assert store.get_tokens("production") == ("", "")
 
     def test_login_token_stdin_agent_mode_no_hint(self, isolated_config):
         """Agent mode outputs JSON — no hint line."""
@@ -1275,6 +1344,7 @@ class TestPostLoginEnvHint:
             "old-token",
             "refresh",
             granted_scopes="cards:read_agentic",
+            profile="human",
         )
 
         result = CliRunner().invoke(
@@ -1285,7 +1355,7 @@ class TestPostLoginEnvHint:
         )
 
         assert result.exit_code == 0
-        assert store.get_granted_scopes("production") == set()
+        assert store.get_granted_scopes("production", profile="human") == set()
 
     def test_login_token_stdin_rejects_oauth_options(self, isolated_config):
         result = CliRunner().invoke(

@@ -14,7 +14,7 @@ from ramp_cli.config.constants import PRODUCTION_BASE_URL, api_url
 from ramp_cli.output.formatter import print_agent_json
 
 
-def _fetch_user_context(env: str) -> tuple[str, str]:
+def _fetch_user_context(env: str, profile: str | None = None) -> tuple[str, str]:
     """Return (business_id, user_id) if authenticated, else ("", "").
 
     Calls ``GET /developer/v1/token/info`` which returns both
@@ -23,9 +23,9 @@ def _fetch_user_context(env: str) -> tuple[str, str]:
     same one the MCP server uses for session context.
     """
     try:
-        if not store.has_tokens(env):
+        if not store.has_tokens(env, profile=profile):
             return "", ""
-        access_token, _ = store.get_tokens(env)
+        access_token, _ = store.get_tokens(env, profile=profile)
     except Exception:
         # Malformed or unreadable config — enrichment is best-effort.
         return "", ""
@@ -59,6 +59,7 @@ def feedback_cmd(ctx: click.Context, text: str) -> None:
 
     agent_mode = ctx.obj.get("agent_mode", False)
     env = ctx.obj.get("env", "production")
+    profile = ctx.obj.get("profile")
 
     # Build context header.
     # Avoid brackets, pipes, and special chars that trigger Cloudflare WAF.
@@ -69,7 +70,7 @@ def feedback_cmd(ctx: click.Context, text: str) -> None:
     ]
 
     # Fetch identifying info when authenticated (short timeout — optional).
-    biz_id, user_id = _fetch_user_context(env)
+    biz_id, user_id = _fetch_user_context(env, profile)
     if biz_id:
         context_parts.append(f"biz={biz_id}")
 

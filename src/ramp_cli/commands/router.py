@@ -31,6 +31,7 @@ from click.core import ParameterSource
 
 from ramp_cli import claude_cowork
 from ramp_cli.commands import claude_code
+from ramp_cli.commands import router_sync as router_sync_module
 from ramp_cli.commands.router_sync import (
     SYNC_HOOK_USER_MANAGED,
     SYNC_OPT_OUT_ENV,
@@ -129,6 +130,13 @@ class RouterModel:
 
     id: str
     metadata: "RouterModelMetadata"
+
+
+@dataclass(frozen=True)
+class RouterConfigureSummary:
+    remaining_credits: Decimal | None
+    switchyard_routing_enabled: bool | None
+    cost_efficient_routing_enabled: bool | None
 
 
 @dataclass(frozen=True)
@@ -451,11 +459,9 @@ CODEX_ORIGINAL_INSTRUCTIONS_STATE_KEY = "original_instructions"
 CODEX_PREEXISTING_ROUTER_SESSIONS_STATE_KEY = "preexisting_router_sessions"
 
 
-# prompt_toolkit ships ("selected", "reverse"), which paints every checked row
-# in inverse video. Every agent starts checked here, so the default turns the
-# whole list into one indistinguishable block. Each class is therefore stated
-# outright, and the checked rows carry the brand color the rest of the CLI uses
-# for a current selection.
+# prompt_toolkit ships ("selected", "reverse"), which paints checked rows in
+# inverse video. Each class is stated outright so selected rows carry the brand
+# color the rest of the CLI uses while remaining distinct from the cursor.
 _RAMP_YELLOW = (228, 242, 33)
 _PICKER_YELLOW = "#e4f221"
 _PICKER_POINTER = "\u25b6"
@@ -778,7 +784,7 @@ def _can_prompt(ctx: click.Context, fmt: str) -> bool:
 
 
 def _pick_installed_clients() -> tuple[str, ...]:
-    """Ask which coding agents to configure, with every agent preselected.
+    """Ask which coding agents to configure, with no agents preselected.
 
     Cowork is deliberately not a line here and asks no question of its own:
     it is Claude Desktop's side of the same Claude setup, so the one Claude
@@ -833,12 +839,12 @@ def _pick_clients(
     candidates: tuple[str, ...],
     titles: dict[str, str] | None = None,
 ) -> tuple[str, ...]:
-    """Ask which of ``candidates`` to act on, with every one preselected."""
+    """Ask which of ``candidates`` to act on, starting with none selected."""
     labels = titles or AGENT_NAMES
     selected = questionary.checkbox(
         message,
         choices=[
-            questionary.Choice(title=labels[client], value=client, checked=True)
+            questionary.Choice(title=labels[client], value=client, checked=False)
             for client in candidates
         ],
         validate=lambda answer: bool(answer) or "Select at least one agent.",
@@ -1317,12 +1323,24 @@ def _run_configure(
             "settings."
         )
     if fmt != "json":
-        remaining_credits = _fetch_remaining_credits(api_key, base_url=base_url)
-        if remaining_credits is not None:
-            click.secho(
-                f"Router credits remaining: {_format_credits_usd(remaining_credits)}",
-                fg=_RAMP_YELLOW,
+        summary = _fetch_configure_summary(api_key, base_url=base_url)
+        if summary is not None:
+            strategy_notice = _strategy_savings_notice(
+                switchyard_routing_enabled=summary.switchyard_routing_enabled,
+                cost_efficient_routing_enabled=summary.cost_efficient_routing_enabled,
+                strategies_url=f"{_statusline_origin(base_url)}/strategies",
             )
+            remaining_credits = summary.remaining_credits
+            if strategy_notice is not None or remaining_credits is not None:
+                click.echo()
+            if strategy_notice is not None:
+                click.secho(strategy_notice, fg=_RAMP_YELLOW)
+            if remaining_credits is not None:
+                click.secho(
+                    "Router credits remaining: "
+                    f"{_format_credits_usd(remaining_credits)}",
+                    fg=_RAMP_YELLOW,
+                )
 
 
 @router_group.command(
@@ -1417,7 +1435,7 @@ def router_refresh(ctx: click.Context) -> None:
 )
 @click.option(
     "--client",
-    type=click.Choice(("claude-code", "codex")),
+    type=click.Choice(("claude-code", "codex", "opencode")),
     default=None,
     help="Hosting agent; selects the structured hook output in --hook mode.",
 )
@@ -1454,11 +1472,11 @@ def router_sync(
 def _run_hook_sync(client: str | None) -> None:
     """The session-start path: never block, never fail, no model-visible output.
 
-    Plain SessionStart stdout is injected into the model's context by both
-    agents — which must never see the update notice, lest it run `ramp update`
-    itself — so the only output ever emitted is Codex's notice as a
-    structured systemMessage. The shutdown update notice is suppressed for
-    the same reason, and failures go to the state-dir log.
+    Plain SessionStart stdout can be injected into the model's context, which
+    must never see the update notice lest it run `ramp update` itself. Output
+    is therefore emitted only in a host-specific structured envelope consumed
+    by user UI. The shutdown update notice is suppressed for the same reason,
+    and failures go to the state-dir log.
     """
     suppress_next_update_notice()
     try:
@@ -1485,6 +1503,11 @@ def _emit_hook_update_notice(client: str | None) -> None:
     sync_update_notice_file()
     notice = update_notice()
     if not notice:
+        return
+    if client == "opencode":
+        # The bundled TUI plugin consumes this envelope directly. Keep its
+        # field host-neutral rather than borrowing Codex's hook vocabulary.
+        click.echo(json.dumps({"updateNotice": notice}))
         return
     if client != "codex":
         # claude-code emits nothing on any channel: its statusline renders a
@@ -2132,17 +2155,18 @@ def router_ui_url() -> str:
     return os.environ.get(ROUTER_UI_URL_ENV, ROUTER_UI_URL).rstrip("/")
 
 
-def _fetch_remaining_credits(
+def _fetch_configure_summary(
     api_key: str, *, base_url: str | None = None
-) -> Decimal | None:
-    """Fetch the key owner's remaining Router credits, or None.
+) -> RouterConfigureSummary | None:
+    """Fetch the key owner's configure-time credits and strategy state.
 
-    The credits line is an extra, so every failure — a Router without the
-    balance endpoint yet, a network problem, an owner without a billing
-    account — reads as "no line" rather than an error at the end of an
-    otherwise successful configure.
+    The summary is an extra, so every failure reads as "no lines" rather than
+    an error at the end of an otherwise successful configure.
     """
-    url = f"{_statusline_origin(base_url)}/session-usage/usage/balance"
+    url = (
+        f"{_statusline_origin(base_url)}/session-usage/usage/balance"
+        "?include_strategy_settings=true"
+    )
     try:
         response = httpx.get(
             url, headers={"Authorization": f"Bearer {api_key}"}, timeout=5
@@ -2152,19 +2176,65 @@ def _fetch_remaining_credits(
         payload = response.json()
     except (httpx.HTTPError, ValueError):
         return None
-    balance = payload.get("balance") if isinstance(payload, dict) else None
-    if not isinstance(balance, dict):
+    if not isinstance(payload, dict):
         return None
-    remaining = balance.get("remaining_credit_usd")
-    if not isinstance(remaining, str):
+
+    remaining_credits = None
+    balance = payload.get("balance")
+    if isinstance(balance, dict):
+        remaining = balance.get("remaining_credit_usd")
+        if isinstance(remaining, str):
+            try:
+                parsed = Decimal(remaining)
+            except InvalidOperation:
+                pass
+            else:
+                if parsed.is_finite():
+                    remaining_credits = parsed
+
+    switchyard_enabled = payload.get("switchyard_routing_enabled")
+    if not isinstance(switchyard_enabled, bool):
+        switchyard_enabled = None
+    cost_efficient_enabled = payload.get("cost_efficient_routing_enabled")
+    if not isinstance(cost_efficient_enabled, bool):
+        cost_efficient_enabled = None
+
+    if (
+        remaining_credits is None
+        and switchyard_enabled is None
+        and cost_efficient_enabled is None
+    ):
         return None
-    try:
-        parsed = Decimal(remaining)
-    except InvalidOperation:
-        return None
-    # Decimal accepts "NaN" and "Infinity", which the formatter cannot
-    # compare or render; a balance that is not a finite number is no balance.
-    return parsed if parsed.is_finite() else None
+    return RouterConfigureSummary(
+        remaining_credits=remaining_credits,
+        switchyard_routing_enabled=switchyard_enabled,
+        cost_efficient_routing_enabled=cost_efficient_enabled,
+    )
+
+
+def _strategy_savings_notice(
+    *,
+    switchyard_routing_enabled: bool | None,
+    cost_efficient_routing_enabled: bool | None,
+    strategies_url: str,
+) -> str | None:
+    switchyard_missing = switchyard_routing_enabled is False
+    cost_efficient_missing = cost_efficient_routing_enabled is False
+    if switchyard_missing and cost_efficient_missing:
+        return (
+            "Enable Nvidia NeMo Switchyard and Cost-Efficient strategies at "
+            f"{strategies_url} for cost savings"
+        )
+    if switchyard_missing:
+        return (
+            "Enable the Nvidia NeMo Switchyard strategy at "
+            f"{strategies_url} for cost savings"
+        )
+    if cost_efficient_missing:
+        return (
+            f"Enable the Cost-Efficient strategy at {strategies_url} for cost savings"
+        )
+    return None
 
 
 def _format_credits_usd(value: Decimal) -> str:
@@ -3153,6 +3223,11 @@ def _configure_plugin_client(
                 # dashboard host from the data-plane URL alone.
                 "usageBaseURL": _statusline_origin(base_url),
                 "apiKey": api_key,
+                **(
+                    {"rampExecutable": str(executable)}
+                    if (executable := router_sync_module.ramp_executable()) is not None
+                    else {}
+                ),
             },
         ]
         existing["plugin"] = [

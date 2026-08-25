@@ -39,6 +39,7 @@ class EnvConfig:
 @dataclass
 class Config:
     environment: str = ""
+    profile: str = ""
     format: str = ""
     scopes: str = ""
     first_login_at: int = 0
@@ -69,6 +70,7 @@ def load() -> Config:
     raw = tomllib.loads(data.decode())
 
     cfg.environment = raw.get("environment", "")
+    cfg.profile = raw.get("profile", "")
     cfg.format = raw.get("format", "")
     cfg.scopes = raw.get("scopes", "")
     cfg.first_login_at = raw.get("first_login_at", 0)
@@ -110,6 +112,8 @@ def save(cfg: Config) -> None:
     raw: dict = {}
     if cfg.environment:
         raw["environment"] = cfg.environment
+    if cfg.profile:
+        raw["profile"] = cfg.profile
     if cfg.format:
         raw["format"] = cfg.format
     if cfg.scopes:

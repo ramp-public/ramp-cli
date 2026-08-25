@@ -1,6 +1,7 @@
 """Tests for agent tool command generation, registry, and CLI integration."""
 
 import json
+import sys
 from unittest.mock import MagicMock
 
 import click
@@ -8,7 +9,7 @@ import pytest
 from click.testing import CliRunner
 
 from ramp_cli.auth import store
-from ramp_cli.main import ToolGroup, cli
+from ramp_cli.main import ToolGroup, cli, main
 from ramp_cli.specs import AGENT_TOOL_SPEC
 from ramp_cli.tools.commands import (
     _build_body,
@@ -216,6 +217,119 @@ class TestBuildToolCommand:
         option_names = {p.name for p in cmd.params if isinstance(p, click.Option)}
         assert "json_body" not in option_names
         assert "dry_run" in option_names
+
+    def test_unknown_option_suggests_high_confidence_typo(self):
+        cmd = build_tool_command(self._simple_tool())
+
+        result = CliRunner().invoke(
+            cmd,
+            ["--dry-rnu"],
+            prog_name="ramp test-tool",
+        )
+
+        assert result.exit_code == 2
+        assert "Did you mean '--dry_run'?" in result.output
+        assert "Run: ramp test-tool --help" in result.output
+
+    def test_unknown_option_suppresses_ambiguous_sibling_suggestion(self):
+        tool = ToolDef(
+            name="dates",
+            path="/developer/v1/agent-tools/dates",
+            http_method="get",
+            summary="Dates",
+            description="Dates",
+            params=[
+                ToolParam(
+                    name=name,
+                    flag=name,
+                    description=name,
+                    type=ParamType.STRING,
+                )
+                for name in ("has_end_date", "max_end_date")
+            ],
+        )
+
+        result = CliRunner().invoke(
+            build_tool_command(tool),
+            ["--hax_end_date"],
+            prog_name="ramp dates",
+        )
+
+        assert result.exit_code == 2
+        assert "Did you mean" not in result.output
+        assert "Run: ramp dates --help" in result.output
+
+    def test_unknown_unrelated_option_has_help_only(self):
+        result = CliRunner().invoke(
+            build_tool_command(self._simple_tool()),
+            ["--merchant"],
+            prog_name="ramp test-tool",
+        )
+
+        assert result.exit_code == 2
+        assert "Did you mean" not in result.output
+        assert "Run: ramp test-tool --help" in result.output
+
+    def test_unknown_option_considers_alias_and_boolean_secondary_form(self):
+        tool = ToolDef(
+            name="options",
+            path="/developer/v1/agent-tools/options",
+            http_method="get",
+            summary="Options",
+            description="Options",
+            params=[
+                ToolParam(
+                    name="page_size",
+                    flag="page_size",
+                    description="Page size",
+                    type=ParamType.INT,
+                ),
+                ToolParam(
+                    name="verbose",
+                    flag="verbose",
+                    description="Verbose",
+                    type=ParamType.BOOL,
+                ),
+            ],
+        )
+        cmd = build_tool_command(tool)
+
+        alias_result = CliRunner().invoke(cmd, ["--limt"])
+        secondary_result = CliRunner().invoke(cmd, ["--no-verbse"])
+
+        assert "Did you mean '--limit'?" in alias_result.output
+        assert "Did you mean '--no-verbose'?" in secondary_result.output
+
+    def test_unknown_option_guidance_is_generated_only(self):
+        manual = click.Command("manual", params=[click.Option(["--known"])])
+
+        result = CliRunner().invoke(manual, ["--knwon"], prog_name="ramp manual")
+
+        assert result.exit_code == 2
+        assert "Run: ramp manual --help" not in result.output
+
+    def test_unknown_option_is_valid_agent_json_without_usage(
+        self, monkeypatch, capsys
+    ):
+        _use_bundled_spec(monkeypatch)
+        monkeypatch.setattr(
+            sys, "argv", ["ramp", "--agent", "get-transactions", "--page_sze"]
+        )
+        monkeypatch.setattr("ramp_cli.main.record_installed_version", lambda: None)
+        monkeypatch.setattr("ramp_cli.main.check_for_update", lambda: None)
+        monkeypatch.setattr("ramp_cli.main.emit_update_notice", lambda agent_mode: None)
+
+        with pytest.raises(SystemExit) as exit_info:
+            main()
+
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert exit_info.value.code == 2
+        assert payload["error"]["code"] == 2
+        assert "Did you mean '--page_size'?" in payload["error"]["message"]
+        assert "Run: ramp get-transactions --help" in payload["error"]["message"]
+        assert "Usage:" not in captured.out
+        assert captured.err == ""
 
     def test_application_progress_tool_has_wait_options(self):
         tool = ToolDef(

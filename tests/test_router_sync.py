@@ -167,7 +167,7 @@ def test_sync_is_due_only_after_the_cooldown():
     assert sync_module.sync_is_due()
 
 
-@pytest.mark.parametrize("client", ["claude-code", "codex"])
+@pytest.mark.parametrize("client", ["claude-code", "codex", "opencode"])
 def test_session_sync_hook_command_wraps_and_quotes_the_executable(monkeypatch, client):
     assert sync_module.session_sync_hook_command(client) == (
         "[ -x /opt/ramp-cli/bin/ramp ] && /opt/ramp-cli/bin/ramp "
@@ -229,6 +229,9 @@ def test_ramp_executable_resolution(monkeypatch, tmp_path):
 
     monkeypatch.setattr(sys, "argv", ["ramp"])
     assert _REAL_RAMP_EXECUTABLE() == Path("/usr/bin/ramp")
+
+    monkeypatch.setattr(sync_module.shutil, "which", lambda _name: "bin/ramp")
+    assert _REAL_RAMP_EXECUTABLE() == fake
 
     monkeypatch.setattr(sync_module.shutil, "which", lambda _name: None)
     assert _REAL_RAMP_EXECUTABLE() is None
@@ -356,6 +359,21 @@ def test_two_back_to_back_session_starts_both_emit_the_notice(monkeypatch):
     assert first.stderr == second.stderr == ""
     # Only the first invocation crossed the cooldown and spawned a refresh.
     assert spawned == [True]
+
+
+def test_opencode_hook_emits_its_tui_notice_contract(monkeypatch):
+    _write_cooldown()
+    _cache_update()
+    _record_spawns(monkeypatch)
+
+    pending = _sync("--hook", "--client", "opencode")
+    (config_dir() / "latest-version.txt").unlink()
+    current = _sync("--hook", "--client", "opencode")
+
+    assert pending.exit_code == current.exit_code == 0
+    assert json.loads(pending.stdout) == {"updateNotice": _NOTICE}
+    assert "systemMessage" not in pending.stdout
+    assert current.output == ""
 
 
 def test_the_codex_notice_names_a_newer_server_recommended_version(monkeypatch):

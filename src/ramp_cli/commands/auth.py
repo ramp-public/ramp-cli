@@ -17,7 +17,7 @@ from ramp_cli.auth.environment import (
 )
 from ramp_cli.auth.oauth import LoginOptions, OAuthTokenError
 from ramp_cli.auth.oauth import login as do_login
-from ramp_cli.config import settings
+from ramp_cli.config import profiles, settings
 from ramp_cli.config.constants import base_url, iter_environments
 from ramp_cli.errors import EnvironmentAuthRequiredError
 from ramp_cli.onboarding import is_first_login, record_first_login, show_welcome
@@ -44,7 +44,11 @@ def _show_post_login_hints(env: str) -> None:
     _show_default_env_hint(env)
 
 
-def _token_state(cfg: settings.Config, env: str) -> store.TokenState:
+def _token_state(
+    cfg: settings.Config, env: str, profile: str | None = None
+) -> store.TokenState:
+    if profile is not None:
+        return store.get_token_state(env, profile=profile)
     env_config = settings.get_env_config(cfg, env)
     return store.TokenState(
         access_token=env_config.access_token,
@@ -56,15 +60,34 @@ def _token_state(cfg: settings.Config, env: str) -> store.TokenState:
     )
 
 
-def _is_authenticated(cfg: settings.Config, env: str) -> bool:
-    return _token_state(cfg, env).is_authenticated()
+def _is_authenticated(
+    cfg: settings.Config, env: str, profile: str | None = None
+) -> bool:
+    return _token_state(cfg, env, profile).is_authenticated()
 
 
-def _granted_scopes(cfg: settings.Config, env: str) -> set[str]:
+def _granted_scopes(
+    cfg: settings.Config, env: str, profile: str | None = None
+) -> set[str]:
+    if profile is not None:
+        return store.get_granted_scopes(env, profile=profile)
     env_config = settings.get_env_config(cfg, env)
     if not env_config.granted_scopes:
         return set()
     return set(env_config.granted_scopes.split())
+
+
+def _activate_profile(ctx: click.Context, profile: str) -> None:
+    profiles.activate(profile)
+    fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
+    if fmt != "json":
+        click.echo(f"Active profile: {profile}")
+
+
+def _with_profile(data: dict, profile: str | None) -> dict:
+    if profile:
+        return {**data, "profile": profile}
+    return data
 
 
 def _refresh_tool_spec_before_login(env: str) -> None:
@@ -129,6 +152,7 @@ def login(
 ) -> None:
     """Authenticate with Ramp."""
     env = ctx.obj["env"]
+    profile = profiles.HUMAN_PROFILE
     label = env_label(env)
 
     if token_stdin:
@@ -149,11 +173,19 @@ def login(
             "",
             agent_key_uuid="",
             clear_granted_scopes=True,
+            profile=profile,
         )
+        _activate_profile(ctx, profile)
         fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
         if fmt == "json":
             print_agent_json(
-                {"message": f"Token saved for {label}.", "environment": env},
+                _with_profile(
+                    {
+                        "message": f"Token saved for {label}.",
+                        "environment": env,
+                    },
+                    profile,
+                ),
                 pagination=None,
             )
         else:
@@ -203,7 +235,9 @@ def login(
         granted_scopes=token_resp.scope,
         agent_key_uuid=token_resp.agent_key_uuid,
         clear_granted_scopes=not bool(token_resp.scope),
+        profile=profile,
     )
+    _activate_profile(ctx, profile)
 
     if not token_resp.scope:
         click.echo(
@@ -221,7 +255,7 @@ def login(
 
     cfg = settings.load()
     envs = [
-        (env_label(env.name), _is_authenticated(cfg, env.name))
+        (env_label(env.name), _is_authenticated(cfg, env.name, profile))
         for env in iter_environments()
     ]
     show_status_box(envs)
@@ -284,17 +318,22 @@ def _login_standalone_agent(
         granted_scopes=token_resp.scope,
         agent_key_uuid="",
         clear_granted_scopes=not bool(token_resp.scope),
+        profile=profiles.AGENT_PROFILE,
     )
+    _activate_profile(ctx, profiles.AGENT_PROFILE)
 
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     if fmt == "json":
         print_agent_json(
-            {
-                "message": f"Authenticated standalone agent for {label}.",
-                "environment": env,
-                "scopes": sorted(set(token_resp.scope.split())),
-                "expires_in": token_resp.expires_in,
-            },
+            _with_profile(
+                {
+                    "message": f"Authenticated standalone agent for {label}.",
+                    "environment": env,
+                    "scopes": sorted(set(token_resp.scope.split())),
+                    "expires_in": token_resp.expires_in,
+                },
+                profiles.AGENT_PROFILE,
+            ),
             pagination=None,
         )
         return
@@ -309,28 +348,34 @@ def status(ctx: click.Context) -> None:
 
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     cfg = settings.load()
+    profile = ctx.obj["profile"]
 
     if fmt == "json":
         data = {
-            env.name: {
-                "authenticated": _is_authenticated(cfg, env.name),
-                "base_url": base_url(env.name),
-                "scopes": sorted(_granted_scopes(cfg, env.name)),
-            }
+            env.name: _with_profile(
+                {
+                    "authenticated": _is_authenticated(cfg, env.name, profile),
+                    "base_url": base_url(env.name),
+                    "scopes": sorted(_granted_scopes(cfg, env.name, profile)),
+                },
+                profile,
+            )
             for env in iter_environments()
         }
         print_agent_json(data, pagination=None)
     else:
+        if profile:
+            click.echo(f"  Profile: {profile}")
         envs = [
-            (env_label(env.name), _is_authenticated(cfg, env.name))
+            (env_label(env.name), _is_authenticated(cfg, env.name, profile))
             for env in iter_environments()
         ]
         show_status_box(envs)
 
         # Show scope warnings for authenticated environments
         current_env = ctx.obj["env"]
-        if _is_authenticated(cfg, current_env):
-            scopes = _granted_scopes(cfg, current_env)
+        if _is_authenticated(cfg, current_env, profile):
+            scopes = _granted_scopes(cfg, current_env, profile)
             if not scopes:
                 click.echo(
                     f"\n  ⚠  No scopes on your {env_label(current_env)} token."
@@ -347,25 +392,35 @@ def logout(ctx: click.Context) -> None:
     """Clear stored credentials."""
 
     env = ctx.obj["env"]
+    profile = ctx.obj["profile"]
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
 
-    if not store.has_tokens(env):
+    if not store.has_tokens(env, profile=profile):
         if fmt == "json":
             print_agent_json(
-                {
-                    "message": f"No credentials stored for {env_label(env)}.",
-                    "environment": env,
-                },
+                _with_profile(
+                    {
+                        "message": f"No credentials stored for {env_label(env)}.",
+                        "environment": env,
+                    },
+                    profile,
+                ),
                 pagination=None,
             )
         else:
             click.echo(f"No credentials stored for {env_label(env)}.")
         return
 
-    store.clear_tokens(env)
+    store.clear_tokens(env, profile=profile)
     if fmt == "json":
         print_agent_json(
-            {"message": f"Logged out of {env_label(env)}.", "environment": env},
+            _with_profile(
+                {
+                    "message": f"Logged out of {env_label(env)}.",
+                    "environment": env,
+                },
+                profile,
+            ),
             pagination=None,
         )
     else:

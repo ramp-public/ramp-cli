@@ -21,11 +21,13 @@ from ramp_cli.commands.env import env_cmd
 from ramp_cli.commands.feedback import feedback_cmd
 from ramp_cli.commands.getting_started import getting_started_cmd
 from ramp_cli.commands.incorporation import incorporation_group
+from ramp_cli.commands.profile import profile_cmd
 from ramp_cli.commands.router import router_group
 from ramp_cli.commands.skills import skills_group
 from ramp_cli.commands.tools import tools_group
 from ramp_cli.commands.update import update_cmd
 from ramp_cli.config.constants import environment_help, normalize_env
+from ramp_cli.config.profiles import resolve_profile
 from ramp_cli.config.settings import load, resolve_environment
 from ramp_cli.easter_eggs.flip import card_cmd
 from ramp_cli.easter_eggs.invoice import invoice_cmd
@@ -123,6 +125,7 @@ class CLIContext:
 
     env: str
     flag_env: str | None
+    profile: str | None
     format: str | None
     config_format: str
     quiet: bool
@@ -134,6 +137,7 @@ class CLIContext:
     def from_params(
         cls,
         flag_env: str | None,
+        flag_profile: str | None,
         flag_output: str | None,
         quiet: bool,
         no_input: bool,
@@ -152,6 +156,7 @@ class CLIContext:
         return cls(
             env=resolve_environment(flag_env),
             flag_env=flag_env,
+            profile=resolve_profile(flag_profile or ""),
             format=fmt,
             config_format=cfg.format,
             quiet=quiet,
@@ -165,6 +170,7 @@ class CLIContext:
         return {
             "env": self.env,
             "flag_env": self.flag_env,
+            "profile": self.profile,
             "format": self.format,
             "config_format": self.config_format,
             "quiet": self.quiet,
@@ -182,6 +188,7 @@ _ROOT_FLAGS = frozenset(
         "-e",
         "--output",
         "-o",
+        "--profile",
         "--quiet",
         "-q",
         "--no-input",
@@ -190,7 +197,7 @@ _ROOT_FLAGS = frozenset(
         "--human",
     }
 )
-_FLAGS_WITH_VALUE = frozenset({"--env", "-e", "--output", "-o"})
+_FLAGS_WITH_VALUE = frozenset({"--env", "-e", "--output", "-o", "--profile"})
 
 
 def _split_root_flags(args: list[str]) -> tuple[list[str], list[str]]:
@@ -260,7 +267,11 @@ class ToolGroup(click.Group):
 
     @staticmethod
     def build(
-        name: str, tools: list, help_text: str, env: str | None = None
+        name: str,
+        tools: list,
+        help_text: str,
+        env: str | None = None,
+        profile: str | None = None,
     ) -> ToolGroup:
         @click.group(
             name=name, cls=ToolGroup, help=help_text, invoke_without_command=True
@@ -272,7 +283,13 @@ class ToolGroup(click.Group):
 
         visible_names: set[str] = set()
         legacy_candidates = {}
-        granted_scopes = get_known_granted_scopes(env) if env else None
+        granted_scopes = None
+        if env:
+            granted_scopes = (
+                get_known_granted_scopes(env, profile=profile)
+                if profile
+                else get_known_granted_scopes(env)
+            )
         for cmd_name, tool in resolve_tool_command_names(
             name, tools, granted_scopes=granted_scopes
         ):
@@ -329,6 +346,7 @@ class RampGroup(click.Group):
                     Resource.GENERAL, f"General ({len(singletons)} tools)"
                 ),
                 env=self._resolve_env(ctx),
+                profile=self._resolve_profile(ctx),
             )
 
         if cmd_name in multi:
@@ -340,6 +358,7 @@ class RampGroup(click.Group):
                 tools,
                 _RESOURCE_HELP.get(cmd_name, fallback),
                 env=self._resolve_env(ctx),
+                profile=self._resolve_profile(ctx),
             )
 
         if legacy_tools := self._legacy_category_tools(ctx, cmd_name):
@@ -350,6 +369,7 @@ class RampGroup(click.Group):
                 legacy_tools,
                 _RESOURCE_HELP.get(cmd_name, fallback),
                 env=self._resolve_env(ctx),
+                profile=self._resolve_profile(ctx),
             )
 
         if tool_def := get_tool(cmd_name, env=self._resolve_env(ctx)):
@@ -389,6 +409,13 @@ class RampGroup(click.Group):
             return resolve_environment(flag_env)
         except ValueError:
             return "production"
+
+    def _resolve_profile(self, ctx: click.Context | None) -> str | None:
+        flag_profile = (ctx.params.get("flag_profile") or "") if ctx else ""
+        try:
+            return resolve_profile(flag_profile)
+        except ValueError:
+            return None
 
     def _split_categories(self, ctx: click.Context) -> tuple[dict[str, list], list]:
         env = self._resolve_env(ctx)
@@ -433,6 +460,13 @@ class RampGroup(click.Group):
     help=f"Environment: {environment_help()}",
 )
 @click.option(
+    "--profile",
+    "flag_profile",
+    type=click.Choice(["human", "agent"]),
+    default=None,
+    help="Credential profile for this command (does not change the default)",
+)
+@click.option(
     "--output", "-o", "flag_output", default=None, help="Output format: json or table"
 )
 @click.option(
@@ -462,6 +496,7 @@ class RampGroup(click.Group):
 def cli(
     ctx: click.Context,
     flag_env: str,
+    flag_profile: str,
     flag_output: str,
     quiet: bool,
     no_input: bool,
@@ -482,6 +517,7 @@ def cli(
     try:
         cli_ctx = CLIContext.from_params(
             flag_env=flag_env,
+            flag_profile=flag_profile,
             flag_output=flag_output,
             quiet=quiet,
             no_input=no_input,
@@ -490,7 +526,7 @@ def cli(
             flag_human=flag_human,
         )
     except ValueError as e:
-        raise click.BadParameter(str(e), param_hint="'--env'") from e
+        raise click.BadParameter(str(e)) from e
     ctx.ensure_object(dict)
     ctx.obj.update(cli_ctx.to_dict())
     set_quiet(quiet)
@@ -532,6 +568,7 @@ for _cmd in (
     applications_group,
     auth_group,
     incorporation_group,
+    profile_cmd,
     card_cmd,
     codex_group,
     config_group,

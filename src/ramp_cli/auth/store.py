@@ -6,7 +6,7 @@ import os
 import time
 from dataclasses import dataclass
 
-from ramp_cli.config import settings
+from ramp_cli.config import profiles, settings
 
 ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 30
 
@@ -64,15 +64,18 @@ class TokenState:
 # --- Public API ---
 
 
-def get_tokens(env: str) -> tuple[str, str]:
+def get_tokens(env: str, *, profile: str | None = None) -> tuple[str, str]:
     """Return (access_token, refresh_token) for the environment."""
-    state = get_token_state(env)
+    state = get_token_state(env, profile=profile)
     return state.access_token, state.refresh_token
 
 
-def get_token_state(env: str) -> TokenState:
-    cfg = settings.load()
-    ec = settings.get_env_config(cfg, env)
+def get_token_state(env: str, *, profile: str | None = None) -> TokenState:
+    if profile is None:
+        cfg = settings.load()
+        ec = settings.get_env_config(cfg, env)
+    else:
+        ec = profiles.get_env_config(profile, env)
     return TokenState(
         access_token=ec.access_token,
         refresh_token=ec.refresh_token,
@@ -93,7 +96,9 @@ def save_tokens(
     granted_scopes: str | None = None,
     agent_key_uuid: str | None = None,
     clear_granted_scopes: bool = False,
-) -> None:
+    profile: str | None = None,
+    expected_refresh_token: str | None = None,
+) -> bool:
     state = _build_token_state(
         access_token,
         refresh_token,
@@ -102,73 +107,106 @@ def save_tokens(
         issued_at,
     )
 
+    def update(ec: settings.EnvConfig) -> None:
+        ec.access_token = state.access_token
+        ec.refresh_token = state.refresh_token
+        ec.access_token_issued_at = state.access_token_issued_at
+        ec.access_token_expires_in = state.access_token_expires_in
+        ec.refresh_token_issued_at = state.refresh_token_issued_at
+        ec.refresh_token_expires_in = state.refresh_token_expires_in
+        # Token refresh responses often omit scope, so preserve grants by default.
+        # Credential replacement callers explicitly clear them when scope is unknown.
+        if clear_granted_scopes:
+            ec.granted_scopes = ""
+        elif granted_scopes:
+            ec.granted_scopes = granted_scopes
+        # Refresh callers omit the UUID to preserve it. Credential replacement
+        # callers pass a value explicitly, including "" to clear it.
+        if agent_key_uuid is not None:
+            ec.agent_key_uuid = agent_key_uuid
+
+    if profile is not None:
+        return profiles.update_env_config(
+            profile,
+            env,
+            update,
+            expected_refresh_token=expected_refresh_token,
+        )
     cfg = settings.load()
-    ec = settings.ensure_env_config(cfg, env)
-    ec.access_token = state.access_token
-    ec.refresh_token = state.refresh_token
-    ec.access_token_issued_at = state.access_token_issued_at
-    ec.access_token_expires_in = state.access_token_expires_in
-    ec.refresh_token_issued_at = state.refresh_token_issued_at
-    ec.refresh_token_expires_in = state.refresh_token_expires_in
-    # Token refresh responses often omit scope, so preserve grants by default.
-    # Credential replacement callers explicitly clear them when scope is unknown.
-    if clear_granted_scopes:
+    update(settings.ensure_env_config(cfg, env))
+    settings.save(cfg)
+    return True
+
+
+def clear_tokens(
+    env: str,
+    *,
+    profile: str | None = None,
+    expected_refresh_token: str | None = None,
+) -> bool:
+    def clear(ec: settings.EnvConfig) -> None:
+        ec.access_token = ""
+        ec.refresh_token = ""
+        ec.access_token_issued_at = 0
+        ec.access_token_expires_in = 0
+        ec.refresh_token_issued_at = 0
+        ec.refresh_token_expires_in = 0
         ec.granted_scopes = ""
-    elif granted_scopes:
-        ec.granted_scopes = granted_scopes
-    # agent_key_uuid contract:
-    #   - refresh callers omit it (None) → preserve stored value
-    #   - login/credential-replacement callers pass the new value explicitly,
-    #     including "" to clear a stale key when no key was issued
-    if agent_key_uuid is not None:
-        ec.agent_key_uuid = agent_key_uuid
-    settings.save(cfg)
+        ec.agent_key_uuid = ""
 
-
-def clear_tokens(env: str) -> None:
+    if profile is not None:
+        return profiles.update_env_config(
+            profile,
+            env,
+            clear,
+            expected_refresh_token=expected_refresh_token,
+        )
     cfg = settings.load()
-    ec = settings.ensure_env_config(cfg, env)
-    ec.access_token = ""
-    ec.refresh_token = ""
-    ec.access_token_issued_at = 0
-    ec.access_token_expires_in = 0
-    ec.refresh_token_issued_at = 0
-    ec.refresh_token_expires_in = 0
-    ec.granted_scopes = ""
-    ec.agent_key_uuid = ""
+    clear(settings.ensure_env_config(cfg, env))
     settings.save(cfg)
+    return True
 
 
-def get_agent_key_uuid(env: str) -> str:
-    cfg = settings.load()
-    ec = settings.get_env_config(cfg, env)
+def get_agent_key_uuid(env: str, *, profile: str | None = None) -> str:
+    if profile is None:
+        cfg = settings.load()
+        ec = settings.get_env_config(cfg, env)
+    else:
+        ec = profiles.get_env_config(profile, env)
     return ec.agent_key_uuid
 
 
-def get_granted_scopes(env: str) -> set[str]:
+def get_granted_scopes(env: str, *, profile: str | None = None) -> set[str]:
     """Return the set of OAuth scopes granted to the current token."""
-    cfg = settings.load()
-    ec = settings.get_env_config(cfg, env)
+    if profile is None:
+        cfg = settings.load()
+        ec = settings.get_env_config(cfg, env)
+    else:
+        ec = profiles.get_env_config(profile, env)
     if not ec.granted_scopes:
         return set()
     return set(ec.granted_scopes.split())
 
 
-def get_known_granted_scopes(env: str) -> set[str] | None:
+def get_known_granted_scopes(
+    env: str, *, profile: str | None = None
+) -> set[str] | None:
     """Return grants only when they are known to match the active credential."""
     if os.environ.get("RAMP_ACCESS_TOKEN"):
         return None
-    scopes = get_granted_scopes(env)
+    scopes = get_granted_scopes(env, profile=profile)
     return scopes or None
 
 
-def has_tokens(env: str) -> bool:
-    access, refresh = get_tokens(env)
+def has_tokens(env: str, *, profile: str | None = None) -> bool:
+    access, refresh = get_tokens(env, profile=profile)
     return bool(access or refresh)
 
 
-def is_authenticated(env: str, now: int | None = None) -> bool:
-    return get_token_state(env).is_authenticated(now)
+def is_authenticated(
+    env: str, now: int | None = None, *, profile: str | None = None
+) -> bool:
+    return get_token_state(env, profile=profile).is_authenticated(now)
 
 
 # --- Helpers ---

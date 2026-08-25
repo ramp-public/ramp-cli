@@ -164,12 +164,18 @@ class ApiError(RampCLIError):
 
 
 class AuthRequiredError(RampCLIError):
-    def __init__(self, env: str) -> None:
+    def __init__(self, env: str, profile: str | None = None) -> None:
+        profile_label = f" profile {profile!r}" if profile else ""
+        login_command = "ramp auth login"
+        if profile == "agent":
+            login_command += " --client-id <agent-client-id>"
         super().__init__(
-            f"Not authenticated for {env} — run: ramp --env {env} auth login",
+            f"Not authenticated for {env}{profile_label} — run: "
+            f"ramp --env {env} {login_command.removeprefix('ramp ')}",
             code=EXIT_AUTH_REQUIRED,
         )
         self.env = env
+        self.profile = profile
 
 
 class EnvironmentAuthRequiredError(RampCLIError):

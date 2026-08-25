@@ -62,6 +62,25 @@ refreshed. Use the `expires_in` value from the login output to schedule the next
 login before the access token expires. Human users should use `ramp auth login` and
 the browser-based PKCE flow instead.
 
+### Switching identities with profiles
+
+Store human and agent credentials separately, then switch the active identity without
+logging in again:
+
+```bash
+ramp auth login
+ramp auth login --client-id "$RAMP_CLIENT_ID"
+ramp profile human
+ramp profile agent
+ramp profile list
+ramp --profile human funds list --rationale "Review my human-owned funds"
+```
+
+The CLI stores these identities separately as `human` and `agent`. The active
+profile is used by subsequent commands. Use `--profile` for a single command
+without changing the default. `RAMP_PROFILE` pins an identity for automation and
+cannot be overridden by a conflicting `--profile` flag.
+
 ## Commands
 
 | Command        | Description                                        |
@@ -69,6 +88,7 @@ the browser-based PKCE flow instead.
 | `auth`         | Login, logout, check status                        |
 | `config`       | Get/set CLI configuration                          |
 | `env`          | Show or set default environment (sandbox/production)|
+| `profile`      | Show, list, or switch credential profiles           |
 | `applications` | Apply for a Ramp account                           |
 | `skills`       | Browse and install agent skill instructions         |
 | `feedback`     | Submit feedback about the CLI                      |

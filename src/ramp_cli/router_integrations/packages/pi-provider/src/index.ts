@@ -15,7 +15,7 @@ import {
   type RefreshModelsContext,
   type ThinkingLevelMap,
 } from "@earendil-works/pi-ai"
-import { openAIResponsesApi } from "@earendil-works/pi-ai/compat"
+import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy"
 
 import {
   closeSync,
@@ -37,6 +37,7 @@ import { join } from "node:path"
 
 import { discoverRouterModels, normalizeBaseURL } from "./discovery.ts"
 import type { RouterModel as DiscoveredModel } from "./discovery.ts"
+import { registerUsageWidget } from "./usage.ts"
 
 const PROVIDER_ID = "ramp-router"
 const API_KEY_ENVS = ["RAMP_ROUTER_API_KEY", "LLM_GATEWAY_API_KEY"]
@@ -1220,6 +1221,7 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
     startupCredentialIdentity,
   )
   pi.registerProvider(registeredProvider)
+  registerUsageWidget(pi, { baseURL: baseUrl, resolveAPIKey: routerApiKey })
 
   // Extension factories run before session_start, which is the first point at
   // which Pi exposes its ModelRegistry. A cached startup refresh can update the

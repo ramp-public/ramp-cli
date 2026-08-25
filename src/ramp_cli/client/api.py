@@ -13,9 +13,14 @@ from ramp_cli.errors import UnsafeRequestUrlError
 class RampClient:
     """Synchronous Core Developer API client with automatic token refresh."""
 
-    def __init__(self, env: str, access_token: str | None = None) -> None:
+    def __init__(
+        self,
+        env: str,
+        access_token: str | None = None,
+        profile: str | None = None,
+    ) -> None:
         self.env = env
-        self._transport = AuthenticatedRampTransport(env, access_token)
+        self._transport = AuthenticatedRampTransport(env, access_token, profile)
 
     def get(
         self,

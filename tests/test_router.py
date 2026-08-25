@@ -95,7 +95,7 @@ def _mock_models(
             return httpx.Response(
                 200, text=cost_hook, request=httpx.Request("GET", url)
             )
-        if url.endswith("/session-usage/usage/balance"):
+        if url.endswith("/session-usage/usage/balance?include_strategy_settings=true"):
             # The credits line has its own tests; here the endpoint is simply
             # unavailable, so configure skips the line.
             return httpx.Response(404, request=httpx.Request("GET", url))
@@ -380,7 +380,7 @@ def test_configure_setup_file_keeps_discovery_and_credits_on_its_router(
                 json={"data": models},
                 request=httpx.Request("GET", url),
             )
-        if url.endswith("/session-usage/usage/balance"):
+        if url.endswith("/session-usage/usage/balance?include_strategy_settings=true"):
             return httpx.Response(
                 200,
                 json=_balance_payload("12.34"),
@@ -410,7 +410,7 @@ def test_configure_setup_file_keeps_discovery_and_credits_on_its_router(
     assert authenticated_urls == [
         "https://router.example/v1/models",
         "https://router.example/v1/models",
-        "https://router.example/session-usage/usage/balance",
+        "https://router.example/session-usage/usage/balance?include_strategy_settings=true",
     ]
 
 
@@ -1398,6 +1398,7 @@ def test_refresh_reapplies_only_clients_with_router_receipts(tmp_path, monkeypat
             "baseURL": ROUTER_BASE_URL,
             "usageBaseURL": "https://app.router.com",
             "apiKey": "keep-me",
+            "rampExecutable": "/opt/ramp-cli/bin/ramp",
         },
     ]
     # A refresh rewrites the TUI registration too, so a rotated key never
@@ -4512,7 +4513,7 @@ def test_configure_waits_for_a_browser_created_key_to_reach_the_data_plane(
     responses = [401, 401, 200, 200]
 
     def get(url, **kwargs):
-        if url.endswith("/session-usage/usage/balance"):
+        if url.endswith("/session-usage/usage/balance?include_strategy_settings=true"):
             # The credits line is exercised elsewhere; here the endpoint is
             # simply unavailable, so configure skips it.
             return httpx.Response(404, request=httpx.Request("GET", url))
@@ -4610,6 +4611,7 @@ def test_configure_opencode_installs_plugin_and_preserves_config(tmp_path, monke
             # display queries; the data plane does not serve it.
             "usageBaseURL": "https://app.router.com",
             "apiKey": "router-secret",
+            "rampExecutable": "/opt/ramp-cli/bin/ramp",
         },
     ]
     assert config["plugin"] == [expected_entry]
@@ -6064,7 +6066,7 @@ def test_claude_original_settings_are_not_taken_from_a_previous_configure(
     assert "router-secret" not in json.dumps(overlay)
 
 
-def test_client_picker_preselects_every_installed_agent(monkeypatch):
+def test_configure_picker_starts_with_no_installed_agents_selected(monkeypatch):
     captured = _capture_picker(monkeypatch, ["codex", "pi"])
     monkeypatch.setattr(
         router_module, "_installed_clients", lambda: ("claude-code", "codex", "pi")
@@ -6080,9 +6082,9 @@ def test_client_picker_preselects_every_installed_agent(monkeypatch):
     assert [
         (choice.title, choice.value, choice.checked) for choice in captured["choices"]
     ] == [
-        ("Claude Code", "claude-code", True),
-        ("Codex (CLI + desktop app)", "codex", True),
-        ("Pi", "pi", True),
+        ("Claude Code", "claude-code", False),
+        ("Codex (CLI + desktop app)", "codex", False),
+        ("Pi", "pi", False),
     ]
     assert captured["validate"](["codex"]) is True
     assert captured["validate"]([]) == "Select at least one agent."
@@ -6436,9 +6438,8 @@ def test_installed_clients_finds_agents_on_path_or_with_a_config_dir(
 
 
 def test_client_picker_does_not_inverse_video_every_checked_row():
-    # prompt_toolkit styles a checked row as "reverse". Every agent starts
-    # checked, so inheriting that default renders the whole list as one
-    # indistinguishable block of inverted text.
+    # prompt_toolkit styles checked rows as "reverse". Avoiding that default
+    # keeps selections distinct from the cursor as users toggle agents on.
     rules = dict(router_module._PICKER_STYLE.style_rules)
 
     assert "noreverse" in rules["selected"]
@@ -6522,7 +6523,9 @@ def test_configure_json_output_bypasses_the_picker(tmp_path, monkeypatch):
     assert len(payload["data"][0]["clients"]) == len(router_module.CLIENT_NAMES)
 
 
-def test_unconfigure_picker_offers_only_configured_agents(tmp_path, monkeypatch):
+def test_unconfigure_picker_starts_with_no_configured_agents_selected(
+    tmp_path, monkeypatch
+):
     codex_home = tmp_path / "codex"
     pi_home = tmp_path / "pi"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
@@ -6552,7 +6555,7 @@ def test_unconfigure_picker_offers_only_configured_agents(tmp_path, monkeypatch)
     assert removed.exit_code == 0, removed.output
     # Claude Code and OpenCode have no setup, so there is nothing to undo.
     assert [choice.value for choice in captured["choices"]] == ["codex", "pi"]
-    assert all(choice.checked for choice in captured["choices"])
+    assert not any(choice.checked for choice in captured["choices"])
     assert "remove Ramp Router from" in captured["message"]
     # Only the picked agent is undone.
     assert "Removed Ramp Router and restored your previous settings for: Codex." in (
@@ -7380,16 +7383,18 @@ def test_a_failed_reconfigure_leaves_the_working_setup_intact(tmp_path, monkeypa
     assert json.loads(new_session.read_text())["payload"]["model_provider"] == "openai"
 
 
-# ── Remaining-credits line ─────────────────────────────────────────────────
+# ── Configure-time Router summary ──────────────────────────────────────────
 
 
-def _mock_balance(monkeypatch, respond):
-    """Serve the balance endpoint on top of whatever _mock_models installed."""
+def _mock_balance(monkeypatch, respond, *, origin="https://app.router.com"):
+    """Serve the configure summary on top of whatever _mock_models installed."""
     inner = router_module.httpx.get
 
     def get(url, *, headers, timeout):
-        if url.endswith("/session-usage/usage/balance"):
-            assert url == "https://app.router.com/session-usage/usage/balance"
+        if url.endswith("/session-usage/usage/balance?include_strategy_settings=true"):
+            assert url == (
+                f"{origin}/session-usage/usage/balance?include_strategy_settings=true"
+            )
             assert headers == {"Authorization": "Bearer router-secret"}
             assert timeout == 5
             return respond(url)
@@ -7398,7 +7403,12 @@ def _mock_balance(monkeypatch, respond):
     monkeypatch.setattr("ramp_cli.commands.router.httpx.get", get)
 
 
-def _balance_payload(remaining="23.77"):
+def _balance_payload(
+    remaining="23.77",
+    *,
+    switchyard_routing_enabled=True,
+    cost_efficient_routing_enabled=True,
+):
     return {
         "billing_account_required": True,
         "balance": {
@@ -7407,6 +7417,8 @@ def _balance_payload(remaining="23.77"):
             "remaining_credit_usd": remaining,
             "balance_observed_at": "2026-08-18T00:00:00Z",
         },
+        "switchyard_routing_enabled": switchyard_routing_enabled,
+        "cost_efficient_routing_enabled": cost_efficient_routing_enabled,
     }
 
 
@@ -7434,8 +7446,91 @@ def test_configure_shows_remaining_credits_when_router_serves_a_balance(
 
     assert result.exit_code == 0, result.output
     credits_line = "Router credits remaining: $1,234.50"
-    assert click.unstyle(result.output).splitlines()[-1] == credits_line
+    lines = click.unstyle(result.output).splitlines()
+    assert lines[-2:] == ["", credits_line]
     assert click.style(credits_line, fg=(228, 242, 33)) in result.output
+    assert "Enable " not in result.output
+
+
+@pytest.mark.parametrize(
+    ("client", "env_name", "config_path"),
+    [
+        ("claude-code", "CLAUDE_CONFIG_DIR", "claude"),
+        ("codex", "CODEX_HOME", "codex"),
+        ("opencode", "OPENCODE_CONFIG", "opencode.json"),
+    ],
+)
+def test_configure_shows_strategy_guidance_for_each_client(
+    tmp_path,
+    monkeypatch,
+    client,
+    env_name,
+    config_path,
+):
+    monkeypatch.setenv(env_name, str(tmp_path / config_path))
+    _mock_models(monkeypatch)
+    _mock_balance(
+        monkeypatch,
+        lambda url: httpx.Response(
+            200,
+            json=_balance_payload(
+                switchyard_routing_enabled=False,
+                cost_efficient_routing_enabled=True,
+            ),
+            request=httpx.Request("GET", url),
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", client, "--api-key", "router-secret"],
+        color=True,
+    )
+
+    assert result.exit_code == 0, result.output
+    notice = (
+        "Enable the Nvidia NeMo Switchyard strategy at "
+        "https://app.router.com/strategies for cost savings"
+    )
+    lines = click.unstyle(result.output).splitlines()
+    notice_index = lines.index(notice)
+    assert lines[notice_index - 1] == ""
+    assert lines[notice_index + 1] == "Router credits remaining: $23.77"
+    assert click.style(notice, fg=(228, 242, 33)) in result.output
+
+
+def test_configure_strategy_guidance_uses_the_configured_router_origin(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / "opencode.json"
+    base_url = "https://qa-router.example/v1"
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
+    monkeypatch.setenv("RAMP_ROUTER_BASE_URL", base_url)
+    _mock_models(monkeypatch, base_url=base_url)
+    _mock_balance(
+        monkeypatch,
+        lambda url: httpx.Response(
+            200,
+            json=_balance_payload(
+                switchyard_routing_enabled=False,
+                cost_efficient_routing_enabled=True,
+            ),
+            request=httpx.Request("GET", url),
+        ),
+        origin="https://qa-router.example",
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "opencode", "--api-key", "router-secret"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "Enable the Nvidia NeMo Switchyard strategy at "
+        "https://qa-router.example/strategies for cost savings"
+        in click.unstyle(result.output)
+    )
 
 
 def test_configure_skips_the_credits_line_when_router_does_not_serve_one(
@@ -7466,7 +7561,12 @@ def test_configure_skips_the_credits_line_without_a_billing_account(
         monkeypatch,
         lambda url: httpx.Response(
             200,
-            json={"billing_account_required": False, "balance": None},
+            json={
+                "billing_account_required": False,
+                "balance": None,
+                "switchyard_routing_enabled": True,
+                "cost_efficient_routing_enabled": True,
+            },
             request=httpx.Request("GET", url),
         ),
     )
@@ -7479,14 +7579,14 @@ def test_configure_skips_the_credits_line_without_a_billing_account(
     assert "Router credits remaining" not in result.output
 
 
-def test_configure_agent_output_never_fetches_the_balance(tmp_path, monkeypatch):
+def test_configure_agent_output_never_fetches_the_summary(tmp_path, monkeypatch):
     """Machine output keeps its shape and makes no extra network calls."""
     config_path = tmp_path / "opencode.json"
     monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
     _mock_models(monkeypatch)
 
     def refuse(url):
-        raise AssertionError("agent output must not fetch the balance")
+        raise AssertionError("agent output must not fetch the configure summary")
 
     _mock_balance(monkeypatch, refuse)
 
@@ -7515,22 +7615,81 @@ def test_configure_agent_output_never_fetches_the_balance(tmp_path, monkeypatch)
         {"balance": {"remaining_credit_usd": "-Infinity"}},
     ],
 )
-def test_fetch_remaining_credits_tolerates_unexpected_payloads(monkeypatch, payload):
+def test_fetch_configure_summary_tolerates_unexpected_payloads(monkeypatch, payload):
     monkeypatch.setattr(
         "ramp_cli.commands.router.httpx.get",
         lambda url, *, headers, timeout: httpx.Response(
             200, json=payload, request=httpx.Request("GET", url)
         ),
     )
-    assert router_module._fetch_remaining_credits("router-secret") is None
+    assert router_module._fetch_configure_summary("router-secret") is None
 
 
-def test_fetch_remaining_credits_swallows_network_errors(monkeypatch):
+def test_fetch_configure_summary_swallows_network_errors(monkeypatch):
     def get(url, *, headers, timeout):
         raise httpx.ConnectError("boom")
 
     monkeypatch.setattr("ramp_cli.commands.router.httpx.get", get)
-    assert router_module._fetch_remaining_credits("router-secret") is None
+    assert router_module._fetch_configure_summary("router-secret") is None
+
+
+def test_fetch_configure_summary_keeps_credits_from_an_older_router(monkeypatch):
+    monkeypatch.setattr(
+        "ramp_cli.commands.router.httpx.get",
+        lambda url, *, headers, timeout: httpx.Response(
+            200,
+            json={"balance": {"remaining_credit_usd": "23.77"}},
+            request=httpx.Request("GET", url),
+        ),
+    )
+
+    assert router_module._fetch_configure_summary(
+        "router-secret"
+    ) == router_module.RouterConfigureSummary(
+        remaining_credits=Decimal("23.77"),
+        switchyard_routing_enabled=None,
+        cost_efficient_routing_enabled=None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("switchyard_enabled", "cost_efficient_enabled", "expected"),
+    [
+        (
+            False,
+            False,
+            "Enable Nvidia NeMo Switchyard and Cost-Efficient strategies at "
+            "https://app.router.com/strategies for cost savings",
+        ),
+        (
+            False,
+            True,
+            "Enable the Nvidia NeMo Switchyard strategy at "
+            "https://app.router.com/strategies for cost savings",
+        ),
+        (
+            True,
+            False,
+            "Enable the Cost-Efficient strategy at "
+            "https://app.router.com/strategies for cost savings",
+        ),
+        (True, True, None),
+        (None, None, None),
+    ],
+)
+def test_strategy_savings_notice_only_names_missing_strategies(
+    switchyard_enabled,
+    cost_efficient_enabled,
+    expected,
+):
+    assert (
+        router_module._strategy_savings_notice(
+            switchyard_routing_enabled=switchyard_enabled,
+            cost_efficient_routing_enabled=cost_efficient_enabled,
+            strategies_url="https://app.router.com/strategies",
+        )
+        == expected
+    )
 
 
 def test_format_credits_usd():

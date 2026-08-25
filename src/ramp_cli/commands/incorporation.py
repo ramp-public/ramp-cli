@@ -297,7 +297,7 @@ def submit_formation(ctx: click.Context, json_body: str, dry_run: bool) -> None:
         return
 
     # Step 2: POST the non-sensitive formation request body.
-    client = RampClient(env)
+    client = RampClient(env, profile=ctx.obj["profile"])
     response = client.post(_INCORPORATION_SUBMIT_PATH, json.dumps(body).encode())
 
     # Step 3: Render response. Never echo request_body or SSN values here.
@@ -337,7 +337,7 @@ def get_state_options(ctx: click.Context) -> None:
     \b
     Endpoint: GET /developer/v1/incorporation/states
     """
-    client = RampClient(ctx.obj["env"])
+    client = RampClient(ctx.obj["env"], profile=ctx.obj["profile"])
     response = client.get(f"{_INCORPORATION_BASE}/states")
     _render_get(response, ctx.obj["format"], ctx.obj["config_format"])
 
@@ -368,7 +368,7 @@ def search_industries(ctx: click.Context, query: str) -> None:
 
     Endpoint: GET /developer/v1/incorporation/industries
     """
-    client = RampClient(ctx.obj["env"])
+    client = RampClient(ctx.obj["env"], profile=ctx.obj["profile"])
     response = client.get(f"{_INCORPORATION_BASE}/industries", params={"search": query})
     _render_get(response, ctx.obj["format"], ctx.obj["config_format"])
 
@@ -383,7 +383,7 @@ def list_countries(ctx: click.Context) -> None:
     \b
     Endpoint: GET /developer/v1/incorporation/countries
     """
-    client = RampClient(ctx.obj["env"])
+    client = RampClient(ctx.obj["env"], profile=ctx.obj["profile"])
     response = client.get(f"{_INCORPORATION_BASE}/countries")
     _render_get(response, ctx.obj["format"], ctx.obj["config_format"])
 
@@ -436,7 +436,7 @@ def create_applicant(
     # that smuggles SSN-like keys or values (P1 Codex thread on #247).
     _reject_ssn_in_json(body)
 
-    client = RampClient(ctx.obj["env"])
+    client = RampClient(ctx.obj["env"], profile=ctx.obj["profile"])
     response = client.post(
         f"{_INCORPORATION_BASE}/applicant", json.dumps(body).encode()
     )
@@ -453,7 +453,7 @@ def get_applicant(ctx: click.Context) -> None:
     \b
     Endpoint: GET /developer/v1/incorporation/applicant
     """
-    client = RampClient(ctx.obj["env"])
+    client = RampClient(ctx.obj["env"], profile=ctx.obj["profile"])
     response = client.get(f"{_INCORPORATION_BASE}/applicant")
     _render_get(response, ctx.obj["format"], ctx.obj["config_format"])
 
@@ -546,7 +546,7 @@ def get_company_status(ctx: click.Context) -> None:
     \b
     Endpoint: GET /developer/v1/incorporation/company-status
     """
-    client = RampClient(ctx.obj["env"])
+    client = RampClient(ctx.obj["env"], profile=ctx.obj["profile"])
     response = client.get(_INCORPORATION_STATUS_PATH)
     _render_status(response, ctx.obj["format"], ctx.obj["config_format"])
 
@@ -561,6 +561,6 @@ def get_documents(ctx: click.Context) -> None:
     \b
     Endpoint: GET /developer/v1/incorporation/documents
     """
-    client = RampClient(ctx.obj["env"])
+    client = RampClient(ctx.obj["env"], profile=ctx.obj["profile"])
     response = client.get(f"{_INCORPORATION_BASE}/documents")
     _render_get(response, ctx.obj["format"], ctx.obj["config_format"])

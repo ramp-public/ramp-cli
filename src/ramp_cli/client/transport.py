@@ -34,8 +34,14 @@ _REQUEST_TIMEOUT = 75.0
 class AuthenticatedRampTransport:
     """Send authenticated requests without owning service URLs or operations."""
 
-    def __init__(self, env: str, access_token: str | None = None) -> None:
+    def __init__(
+        self,
+        env: str,
+        access_token: str | None = None,
+        profile: str | None = None,
+    ) -> None:
         self.env = env
+        self.profile = profile
         self._static_access_token = access_token or os.environ.get("RAMP_ACCESS_TOKEN")
 
     def request(
@@ -68,7 +74,7 @@ class AuthenticatedRampTransport:
             # reported as AuthRequiredError, which would wrongly send the user to
             # `ramp auth login` for a proxy-configuration problem.
             if resp.status_code == 401 and not self._static_access_token:
-                new_token = try_refresh(self.env)
+                new_token = self._try_refresh()
                 if new_token:
                     resp = self._request(
                         http,
@@ -82,12 +88,12 @@ class AuthenticatedRampTransport:
                 elif proxied:
                     raise ApiError(resp.status_code, resp.text)
                 else:
-                    raise AuthRequiredError(self.env)
+                    raise AuthRequiredError(self.env, self.profile)
 
             if resp.status_code == 401:
                 if proxied:
                     raise ApiError(resp.status_code, resp.text)
-                raise AuthRequiredError(self.env)
+                raise AuthRequiredError(self.env, self.profile)
             if resp.is_error:
                 raise ApiError(resp.status_code, resp.text)
             return resp.content
@@ -116,7 +122,7 @@ class AuthenticatedRampTransport:
             )
 
             if resp.status_code == 401 and not self._static_access_token:
-                new_token = try_refresh(self.env)
+                new_token = self._try_refresh()
                 if new_token:
                     resp = self._request_multipart(
                         http,
@@ -129,10 +135,10 @@ class AuthenticatedRampTransport:
                         request_headers=request_headers,
                     )
                 else:
-                    raise AuthRequiredError(self.env)
+                    raise AuthRequiredError(self.env, self.profile)
 
             if resp.status_code == 401:
-                raise AuthRequiredError(self.env)
+                raise AuthRequiredError(self.env, self.profile)
             if resp.is_error:
                 raise ApiError(resp.status_code, resp.text)
             return resp.content
@@ -150,13 +156,17 @@ class AuthenticatedRampTransport:
         return extra_auth_headers(self.env)
 
     def _get_access_token(self) -> str:
-        state = store.get_token_state(self.env)
+        state = (
+            store.get_token_state(self.env, profile=self.profile)
+            if self.profile
+            else store.get_token_state(self.env)
+        )
         now = int(time.time())
 
         if state.access_token and not state.access_token_is_expired(now):
             if state.refresh_token and state.access_token_is_expiring_soon(now):
                 try:
-                    new_token = try_refresh(self.env)
+                    new_token = self._try_refresh()
                 except RefreshFailedError:
                     return state.access_token
                 if new_token:
@@ -164,10 +174,15 @@ class AuthenticatedRampTransport:
             return state.access_token
 
         if state.refresh_token:
-            new_token = try_refresh(self.env)
+            new_token = self._try_refresh()
             if new_token:
                 return new_token
-        raise AuthRequiredError(self.env)
+        raise AuthRequiredError(self.env, self.profile)
+
+    def _try_refresh(self) -> str | None:
+        if self.profile:
+            return try_refresh(self.env, profile=self.profile)
+        return try_refresh(self.env)
 
     def _request(
         self,

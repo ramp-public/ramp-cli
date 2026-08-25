@@ -15,7 +15,7 @@ from ramp_cli.views.invoice import render_bill_invoice
 @click.argument("bill_id")
 @click.pass_context
 def invoice_cmd(ctx: click.Context, bill_id: str) -> None:
-    client = RampClient(ctx.obj["env"])
+    client = RampClient(ctx.obj["env"], profile=ctx.obj["profile"])
     body = client.get(f"/developer/v1/bills/{bill_id}")
 
     if not render_bill_invoice(body):

@@ -63,7 +63,7 @@ def test_windows_build_does_not_block_release():
     release_job = workflow.split("  release:", 1)[1].split("  upload-windows:", 1)[0]
     windows_job = workflow.split("  build-windows:", 1)[1].split("  release:", 1)[0]
 
-    assert "    needs: build" in release_job.splitlines()
+    assert "    needs: [build, validate-release-tag]" in release_job.splitlines()
     assert "windows-amd64" not in release_job
     assert "--prerelease" in release_job
     assert "needs: [build-windows, release]" in workflow

@@ -86,11 +86,20 @@ Or copy the skill folder into `.claude/skills/` (Claude Code), `.codex/skills/` 
 
 ## Prerequisites
 
-The `ramp` CLI must be installed and authenticated:
+The `ramp` CLI must be installed using one of the supported install paths from the repo root README:
+
 ```bash
-npm install -g @ramp/cli
+curl -fsSL https://agents.ramp.com/install.sh | sh
+# or: brew install ramp-public/ramp/ramp-cli
+# or: uv tool install git+https://github.com/ramp/ramp-cli.git
+```
+
+Then authenticate and refresh the agent-tool spec before installing or using skills:
+
+```bash
 ramp auth login
 ramp tools refresh   # fetch latest tool aliases
+ramp skills list
 ```
 
 ## Flag conventions

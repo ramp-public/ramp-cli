@@ -10,7 +10,7 @@ from click.testing import CliRunner
 
 from ramp_cli.auth import store
 from ramp_cli.commands.getting_started import _remap_categories
-from ramp_cli.config import settings
+from ramp_cli.config import profiles, settings
 from ramp_cli.config.constants import environment_usage
 from ramp_cli.main import cli
 from ramp_cli.onboarding import (
@@ -170,7 +170,7 @@ class TestGettingStartedCommand:
         assert "Getting Started" in result.output
         assert "Resources to explore" in result.output
 
-    def test_authenticated_agent_json(self, isolated_config, monkeypatch):
+    def test_authenticated_named_profile_agent_json(self, isolated_config, monkeypatch):
         store.save_tokens(
             "production",
             "access123",
@@ -178,7 +178,9 @@ class TestGettingStartedCommand:
             access_token_expires_in=3600,
             refresh_token_expires_in=604800,
             granted_scopes="business:read",
+            profile="human",
         )
+        profiles.activate("human")
         monkeypatch.setattr(store.time, "time", lambda: 100)
 
         runner = CliRunner()
@@ -192,6 +194,7 @@ class TestGettingStartedCommand:
         assert "categories_unexplored" in payload
         assert "sample_prompts" in payload
         assert payload["environment"] == "production"
+        assert payload["scopes_granted"] == 1
 
     def test_tracks_explored_categories(self, isolated_config, monkeypatch):
         store.save_tokens(

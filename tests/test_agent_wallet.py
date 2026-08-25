@@ -230,21 +230,22 @@ def test_list__preserves_machine_readable_empty_state(monkeypatch):
     }
 
 
-def test_top_level_list__is_removed():
-    result = CliRunner().invoke(cli, ["agent-wallet", "list"])
+def test_top_level_list__is_generated_from_current_spec():
+    result = CliRunner().invoke(cli, ["agent-wallet", "list", "--help"])
 
-    assert result.exit_code == 2
-    assert "No such command 'list'" in result.output
+    assert result.exit_code == 0, result.output
+    assert "[AGENT_ID]" in result.output
+    assert "--limit" in result.output
 
 
-def test_payments__is_canonical_help_surface():
+def test_payments__is_canonical_payment_history_help_surface():
     group_help = CliRunner().invoke(cli, ["agent-wallet", "--help"])
     payments_help = CliRunner().invoke(cli, ["agent-wallet", "payments", "--help"])
 
     assert group_help.exit_code == 0, group_help.output
     assert payments_help.exit_code == 0, payments_help.output
     assert "  payments " in group_help.output
-    assert "  list " not in group_help.output
+    assert "  list " in group_help.output
     assert "  list " in payments_help.output
     assert "  cancel " in payments_help.output
 

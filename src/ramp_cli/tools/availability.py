@@ -75,7 +75,9 @@ class AvailabilitySnapshot:
         return self.entries.get((segment, tool.http_method.upper()))
 
 
-def fetch_availability(env: str) -> AvailabilitySnapshot | None:
+def fetch_availability(
+    env: str, *, profile: str | None = None
+) -> AvailabilitySnapshot | None:
     """Best-effort fetch of effective tool availability for the current token.
 
     Returns ``None`` when the kill switch is set, no credential is available,
@@ -84,10 +86,16 @@ def fetch_availability(env: str) -> AvailabilitySnapshot | None:
     """
     if os.environ.get(KILL_SWITCH_ENV_VAR):
         return None
-    if not os.environ.get("RAMP_ACCESS_TOKEN") and not store.is_authenticated(env):
+    authenticated = (
+        store.is_authenticated(env, profile=profile)
+        if profile
+        else store.is_authenticated(env)
+    )
+    if not os.environ.get("RAMP_ACCESS_TOKEN") and not authenticated:
         return None
     try:
-        payload = json.loads(RampClient(env).get(AVAILABILITY_PATH))
+        client = RampClient(env, profile=profile) if profile else RampClient(env)
+        payload = json.loads(client.get(AVAILABILITY_PATH))
         entries = {
             (item["tool"], item["method"].upper()): ToolAvailability(
                 available=bool(item["available"]),

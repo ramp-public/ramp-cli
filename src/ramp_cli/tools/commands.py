@@ -13,6 +13,7 @@ import threading
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
@@ -56,6 +57,8 @@ _TOOL_CALL_MODE_HEADER = "X-Ramp-Agent-Mode"
 _HUMAN_RATIONALE = "User initiated this request through the Ramp CLI."
 _APPLICATION_PROGRESS_PATH = "/developer/v1/applications/progress"
 _VAULT_PROXY_TOOL = "get-agent-card-creds"
+_OPTION_SUGGESTION_CUTOFF = 0.6
+_OPTION_SUGGESTION_MARGIN = 0.1
 
 CLI_RESOURCE_CATEGORIES = frozenset(
     {
@@ -222,6 +225,51 @@ def _build_argument(param: ToolParam) -> click.Argument:
     )
 
 
+class GeneratedToolCommand(click.Command):
+    """A generated command with conservative unknown-option guidance."""
+
+    @staticmethod
+    def _normalize_option(option: str) -> str:
+        return option.removeprefix("--").replace("-", "_").casefold()
+
+    def _suggest_option(self, ctx: click.Context, unknown: str) -> str | None:
+        candidates: dict[str, str] = {}
+        for param in self.get_params(ctx):
+            if not isinstance(param, click.Option) or param.hidden:
+                continue
+            for option in (*param.opts, *param.secondary_opts):
+                if option.startswith("--"):
+                    candidates.setdefault(self._normalize_option(option), option)
+
+        normalized = self._normalize_option(unknown)
+        ranked = sorted(
+            (
+                (SequenceMatcher(None, normalized, candidate).ratio(), option)
+                for candidate, option in candidates.items()
+            ),
+            reverse=True,
+        )
+        if not ranked or ranked[0][0] < _OPTION_SUGGESTION_CUTOFF:
+            return None
+        if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < _OPTION_SUGGESTION_MARGIN:
+            return None
+        return ranked[0][1]
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        try:
+            return super().parse_args(ctx, args)
+        except click.NoSuchOption as error:
+            message = error.message
+            if suggestion := self._suggest_option(ctx, error.option_name):
+                message += f" Did you mean '{suggestion}'?"
+            message += f"\nRun: {ctx.command_path} --help"
+            raise click.NoSuchOption(
+                error.option_name,
+                message=message,
+                ctx=ctx,
+            ) from error
+
+
 def build_tool_command(
     tool: ToolDef,
     *,
@@ -270,7 +318,7 @@ def build_tool_command(
     if any(p.is_complex for p in tool.params):
         help_text += " (use --json for complex fields)"
 
-    return click.Command(
+    return GeneratedToolCommand(
         name=tool.name,
         callback=callback,
         help=help_text,
@@ -575,7 +623,8 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
     stop_spinner = _start_spinner(tool.display_name) if is_human else None
     t0 = time.monotonic()
 
-    client = RampClient(env)
+    profile = ctx.obj.get("profile")
+    client = RampClient(env, profile=profile) if profile else RampClient(env)
     try:
         if wait_config is None:
             resp_bytes = _execute_prepared_request(
@@ -598,9 +647,9 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
             raise ApiError(
                 error.status_code,
                 error.body,
-                contextual_hint=_scope_error_hint(tool, env),
+                contextual_hint=_scope_error_hint(tool, env, profile),
             ) from error
-        hint = _availability_error_hint(tool, env, error)
+        hint = _availability_error_hint(tool, env, error, profile)
         if hint:
             raise ApiError(
                 error.status_code, error.body, contextual_hint=hint
@@ -640,11 +689,15 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
         _render_human(data, wide=wide, category=tool.category)
 
 
-def _availability_error_hint(tool: ToolDef, env: str, error: ApiError) -> str | None:
+def _availability_error_hint(
+    tool: ToolDef, env: str, error: ApiError, profile: str | None = None
+) -> str | None:
     """Explain a rejected tool call using the effective-availability endpoint."""
     if not 400 <= error.status_code < 500:
         return None
-    snapshot = fetch_availability(env)
+    snapshot = (
+        fetch_availability(env, profile=profile) if profile else fetch_availability(env)
+    )
     entry = snapshot.lookup(tool) if snapshot else None
     if entry is None or entry.available:
         return None
@@ -653,7 +706,7 @@ def _availability_error_hint(tool: ToolDef, env: str, error: ApiError) -> str | 
     )
 
 
-def _scope_error_hint(tool: ToolDef, env: str) -> str:
+def _scope_error_hint(tool: ToolDef, env: str, profile: str | None = None) -> str:
     if os.environ.get("RAMP_ACCESS_TOKEN"):
         return (
             f"The `{tool.name}` command was rejected by Core because "
@@ -678,13 +731,16 @@ def _scope_error_hint(tool: ToolDef, env: str) -> str:
             "before logging in.\n"
         )
 
+    login_command = f"ramp --env {env} auth login"
+    if profile == "agent":
+        login_command += " --client-id <agent-client-id>"
     return (
         f"The `{tool.name}` command was rejected by Core because the active "
         "credential has insufficient OAuth scope.\n"
         f"{override_guidance}\n"
         f"  Refresh the tool definitions and re-authorize for {env}:\n\n"
         f"    ramp --env {env} tools refresh\n"
-        f"    ramp --env {env} auth login"
+        f"    {login_command}"
     )
 
 

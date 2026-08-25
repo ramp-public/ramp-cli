@@ -83,9 +83,14 @@ def agent_wallet_payment_base_url() -> str:
 class AgentWalletClient:
     """Client for public Agent Wallet payments."""
 
-    def __init__(self, env: str, access_token: str | None = None) -> None:
+    def __init__(
+        self,
+        env: str,
+        access_token: str | None = None,
+        profile: str | None = None,
+    ) -> None:
         self.env = env
-        self._transport = AuthenticatedRampTransport(env, access_token)
+        self._transport = AuthenticatedRampTransport(env, access_token, profile)
 
     @property
     def payment_url(self) -> str:

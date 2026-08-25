@@ -49,15 +49,22 @@ def tools_refresh(ctx: click.Context) -> None:
 @click.pass_context
 def tools_list(ctx: click.Context) -> None:
     env: str = ctx.obj["env"]
+    profile = ctx.obj["profile"]
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
 
     # Opportunistically sync before listing so the user sees the latest tools.
     maybe_sync(env)
 
     categories = resolve_cli_tool_groups(list_tool_defs(env))
-    granted_scopes = get_known_granted_scopes(env)
+    granted_scopes = (
+        get_known_granted_scopes(env, profile=profile)
+        if profile
+        else get_known_granted_scopes(env)
+    )
     # Best-effort effective-availability overlay; None preserves current output.
-    snapshot = fetch_availability(env)
+    snapshot = (
+        fetch_availability(env, profile=profile) if profile else fetch_availability(env)
+    )
 
     def _is_business_disabled(tool) -> bool:
         entry = snapshot.lookup(tool) if snapshot else None
@@ -145,7 +152,11 @@ def tools_schema(ctx: click.Context, category: str, tool_name: str) -> None:
     named_tools = resolve_tool_command_names(
         category,
         category_tools,
-        granted_scopes=get_known_granted_scopes(env),
+        granted_scopes=(
+            get_known_granted_scopes(env, profile=ctx.obj["profile"])
+            if ctx.obj["profile"]
+            else get_known_granted_scopes(env)
+        ),
     )
     tool = next(
         (candidate for name, candidate in named_tools if name == tool_name),

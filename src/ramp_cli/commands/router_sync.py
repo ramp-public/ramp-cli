@@ -1,11 +1,11 @@
 """Rate-limited session-start sync for installed Router artifacts.
 
-Configure/refresh register a SessionStart hook in Claude Code and Codex that
-runs `ramp router sync --hook`, keeping the locally installed artifacts (Codex
-catalog snapshot and instructions, Claude statusline, default model ids,
-plugin paths) from going stale. The invocation is cheap and fail-open: the
-common case is one stat() with zero network I/O, and an expired cooldown
-spawns `ramp router refresh` detached so session start never waits.
+Configure/refresh register a session-start sync in Claude Code, Codex, and
+OpenCode that runs `ramp router sync --hook`, keeping the locally installed
+artifacts (Codex catalog snapshot and instructions, Claude statusline, default
+model ids, plugin paths) from going stale. The invocation is cheap and
+fail-open: the common case is one stat() with zero network I/O, and an expired
+cooldown spawns `ramp router refresh` detached so session start never waits.
 """
 
 from __future__ import annotations
@@ -132,7 +132,7 @@ def ramp_executable() -> Path | None:
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return candidate
     resolved = shutil.which("ramp")
-    return Path(resolved) if resolved else None
+    return Path(os.path.abspath(resolved)) if resolved else None
 
 
 def session_sync_hook_command(client: str) -> str | None:
@@ -178,7 +178,12 @@ def command_runs_session_sync(command: str) -> bool:
         return False
     if tokens[1:4] != ["router", "sync", "--hook"]:
         return False
-    return tokens[4:] in ([], ["--client", "claude-code"], ["--client", "codex"])
+    return tokens[4:] in (
+        [],
+        ["--client", "claude-code"],
+        ["--client", "codex"],
+        ["--client", "opencode"],
+    )
 
 
 def spawn_detached_refresh() -> None:

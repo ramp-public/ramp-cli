@@ -44,6 +44,28 @@ def test_get_access_token__refreshes_when_only_refresh_token_exists(monkeypatch)
     assert client._get_access_token() == "access-new"
 
 
+def test_get_access_token__loads_and_refreshes_selected_profile(monkeypatch):
+    client = AuthenticatedRampTransport("sandbox", profile="agent")
+    observed = {}
+
+    def get_state(env: str, *, profile: str):
+        observed["state"] = (env, profile)
+        return TokenState(refresh_token="agent-refresh")
+
+    def refresh(env: str, *, profile: str):
+        observed["refresh"] = (env, profile)
+        return "agent-access"
+
+    monkeypatch.setattr("ramp_cli.client.transport.store.get_token_state", get_state)
+    monkeypatch.setattr("ramp_cli.client.transport.try_refresh", refresh)
+
+    assert client._get_access_token() == "agent-access"
+    assert observed == {
+        "state": ("sandbox", "agent"),
+        "refresh": ("sandbox", "agent"),
+    }
+
+
 def test_get_access_token__raises_auth_required_without_local_credentials(monkeypatch):
     client = AuthenticatedRampTransport("sandbox")
     monkeypatch.setattr(
@@ -56,6 +78,21 @@ def test_get_access_token__raises_auth_required_without_local_credentials(monkey
 
     assert exc_info.value.code == EXIT_AUTH_REQUIRED
     assert "ramp --env sandbox auth login" in str(exc_info.value)
+
+
+def test_get_access_token__agent_error_explains_how_to_reauthenticate(monkeypatch):
+    client = AuthenticatedRampTransport("sandbox", profile="agent")
+    monkeypatch.setattr(
+        "ramp_cli.client.transport.store.get_token_state",
+        lambda env, *, profile: TokenState(),
+    )
+
+    with pytest.raises(AuthRequiredError) as exc_info:
+        client._get_access_token()
+
+    assert "ramp --env sandbox auth login --client-id <agent-client-id>" in str(
+        exc_info.value
+    )
 
 
 def test_get_access_token__raises_when_refresh_fails(monkeypatch):

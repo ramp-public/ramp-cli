@@ -18,6 +18,7 @@ export type RouterPluginOptions = PluginOptions & {
   usageBaseURL?: string
   apiKey?: string
   apiKeyEnv?: string
+  rampExecutable?: string
 }
 
 export function nonEmpty(value: unknown, fallback: string): string {

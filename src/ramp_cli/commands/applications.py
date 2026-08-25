@@ -316,7 +316,9 @@ def _inject_pkce_authorize_params(body: dict[str, Any], callback: PkceCallback) 
     )
 
 
-def _save_token_response(env: str, token_resp: TokenResponse) -> None:
+def _save_token_response(
+    env: str, token_resp: TokenResponse, profile: str | None = None
+) -> None:
     store.save_tokens(
         env,
         token_resp.access_token,
@@ -326,6 +328,7 @@ def _save_token_response(env: str, token_resp: TokenResponse) -> None:
         granted_scopes=token_resp.scope,
         agent_key_uuid=token_resp.agent_key_uuid,
         clear_granted_scopes=not bool(token_resp.scope),
+        profile=profile,
     )
 
 
@@ -451,7 +454,7 @@ def create_application(
                 timeout_message=f"OAuth redirect timed out after {auth_timeout} seconds",
             )
             token_resp = exchange_pkce_callback_code(env, callback, code)
-            _save_token_response(env, token_resp)
+            _save_token_response(env, token_resp, ctx.obj["profile"])
             authenticated = True
         except KeyboardInterrupt:
             suppress_next_update_notice()

@@ -5,6 +5,11 @@ Pi refreshes authenticated `GET /v1/models` discovery through its provider
 credential store and caches exactly the models available to the configured
 Router API key. Model requests use the OpenAI Responses API.
 
+Router sessions also show a native widget above Pi's editor after settled
+turns. It reports Switchyard routing, Router's last routed model and provider,
+and Ramp session cost against the Claude Opus reference cost. The built-in Pi
+footer and local cost display remain unchanged.
+
 The recommended installer is:
 
 ```bash

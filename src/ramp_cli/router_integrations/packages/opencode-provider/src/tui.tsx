@@ -16,6 +16,7 @@ import { fetchSessionUsage } from "./usage.ts"
 import type { SessionUsage } from "./usage.ts"
 import { sidebarUsageView } from "./sidebar-view.ts"
 import type { SidebarBarRow } from "./sidebar-view.ts"
+import { showRampCLIUpdateNotice } from "./update-notice.ts"
 
 const USAGE_FETCH_TIMEOUT_MS = 3_000
 // One idle event ends every turn, but streams of them can land close together
@@ -49,6 +50,11 @@ function barFill(row: SidebarBarRow): string {
 const RouterTui: TuiPlugin = async (api, rawOptions) => {
   const options = routerPluginOptions(rawOptions)
   const providerID = resolveProviderID(options)
+  const [updateNotice, setUpdateNotice] = createSignal<string>()
+
+  // Deliberately not awaited: the bounded, fail-open hook reads cached state
+  // while the TUI continues becoming ready.
+  void showRampCLIUpdateNotice(api.ui.toast, options).then(setUpdateNotice)
 
   const [usages, setUsages] = createSignal<Record<string, SessionUsage>>({})
   const inFlight = new Set<string>()
@@ -153,37 +159,55 @@ const RouterTui: TuiPlugin = async (api, rawOptions) => {
         })
         const theme = () => ctx.theme.current
         return (
-          <Show when={view()}>
-            {(v) => (
-              <box flexDirection="column">
-                <Show when={v().switchyardEnabled}>
-                  <text fg={NVIDIA_GREEN}>Switchyard enabled</text>
-                  <text> </text>
-                </Show>
-                <Show when={v().routedTo || v().delta}>
-                  <box flexDirection="row" gap={2}>
-                    <Show when={v().routedTo}>
-                      <text fg={theme().text}>
-                        <b>{v().routedTo}</b>
-                      </text>
+          <Show when={view() || updateNotice()}>
+            <box flexDirection="column">
+              <Show when={view()}>
+                {(v) => (
+                  <>
+                    <Show when={v().switchyardEnabled}>
+                      <text fg={NVIDIA_GREEN}>Switchyard enabled</text>
+                      <text> </text>
                     </Show>
-                    <Show when={v().delta}>
-                      <text fg={RAMP_YELLOW}>{v().delta}</text>
+                    <Show when={v().routedTo || v().delta}>
+                      <box flexDirection="row" gap={2}>
+                        <Show when={v().routedTo}>
+                          <text fg={theme().text}>
+                            <b>{v().routedTo}</b>
+                          </text>
+                        </Show>
+                        <Show when={v().delta}>
+                          <text fg={RAMP_YELLOW}>{v().delta}</text>
+                        </Show>
+                      </box>
                     </Show>
-                  </box>
-                </Show>
-                <For each={v().bars}>
-                  {(row) => (
-                    <box flexDirection="row">
-                      <text fg={theme().text}>{`${row.label} `}</text>
-                      <text fg={barFill(row)}>{"█".repeat(row.filled)}</text>
-                      <text fg={theme().textMuted}>{"░".repeat(row.empty)}</text>
-                      <text fg={theme().text}>{` ${row.cost}`}</text>
-                    </box>
-                  )}
-                </For>
-              </box>
-            )}
+                    <For each={v().bars}>
+                      {(row) => (
+                        <box flexDirection="row">
+                          <text fg={theme().text}>{`${row.label} `}</text>
+                          <text fg={barFill(row)}>{"█".repeat(row.filled)}</text>
+                          <text fg={theme().textMuted}>
+                            {"░".repeat(row.empty)}
+                          </text>
+                          <text fg={theme().text}>{` ${row.cost}`}</text>
+                        </box>
+                      )}
+                    </For>
+                  </>
+                )}
+              </Show>
+              <Show when={updateNotice()}>
+                {(notice) => (
+                  <>
+                    <Show when={view()}>
+                      <text> </text>
+                    </Show>
+                    <text fg={RAMP_YELLOW} wrapMode="word">
+                      {notice()}
+                    </text>
+                  </>
+                )}
+              </Show>
+            </box>
           </Show>
         )
       },

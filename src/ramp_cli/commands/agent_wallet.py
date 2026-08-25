@@ -107,7 +107,7 @@ def _submit_payment(
         )
     if display_amount and is_human:
         click.echo(f"Amount: {display_amount}", err=True)
-    result = AgentWalletClient(ctx.obj["env"]).pay(body)
+    result = AgentWalletClient(ctx.obj["env"], profile=ctx.obj["profile"]).pay(body)
     if result.get("payment_operation_id") != str(payment_id):
         raise AgentWalletClientError("Agent Wallet returned an invalid response")
     _render(result, ctx)
@@ -142,7 +142,9 @@ def payments_group() -> None:
 @click.pass_context
 def list_payments(ctx: click.Context, limit: int) -> None:
     """List recent Agent Wallet payments."""
-    payments = AgentWalletClient(ctx.obj["env"]).list_payments(limit)
+    payments = AgentWalletClient(
+        ctx.obj["env"], profile=ctx.obj["profile"]
+    ).list_payments(limit)
     if (
         not payments
         and resolve_format(ctx.obj["format"], ctx.obj["config_format"]) != "json"
@@ -153,7 +155,9 @@ def list_payments(ctx: click.Context, limit: int) -> None:
 
 
 def _cancel_payment(ctx: click.Context, payment_id: UUID) -> None:
-    result = AgentWalletClient(ctx.obj["env"]).cancel(payment_id)
+    result = AgentWalletClient(ctx.obj["env"], profile=ctx.obj["profile"]).cancel(
+        payment_id
+    )
     if result.get("payment_operation_id") != str(payment_id):
         raise AgentWalletClientError("Agent Wallet returned an invalid response")
     _render(result, ctx)

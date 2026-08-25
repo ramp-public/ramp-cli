@@ -41,10 +41,11 @@ def getting_started_cmd(ctx: click.Context) -> None:
     """Print a getting-started guide tailored to the user's granted scopes
     and tool-usage history."""
     env: str = ctx.obj["env"]
+    profile: str | None = ctx.obj["profile"]
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     is_json = fmt == "json"
 
-    if not is_authenticated(env):
+    if not is_authenticated(env, profile=profile):
         if is_json:
             print_agent_json(
                 {
@@ -62,7 +63,7 @@ def getting_started_cmd(ctx: click.Context) -> None:
             )
         return
 
-    scopes = get_granted_scopes(env)
+    scopes = get_granted_scopes(env, profile=profile)
     categories = _remap_categories(list_categories(env))
     print_getting_started(
         env=env,
