@@ -47,6 +47,9 @@ _HEADER_BG = (88, 88, 88)  # #585858 — header row background
 DIAMOND_FILLED = "\u25c6"  # ◆  authenticated
 DIAMOND_HOLLOW = "\u25c7"  # ◇  not authenticated
 
+# === Semantic Colors ===
+SUCCESS_GREEN = "green"
+
 # === Box Drawing ===
 BOX_H = "\u2500"  # ─
 BOX_V = "\u2502"  # │

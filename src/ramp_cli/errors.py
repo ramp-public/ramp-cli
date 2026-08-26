@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from http import HTTPStatus
 
+from ramp_cli.config.profiles import AGENT_PROFILE
+
 EXIT_SUCCESS = 0
 EXIT_RUNTIME = 1
 EXIT_USAGE = 2
@@ -167,8 +169,8 @@ class AuthRequiredError(RampCLIError):
     def __init__(self, env: str, profile: str | None = None) -> None:
         profile_label = f" profile {profile!r}" if profile else ""
         login_command = "ramp auth login"
-        if profile == "agent":
-            login_command += " --client-id <agent-client-id>"
+        if profile == AGENT_PROFILE:
+            login_command = "ramp agent login --client-id <agent-client-id>"
         super().__init__(
             f"Not authenticated for {env}{profile_label} — run: "
             f"ramp --env {env} {login_command.removeprefix('ramp ')}",

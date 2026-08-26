@@ -12,6 +12,7 @@ import click
 
 from ramp_cli import __version__ as VERSION
 from ramp_cli.auth.store import get_known_granted_scopes
+from ramp_cli.commands.agent import agent_group
 from ramp_cli.commands.agent_wallet import agent_wallet_group
 from ramp_cli.commands.applications import applications_group
 from ramp_cli.commands.auth import auth_group
@@ -564,6 +565,7 @@ def _validate_flags(
 # ── Command registration ────────────────────────────────────────────────────
 
 for _cmd in (
+    agent_group,
     agent_wallet_group,
     applications_group,
     auth_group,

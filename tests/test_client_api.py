@@ -90,7 +90,7 @@ def test_get_access_token__agent_error_explains_how_to_reauthenticate(monkeypatc
     with pytest.raises(AuthRequiredError) as exc_info:
         client._get_access_token()
 
-    assert "ramp --env sandbox auth login --client-id <agent-client-id>" in str(
+    assert "ramp --env sandbox agent login --client-id <agent-client-id>" in str(
         exc_info.value
     )
 

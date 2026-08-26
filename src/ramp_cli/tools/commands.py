@@ -25,6 +25,7 @@ from ramp_cli.client.api import RampClient
 from ramp_cli.client.session import get_session_id
 from ramp_cli.client.vault import vault_proxy_headers, vault_proxy_target
 from ramp_cli.config.constants import api_url, append_query_params
+from ramp_cli.config.profiles import AGENT_PROFILE
 from ramp_cli.config.settings import configured_scopes, resolve_environment
 from ramp_cli.errors import ApiError
 from ramp_cli.onboarding import maybe_show_category_tip
@@ -732,8 +733,8 @@ def _scope_error_hint(tool: ToolDef, env: str, profile: str | None = None) -> st
         )
 
     login_command = f"ramp --env {env} auth login"
-    if profile == "agent":
-        login_command += " --client-id <agent-client-id>"
+    if profile == AGENT_PROFILE:
+        login_command = f"ramp --env {env} agent login --client-id <agent-client-id>"
     return (
         f"The `{tool.name}` command was rejected by Core because the active "
         "credential has insufficient OAuth scope.\n"

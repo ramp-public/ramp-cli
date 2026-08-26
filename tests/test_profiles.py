@@ -6,6 +6,7 @@ import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -43,6 +44,20 @@ def test_profile_command_reports_and_lists_active_profile(isolated_config):
     assert current.output.strip() == "human"
     assert human_line.startswith("* human")
     assert "not authenticated" not in human_line
+
+
+def test_profile_list_colors_authenticated_status_green(isolated_config):
+    store.save_tokens("production", "agent-token", "", profile="agent")
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "profile", "list"],
+        color=True,
+        catch_exceptions=False,
+    )
+    agent_line = next(line for line in result.output.splitlines() if "agent" in line)
+
+    assert click.style("authenticated", fg="green", bold=True) in agent_line
 
 
 def test_profile_switch_uses_agent_json_output(isolated_config):

@@ -22,7 +22,7 @@ from ramp_cli.config.constants import base_url, iter_environments
 from ramp_cli.errors import EnvironmentAuthRequiredError
 from ramp_cli.onboarding import is_first_login, record_first_login, show_welcome
 from ramp_cli.output.formatter import print_agent_json, resolve_format
-from ramp_cli.output.style import env_label, show_status_box
+from ramp_cli.output.style import SUCCESS_GREEN, env_label, show_status_box
 from ramp_cli.specs.sync import fetch_spec
 
 CLIENT_SECRET_ENV_VAR = "RAMP_CLIENT_SECRET"
@@ -197,7 +197,7 @@ def login(
         raise click.UsageError("--client-secret requires --client-id.")
 
     if client_id:
-        _login_standalone_agent(
+        login_standalone_agent(
             ctx,
             env=env,
             label=label,
@@ -267,7 +267,7 @@ def login(
         click.echo()
 
 
-def _login_standalone_agent(
+def login_standalone_agent(
     ctx: click.Context,
     *,
     env: str,
@@ -338,7 +338,7 @@ def _login_standalone_agent(
         )
         return
 
-    click.secho("\u2713 Standalone agent authenticated", fg="green", bold=True)
+    click.secho("\u2713 Standalone agent authenticated", fg=SUCCESS_GREEN, bold=True)
 
 
 @auth_group.command()
@@ -386,13 +386,9 @@ def status(ctx: click.Context) -> None:
                 click.echo(f"  Scopes: {len(scopes)} granted", err=True)
 
 
-@auth_group.command()
-@click.pass_context
-def logout(ctx: click.Context) -> None:
-    """Clear stored credentials."""
-
+def logout_profile(ctx: click.Context, profile: str | None) -> None:
+    """Clear stored credentials for a profile."""
     env = ctx.obj["env"]
-    profile = ctx.obj["profile"]
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
 
     if not store.has_tokens(env, profile=profile):
@@ -425,3 +421,11 @@ def logout(ctx: click.Context) -> None:
         )
     else:
         click.echo(f"Logged out of {env_label(env)}.")
+
+
+# TODO: Remove `ramp auth logout` after callers migrate to `ramp agent logout`.
+@auth_group.command()
+@click.pass_context
+def logout(ctx: click.Context) -> None:
+    """Clear stored credentials."""
+    logout_profile(ctx, ctx.obj["profile"])

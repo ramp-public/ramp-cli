@@ -9,6 +9,7 @@ import click
 from ramp_cli.auth import store
 from ramp_cli.config import profiles
 from ramp_cli.output.formatter import print_agent_json, resolve_format
+from ramp_cli.output.style import SUCCESS_GREEN
 
 
 @click.command("profile", help="Show, list, or switch credential profiles")
@@ -76,5 +77,9 @@ def _list_profiles(ctx: click.Context) -> None:
 
     for record in records:
         marker = "*" if record["active"] else " "
-        status = "authenticated" if record["authenticated"] else "not authenticated"
+        status = (
+            click.style("authenticated", fg=SUCCESS_GREEN, bold=True)
+            if record["authenticated"]
+            else "not authenticated"
+        )
         click.echo(f"{marker} {record['profile']:<24} {status}")

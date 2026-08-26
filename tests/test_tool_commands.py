@@ -1835,7 +1835,7 @@ class TestCLIIntegration:
         assert result.exit_code == 0
         assert "list" in result.output
 
-    def test_agent_singleton_stays_resource(self, monkeypatch):
+    def test_agent_singleton_stays_resource_with_login_command(self, monkeypatch):
         agent_tool = ToolDef(
             name="get_agent_list_resource",
             path="/developer/v1/agents",
@@ -1855,10 +1855,14 @@ class TestCLIIntegration:
 
         runner = CliRunner()
         root_help = runner.invoke(cli, ["--help"])
+        agent_help = runner.invoke(cli, ["agent", "--help"])
         list_help = runner.invoke(cli, ["agent", "list", "--help"])
 
         assert root_help.exit_code == 0
         assert "Manage standalone agent identities" in root_help.output
+        assert agent_help.exit_code == 0
+        assert "login" in agent_help.output
+        assert "list" in agent_help.output
         assert list_help.exit_code == 0
         assert "Usage: cli agent list" in list_help.output
 

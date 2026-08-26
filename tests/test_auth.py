@@ -25,7 +25,7 @@ from ramp_cli.auth.oauth import (
     _generate_verifier,
 )
 from ramp_cli.commands import auth as auth_command_module
-from ramp_cli.config import settings
+from ramp_cli.config import profiles, settings
 from ramp_cli.errors import RefreshFailedError
 from ramp_cli.main import BoxHelpFormatter, cli, main
 from ramp_cli.onboarding import record_first_login
@@ -276,6 +276,45 @@ class TestAuthLogout:
         data = json.loads(result.output)
         assert data["schema_version"] == "1.0"
         assert "Logged out" in data["data"][0]["message"]
+
+    def test_agent_logout_clears_only_selected_agent_environment(self, isolated_config):
+        store.save_tokens(
+            "sandbox",
+            "standalone-access",
+            "",
+            granted_scopes="transactions:read",
+            profile=profiles.AGENT_PROFILE,
+        )
+        store.save_tokens(
+            "production",
+            "production-access",
+            "",
+            profile=profiles.AGENT_PROFILE,
+        )
+        store.save_tokens(
+            "sandbox",
+            "human-access",
+            "human-refresh",
+            profile=profiles.HUMAN_PROFILE,
+        )
+
+        result = CliRunner().invoke(
+            cli,
+            ["--agent", "--env", "sandbox", "agent", "logout"],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert not store.has_tokens("sandbox", profile=profiles.AGENT_PROFILE)
+        assert not store.get_granted_scopes("sandbox", profile=profiles.AGENT_PROFILE)
+        assert store.get_tokens("production", profile=profiles.AGENT_PROFILE) == (
+            "production-access",
+            "",
+        )
+        assert store.get_tokens("sandbox", profile=profiles.HUMAN_PROFILE) == (
+            "human-access",
+            "human-refresh",
+        )
 
 
 def test_status_reports_expired_tokens_as_unauthenticated(isolated_config):
@@ -1066,6 +1105,61 @@ class TestAuthLoginSpecRefresh:
 
 
 class TestStandaloneAgentLogin:
+    def test_agent_login_reads_credentials_from_environment(
+        self, isolated_config, monkeypatch
+    ):
+        monkeypatch.setenv("RAMP_CLIENT_ID", "agent-client")
+        monkeypatch.setenv("RAMP_CLIENT_SECRET", "agent-secret")
+        monkeypatch.setattr(
+            "ramp_cli.tools.commands.maybe_sync",
+            lambda env: pytest.fail("agent login must not refresh the tool spec"),
+        )
+
+        def fake_client_credentials_login(
+            env: str,
+            *,
+            client_id: str,
+            client_secret: str,
+            scopes: tuple[str, ...],
+        ) -> TokenResponse:
+            assert env == "sandbox"
+            assert client_id == "agent-client"
+            assert client_secret == "agent-secret"
+            assert scopes == ()
+            return TokenResponse(
+                access_token="standalone-access",
+                expires_in=604800,
+                scope="transactions:read",
+            )
+
+        monkeypatch.setattr(
+            auth_command_module,
+            "do_client_credentials_login",
+            fake_client_credentials_login,
+        )
+
+        result = CliRunner().invoke(
+            cli,
+            ["--agent", "--env", "sandbox", "agent", "login"],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert store.get_tokens("sandbox", profile="agent") == (
+            "standalone-access",
+            "",
+        )
+        assert settings.load().profile == "agent"
+
+    def test_agent_login_requires_client_id(self, isolated_config, monkeypatch):
+        monkeypatch.delenv("RAMP_CLIENT_ID", raising=False)
+        monkeypatch.setenv("RAMP_CLIENT_SECRET", "agent-secret")
+
+        result = CliRunner().invoke(cli, ["--human", "agent", "login"])
+
+        assert result.exit_code == 2
+        assert "Pass --client-id or set RAMP_CLIENT_ID." in result.output
+
     def test_env_secret_selects_client_credentials_and_replaces_stale_state(
         self, isolated_config, monkeypatch
     ):

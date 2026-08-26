@@ -54,13 +54,13 @@ env:
   RAMP_CLIENT_ID: ${{ vars.RAMP_CLIENT_ID }}
   RAMP_CLIENT_SECRET: ${{ secrets.RAMP_CLIENT_SECRET }}
 steps:
-  - run: ramp --env production auth login --client-id "$RAMP_CLIENT_ID"
+  - run: ramp --env production agent login
 ```
 
-`RAMP_CLIENT_SECRET` is read automatically. Client-credentials tokens cannot be
-refreshed. Use the `expires_in` value from the login output to schedule the next full
-login before the access token expires. Human users should use `ramp auth login` and
-the browser-based PKCE flow instead.
+`RAMP_CLIENT_ID` and `RAMP_CLIENT_SECRET` are read automatically. Client-credentials
+tokens cannot be refreshed. Use the `expires_in` value from the login output to
+schedule the next full login before the access token expires. Human users should use
+`ramp auth login` and the browser-based PKCE flow instead.
 
 ### Switching identities with profiles
 
@@ -69,7 +69,7 @@ logging in again:
 
 ```bash
 ramp auth login
-ramp auth login --client-id "$RAMP_CLIENT_ID"
+ramp agent login
 ramp profile human
 ramp profile agent
 ramp profile list
