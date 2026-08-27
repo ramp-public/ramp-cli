@@ -20,6 +20,7 @@ def cowork_host(tmp_path, monkeypatch):
     events = []
     monkeypatch.setattr(claude_cowork, "_ensure_claude_installed", lambda: None)
     monkeypatch.setattr(claude_cowork, "_quit_claude", lambda: events.append("quit"))
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: False)
     monkeypatch.setattr(
         claude_cowork,
         "_launch_claude",
@@ -214,7 +215,9 @@ def test_configure_and_unconfigure_restore_the_previous_claude_setup(cowork_host
     desktop_path.write_text(json.dumps(original_desktop))
     meta_path.write_text(json.dumps(original_meta))
 
-    profile_path = claude_cowork.configure("router-secret", "https://router.example/v1")
+    profile_path, _ = claude_cowork.configure(
+        "router-secret", "https://router.example/v1"
+    )
 
     assert events == ["quit", "launch"]
     desktop = json.loads(desktop_path.read_text())
@@ -314,7 +317,9 @@ def test_unconfigure_reads_settings_after_claude_flushes_on_quit(
 def test_unconfigure_removes_files_that_configure_created(cowork_host):
     root, _events = cowork_host
 
-    profile_path = claude_cowork.configure("router-secret", "https://router.example/v1")
+    profile_path, _ = claude_cowork.configure(
+        "router-secret", "https://router.example/v1"
+    )
     claude_cowork.unconfigure()
 
     assert not (root / "Claude-3p" / "claude_desktop_config.json").exists()
@@ -331,8 +336,10 @@ def test_reconfigure_rotates_the_key_without_losing_the_original_snapshot(
     desktop_path = third_party / "claude_desktop_config.json"
     desktop_path.write_text(json.dumps({"deploymentMode": "1p"}))
 
-    first_profile = claude_cowork.configure("first-secret", "https://router.example/v1")
-    second_profile = claude_cowork.configure(
+    first_profile, _ = claude_cowork.configure(
+        "first-secret", "https://router.example/v1"
+    )
+    second_profile, _ = claude_cowork.configure(
         "second-secret", "https://router.example/v1"
     )
 
@@ -349,7 +356,9 @@ def test_interrupted_reconfigure_restores_the_previous_receipt_and_profile(
     cowork_host, monkeypatch
 ):
     _root, events = cowork_host
-    profile_path = claude_cowork.configure("first-secret", "https://router.example/v1")
+    profile_path, _ = claude_cowork.configure(
+        "first-secret", "https://router.example/v1"
+    )
     previous_state = claude_cowork.state_path().read_text()
     real_write = claude_cowork._write_private_json
     interrupted = False
@@ -384,7 +393,9 @@ def test_interrupted_unconfigure_restores_all_router_files(cowork_host, monkeypa
     meta_path = library / "_meta.json"
     desktop_path.write_text(json.dumps({"deploymentMode": "1p"}))
     meta_path.write_text(json.dumps({"entries": [], "appliedId": ""}))
-    profile_path = claude_cowork.configure("router-secret", "https://router.example/v1")
+    profile_path, _ = claude_cowork.configure(
+        "router-secret", "https://router.example/v1"
+    )
     before = {
         path: path.read_text()
         for path in (
@@ -417,7 +428,9 @@ def test_interrupted_unconfigure_restores_all_router_files(cowork_host, monkeypa
 
 def test_unconfigure_refuses_to_delete_a_profile_the_user_changed(cowork_host):
     _root, events = cowork_host
-    profile_path = claude_cowork.configure("router-secret", "https://router.example/v1")
+    profile_path, _ = claude_cowork.configure(
+        "router-secret", "https://router.example/v1"
+    )
     profile = json.loads(profile_path.read_text())
     profile["custom"] = True
     profile_path.write_text(json.dumps(profile))
@@ -433,7 +446,9 @@ def test_unconfigure_refuses_to_delete_a_profile_the_user_changed(cowork_host):
 
 def test_unconfigure_refuses_to_delete_a_profile_with_a_changed_gateway(cowork_host):
     _root, events = cowork_host
-    profile_path = claude_cowork.configure("router-secret", "https://router.example/v1")
+    profile_path, _ = claude_cowork.configure(
+        "router-secret", "https://router.example/v1"
+    )
     profile = json.loads(profile_path.read_text())
     profile["inferenceGatewayBaseUrl"] = "https://different.example"
     profile_path.write_text(json.dumps(profile))
@@ -518,7 +533,9 @@ def test_unconfigure_preserves_metadata_added_after_cli_created_the_library(
 
 def test_unconfigure_uses_a_restore_specific_relaunch_error(cowork_host, monkeypatch):
     _root, _events = cowork_host
-    profile_path = claude_cowork.configure("router-secret", "https://router.example/v1")
+    profile_path, _ = claude_cowork.configure(
+        "router-secret", "https://router.example/v1"
+    )
 
     def fail_launch(*, failure_message=None):
         raise click.ClickException(failure_message or "wrong setup message")
@@ -553,7 +570,9 @@ def test_unconfigure_preserves_shared_settings_after_the_active_profile_changes(
         )
     )
 
-    profile_path = claude_cowork.configure("router-secret", "https://router.example/v1")
+    profile_path, _ = claude_cowork.configure(
+        "router-secret", "https://router.example/v1"
+    )
     desktop_path.write_text(
         json.dumps({"deploymentMode": "3p", "awaitingSignIn": False})
     )
@@ -654,3 +673,246 @@ def test_setup_file_is_validated_without_exposing_its_key(tmp_path):
     with pytest.raises(click.ClickException) as error:
         claude_cowork.read_setup_file(setup_path)
     assert "router-secret" not in str(error.value)
+
+
+# The ids below mirror Router's actual rename history for one model: the
+# selector state written before a rename keeps the old id, and Claude sizes
+# unrecognized ids at its 200k unknown-model fallback instead of the model's
+# real window.
+CURRENT_MODEL_IDS = (
+    "claude-opus-5",
+    "claude-fable-router-5-6-sol-419255[1m]",
+    "claude-fable-router-model-1e3b36d63ed19af0[1m]",
+    "claude-fable-router-model-44968622fb48d054",
+)
+
+
+def _account_settings_path(root: Path) -> Path:
+    return (
+        root
+        / "Claude-3p"
+        / "local-agent-mode-sessions"
+        / "1bcd7467"
+        / "00000000"
+        / "cowork_account_settings.json"
+    )
+
+
+def _write_stale_selector_state(root: Path) -> Path:
+    path = _account_settings_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "__created_at": "2026-08-15T22:23:31.085Z",
+                "__model_selector_state": {
+                    "cowork": {"model": "claude-router-5-6-sol-419255"},
+                    "code": {
+                        "model": "claude-router-5-6-sol-419255[1m]",
+                        "thinking_by_model": {
+                            "claude-router-model-1e3b36d63ed19af0": {
+                                "type": "effort",
+                                "effort": "high",
+                            }
+                        },
+                    },
+                },
+            }
+        )
+    )
+    return path
+
+
+@pytest.mark.parametrize(
+    ("persisted", "expected"),
+    [
+        # Already current: nothing to do.
+        ("claude-fable-router-5-6-sol-419255[1m]", None),
+        # Same id without the 1M marker: restore the marker.
+        (
+            "claude-fable-router-5-6-sol-419255",
+            "claude-fable-router-5-6-sol-419255[1m]",
+        ),
+        # Renamed prefix: join on the catalog hash the id ends with.
+        ("claude-router-5-6-sol-419255", "claude-fable-router-5-6-sol-419255[1m]"),
+        # A longer digest generation of the same catalog hash still joins.
+        (
+            "claude-router-accounts-fireworks-models-kimi-k3-1e3b36[1m]",
+            "claude-fable-router-model-1e3b36d63ed19af0[1m]",
+        ),
+        # Anthropic ids have no hash token and never remap.
+        ("claude-opus-4-8", None),
+        # An id Router no longer serves at all is left alone.
+        ("claude-router-model-ffffff", None),
+    ],
+)
+def test_resolve_current_model_id_joins_on_the_catalog_hash(persisted, expected):
+    assert (
+        claude_cowork._resolve_current_model_id(persisted, CURRENT_MODEL_IDS)
+        == expected
+    )
+
+
+def test_resolve_current_model_id_refuses_an_ambiguous_join():
+    current = (
+        "claude-fable-router-model-419255aaaaaaaaaa[1m]",
+        "claude-fable-router-5-6-sol-419255[1m]",
+    )
+    assert (
+        claude_cowork._resolve_current_model_id("claude-router-5-6-sol-419255", current)
+        is None
+    )
+
+
+def test_configure_migrates_stale_model_selections(cowork_host):
+    tmp_path, _events = cowork_host
+    settings_path = _write_stale_selector_state(tmp_path)
+
+    _, migrated = claude_cowork.configure(
+        "router-secret",
+        "https://router.example/v1",
+        model_ids=CURRENT_MODEL_IDS,
+    )
+
+    selector = json.loads(settings_path.read_text())["__model_selector_state"]
+    assert selector["cowork"]["model"] == "claude-fable-router-5-6-sol-419255[1m]"
+    assert selector["code"]["model"] == "claude-fable-router-5-6-sol-419255[1m]"
+    assert selector["code"]["thinking_by_model"] == {
+        "claude-fable-router-model-1e3b36d63ed19af0[1m]": {
+            "type": "effort",
+            "effort": "high",
+        }
+    }
+    assert [(change["surface"], change["field"]) for change in migrated] == [
+        ("cowork", "model"),
+        ("code", "model"),
+        ("code", "thinking_by_model"),
+    ]
+    assert all(change["path"] == str(settings_path) for change in migrated)
+
+
+def test_configure_without_model_ids_leaves_selections_alone(cowork_host):
+    tmp_path, _events = cowork_host
+    settings_path = _write_stale_selector_state(tmp_path)
+    before = settings_path.read_text()
+
+    claude_cowork.configure("router-secret", "https://router.example/v1")
+
+    assert settings_path.read_text() == before
+
+
+def test_configure_skips_selector_documents_it_cannot_read(cowork_host):
+    tmp_path, _events = cowork_host
+    broken = _account_settings_path(tmp_path)
+    broken.parent.mkdir(parents=True, exist_ok=True)
+    broken.write_text("not json")
+
+    _, migrated = claude_cowork.configure(
+        "router-secret",
+        "https://router.example/v1",
+        model_ids=CURRENT_MODEL_IDS,
+    )
+
+    assert migrated == ()
+    assert broken.read_text() == "not json"
+
+
+def test_migrate_model_selections_waits_for_claude_to_close(cowork_host, monkeypatch):
+    tmp_path, _events = cowork_host
+    settings_path = _write_stale_selector_state(tmp_path)
+    before = settings_path.read_text()
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: True)
+
+    outcome = claude_cowork.migrate_model_selections(CURRENT_MODEL_IDS)
+
+    assert outcome.skipped_while_running
+    assert outcome.migrated == ()
+    assert settings_path.read_text() == before
+
+
+def test_migrate_model_selections_heals_stale_ids_while_claude_is_closed(
+    cowork_host, monkeypatch
+):
+    tmp_path, _events = cowork_host
+    settings_path = _write_stale_selector_state(tmp_path)
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: False)
+
+    outcome = claude_cowork.migrate_model_selections(CURRENT_MODEL_IDS)
+
+    assert not outcome.skipped_while_running
+    assert len(outcome.migrated) == 3
+    selector = json.loads(settings_path.read_text())["__model_selector_state"]
+    assert selector["cowork"]["model"] == "claude-fable-router-5-6-sol-419255[1m]"
+
+
+def test_resolve_current_model_id_never_hash_joins_anthropic_dated_ids():
+    # Anthropic's dated ids end in an all-hex segment too; only ids carrying
+    # Router's generated naming scheme may join on the catalog hash.
+    current = ("claude-fable-router-model-20250514abc[1m]",)
+    assert (
+        claude_cowork._resolve_current_model_id("claude-opus-4-20250514", current)
+        is None
+    )
+    # And a Router-shaped stale id never joins to a non-Router candidate.
+    assert (
+        claude_cowork._resolve_current_model_id(
+            "claude-router-model-20250514", ("claude-opus-4-20250514abc",)
+        )
+        is None
+    )
+
+
+def test_migrate_model_selections_aborts_when_claude_launches_mid_pass(
+    cowork_host, monkeypatch
+):
+    tmp_path, _events = cowork_host
+    settings_path = _write_stale_selector_state(tmp_path)
+    before = settings_path.read_text()
+    # Not running at the outer gate, then running again by the pre-write check.
+    answers = iter([False, True])
+    monkeypatch.setattr(
+        claude_cowork, "_claude_is_running", lambda: next(answers, True)
+    )
+
+    outcome = claude_cowork.migrate_model_selections(CURRENT_MODEL_IDS)
+
+    assert outcome.skipped_while_running
+    assert outcome.migrated == ()
+    assert settings_path.read_text() == before
+
+
+def test_configure_aborts_the_migration_when_claude_relaunches_mid_pass(
+    cowork_host, monkeypatch
+):
+    # A manual Desktop launch between configure's quit and the selector
+    # rewrite aborts the remaining writes; configure itself still succeeds.
+    tmp_path, _events = cowork_host
+    settings_path = _write_stale_selector_state(tmp_path)
+    before = settings_path.read_text()
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: True)
+
+    profile_path, migrated = claude_cowork.configure(
+        "router-secret",
+        "https://router.example/v1",
+        model_ids=CURRENT_MODEL_IDS,
+    )
+
+    assert profile_path.exists()
+    assert migrated == ()
+    assert settings_path.read_text() == before
+
+
+def test_configured_gateway_base_url_rejects_endpoint_drift(cowork_host):
+    tmp_path, _events = cowork_host
+    profile_path, _ = claude_cowork.configure(
+        "router-secret", "https://router.example/v1"
+    )
+    assert claude_cowork.configured_gateway_base_url() == "https://router.example"
+
+    profile = json.loads(profile_path.read_text())
+    profile["inferenceGatewayBaseUrl"] = "https://elsewhere.example"
+    profile_path.write_text(json.dumps(profile))
+
+    with pytest.raises(click.ClickException) as error:
+        claude_cowork.configured_gateway_base_url()
+    assert "endpoint changed after setup" in error.value.message

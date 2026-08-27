@@ -3195,45 +3195,51 @@ class TestVaultProxyRouting:
         "Validate the ephemeral Agent Card fallback",
     ]
 
-    def test_dry_run_targets_proxy_and_redacts_proxy_auth(self, monkeypatch):
+    def test_dry_run_targets_known_proxy_and_redacts_proxy_auth(self, monkeypatch):
         _use_bundled_spec(monkeypatch)
-        monkeypatch.setenv("RAMP_VAULT_PROXY_ENABLED", "1")
-        monkeypatch.setenv("RAMP_VAULT_PROXY_URL", "https://proxy.example.com")
         monkeypatch.setenv("RAMP_VAULT_PROXY_HEADERS", '{"BT-API-KEY": "secret"}')
 
         result = CliRunner().invoke(
             cli,
-            ["--agent", "--env", "production", *self._CREDS_ARGS, "--dry_run"],
+            [
+                "--agent",
+                "--env",
+                "production",
+                *self._CREDS_ARGS,
+                "--dry_run",
+            ],
         )
 
         assert result.exit_code == 0, result.output
         payload = json.loads(result.output)["data"][0]
         assert payload["url"] == (
-            "https://proxy.example.com/developer/v1/agent-tools/get-agent-card-creds"
+            "https://vault-api.ramp.com/developer/v1/agent-tools/get-agent-card-creds"
         )
         assert payload["via_vault_proxy"] is True
         assert payload["proxy_headers"] == {"BT-API-KEY": "<redacted>"}
         assert "secret" not in result.output
 
-    def test_flag_off_stays_on_direct_ramp_api(self, monkeypatch):
+    def test_non_production_stays_on_direct_ramp_api(self, monkeypatch):
         _use_bundled_spec(monkeypatch)
-        monkeypatch.delenv("RAMP_VAULT_PROXY_ENABLED", raising=False)
-        monkeypatch.setenv("RAMP_VAULT_PROXY_URL", "https://proxy.example.com")
 
         result = CliRunner().invoke(
             cli,
-            ["--agent", "--env", "production", *self._CREDS_ARGS, "--dry_run"],
+            [
+                "--agent",
+                "--env",
+                "sandbox",
+                *self._CREDS_ARGS,
+                "--dry_run",
+            ],
         )
 
         assert result.exit_code == 0, result.output
         payload = json.loads(result.output)["data"][0]
-        assert payload["url"].startswith("https://api.ramp.com/")
+        assert not payload["url"].startswith("https://vault-api.ramp.com/")
         assert "via_vault_proxy" not in payload
 
     def test_live_call_uses_proxy_url_and_preserves_ramp_headers(self, monkeypatch):
         _use_bundled_spec(monkeypatch)
-        monkeypatch.setenv("RAMP_VAULT_PROXY_ENABLED", "1")
-        monkeypatch.setenv("RAMP_VAULT_PROXY_URL", "https://proxy.example.com")
         monkeypatch.setenv("RAMP_VAULT_PROXY_HEADERS", '{"BT-API-KEY": "secret"}')
         monkeypatch.setattr("ramp_cli.tools.commands.maybe_sync", lambda env: None)
         client = MagicMock()
@@ -3242,7 +3248,12 @@ class TestVaultProxyRouting:
 
         result = CliRunner().invoke(
             cli,
-            ["--agent", "--env", "production", *self._CREDS_ARGS],
+            [
+                "--agent",
+                "--env",
+                "production",
+                *self._CREDS_ARGS,
+            ],
         )
 
         assert result.exit_code == 0, result.output
@@ -3256,16 +3267,28 @@ class TestVaultProxyRouting:
 
     def test_proxy_headers_cannot_override_authorization(self, monkeypatch):
         _use_bundled_spec(monkeypatch)
-        monkeypatch.setenv("RAMP_VAULT_PROXY_ENABLED", "1")
-        monkeypatch.setenv("RAMP_VAULT_PROXY_URL", "https://proxy.example.com")
         monkeypatch.setenv(
             "RAMP_VAULT_PROXY_HEADERS", '{"Authorization": "Bearer attacker"}'
         )
 
         result = CliRunner().invoke(
             cli,
-            ["--agent", "--env", "production", *self._CREDS_ARGS, "--dry_run"],
+            [
+                "--agent",
+                "--env",
+                "production",
+                *self._CREDS_ARGS,
+                "--dry_run",
+            ],
         )
 
         assert result.exit_code != 0
         assert "cannot override Ramp authentication" in result.output
+
+    def test_creds_help_does_not_expose_card_type_selection(self, monkeypatch):
+        _use_bundled_spec(monkeypatch)
+
+        result = CliRunner().invoke(cli, ["funds", "creds", "--help"])
+
+        assert result.exit_code == 0, result.output
+        assert "--card-type" not in result.output

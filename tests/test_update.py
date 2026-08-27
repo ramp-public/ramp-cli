@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -15,6 +16,31 @@ from ramp_cli.version_check import latest_version, parse_version
 def _invoke(args, **kwargs):
     runner = CliRunner()
     return runner.invoke(cli, args, catch_exceptions=False, **kwargs)
+
+
+_DEFAULT_MANAGED_TARGET = Path("/managed/skills")
+
+
+@contextmanager
+def _interactive_update(targets=(_DEFAULT_MANAGED_TARGET,)):
+    with (
+        patch("ramp_cli.commands.update.__version__", "0.1.3"),
+        patch("ramp_cli.commands.update.latest_version", return_value="0.2.0"),
+        patch("ramp_cli.commands.update.shutil.which") as mock_which,
+        patch("ramp_cli.commands.update.subprocess.run") as mock_run,
+        patch("ramp_cli.commands.update.suppress_next_update_notice"),
+        patch("ramp_cli.commands.update._is_homebrew_install", return_value=False),
+        patch("ramp_cli.commands.update._is_interactive", return_value=True),
+        patch(
+            "ramp_cli.commands.update.managed_skill_targets",
+            return_value=list(targets),
+        ),
+    ):
+        mock_which.side_effect = lambda command: {
+            "curl": "/usr/bin/curl",
+            "ramp": "/usr/local/bin/ramp",
+        }[command]
+        yield mock_run
 
 
 class TestUpdateAlreadyCurrent:
@@ -59,11 +85,115 @@ class TestUpdateAvailable:
         assert "v0.1.3" in result.output
         assert "v0.2.0" in result.output
         assert "installed binary passed checksum verification" in result.output
-        assert mock_run.call_count == 3
+        mock_run.assert_called_once()
         cmd = mock_run.call_args_list[0].args[0]
         assert "agents.ramp.com/install.sh" in cmd[-1]
         assert 'sh "$tmp" --no-skills' in cmd[-1]
+        assert "agent skills" not in result.output
         mock_notice.assert_called_once_with()
+
+    def test_declining_skills_update_does_not_install_skills(self, isolated_config):
+        with _interactive_update() as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = _invoke(
+                ["--human", "update"],
+                input="n\n",
+                env={"RAMP_INSTALL_DIR": "/usr/local/bin"},
+            )
+
+        assert result.exit_code == 0
+        assert str(_DEFAULT_MANAGED_TARGET) in result.output
+        assert "latest version? [y/N]: n" in result.output
+        assert "Ramp skills were not updated." in result.output
+        mock_run.assert_called_once()
+
+    def test_no_managed_targets_skips_skills_update(self, isolated_config):
+        with _interactive_update(targets=()) as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = _invoke(
+                ["--human", "update"], env={"RAMP_INSTALL_DIR": "/usr/local/bin"}
+            )
+
+        assert result.exit_code == 0
+        assert "Update these skills" not in result.output
+        mock_run.assert_called_once()
+
+    def test_no_input_skips_skills_update(self, isolated_config):
+        with _interactive_update() as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = _invoke(
+                ["--human", "--no-input", "update"],
+                env={"RAMP_INSTALL_DIR": "/usr/local/bin"},
+            )
+
+        assert result.exit_code == 0
+        assert "Ramp-managed skills are installed in" not in result.output
+        mock_run.assert_called_once()
+
+    def test_json_output_skips_skills_update(self, isolated_config):
+        with _interactive_update() as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = _invoke(
+                ["--output", "json", "update"],
+                env={"RAMP_INSTALL_DIR": "/usr/local/bin"},
+            )
+
+        assert result.exit_code == 0
+        assert "Ramp-managed skills are installed in" not in result.output
+        mock_run.assert_called_once()
+
+    def test_accepting_skills_update_installs_latest_catalog(self, isolated_config):
+        targets = (Path("/managed/claude-skills"), Path("/custom/cursor-skills"))
+        with _interactive_update(targets) as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = _invoke(
+                ["--human", "update"],
+                input="y\n",
+                env={"RAMP_INSTALL_DIR": "/usr/local/bin"},
+            )
+
+        assert result.exit_code == 0
+        assert all(str(target) in result.output for target in targets)
+        assert "latest version? [y/N]: y" in result.output
+        assert [call.args[0] for call in mock_run.call_args_list[1:]] == [
+            ["/usr/local/bin/ramp", "skills", "update"],
+            [
+                "/usr/local/bin/ramp",
+                "skills",
+                "install",
+                "--all",
+                "--target",
+                "/managed/claude-skills",
+            ],
+            [
+                "/usr/local/bin/ramp",
+                "skills",
+                "install",
+                "--all",
+                "--target",
+                "/custom/cursor-skills",
+            ],
+        ]
+
+    def test_skills_catalog_failure_does_not_touch_skill_directories(
+        self, isolated_config
+    ):
+        with _interactive_update() as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0),
+                MagicMock(returncode=1),
+            ]
+            result = _invoke(
+                ["--human", "update"],
+                input="y\n",
+                env={"RAMP_INSTALL_DIR": "/usr/local/bin"},
+            )
+
+        assert result.exit_code == 0
+        assert "optional skills catalog could not be updated" in result.output
+        assert [call.args[0] for call in mock_run.call_args_list[1:]] == [
+            ["/usr/local/bin/ramp", "skills", "update"]
+        ]
 
     @patch("ramp_cli.commands.update._is_homebrew_install", return_value=False)
     @patch("ramp_cli.commands.update.suppress_next_update_notice")
@@ -88,8 +218,6 @@ class TestUpdateAvailable:
         mock_run.side_effect = [
             MagicMock(returncode=0),
             MagicMock(returncode=0, stdout="ramp-cli, version 0.2.0\n"),
-            MagicMock(returncode=0),
-            MagicMock(returncode=0),
         ]
 
         result = _invoke(["update"], env={"RAMP_INSTALL_DIR": "/home/user/.local/bin"})
@@ -102,49 +230,6 @@ class TestUpdateAvailable:
         assert "export PATH=/home/user/.local/bin:$PATH && hash -r" in result.output
         assert ["/repo/.venv/bin/ramp", "--version"] not in [
             call.args[0] for call in mock_run.call_args_list
-        ]
-
-    @patch("ramp_cli.commands.update.Path.home", return_value=Path("/home/test"))
-    @patch("ramp_cli.commands.update._is_homebrew_install", return_value=False)
-    @patch("ramp_cli.commands.update.suppress_next_update_notice")
-    @patch("ramp_cli.commands.update.subprocess.run")
-    @patch("ramp_cli.commands.update.shutil.which", return_value="/usr/bin/curl")
-    @patch("ramp_cli.commands.update.latest_version", return_value="0.2.0")
-    @patch("ramp_cli.commands.update.__version__", "0.1.3")
-    def test_skills_catalog_failure_reports_partial_success_and_retry(
-        self,
-        mock_latest,
-        mock_which,
-        mock_run,
-        mock_notice,
-        mock_brew,
-        mock_home,
-        isolated_config,
-        monkeypatch,
-    ):
-        mock_which.side_effect = lambda command: {
-            "curl": "/usr/bin/curl",
-            "ramp": "/home/test/.local/bin/ramp",
-        }[command]
-        monkeypatch.setenv("RAMP_INSTALL_DIR", "")
-        monkeypatch.setattr("ramp_cli.commands.update.sys.platform", "win32")
-        mock_run.side_effect = [
-            MagicMock(returncode=0),
-            MagicMock(returncode=1),
-            MagicMock(returncode=1),
-        ]
-
-        result = _invoke(["update"])
-
-        assert result.exit_code == 0
-        assert "installed binary passed checksum verification" in result.output
-        assert result.output.count("Ramp CLI update succeeded") == 3
-        assert result.output.count("api.github.com") == 2
-        assert "ramp skills install --all --target ~/.claude/skills" in result.output
-        assert "ramp skills install --all --target ~/.codex/skills" in result.output
-        assert mock_run.call_args_list[1].args[0][:2] == [
-            "sh",
-            "/home/test/.local/bin/ramp",
         ]
 
     @patch(

@@ -14,6 +14,8 @@ import click
 
 from ramp_cli import __version__
 from ramp_cli.commands.router import CLIENT_NAMES, configured_router_clients
+from ramp_cli.output.formatter import resolve_format
+from ramp_cli.skills import managed_skill_targets
 from ramp_cli.version_check import (
     latest_version,
     parse_version,
@@ -25,16 +27,26 @@ from ramp_cli.version_check import (
 # and deployed from agent-cards-site so fresh installs and self-updates agree.
 _INSTALL_URL = "https://agents.ramp.com/install.sh"
 _SKILLS_CATALOG_HOST = "api.github.com"
-_SKILL_TARGETS = (
-    ("Claude", Path(".claude/skills")),
-    ("Codex", Path(".codex/skills")),
-)
 
 
-def _install_optional_skills(ramp_executable: Path) -> None:
-    for agent, relative_target in _SKILL_TARGETS:
-        target = Path.home() / relative_target
-        retry_command = f"ramp skills install --all --target ~/{relative_target}"
+def _update_optional_skills(ramp_executable: Path, targets: list[Path]) -> None:
+    try:
+        catalog_update = subprocess.run(
+            _installed_invocation(ramp_executable, "skills", "update")
+        )
+    except OSError:
+        catalog_update = None
+    if catalog_update is None or catalog_update.returncode != 0:
+        click.echo(
+            "Ramp CLI update succeeded, but the optional skills catalog could not "
+            f"be updated. Skills catalog host: {_SKILLS_CATALOG_HOST}. Retry with:\n"
+            "  ramp skills update",
+            err=True,
+        )
+        return
+
+    for target in targets:
+        retry_command = "ramp skills install --all --target " + shlex.quote(str(target))
         try:
             result = subprocess.run(
                 _installed_invocation(
@@ -49,14 +61,39 @@ def _install_optional_skills(ramp_executable: Path) -> None:
         except OSError:
             result = None
         if result is not None and result.returncode == 0:
-            click.echo(f"{agent} skills installed.")
+            click.echo(f"Skills updated in {target}.")
         else:
             click.echo(
-                f"Ramp CLI update succeeded, but optional {agent} skills could not "
-                f"be installed. Skills catalog host: {_SKILLS_CATALOG_HOST}. Retry with:\n"
-                f"  {retry_command}",
+                f"Ramp CLI update succeeded, but optional skills in {target} could not "
+                f"be installed. Retry with:\n  {retry_command}",
                 err=True,
             )
+
+
+def _is_interactive() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _offer_optional_skills_update(ramp_executable: Path) -> None:
+    ctx = click.get_current_context()
+    if (
+        ctx.obj.get("no_input")
+        or not _is_interactive()
+        or resolve_format(ctx.obj["format"], ctx.obj["config_format"]) == "json"
+    ):
+        return
+    targets = managed_skill_targets()
+    if not targets:
+        return
+    click.echo("Ramp-managed skills are installed in:")
+    for target in targets:
+        click.echo(f"  {target}")
+    if not click.confirm("Update these skills to the latest version?", default=False):
+        click.echo("Ramp skills were not updated.")
+        return
+
+    click.echo("Updating optional agent skills...")
+    _update_optional_skills(ramp_executable, targets)
 
 
 def _installed_executable() -> Path:
@@ -213,5 +250,4 @@ def update_cmd() -> None:
                 f"  {' '.join(shlex.quote(part) for part in refresh_command)}"
             )
     else:
-        click.echo("Installing optional agent skills...")
-        _install_optional_skills(installed_executable)
+        _offer_optional_skills_update(installed_executable)

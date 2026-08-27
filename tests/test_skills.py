@@ -17,6 +17,8 @@ from ramp_cli.skills import (
     get_skill_content,
     install_skill,
     installed_skill_name,
+    managed_skill_targets,
+    record_receipt,
     skill_names,
 )
 from ramp_cli.specs import SKILLS_DIR
@@ -333,6 +335,21 @@ class TestSkillsInstall:
         result = runner.invoke(cli, ["skills", "install"])
         assert result.exit_code != 0
         assert "Provide a skill name or use --all" in result.output
+
+
+class TestManagedSkillTargets:
+    def test_returns_only_targets_with_existing_receipt_backed_skills(self, tmp_path):
+        live = tmp_path / "live"
+        install_skill("browser-automation", live)
+        record_receipt(live, "ramp-browser-automation")
+
+        stale = tmp_path / "stale"
+        record_receipt(stale, "ramp-browser-automation")
+
+        unowned = tmp_path / "unowned"
+        install_skill("browser-automation", unowned)
+
+        assert managed_skill_targets() == [live.resolve()]
 
 
 class TestSkillsSync:

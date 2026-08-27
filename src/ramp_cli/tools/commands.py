@@ -576,7 +576,7 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
     proxy_url: str | None = None
     proxy_headers: dict[str, str] = {}
     if tool.name == _VAULT_PROXY_TOOL:
-        proxy_url = vault_proxy_target(request_path)
+        proxy_url = vault_proxy_target(request_path, environment=env)
         if proxy_url:
             if request.method != "post":
                 raise click.UsageError(

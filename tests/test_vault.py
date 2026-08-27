@@ -6,61 +6,36 @@ import click
 import pytest
 
 from ramp_cli.client.vault import (
-    VAULT_PROXY_ENABLED_ENV,
     VAULT_PROXY_HEADERS_ENV,
-    VAULT_PROXY_URL_ENV,
-    vault_proxy_enabled,
     vault_proxy_headers,
     vault_proxy_target,
-    vault_proxy_url,
 )
 
-_ON = {VAULT_PROXY_ENABLED_ENV: "1"}
 
-
-@pytest.mark.parametrize("value", ["", "0", "false", "FALSE", "no", "off"])
-def test_vault_proxy_disabled_for_falsey_values(value: str) -> None:
-    assert vault_proxy_enabled({VAULT_PROXY_ENABLED_ENV: value}) is False
-
-
-@pytest.mark.parametrize("value", ["1", "true", "yes", "on"])
-def test_vault_proxy_enabled_for_truthy_values(value: str) -> None:
-    assert vault_proxy_enabled({VAULT_PROXY_ENABLED_ENV: value}) is True
-
-
-def test_vault_proxy_url_requires_https() -> None:
-    with pytest.raises(click.BadParameter):
-        vault_proxy_url({VAULT_PROXY_URL_ENV: "http://proxy.example.com"})
-
-
-@pytest.mark.parametrize(
-    "url",
-    [
-        "https://user@proxy.example.com",
-        "https://proxy.example.com?destination=ramp",
-        "https://proxy.example.com#fragment",
-    ],
-)
-def test_vault_proxy_url_rejects_unsafe_components(url: str) -> None:
-    with pytest.raises(click.BadParameter):
-        vault_proxy_url({VAULT_PROXY_URL_ENV: url})
-
-
-def test_vault_proxy_target_is_direct_when_disabled() -> None:
-    env = {VAULT_PROXY_URL_ENV: "https://proxy.example.com"}
-    assert vault_proxy_target("/developer/v1/agent-tools/x", env) is None
-
-
-def test_vault_proxy_target_requires_url_when_enabled() -> None:
-    with pytest.raises(click.UsageError):
-        vault_proxy_target("/developer/v1/agent-tools/x", _ON)
-
-
-def test_vault_proxy_target_appends_api_path() -> None:
-    env = {**_ON, VAULT_PROXY_URL_ENV: "https://proxy.example.com/"}
-    assert vault_proxy_target("/developer/v1/agent-tools/x", env) == (
-        "https://proxy.example.com/developer/v1/agent-tools/x"
+@pytest.mark.parametrize("environment", ["sandbox", "qa"])
+def test_vault_proxy_target_is_direct_outside_production(environment: str) -> None:
+    assert (
+        vault_proxy_target(
+            "/developer/v1/agent-tools/x",
+            environment=environment,
+        )
+        is None
     )
+
+
+def test_vault_proxy_target_uses_production_proxy() -> None:
+    assert vault_proxy_target(
+        "/developer/v1/agent-tools/x",
+        environment="production",
+    ) == ("https://vault-api.ramp.com/developer/v1/agent-tools/x")
+
+
+def test_vault_proxy_target_requires_an_api_path() -> None:
+    with pytest.raises(click.UsageError, match="must start"):
+        vault_proxy_target(
+            "developer/v1/agent-tools/x",
+            environment="production",
+        )
 
 
 def test_vault_proxy_headers_parse_proxy_auth() -> None:

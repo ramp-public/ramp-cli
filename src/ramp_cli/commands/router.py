@@ -1197,7 +1197,11 @@ def _run_configure(
             models = models_by_client[item]
             if item == COWORK_CLIENT:
                 try:
-                    profile_path = claude_cowork.configure(api_key, base_url)
+                    profile_path, migrated_selections = claude_cowork.configure(
+                        api_key,
+                        base_url,
+                        model_ids=tuple(model.id for model in models),
+                    )
                 except click.ClickException as exc:
                     failures.append(f"{AGENT_NAMES[item]}: {exc.message}")
                     continue
@@ -1219,6 +1223,13 @@ def _run_configure(
                     f"Pick {preferred_label} in Cowork and send a message to "
                     "verify the connection."
                 )
+                if migrated_selections:
+                    count = len(migrated_selections)
+                    plural = "" if count == 1 else "s"
+                    cowork_note = (
+                        f"Updated {count} saved model selection{plural} to the "
+                        "ids Router serves today. " + cowork_note
+                    )
                 results.append(
                     {
                         "client": item,
@@ -1228,6 +1239,7 @@ def _run_configure(
                         # recommends a starting model rather than claiming to
                         # have set a default.
                         "recommended_model": preferred.id,
+                        "migrated_model_selections": len(migrated_selections),
                         "models_available": len(models),
                         "setup_file_deleted": setup_file is not None,
                     }
@@ -1343,6 +1355,76 @@ def _run_configure(
                 )
 
 
+def _refresh_cowork_model_selections() -> dict | None:
+    """Migrate Cowork's persisted model selections during a refresh.
+
+    Cowork joins refresh for exactly one artifact: the model selections its
+    host app persisted. The Router profile itself needs no reapplication —
+    configure writes it once — but a selection that predates a Router model
+    rename keeps an id Claude no longer recognizes, which it sizes at its
+    200k unknown-model fallback instead of the model's real window. Refresh
+    heals those whenever Claude Desktop is closed; configure covers the
+    deterministic case because it stops the app first.
+
+    Strictly best-effort: this leg reports what it did (or why it could
+    not run) but never joins the refresh failures. A stale Cowork receipt,
+    a rotated credential, or an unreachable Router must not fail refreshes
+    for otherwise healthy clients, and a running Claude Desktop skips the
+    pass before any authenticated network request is made.
+    """
+    if not claude_cowork.state_path().exists():
+        return None
+    if claude_cowork.claude_is_running():
+        return {
+            "client": COWORK_CLIENT,
+            "migrated_model_selections": 0,
+            "skipped_while_running": True,
+        }
+    try:
+        api_key = claude_cowork.configured_api_key()
+        base_url = f"{claude_cowork.configured_gateway_base_url()}/v1"
+        # Cowork accepts the ids from its own projection, same as configure.
+        models = _fetch_models(
+            api_key,
+            gateway_client=claude_cowork.GATEWAY_CLIENT,
+            base_url=base_url,
+        )
+        outcome = claude_cowork.migrate_model_selections(
+            tuple(model.id for model in models)
+        )
+    except click.ClickException as exc:
+        return {
+            "client": COWORK_CLIENT,
+            "migrated_model_selections": 0,
+            "skipped_while_running": False,
+            "error": exc.message,
+        }
+    return {
+        "client": COWORK_CLIENT,
+        "migrated_model_selections": len(outcome.migrated),
+        "skipped_while_running": outcome.skipped_while_running,
+    }
+
+
+def _cowork_refresh_message(result: dict) -> str:
+    error = result.get("error")
+    if error is not None:
+        return f"Claude Cowork's saved model selections were not checked: {error}"
+    if result["skipped_while_running"]:
+        return (
+            "Claude Cowork's saved model selections were not checked because "
+            "Claude Desktop is running."
+        )
+    count = result["migrated_model_selections"]
+    if count:
+        plural = "" if count == 1 else "s"
+        return (
+            f"Updated {count} saved Claude Cowork model selection{plural} to "
+            "the ids Router serves today."
+        )
+    return "Claude Cowork's saved model selections are current."
+
+
 @router_group.command(
     "refresh",
     help="Reapply current Router setup to agents already configured with it",
@@ -1407,15 +1489,22 @@ def router_refresh(ctx: click.Context) -> None:
             }
         )
 
+    cowork_result = _refresh_cowork_model_selections()
+    if cowork_result is not None:
+        results.append(cowork_result)
+
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     if failures and fmt == "json":
         raise click.ClickException("Could not refresh " + "; ".join(failures))
     if fmt == "json":
         print_agent_json({"clients": results}, pagination=None)
-    elif not clients:
+    elif not clients and cowork_result is None:
         click.echo("Ramp Router is not configured in any coding agent.")
     else:
         for result in results:
+            if result["client"] == COWORK_CLIENT:
+                click.echo(_cowork_refresh_message(result))
+                continue
             name = CLIENT_NAMES[result["client"]]
             click.echo(f"Refreshed the Ramp Router configuration for {name}.")
 

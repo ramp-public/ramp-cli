@@ -198,9 +198,10 @@ def test_configure_cowork_consumes_the_setup_file_and_deletes_it_after_success(
             )
         ]
 
-    def configure(api_key, base_url):
+    def configure(api_key, base_url, model_ids=()):
         captured["configure"] = (api_key, base_url)
-        return tmp_path / "Claude-3p" / "configLibrary" / "profile.json"
+        captured["configure_model_ids"] = model_ids
+        return tmp_path / "Claude-3p" / "configLibrary" / "profile.json", ()
 
     monkeypatch.setattr(router_module, "_fetch_models", fetch_models)
     monkeypatch.setattr(claude_cowork, "configure", configure)
@@ -229,6 +230,7 @@ def test_configure_cowork_consumes_the_setup_file_and_deletes_it_after_success(
         "router-secret",
         "https://router.example/v1",
     )
+    assert captured["configure_model_ids"] == ("claude-router-5-6-sol-abc123",)
     assert not setup_file.exists()
     assert "router-secret" not in result.output
     assert "ambient-secret" not in result.output
@@ -486,7 +488,7 @@ def test_configure_cowork_names_the_model_that_was_actually_discovered(
     monkeypatch.setattr(
         claude_cowork,
         "configure",
-        lambda *_args, **_kwargs: tmp_path / "profile.json",
+        lambda *_args, **_kwargs: (tmp_path / "profile.json", ()),
     )
 
     result = CliRunner().invoke(
@@ -518,7 +520,7 @@ def test_configure_cowork_agent_output_recommends_without_claiming_a_default(
     monkeypatch.setattr(
         claude_cowork,
         "configure",
-        lambda *_args, **_kwargs: tmp_path / "profile.json",
+        lambda *_args, **_kwargs: (tmp_path / "profile.json", ()),
     )
 
     result = CliRunner().invoke(
@@ -561,7 +563,7 @@ def test_configure_cowork_quiet_mode_does_not_start_a_spinner(tmp_path, monkeypa
     monkeypatch.setattr(
         claude_cowork,
         "configure",
-        lambda *_args, **_kwargs: tmp_path / "profile.json",
+        lambda *_args, **_kwargs: (tmp_path / "profile.json", ()),
     )
     monkeypatch.setattr(
         router_module,
@@ -750,7 +752,7 @@ def test_configure_cowork_through_the_consolidated_command(tmp_path, monkeypatch
     monkeypatch.setattr(
         claude_cowork,
         "configure",
-        lambda *_args, **_kwargs: tmp_path / "profile.json",
+        lambda *_args, **_kwargs: (tmp_path / "profile.json", ()),
     )
 
     result = CliRunner().invoke(
@@ -815,8 +817,9 @@ def test_configure_sets_up_cowork_alongside_a_coding_agent(tmp_path, monkeypatch
     monkeypatch.setattr(
         claude_cowork,
         "configure",
-        lambda api_key, base_url: (
-            captured.update(cowork=(api_key, base_url)) or tmp_path / "profile.json"
+        lambda api_key, base_url, model_ids=(): (
+            captured.update(cowork=(api_key, base_url))
+            or (tmp_path / "profile.json", ())
         ),
     )
 
@@ -896,8 +899,9 @@ def test_a_setup_file_covers_every_selected_agent(tmp_path, monkeypatch):
     monkeypatch.setattr(
         claude_cowork,
         "configure",
-        lambda api_key, base_url: (
-            captured.update(cowork=(api_key, base_url)) or tmp_path / "profile.json"
+        lambda api_key, base_url, model_ids=(): (
+            captured.update(cowork=(api_key, base_url))
+            or (tmp_path / "profile.json", ())
         ),
     )
 
@@ -1520,6 +1524,128 @@ def test_refresh_reapplies_claude_config_and_preserves_selected_model(
     settings = json.loads(settings_path.read_text())
     assert settings["model"] == "claude-router-b"
     assert settings["env"]["ANTHROPIC_BASE_URL"] == "https://stored.example"
+
+
+def _stale_cowork_selection(tmp_path, monkeypatch):
+    """A configured Cowork whose persisted selection predates a model rename."""
+    monkeypatch.setattr(claude_cowork.sys, "platform", "darwin")
+    monkeypatch.setenv("RAMP_CLAUDE_DESKTOP_APP_SUPPORT", str(tmp_path))
+    state_path = tmp_path / "Claude" / "ramp-router-cowork-state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("{}\n")
+    settings_path = (
+        tmp_path
+        / "Claude-3p"
+        / "local-agent-mode-sessions"
+        / "1bcd7467"
+        / "00000000"
+        / "cowork_account_settings.json"
+    )
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(
+        json.dumps(
+            {
+                "__model_selector_state": {
+                    "cowork": {"model": "claude-router-5-6-sol-419255"}
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(claude_cowork, "configured_api_key", lambda: "cowork-secret")
+    monkeypatch.setattr(
+        claude_cowork,
+        "configured_gateway_base_url",
+        lambda: "https://router.example",
+    )
+    return settings_path
+
+
+def test_refresh_migrates_stale_cowork_model_selections(tmp_path, monkeypatch):
+    settings_path = _stale_cowork_selection(tmp_path, monkeypatch)
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: False)
+    captured = {}
+
+    def fetch_models(api_key, **kwargs):
+        captured["fetch"] = (api_key, kwargs)
+        return [
+            _router_model(
+                "claude-fable-router-5-6-sol-419255[1m]",
+                request_name="gpt-5.6-sol",
+                display_name="5.6 Sol",
+            )
+        ]
+
+    monkeypatch.setattr(router_module, "_fetch_models", fetch_models)
+
+    result = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+
+    assert result.exit_code == 0, result.output
+    # Refresh asks for Cowork's own id projection at the configured origin.
+    assert captured["fetch"] == (
+        "cowork-secret",
+        {
+            "gateway_client": "claude-cowork",
+            "base_url": "https://router.example/v1",
+        },
+    )
+    assert (
+        "Updated 1 saved Claude Cowork model selection to the ids Router "
+        "serves today." in result.output
+    )
+    selector = json.loads(settings_path.read_text())["__model_selector_state"]
+    assert selector["cowork"]["model"] == "claude-fable-router-5-6-sol-419255[1m]"
+
+
+def test_refresh_leaves_cowork_selections_alone_while_claude_runs(
+    tmp_path, monkeypatch
+):
+    settings_path = _stale_cowork_selection(tmp_path, monkeypatch)
+    before = settings_path.read_text()
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: True)
+
+    def fetch_models(*_args, **_kwargs):
+        raise AssertionError("a running Claude Desktop must skip discovery")
+
+    monkeypatch.setattr(router_module, "_fetch_models", fetch_models)
+
+    result = CliRunner().invoke(cli, ["--agent", "router", "refresh"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)["data"][0]["clients"]
+    assert payload == [
+        {
+            "client": "cowork",
+            "migrated_model_selections": 0,
+            "skipped_while_running": True,
+        }
+    ]
+    assert settings_path.read_text() == before
+
+
+def test_refresh_reports_an_unusable_cowork_setup_without_failing(
+    tmp_path, monkeypatch
+):
+    # A receipt can outlive its profile (the app owns that directory), and a
+    # broken Cowork setup must not fail refreshes for healthy clients.
+    settings_path = _stale_cowork_selection(tmp_path, monkeypatch)
+    before = settings_path.read_text()
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: False)
+
+    def raise_credential_changed():
+        raise click.ClickException(
+            "The Claude Cowork Router credential changed after setup."
+        )
+
+    monkeypatch.setattr(claude_cowork, "configured_api_key", raise_credential_changed)
+
+    result = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "Claude Cowork's saved model selections were not checked: "
+        "The Claude Cowork Router credential changed after setup."
+    ) in result.output
+    assert settings_path.read_text() == before
 
 
 def test_refresh_without_the_configure_environment_keeps_stored_endpoints(
@@ -6154,7 +6280,7 @@ def test_claude_models_option_survives_the_merged_claude_entry(tmp_path, monkeyp
     monkeypatch.setattr(
         claude_cowork,
         "configure",
-        lambda *_args, **_kwargs: tmp_path / "profile.json",
+        lambda *_args, **_kwargs: (tmp_path / "profile.json", ()),
     )
 
     result = CliRunner().invoke(
@@ -6183,7 +6309,7 @@ def test_picking_claude_in_the_menu_sets_up_cowork_without_a_question(
     monkeypatch.setattr(
         claude_cowork,
         "configure",
-        lambda *_args, **_kwargs: tmp_path / "profile.json",
+        lambda *_args, **_kwargs: (tmp_path / "profile.json", ()),
     )
 
     result = CliRunner().invoke(cli, ["--human", "router", "configure"])
@@ -6248,7 +6374,7 @@ def test_a_setup_file_run_covers_the_picked_claude_entry(tmp_path, monkeypatch):
     monkeypatch.setattr(
         claude_cowork,
         "configure",
-        lambda *_args, **_kwargs: tmp_path / "profile.json",
+        lambda *_args, **_kwargs: (tmp_path / "profile.json", ()),
     )
 
     result = CliRunner().invoke(

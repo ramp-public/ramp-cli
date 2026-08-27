@@ -339,6 +339,16 @@ def managed_skill_names(target_dir: Path) -> list[str]:
     return sorted(entry["skills"]) if entry else []
 
 
+def managed_skill_targets() -> list[Path]:
+    """Targets containing at least one existing receipt-backed skill."""
+    targets = []
+    for target, entry in _load_state().items():
+        target_dir = Path(target)
+        if any((target_dir / name / "SKILL.md").is_file() for name in entry["skills"]):
+            targets.append(target_dir)
+    return sorted(targets, key=str)
+
+
 def uninstall_skills(
     target_dir: Path,
     names: list[str] | None = None,

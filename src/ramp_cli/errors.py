@@ -52,9 +52,8 @@ _ERROR_CODE_HINTS: dict[str, tuple[frozenset[int], str]] = {
         frozenset({400}),
         (
             "This Agent Card credential request must go through the payment-vault "
-            "proxy.\n  Set RAMP_VAULT_PROXY_ENABLED=1 and RAMP_VAULT_PROXY_URL to "
-            "the proxy host provisioned for your integration, or contact your Ramp "
-            "representative."
+            "proxy.\n  Update to the latest Ramp CLI and retry in the production "
+            "environment."
         ),
     ),
     # Insufficient OAuth scope.

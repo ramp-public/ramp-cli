@@ -17,7 +17,9 @@ import sys
 import tempfile
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -38,6 +40,13 @@ STATE_VERSION = 1
 _APP_SUPPORT_OVERRIDE = "RAMP_CLAUDE_DESKTOP_APP_SUPPORT"
 _STATE_FILE = "ramp-router-cowork-state.json"
 _DESKTOP_CONFIG_FILE = "claude_desktop_config.json"
+_LOCAL_AGENT_SESSIONS_DIR = "local-agent-mode-sessions"
+_ACCOUNT_SETTINGS_FILE = "cowork_account_settings.json"
+_MODEL_SELECTOR_KEY = "__model_selector_state"
+_ONE_MILLION_SUFFIX = "[1m]"
+_MODEL_HASH_ALPHABET = frozenset("0123456789abcdef")
+_MODEL_HASH_MIN_CHARS = 6
+_ROUTER_MODEL_ID_MARKER = "-router-"
 
 
 def _app_support_root() -> Path:
@@ -470,7 +479,212 @@ def _configure_stopped(api_key: str, router_base_url: str, profile: dict) -> Pat
     return profile_path
 
 
-def configure(api_key: str, router_base_url: str) -> Path:
+def _account_settings_paths() -> list[Path]:
+    """Every Cowork account-settings document Claude Desktop keeps locally."""
+    sessions_root = _third_party_root() / _LOCAL_AGENT_SESSIONS_DIR
+    if not sessions_root.is_dir():
+        return []
+    return sorted(sessions_root.glob(f"*/*/{_ACCOUNT_SETTINGS_FILE}"))
+
+
+def _model_id_base(identifier: str) -> str:
+    """The model id without its trailing 1M-context markers."""
+    base = identifier
+    while base.lower().endswith(_ONE_MILLION_SUFFIX):
+        base = base[: -len(_ONE_MILLION_SUFFIX)]
+    return base
+
+
+def _model_hash_token(identifier: str) -> str | None:
+    """The catalog hash Router embeds as a model id's final segment.
+
+    Router has renamed its model ids more than once, but every generation of
+    the scheme ends with a hex digest of the catalog entry — sometimes
+    truncated to six characters, sometimes longer. That digest is the only
+    part of the id that survives a rename, so it is what stale-selection
+    migration joins on. Ids whose final segment is not hex (Anthropic's own
+    model names) have no token and never join.
+    """
+    token = _model_id_base(identifier).rsplit("-", 1)[-1].lower()
+    if len(token) < _MODEL_HASH_MIN_CHARS:
+        return None
+    if not set(token) <= _MODEL_HASH_ALPHABET:
+        return None
+    return token
+
+
+def _is_router_model_id(identifier: str) -> bool:
+    """Whether an id follows Router's generated naming scheme.
+
+    Anthropic's own dated ids also end in an all-hex segment (for example
+    ``claude-opus-4-20250514``), so the catalog-hash join must be reserved
+    for ids Router generated — every generation of that scheme carries a
+    ``-router-`` marker. Joining on a date segment could silently switch a
+    selection to an unrelated model.
+    """
+    return _ROUTER_MODEL_ID_MARKER in _model_id_base(identifier)
+
+
+def _resolve_current_model_id(
+    identifier: str, current_ids: tuple[str, ...]
+) -> str | None:
+    """Map one persisted model id to the id Router serves for it today.
+
+    Claude sizes a model's context window from the id string alone: an id it
+    does not recognize falls into a 200k-token fallback unless the id carries
+    the ``[1m]`` marker. A selection persisted before a Router rename keeps
+    the old id forever, so a 1M model quietly compacts at a fifth of its
+    window. Returns the current id when exactly one entry matches, and None
+    when the id is already current or no single match exists — guessing
+    between two candidates could silently switch the user's model.
+    """
+    if identifier in current_ids:
+        return None
+    base = _model_id_base(identifier)
+    renamed = [
+        candidate for candidate in current_ids if _model_id_base(candidate) == base
+    ]
+    if len(renamed) == 1:
+        return renamed[0]
+    if renamed:
+        return None
+    if not _is_router_model_id(identifier):
+        return None
+    token = _model_hash_token(identifier)
+    if token is None:
+        return None
+    matches = []
+    for candidate in current_ids:
+        if not _is_router_model_id(candidate):
+            continue
+        candidate_token = _model_hash_token(candidate)
+        if candidate_token is None:
+            continue
+        if candidate_token.startswith(token) or token.startswith(candidate_token):
+            matches.append(candidate)
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _migrate_selector_state(selector: dict, current_ids: tuple[str, ...]) -> list[dict]:
+    """Rewrite one ``__model_selector_state`` object in place."""
+    changes = []
+    for surface, preferences in selector.items():
+        if not isinstance(preferences, dict):
+            continue
+        selected = preferences.get("model")
+        if isinstance(selected, str):
+            replacement = _resolve_current_model_id(selected, current_ids)
+            if replacement is not None:
+                preferences["model"] = replacement
+                changes.append(
+                    {
+                        "surface": surface,
+                        "field": "model",
+                        "from": selected,
+                        "to": replacement,
+                    }
+                )
+        thinking = preferences.get("thinking_by_model")
+        if isinstance(thinking, dict):
+            for stale in list(thinking):
+                if not isinstance(stale, str):
+                    continue
+                replacement = _resolve_current_model_id(stale, current_ids)
+                if replacement is None or replacement in thinking:
+                    continue
+                thinking[replacement] = thinking.pop(stale)
+                changes.append(
+                    {
+                        "surface": surface,
+                        "field": "thinking_by_model",
+                        "from": stale,
+                        "to": replacement,
+                    }
+                )
+    return changes
+
+
+def _migrate_model_selections_stopped(
+    model_ids: tuple[str, ...],
+    still_safe: Callable[[], bool] | None = None,
+) -> tuple[tuple[dict, ...], bool]:
+    """Rewrite persisted model selections to ids Router serves today.
+
+    Best-effort by design: these documents belong to Claude Desktop, so one
+    that cannot be read or written is left for the app rather than failing
+    the caller's configure or refresh. Runs only while Claude Desktop is
+    stopped, because the app rewrites these documents from memory and would
+    clobber a concurrent migration. ``still_safe`` is consulted immediately
+    before each write so a launch that lands mid-pass aborts the remaining
+    rewrites; the unavoidable residue — a launch inside the milliseconds
+    between that check and the atomic replace — at worst restores the stale
+    id when the app flushes, and the next configure or refresh converges it.
+    Returns the changes written and whether the pass was aborted.
+    """
+    if not model_ids:
+        return (), False
+    migrated: list[dict] = []
+    for path in _account_settings_paths():
+        try:
+            settings, existed = _read_object(path, "Claude Cowork account settings")
+        except click.ClickException:
+            continue
+        if not existed:
+            continue
+        selector = settings.get(_MODEL_SELECTOR_KEY)
+        if not isinstance(selector, dict):
+            continue
+        changes = _migrate_selector_state(selector, model_ids)
+        if not changes:
+            continue
+        if still_safe is not None and not still_safe():
+            return tuple(migrated), True
+        try:
+            _write_private_json(path, settings)
+        except OSError:
+            continue
+        migrated.extend({"path": str(path), **change} for change in changes)
+    return tuple(migrated), False
+
+
+def claude_is_running() -> bool:
+    """Whether Claude Desktop is currently running on this host."""
+    return _claude_is_running()
+
+
+@dataclass(frozen=True)
+class ModelSelectionMigration:
+    """What one opportunistic stale-selection migration pass did."""
+
+    migrated: tuple[dict, ...]
+    skipped_while_running: bool
+
+
+def migrate_model_selections(model_ids: tuple[str, ...]) -> ModelSelectionMigration:
+    """Migrate stale persisted Cowork model selections when it is safe.
+
+    The refresh path calls this in the background, where quitting the user's
+    Claude Desktop would be hostile, so a running app skips the pass instead;
+    configure covers the deterministic case because it already stops the app.
+    """
+    if sys.platform != "darwin":
+        return ModelSelectionMigration(migrated=(), skipped_while_running=False)
+    with transaction_lock():
+        if _claude_is_running():
+            return ModelSelectionMigration(migrated=(), skipped_while_running=True)
+        migrated, aborted = _migrate_model_selections_stopped(
+            model_ids, still_safe=lambda: not _claude_is_running()
+        )
+        return ModelSelectionMigration(migrated=migrated, skipped_while_running=aborted)
+
+
+def configure(
+    api_key: str,
+    router_base_url: str,
+    model_ids: tuple[str, ...] = (),
+) -> tuple[Path, tuple[dict, ...]]:
     """Configure and relaunch Claude Desktop with a Cowork-safe Router profile."""
     preflight()
     api_key = api_key.strip()
@@ -489,8 +703,16 @@ def configure(api_key: str, router_base_url: str) -> Path:
                 pass
             raise
 
+        # While the app is stopped anyway, heal selections that still name
+        # ids Router no longer serves: Claude sizes context windows from the
+        # id string, and a stale id lands in its 200k unknown-model fallback.
+        # Guarded like the refresh pass: a manual Desktop launch between the
+        # quit above and this rewrite aborts the remaining writes.
+        migrated, _aborted = _migrate_model_selections_stopped(
+            model_ids, still_safe=lambda: not _claude_is_running()
+        )
         _launch_claude(fresh_cowork=True)
-        return profile_path
+        return profile_path, migrated
 
 
 def configured_api_key() -> str:
@@ -507,6 +729,33 @@ def configured_api_key() -> str:
             "Run the configure command again to adopt it."
         )
     return str(api_key)
+
+
+def configured_gateway_base_url() -> str:
+    """The Router origin the configured Cowork profile points at.
+
+    Validated against the live profile the way ``configured_api_key``
+    validates the credential: an endpoint edited after setup would let a
+    refresh fetch one endpoint's catalog and rewrite selections Claude
+    resolves against another.
+    """
+    state = _read_state()
+    if state is None:
+        raise click.ClickException("Ramp Router is not configured in Claude Cowork.")
+    base_url = state.get("gateway_base_url")
+    if not isinstance(base_url, str) or not base_url:
+        raise click.ClickException(
+            f"Could not read the Claude Cowork restore state {state_path()}."
+        )
+    profile, _ = _read_object(
+        _profile_path(state["profile_id"]), "Claude Cowork Router profile"
+    )
+    if profile.get("inferenceGatewayBaseUrl") != base_url:
+        raise click.ClickException(
+            "The Claude Cowork Router endpoint changed after setup. "
+            "Run the configure command again to adopt it."
+        )
+    return base_url
 
 
 def _owned_profile(state: dict) -> dict | None:
