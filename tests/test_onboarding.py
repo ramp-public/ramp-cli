@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+from unittest.mock import MagicMock
 
 from click.testing import CliRunner
 
@@ -68,6 +69,34 @@ class TestCategoryTracking:
         # Simulate fresh load
         used = get_used_categories()
         assert "funds" in used
+
+    def test_multiword_command_preserves_existing_raw_category(
+        self, isolated_config, monkeypatch
+    ):
+        cfg = settings.load()
+        cfg.tools_used = "purchase_orders"
+        settings.save(cfg)
+        client = MagicMock()
+        client.post.return_value = b"{}"
+        monkeypatch.setattr("click.testing._NamedTextIOWrapper.isatty", lambda _: True)
+        monkeypatch.setattr("ramp_cli.tools.commands.RampClient", lambda env: client)
+        monkeypatch.setattr("ramp_cli.tools.commands.maybe_sync", lambda env: None)
+        monkeypatch.setattr("ramp_cli.tools.commands._start_spinner", lambda _: None)
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--human",
+                "--no-input",
+                "purchase-orders",
+                "search",
+                "--rationale",
+                "test",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert get_used_categories() == {"purchase_orders"}
 
 
 # ── Welcome message ──────────────────────────────────────────────────────────
@@ -253,6 +282,8 @@ class TestGettingStartedCommand:
         assert "agent_cards" not in cats
         # Merged target should be present
         assert "funds" in cats
+        assert "purchase_orders" in cats
+        assert "purchase-orders" not in cats
 
 
 # ── Category remapping ───────────────────────────────────────────────────────

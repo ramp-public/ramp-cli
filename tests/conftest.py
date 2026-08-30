@@ -21,6 +21,12 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
     monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "pi"))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    # Hermes is configured through its own `hermes config` executable rather
+    # than direct file writes, so a developer with Hermes installed would
+    # otherwise have tests drive the real binary against their real setup.
+    # Tests that exercise the Hermes client re-point this at a test double.
+    monkeypatch.setattr("ramp_cli.hermes_agent.hermes_executable", lambda: None)
     # The CLI reads these, so a developer pointing their own shell at a local
     # stack would otherwise change what the tests assert.
     for leaked in (

@@ -17,7 +17,7 @@ from ramp_cli.tools.registry import (
 def _remap_categories(categories: dict[str, list]) -> dict[str, list]:
     """Apply the same category remapping that main.py uses for CLI groups.
 
-    E.g. ``agent_cards`` is merged into ``funds`` so that the onboarding
+    E.g. ``agent-cards`` is merged into ``funds`` so that the onboarding
     guide shows names that match invokable ``ramp <resource>`` groups.
 
     ``CATEGORY_ALIAS_GROUPS`` (e.g. ``cards``) are additionally surfaced as

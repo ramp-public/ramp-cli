@@ -153,6 +153,85 @@ class TestToolsList:
         assert "get-transactions" in result.output
         assert '"category": "funds"' in result.output
 
+    @patch("ramp_cli.commands.tools.maybe_sync")
+    @patch("ramp_cli.main.maybe_sync")
+    def test_list_json_preserves_raw_multiword_categories(
+        self, _root_sync, _tool_sync, monkeypatch, runner
+    ):
+        monkeypatch.setattr(
+            "ramp_cli.commands.tools.list_tool_defs",
+            lambda env: parse_spec(AGENT_TOOL_SPEC),
+        )
+
+        result = runner.invoke(cli, ["--agent", "tools", "list"])
+
+        assert result.exit_code == 0
+        categories = {item["category"] for item in json.loads(result.output)["data"]}
+        assert "procurement_requests" in categories
+        assert "purchase_orders" in categories
+        assert "procurement-requests" not in categories
+        assert "purchase-orders" not in categories
+
+    @pytest.mark.parametrize(
+        ("category", "name", "args", "expected_operation"),
+        [
+            pytest.param(
+                "cards",
+                "lock",
+                ["card-123", "--action", "lock", "--rationale", "test"],
+                "lock-or-unlock-card",
+                id="remapped-alias-group",
+            ),
+            pytest.param(
+                "general",
+                "comment",
+                [
+                    "object-123",
+                    "--message",
+                    "hello",
+                    "--ramp_object_type",
+                    "card",
+                    "--rationale",
+                    "test",
+                ],
+                "post-comment",
+                id="singleton-group",
+            ),
+        ],
+    )
+    @patch("ramp_cli.commands.tools.maybe_sync")
+    @patch("ramp_cli.main.maybe_sync")
+    def test_list_json_advertises_invokable_operation(
+        self,
+        _root_sync,
+        _tool_sync,
+        monkeypatch,
+        runner,
+        category,
+        name,
+        args,
+        expected_operation,
+    ):
+        tools = parse_spec(AGENT_TOOL_SPEC)
+        monkeypatch.setattr("ramp_cli.commands.tools.list_tool_defs", lambda env: tools)
+
+        list_result = runner.invoke(cli, ["--agent", "tools", "list"])
+
+        assert list_result.exit_code == 0, list_result.output
+        advertised = {
+            (item["category"], item["name"])
+            for item in json.loads(list_result.output)["data"]
+        }
+        assert (category, name) in advertised
+
+        command_result = runner.invoke(
+            cli, ["--agent", category, name, *args, "--dry_run"]
+        )
+
+        assert command_result.exit_code == 0, command_result.output
+        request = json.loads(command_result.output)["data"][0]
+        assert request["url"].endswith(f"/{expected_operation}")
+
     @patch(
         "ramp_cli.commands.tools.list_tool_defs",
         return_value=FAKE_TOOLS,
@@ -373,6 +452,35 @@ class TestToolsSchema:
         schema = json.loads(result.output)["data"][0]
         assert "$ref" not in json.dumps(schema)
         assert "manual_bank_account" in schema["properties"]
+
+    @pytest.mark.parametrize(
+        "category",
+        [
+            pytest.param("purchase-orders", id="canonical"),
+            pytest.param("purchase_orders", id="legacy"),
+        ],
+    )
+    @patch("ramp_cli.main.maybe_sync")
+    @patch("ramp_cli.commands.tools.maybe_sync")
+    def test_multiword_category_schema_supports_legacy_name(
+        self,
+        _tool_sync,
+        _root_sync,
+        isolated_config,
+        monkeypatch,
+        runner,
+        category,
+    ):
+        self._use_bundled_tools(monkeypatch)
+
+        result = runner.invoke(
+            cli,
+            ["--agent", "tools", "schema", category, "search"],
+        )
+
+        assert result.exit_code == 0
+        schema = json.loads(result.output)["data"][0]
+        assert "filters" in schema["properties"]
 
     @patch("ramp_cli.main.maybe_sync")
     @patch("ramp_cli.commands.tools.maybe_sync")

@@ -57,7 +57,7 @@ jobs:
             runner: macos-14
           - os: darwin
             arch: amd64
-            runner: macos-14
+            runner: macos-15-intel
           - os: linux
             arch: amd64
             runner: ubuntu-22.04
@@ -107,6 +107,15 @@ jobs:
             --python-flag=no_site \
             --assume-yes-for-downloads \
             src/ramp_cli/main.py
+
+      - name: Validate release architecture
+        shell: bash
+        run: |
+          uv run python scripts/validate-release-architecture.py \
+            --directory build/main.dist \
+            --executable "ramp-${{ matrix.os }}-${{ matrix.arch }}" \
+            --os "${{ matrix.os }}" \
+            --arch "${{ matrix.arch }}"
 
       - name: Package standalone directory
         if: startsWith(github.ref, 'refs/tags/')
@@ -173,6 +182,15 @@ jobs:
             --python-flag=no_site \
             --assume-yes-for-downloads \
             src/ramp_cli/main.py
+
+      - name: Validate release architecture
+        shell: bash
+        run: |
+          uv run python scripts/validate-release-architecture.py \
+            --directory build/main.dist \
+            --executable ramp-windows-amd64.exe \
+            --os windows \
+            --arch amd64
 
       - name: Package standalone directory
         if: startsWith(github.ref, 'refs/tags/')

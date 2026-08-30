@@ -51,7 +51,7 @@ CATEGORY_SAMPLES: dict[str, list[str]] = {
         "ramp receipts upload <TRANSACTION_ID> --file_path receipt.pdf",
     ],
     "purchase_orders": [
-        "ramp purchase_orders search",
+        "ramp purchase-orders search",
     ],
     "requests": [
         "ramp requests list",

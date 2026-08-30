@@ -44,6 +44,7 @@ from ramp_cli.output.help import (
 from ramp_cli.specs.sync import maybe_sync
 from ramp_cli.tools.commands import (
     build_tool_command,
+    cli_category_name,
     resolve_cli_tool_groups,
     resolve_tool_command_names,
 )
@@ -75,7 +76,7 @@ class Resource(StrEnum):
     CARDS = "cards"
     FUNDS = "funds"
     GENERAL = "general"
-    PURCHASE_ORDERS = "purchase_orders"
+    PURCHASE_ORDERS = "purchase-orders"
     RECEIPTS = "receipts"
     REIMBURSEMENTS = "reimbursements"
     REQUESTS = "requests"
@@ -100,8 +101,8 @@ _RESOURCE_HELP: dict[str, str] = {
     "cards": "Activate a card, and lock or unlock a card",
     "funds": "Manage funds (budgets/cards), activate cards, and make agent card payments",
     "general": "Post comments, explain declines, answer policy questions, search help center, and report missing capabilities",
-    "procurement_requests": "Create and submit procurement requests",
-    "purchase_orders": "Search and view purchase order details",
+    "procurement-requests": "Create and submit procurement requests",
+    "purchase-orders": "Search and view purchase order details",
     "receipts": "Upload and attach receipts to transactions and reimbursements",
     "reimbursements": "Submit, review, and manage out-of-pocket expense reimbursements",
     "requests": "Make and review requests for funds and purchases",
@@ -350,14 +351,15 @@ class RampGroup(click.Group):
                 profile=self._resolve_profile(ctx),
             )
 
-        if cmd_name in multi:
-            tools = multi[cmd_name]
+        generated_name = cli_category_name(cmd_name)
+        if generated_name in multi:
+            tools = multi[generated_name]
             aliases = ", ".join(sorted(t.alias or t.name for t in tools))
-            fallback = f"{cmd_name.replace('_', ' ').title()} \u2014 {aliases}"
+            fallback = f"{generated_name.replace('-', ' ').title()} \u2014 {aliases}"
             return ToolGroup.build(
-                cmd_name,
+                generated_name,
                 tools,
-                _RESOURCE_HELP.get(cmd_name, fallback),
+                _RESOURCE_HELP.get(generated_name, fallback),
                 env=self._resolve_env(ctx),
                 profile=self._resolve_profile(ctx),
             )

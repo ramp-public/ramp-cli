@@ -15,7 +15,7 @@ import tempfile
 import time
 import tomllib
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
@@ -29,7 +29,7 @@ import questionary
 import zstandard
 from click.core import ParameterSource
 
-from ramp_cli import claude_cowork
+from ramp_cli import claude_cowork, hermes_agent
 from ramp_cli.commands import claude_code
 from ramp_cli.commands import router_sync as router_sync_module
 from ramp_cli.commands.router_sync import (
@@ -71,6 +71,11 @@ PI_PLUGIN_RUNTIME_MODELS_FILE = "ramp-router-runtime-models.json"
 ROUTER_UI_URL = "https://app.router.com"
 ROUTER_UI_URL_ENV = "RAMP_ROUTER_UI_URL"
 ROUTER_PROVIDER = "ramp-router"
+# The provider name inside Hermes's own configuration. Hermes ships a bundled
+# ``router`` provider profile (hermes-agent plugins/model-providers/router),
+# and the ``providers.router`` entry written for older Hermes versions uses
+# the same name so both generations resolve one provider identity.
+HERMES_ROUTER_PROVIDER = "router"
 # Read instead of --api-key so the secret stays out of shell history and out
 # of the process list.
 CONFIGURE_KEY_ENV = "RAMP_ROUTER_CONFIGURE_API_KEY"
@@ -99,6 +104,7 @@ CLIENT_NAMES = {
     "codex": "Codex",
     "opencode": "OpenCode",
     "pi": "Pi",
+    "hermes": "Hermes",
 }
 # The command each agent puts on PATH. Used to tell which agents this machine
 # actually has, so the picker does not offer to write configuration into
@@ -108,6 +114,7 @@ CLIENT_EXECUTABLES = {
     "codex": "codex",
     "opencode": "opencode",
     "pi": "pi",
+    "hermes": "hermes",
 }
 # Claude Cowork joins the configure and unconfigure pickers but stays out of
 # CLIENT_NAMES: it has no config file of its own, exists only on macOS, and is
@@ -747,18 +754,16 @@ def _clients_with_a_receipt() -> tuple[str, ...]:
 
 
 def _installed_clients() -> tuple[str, ...]:
-    """Return the coding agents that appear to be present on this machine.
+    """Return the coding agents whose commands are present on this machine.
 
-    An agent counts when its command is on PATH or when it already keeps a
-    configuration directory, because an agent installed somewhere PATH does not
-    reach still has a setup worth pointing at Router. Detection only narrows
-    what the picker offers; naming an agent explicitly always configures it, so
-    a missed install costs an argument rather than the whole command.
+    Configuration directories can outlive an uninstall or be created by setup
+    before the agent exists. Detection only narrows what the picker offers;
+    naming an agent explicitly still supports preconfiguration.
     """
     return tuple(
         client
         for client, executable in CLIENT_EXECUTABLES.items()
-        if shutil.which(executable) or _client_config_path(client).parent.is_dir()
+        if shutil.which(executable)
     )
 
 
@@ -801,9 +806,15 @@ def _pick_installed_clients() -> tuple[str, ...]:
     if not candidates:
         # Offering nothing would end the command on a machine where detection
         # simply missed, and configuring an agent before installing it is a
-        # supported thing to do.
+        # supported thing to do. Hermes is the exception: its setup runs
+        # through the hermes executable, so a machine detection just proved
+        # has neither the binary nor a config directory can only fail on it.
         click.echo("No coding agents found. Showing every agent Router supports.")
-        candidates = tuple(CLIENT_NAMES)
+        candidates = tuple(
+            client
+            for client in CLIENT_NAMES
+            if client != "hermes" or hermes_agent.hermes_executable() is not None
+        )
     # The list says which apps an entry covers, so nobody has to think of
     # Claude Code and Claude Desktop as two separate things to configure.
     titles = dict(AGENT_NAMES)
@@ -1195,6 +1206,18 @@ def _run_configure(
             )
         for item in clients:
             models = models_by_client[item]
+            if (
+                item == "hermes"
+                and not requested_clients
+                and hermes_agent.hermes_executable() is None
+            ):
+                # Hermes is configured through its own `hermes config`
+                # surface, so it is the one agent a bare run cannot set up
+                # before it is installed. Skipping keeps "configure
+                # everything" meaning everything configurable on this
+                # machine; naming hermes explicitly still reports the
+                # missing binary as the failure it is.
+                continue
             if item == COWORK_CLIENT:
                 try:
                     profile_path, migrated_selections = claude_cowork.configure(
@@ -1438,45 +1461,74 @@ def router_refresh(ctx: click.Context) -> None:
     for client in clients:
         path = _client_config_path(client)
         try:
-            api_key = _stored_router_api_key(client, path)
-            # The endpoint paired with the stored credential wins for every
-            # client, so a refresh run under a different environment — such
-            # as one spawned by session sync — cannot rewrite a
-            # non-production setup to the default Router.
-            base_url = _stored_router_base_url(client, path) or router_base_url()
-            claude_code_view = client == "claude-code"
-            request_key = (api_key, claude_code_view, base_url)
-            models = models_by_request.get(request_key)
-            if models is None:
-                # Always the exhaustive view, whatever picker view the user
-                # chose: this list validates the configured default model id,
-                # ids are identical across views, and the compact view can
-                # omit callable models. The configured preference still flows
-                # into the settings via claude_model_view below.
-                models = (
-                    _fetch_models(
-                        api_key,
-                        claude_code_view=True,
-                        model_view_all=True,
-                        base_url=base_url,
+            # For Hermes, the credential read, endpoint read, model
+            # discovery, and reconfiguration form one transaction under its
+            # config lock. With the reads outside the lock, an unconfigure
+            # interleaving after the key read could restore a pre-Router
+            # endpoint that the discovery request would then transmit the
+            # live Router credential to.
+            transaction = _hermes_config_lock() if client == "hermes" else nullcontext()
+            with transaction:
+                if client == "hermes" and (
+                    not (path.parent / "ramp-router-state.json").exists()
+                    or not _hermes_receipt_enrolls(
+                        path.parent / "ramp-router-state.json"
                     )
-                    if claude_code_view
-                    else _fetch_models(api_key, base_url=base_url)
+                ):
+                    # A concurrent unconfigure finished between the
+                    # enrollment scan and this lock: nothing is left to
+                    # refresh, and the credential and endpoint on disk are
+                    # the user's restored state, not ours to read or use.
+                    raise click.ClickException(
+                        "Ramp Router is no longer configured in Hermes."
+                    )
+                api_key = _stored_router_api_key(client, path)
+                # The endpoint paired with the stored credential wins for
+                # every client, so a refresh run under a different
+                # environment — such as one spawned by session sync — cannot
+                # rewrite a non-production setup to the default Router.
+                base_url = _stored_router_base_url(client, path) or router_base_url()
+                claude_code_view = client == "claude-code"
+                request_key = (api_key, claude_code_view, base_url)
+                models = models_by_request.get(request_key)
+                if models is None:
+                    # Always the exhaustive view, whatever picker view the
+                    # user chose: this list validates the configured default
+                    # model id, ids are identical across views, and the
+                    # compact view can omit callable models. The configured
+                    # preference still flows into the settings via
+                    # claude_model_view below.
+                    models = (
+                        _fetch_models(
+                            api_key,
+                            claude_code_view=True,
+                            model_view_all=True,
+                            base_url=base_url,
+                        )
+                        if claude_code_view
+                        else _fetch_models(api_key, base_url=base_url)
+                    )
+                    models_by_request[request_key] = models
+                selected_model = _configured_model(client, path)
+                configure_options = {
+                    "base_url": base_url,
+                    "selected_model": selected_model,
+                }
+                if client == "claude-code":
+                    configure_options["claude_model_view"] = (
+                        "all" if _configured_claude_model_view_all(path) else "compact"
+                    )
+                    configure_options["preserve_model_view_ownership"] = True
+                elif client == "hermes":
+                    # The receipt was just checked, but only inside this
+                    # same lock scope — keep the check at the write too so
+                    # the invariant survives future callers of the locked
+                    # configure path.
+                    configure_options["hermes_require_receipt"] = True
+                    configure_options["hermes_lock_held"] = True
+                _, default_model, _ = _configure_client(
+                    client, api_key, models, **configure_options
                 )
-                models_by_request[request_key] = models
-            selected_model = _configured_model(client, path)
-            configure_options = {
-                "base_url": base_url,
-                "selected_model": selected_model,
-            }
-            if client == "claude-code":
-                configure_options["claude_model_view"] = (
-                    "all" if _configured_claude_model_view_all(path) else "compact"
-                )
-                configure_options["preserve_model_view_ownership"] = True
-            _, default_model, _ = _configure_client(
-                client, api_key, models, **configure_options
-            )
         except click.ClickException as exc:
             failures.append(f"{CLIENT_NAMES[client]}: {exc.message}")
             continue
@@ -2047,11 +2099,619 @@ def _unconfigure_client(client: str, path: Path) -> None:
     if client == "claude-code":
         _unconfigure_claude_code(path)
         return
+    if client == "hermes":
+        _unconfigure_hermes(path)
+        return
     if client != "codex":
         _unconfigure_json_client(client, path)
         return
     with codex_config_lock(path):
         _unconfigure_codex(path)
+
+
+def _configure_hermes(
+    path: Path,
+    api_key: str,
+    default_model: str,
+    base_url: str | None = None,
+    require_receipt: bool = False,
+) -> None:
+    """Point Hermes at Ramp Router through its own config surface.
+
+    Hermes resolves a provider named ``router`` from its bundled provider
+    registry on versions that ship it, and from the ``providers.router``
+    entry written here on versions that predate it — the entry pins the
+    endpoint, the Responses-only wire (api.router.com serves no
+    /chat/completions), and the .env variable carrying the key, so the same
+    five keys configure every Hermes generation. The credential itself goes
+    straight into .env rather than through ``hermes config set``, keeping it
+    out of process listings.
+    """
+    with _hermes_config_lock():
+        _configure_hermes_locked(
+            path,
+            api_key,
+            default_model,
+            base_url=base_url,
+            require_receipt=require_receipt,
+        )
+
+
+def _configure_hermes_locked(
+    path: Path,
+    api_key: str,
+    default_model: str,
+    base_url: str | None = None,
+    require_receipt: bool = False,
+) -> None:
+    state_path = path.parent / "ramp-router-state.json"
+    endpoint = (base_url or router_base_url()).rstrip("/")
+    if require_receipt and not state_path.exists():
+        # The refresh path: a concurrent unconfigure finished between the
+        # enrollment scan and this write lock, so re-applying the setup here
+        # would resurrect what the user just removed.
+        raise click.ClickException("Ramp Router is no longer configured in Hermes.")
+    if require_receipt and not _hermes_receipt_enrolls(state_path):
+        # Same guard for a teardown whose receipt could not be deleted and
+        # for a first configure that never promoted: refresh must not
+        # resurrect the one or complete the other.
+        raise click.ClickException("Ramp Router is no longer configured in Hermes.")
+    written_provider_entry = {
+        "base_url": endpoint,
+        "api_mode": "codex_responses",
+        "key_env": hermes_agent.ROUTER_KEY_ENV,
+    }
+    if state_path.exists():
+        # A repeat configure keeps the pre-Router snapshot but re-records
+        # what this CLI is writing now, so the unconfigure ownership check
+        # compares against the entry that is actually on disk.
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                raise ValueError
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+            raise click.ClickException(
+                f"Could not read Ramp Router setup state from {state_path}."
+            ) from None
+        if state.get("unconfigured") is True:
+            # An explicit configure cannot safely re-enroll over a
+            # torn-down receipt: its snapshot predates the completed
+            # teardown, and the user may have reshaped Hermes since — a
+            # later unconfigure restoring that obsolete snapshot would
+            # destroy the intervening settings. The receipt's deletion is
+            # what failed, so ask for it again instead of reusing it.
+            # Manual deletion is offered only for a teardown that finished
+            # its restores: an incomplete receipt is the only pre-Router
+            # snapshot left, and deleting it would end the recovery.
+            manual_hint = (
+                " (or delete the file)" if state.get("restore_complete") is True else ""
+            )
+            raise click.ClickException(
+                "A previous unconfigure could not delete its receipt at "
+                f"{state_path}. Run 'ramp router unconfigure hermes' again"
+                f"{manual_hint} before configuring Hermes."
+            )
+    else:
+        # Snapshot before the first write so unconfigure can put back
+        # exactly what this CLI found: the model selection (scalar or
+        # mapping), any user-defined provider entry under our name, and the
+        # .env line for the key variable.
+        state = {
+            # ``hermes config get`` answers from merged defaults, so a
+            # never-configured model reads as an empty value rather than a
+            # miss; recording it as absent makes the restore unset the key,
+            # which reproduces the same default.
+            "model": hermes_agent.read_config_json("model") or None,
+            "provider_entry": hermes_agent.read_config_json(
+                f"providers.{HERMES_ROUTER_PROVIDER}"
+            ),
+            # The raw assignment line, quoting and export prefix included:
+            # the restore writes this back verbatim, and a decoded snapshot
+            # would restore a line dotenv or a sourcing shell reads
+            # differently.
+            "env_key": hermes_agent.read_env_line(hermes_agent.ROUTER_KEY_ENV),
+        }
+        # Providers that already referenced the key variable expect the
+        # snapshot credential back at teardown; ones the user creates later
+        # are built around the CLI-written key and keep it. The distinction
+        # only exists at snapshot time, so the full entries land in the
+        # receipt — an entry the user later edits has been rebuilt around
+        # the live key and no longer expects the snapshot one.
+        providers_before = hermes_agent.read_config_json("providers")
+        state["preexisting_key_env_providers"] = {
+            name: entry
+            for name, entry in (
+                providers_before.items() if isinstance(providers_before, dict) else ()
+            )
+            if name != HERMES_ROUTER_PROVIDER
+            and isinstance(entry, dict)
+            and entry.get("key_env") == hermes_agent.ROUTER_KEY_ENV
+        }
+    # Ownership marks the last completed generation (``written_*``) plus the
+    # not-yet-completed ones (``pending_*s``). The receipt lands before the
+    # provider writes, so anything a failed attempt managed to write is only
+    # recognizable through its pending marker — and consecutive failed
+    # retries toward different endpoints must keep every unpromoted marker,
+    # or the leaves an earlier attempt wrote would read as user edits. The
+    # pending set is cleared when a configure completes, so a credential the
+    # user later rotates back to an old *completed* CLI value is never
+    # claimed by stale history.
+    pending_entries = state.get("pending_provider_entries")
+    if not isinstance(pending_entries, list):
+        pending_entries = []
+    if written_provider_entry not in pending_entries:
+        pending_entries.append(written_provider_entry)
+    state["pending_provider_entries"] = pending_entries
+    # A fingerprint, not the credential: enough for unconfigure to tell the
+    # key it wrote from one the user has since rotated, without duplicating
+    # the active secret into the receipt.
+    key_digest = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    pending_digests = state.get("pending_env_key_sha256s")
+    if not isinstance(pending_digests, list):
+        pending_digests = []
+    if key_digest not in pending_digests:
+        pending_digests.append(key_digest)
+    state["pending_env_key_sha256s"] = pending_digests
+    # The ownership marker tracks the default this CLI *chose*, so the
+    # unconfigure check can tell a CLI selection from a user selection. A
+    # refresh that merely echoes the user's live pick back (it passes the
+    # current selection through as default_model) must not re-stamp that
+    # pick as CLI-owned — that would defeat the check and let unconfigure
+    # replace a selection the user made deliberately.
+    live_model = hermes_agent.read_config_json("model")
+    live_default = (
+        live_model.get("default")
+        if isinstance(live_model, dict)
+        and live_model.get("provider") == HERMES_ROUTER_PROVIDER
+        else None
+    )
+    prior_marker = state.get("written_model_default")
+    preserving_user_selection = (
+        live_default is not None
+        and live_default == default_model
+        and prior_marker is not None
+        and prior_marker != default_model
+    )
+    if not preserving_user_selection:
+        state["written_model_default"] = default_model
+    # The receipt lands before the first write, so an interrupted setup is
+    # already restorable; configured_router_clients still requires a
+    # readable credential, so a receipt alone never enrolls in refresh. It
+    # can carry the pre-existing key, so it gets the same owner-only
+    # treatment as the .env it was read from.
+    # Filesystem failures surface as ClickExceptions so a multi-client
+    # configure reports Hermes as the failed client and finishes normally,
+    # the same contract the other client writers follow.
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_private_file(state_path, json.dumps(state, indent=2) + "\n")
+    except OSError as exc:
+        raise click.ClickException(f"Could not write {state_path}: {exc}") from None
+    hermes_agent.write_env_value(hermes_agent.ROUTER_KEY_ENV, api_key)
+    hermes_agent.set_config_value(
+        f"providers.{HERMES_ROUTER_PROVIDER}.base_url", endpoint
+    )
+    hermes_agent.set_config_value(
+        f"providers.{HERMES_ROUTER_PROVIDER}.api_mode", "codex_responses"
+    )
+    hermes_agent.set_config_value(
+        f"providers.{HERMES_ROUTER_PROVIDER}.key_env", hermes_agent.ROUTER_KEY_ENV
+    )
+    hermes_agent.set_config_value("model.provider", HERMES_ROUTER_PROVIDER)
+    hermes_agent.set_config_value("model.default", default_model)
+    # Every write above landed: promote the pending generation to the
+    # written one. If this final receipt rewrite itself fails, unconfigure
+    # still recognizes both generations — written and pending — as ours.
+    state["written_provider_entry"] = written_provider_entry
+    state["written_env_key_sha256"] = key_digest
+    state.pop("pending_provider_entries", None)
+    state.pop("pending_env_key_sha256s", None)
+    try:
+        _write_private_file(state_path, json.dumps(state, indent=2) + "\n")
+    except OSError as exc:
+        raise click.ClickException(f"Could not write {state_path}: {exc}") from None
+
+
+def _hermes_entry_is_ours(current: object, written: object, previous: object) -> bool:
+    """Report whether the live ``providers.router`` entry belongs to this setup.
+
+    True for the entry configure wrote, for an absent entry (a retry after
+    the old unset-then-restore path failed), and for any per-leaf mix of
+    configure-written and snapshot values (a retry after a partial restore).
+    A leaf value that matches neither origin is a deliberate user edit, and
+    the entry is theirs to keep. Receipts from before the ownership field
+    default to the old always-restore behavior.
+
+    ``written`` accepts one marker or a pair — the last successfully
+    written generation plus a pending one from a reconfigure whose writes
+    did not complete. A repeat configure toward a different endpoint
+    records its new marker as pending before writing, and when those writes
+    fail mid-flight the live entry still carries the prior CLI-written
+    values — both generations must read as ours, or unconfigure would
+    refuse to restore the CLI's own entry.
+    """
+    markers = written if isinstance(written, list) else [written]
+    markers = [marker for marker in markers if marker is not None]
+    if not markers or current is None:
+        return True
+    if not isinstance(current, dict):
+        return any(current == marker for marker in markers)
+    # A snapshot leaf missing from the live entry is a deliberate user
+    # deletion (configure and restore only ever write leaves, never delete
+    # them), but it does not surrender the rest: that one deletion sticks
+    # in the restore below while every other managed leaf is still torn
+    # down — abandoning them all would leave the credential and model
+    # behind and report success.
+    for leaf, value in current.items():
+        candidates = []
+        for marker in markers:
+            if isinstance(marker, dict) and leaf in marker:
+                candidates.append(marker[leaf])
+        if isinstance(previous, dict) and leaf in previous:
+            candidates.append(previous[leaf])
+        if value not in candidates:
+            return False
+    return True
+
+
+def _unconfigure_hermes(path: Path) -> None:
+    with _hermes_config_lock():
+        _unconfigure_hermes_locked(path)
+
+
+def _unconfigure_hermes_locked(path: Path) -> None:
+    state_path = path.parent / "ramp-router-state.json"
+    if not state_path.exists():
+        raise click.ClickException("Ramp Router is not configured in Hermes.")
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            raise ValueError
+        previous_model = state["model"]
+        previous_provider_entry = state["provider_entry"]
+        previous_env_key = state["env_key"]
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
+        raise click.ClickException(
+            f"Could not read Ramp Router setup state from {state_path}."
+        ) from None
+
+    # The terminal mark lands before any restore write: should the receipt
+    # survive this teardown (its deletion below can fail on a full or
+    # read-only filesystem), it must never re-enroll Hermes — a detached
+    # session-start refresh would otherwise read the restored key and
+    # endpoint and reapply the setup the user just removed. A retry of this
+    # unconfigure still proceeds normally from the marked receipt.
+    retrying_teardown = state.get("unconfigured") is True
+    if not retrying_teardown:
+        state["unconfigured"] = True
+        try:
+            _write_private_file(state_path, json.dumps(state, indent=2) + "\n")
+        except OSError as exc:
+            raise click.ClickException(f"Could not write {state_path}: {exc}") from None
+
+    provider_key = f"providers.{HERMES_ROUTER_PROVIDER}"
+    # The provider entry is restored only while this setup still owns it: a
+    # user who has since re-pointed providers.router at another endpoint or
+    # key keeps their edit, the same ownership rule the model restore below
+    # applies. Ownership accepts any mix of configure-written and
+    # snapshot-restored leaf values, so a retry after a partially failed
+    # restore still recognizes the entry and finishes the job instead of
+    # abandoning the snapshot.
+    # The last successfully written marker plus every pending one left by
+    # configures whose writes did not complete: all those generations are
+    # ours — a failed retry may have replaced the endpoint an even earlier
+    # failed attempt managed to write.
+    pending_markers = state.get("pending_provider_entries")
+    written_entry = [
+        marker
+        for marker in [
+            state.get("written_provider_entry"),
+            *(pending_markers if isinstance(pending_markers, list) else []),
+        ]
+        if marker is not None
+    ]
+    current_entry = hermes_agent.read_config_json(provider_key)
+    # Ownership is judged leaf-scoped: only the leaves this CLI wrote
+    # (base_url, api_mode, key_env) are managed. A custom field the user
+    # added under providers.router is invisible to the check and never
+    # touched — otherwise one unrelated edit would make unconfigure abandon
+    # the whole Router teardown while reporting success.
+    managed_leaves: set[str] = set()
+    for marker in written_entry:
+        if isinstance(marker, dict):
+            managed_leaves.update(marker)
+    if managed_leaves and isinstance(current_entry, dict):
+        current_managed: object = {
+            leaf: value
+            for leaf, value in current_entry.items()
+            if leaf in managed_leaves
+        }
+        unmanaged_leaves = {
+            leaf for leaf in current_entry if leaf not in managed_leaves
+        }
+    else:
+        current_managed = current_entry
+        unmanaged_leaves = set()
+    previous_managed: object = previous_provider_entry
+    if managed_leaves and isinstance(previous_provider_entry, dict):
+        previous_managed = {
+            leaf: value
+            for leaf, value in previous_provider_entry.items()
+            if leaf in managed_leaves
+        }
+    if current_entry is None and previous_provider_entry is not None:
+        # The user deleted the whole providers.router mapping after setup.
+        # Nothing in this CLI produces that state — configure and the
+        # per-leaf restore only ever write values — so absence alongside a
+        # non-empty snapshot is a deliberate removal, and replaying the
+        # snapshot would resurrect the entry. (With no pre-Router entry,
+        # absence is just the completed teardown state and stays ours so a
+        # retry can finish the no-op removal.)
+        entry_is_ours = False
+    else:
+        entry_is_ours = _hermes_entry_is_ours(
+            current_managed, written_entry, previous_managed
+        )
+    if entry_is_ours:
+        if current_entry is not None and previous_provider_entry is None:
+            if managed_leaves and unmanaged_leaves:
+                # The user's own fields survive; only the managed leaves go.
+                for leaf in sorted(managed_leaves):
+                    if isinstance(current_entry, dict) and leaf in current_entry:
+                        hermes_agent.unset_config_key(f"{provider_key}.{leaf}")
+            else:
+                hermes_agent.unset_config_key(provider_key)
+        elif previous_provider_entry is not None:
+            # Restore by overwriting leaves rather than unset-then-set: each
+            # step is idempotent, so a transient failure leaves a state a
+            # retry completes from, never one where the snapshot is gone. An
+            # absent entry restores the full snapshot; a live one gets only
+            # its managed leaves put back, so user-added fields and a
+            # user-deleted snapshot field both keep their fate.
+            if current_entry is None or not (
+                managed_leaves and isinstance(previous_provider_entry, dict)
+            ):
+                hermes_agent.set_config_tree(provider_key, previous_provider_entry)
+            else:
+                for leaf in sorted(managed_leaves):
+                    if not (isinstance(current_entry, dict) and leaf in current_entry):
+                        # Deleted by the user after setup, or never present:
+                        # deletions stick and absences need nothing.
+                        continue
+                    if leaf in previous_provider_entry:
+                        hermes_agent.set_config_tree(
+                            f"{provider_key}.{leaf}",
+                            previous_provider_entry[leaf],
+                        )
+                    else:
+                        hermes_agent.unset_config_key(f"{provider_key}.{leaf}")
+
+    # The model selection is restored only while this setup still owns it: a
+    # user who has since switched Hermes to another provider — or to another
+    # Router model — keeps their choice, exactly as the OpenCode restore
+    # leaves a foreign model alone. Receipts from before the field default
+    # to matching any Router-provider model, the old behavior.
+    current_model = hermes_agent.read_config_json("model")
+    written_model_default = state.get("written_model_default")
+    model_is_ours = (
+        isinstance(current_model, dict)
+        and current_model.get("provider") == HERMES_ROUTER_PROVIDER
+        and (
+            written_model_default is None
+            or current_model.get("default") == written_model_default
+        )
+    )
+    # A model the user re-picked — still on Router — is their selection, but
+    # it cannot outlive the provider entry and credential it calls through.
+    # Once the teardown above removed or restored providers.router, leaving
+    # model.provider pointed at it would strand Hermes on a provider that no
+    # longer exists, so the pre-Router selection comes back with it. When the
+    # user instead re-pointed providers.router at their own endpoint, that
+    # entry survives above, their model keeps working, and it stays.
+    model_is_stranded = (
+        not model_is_ours
+        and entry_is_ours
+        and isinstance(current_model, dict)
+        and current_model.get("provider") == HERMES_ROUTER_PROVIDER
+    )
+    # The inverse of the strand rule, matching key_still_referenced below: a
+    # surviving user-owned provider entry keeps every dependency it calls
+    # through. Restoring the pre-Router model would disable the setup the
+    # user deliberately kept while its provider and credential remain.
+    model_retained_by_user_entry = (
+        not entry_is_ours
+        and isinstance(current_entry, dict)
+        and isinstance(current_model, dict)
+        and current_model.get("provider") == HERMES_ROUTER_PROVIDER
+    )
+    # An absent model during a marked-teardown retry is this command's own
+    # unset-then-set window (the exact-shape restore below crashed between
+    # its two steps), not a user deletion — configure always leaves a model
+    # behind, and a pre-teardown user deletion arrives with no mark. The
+    # retry must finish the restore or the snapshot is lost with the
+    # receipt. Hermes answers an unset model with an empty default rather
+    # than a miss, so any falsy read counts as absent — the same
+    # normalization the setup snapshot applies.
+    model_restore_interrupted = not current_model and retrying_teardown
+    # A CLI-written default whose provider leaf the user deleted is still
+    # ours to clean up: leaving it would point Hermes's fallback provider at
+    # a Router model id. The deletion of the provider leaf itself sticks.
+    # A CLI-written default whose provider leaf the user *deleted* is still
+    # ours to clean up: nothing pairs with it deliberately, and it would
+    # dangle under Hermes's implicit fallback. A provider *switched* to
+    # another name is different — keeping the same model id under a new
+    # provider is a deliberate user pairing, and value-equality with the
+    # CLI's marker is not evidence of ownership there, so it stays (the
+    # same rule as a surviving user-owned provider entry).
+    model_default_is_cli = (
+        isinstance(current_model, dict)
+        and "provider" not in current_model
+        and current_model.get("default") is not None
+        and (
+            written_model_default is None
+            or current_model.get("default") == written_model_default
+        )
+    )
+    # Restoration is leaf-scoped like the provider entry: this CLI wrote
+    # exactly model.provider and model.default, so any other field the user
+    # added under model survives the teardown instead of being discarded by
+    # a whole-mapping unset-and-replay.
+    model_managed = ("provider", "default")
+    unmanaged_model_leaves = (
+        {leaf for leaf in current_model if leaf not in model_managed}
+        if isinstance(current_model, dict)
+        else set()
+    )
+    if model_retained_by_user_entry:
+        restore_model_leaves: tuple[str, ...] = ()
+    elif model_is_ours or model_is_stranded or model_restore_interrupted:
+        restore_model_leaves = model_managed
+    elif model_default_is_cli:
+        restore_model_leaves = ("default",)
+    else:
+        restore_model_leaves = ()
+    if restore_model_leaves:
+        if (
+            restore_model_leaves != model_managed
+            or isinstance(previous_model, dict)
+            or unmanaged_model_leaves
+        ):
+            # Per-leaf restore whenever a whole-mapping replay could touch
+            # anything beyond the leaves this teardown owns: a mapping
+            # snapshot may hold an unrelated field the user has since
+            # deleted (deletions stick, as in the provider restoration
+            # path), live user fields must survive, and a user-switched
+            # provider leaf is not ours to replace. Hermes promotes a
+            # scalar model to {"default": scalar}, so a scalar snapshot
+            # restores through the same leaf writes.
+            if isinstance(previous_model, dict):
+                previous_map = previous_model
+            elif previous_model is not None:
+                previous_map = {"default": previous_model}
+            else:
+                previous_map = {}
+            for leaf in restore_model_leaves:
+                leaf_live = isinstance(current_model, dict) and leaf in current_model
+                if not leaf_live and not model_restore_interrupted:
+                    # Deleted by the user after setup, or never present:
+                    # deletions stick, matching the provider-entry path. An
+                    # interrupted restore is the exception — the absence is
+                    # this command's own unset, and the retry must finish.
+                    continue
+                if leaf in previous_map:
+                    hermes_agent.set_config_tree(f"model.{leaf}", previous_map[leaf])
+                elif leaf_live:
+                    hermes_agent.unset_config_key(f"model.{leaf}")
+        else:
+            # A scalar or absent snapshot with no user fields in the live
+            # mapping restores exactly, shape included.
+            hermes_agent.unset_config_key("model")
+            if previous_model is not None:
+                hermes_agent.set_config_tree("model", previous_model)
+
+    # The key line follows the same ownership rule as the model and the
+    # provider entry: a credential the user has since rotated is theirs, and
+    # overwriting it with the pre-configure snapshot would destroy the only
+    # copy. Receipts from before the fingerprint field keep the old
+    # always-restore behavior. Ownership covers the last successful write
+    # plus digests of unpromoted pending writes — any of those keys can be
+    # the one on disk after failed attempts. Completed generations never
+    # accumulate (the pending set clears on promote), so a key the user
+    # deliberately rotates back to an old completed CLI value stays theirs.
+    pending_digests = state.get("pending_env_key_sha256s")
+    written_key_digests = [
+        digest
+        for digest in [
+            state.get("written_env_key_sha256"),
+            *(pending_digests if isinstance(pending_digests, list) else []),
+        ]
+        if isinstance(digest, str)
+    ]
+    current_key = hermes_agent.read_env_value(hermes_agent.ROUTER_KEY_ENV)
+    key_is_ours = (
+        not written_key_digests
+        # An absent value where the snapshot held a key is a deliberate user
+        # deletion — restoring would resurrect the removed credential. When
+        # the snapshot held none, absence is just the restored end state (or
+        # a retry of it) and the removal below is a no-op.
+        or (current_key is None and previous_env_key is None)
+        or (
+            current_key is not None
+            and hashlib.sha256(current_key.encode("utf-8")).hexdigest()
+            in written_key_digests
+        )
+    )
+    # A provider entry the user now owns can still name our key variable —
+    # they re-pointed base_url but kept key_env — and that surviving setup
+    # is only functional while the credential exists. The key is the user's
+    # own Router credential that this CLI merely wrote down, so it stays
+    # with the entry that depends on it, exactly as a rotated key stays.
+    # Any *other* provider entry naming the variable counts too: the user
+    # may have built their own provider around the CLI-written credential.
+    # The router entry itself is excluded when this teardown owns it — its
+    # pairing with the snapshot key is exactly what the restore reproduces.
+    # A reference that already existed at snapshot time does not block the
+    # restore either: that provider's effective credential *was* the
+    # snapshot key, and keeping the CLI's would leave it authenticated with
+    # the wrong secret.
+    preexisting_refs = state.get("preexisting_key_env_providers")
+    if not isinstance(preexisting_refs, dict):
+        preexisting_refs = {}
+
+    def _connection_identity(entry: object) -> tuple[object, ...] | None:
+        """The fields that decide which credential an entry expects.
+
+        A pre-existing reference stops expecting the snapshot key only when
+        its connection itself changes — endpoint, wire, or key variable. An
+        unrelated edit such as a label keeps the dependency it always had.
+        """
+        if not isinstance(entry, dict):
+            return None
+        return tuple(entry.get(field) for field in ("base_url", "api_mode", "key_env"))
+
+    providers_after_teardown = hermes_agent.read_config_json("providers")
+    other_entry_references_key = isinstance(providers_after_teardown, dict) and any(
+        isinstance(entry, dict) and entry.get("key_env") == hermes_agent.ROUTER_KEY_ENV
+        for name, entry in providers_after_teardown.items()
+        # A pre-existing reference counts only while its connection is
+        # unchanged since the snapshot: one the user re-pointed after setup
+        # was rebuilt around the live key and keeps it, exactly like a new
+        # provider.
+        if name != HERMES_ROUTER_PROVIDER
+        and _connection_identity(preexisting_refs.get(name))
+        != _connection_identity(entry)
+    )
+    key_still_referenced = other_entry_references_key or (
+        not entry_is_ours
+        and isinstance(current_entry, dict)
+        and current_entry.get("key_env") == hermes_agent.ROUTER_KEY_ENV
+    )
+    if key_is_ours and not key_still_referenced:
+        hermes_agent.write_env_line(hermes_agent.ROUTER_KEY_ENV, previous_env_key)
+    # Hermes is fully restored at this point; a receipt that cannot be
+    # removed is a per-client failure the unconfigure loop can report and
+    # continue past, not an internal error that aborts later clients.
+    try:
+        state_path.unlink()
+    except OSError as exc:
+        # Distinguish this completed teardown from a mid-restore failure:
+        # only a receipt marked complete is safe to clear by hand, since an
+        # incomplete one still holds the only pre-Router snapshot. Best
+        # effort — when this write fails too, the receipt conservatively
+        # keeps reading as incomplete and the retry path stays the answer.
+        state["restore_complete"] = True
+        try:
+            _write_private_file(state_path, json.dumps(state, indent=2) + "\n")
+        except OSError:
+            pass
+        raise click.ClickException(f"Could not remove {state_path}: {exc}") from None
 
 
 def _unconfigure_codex(path: Path) -> None:
@@ -2223,6 +2883,22 @@ def codex_config_lock(path: Path):
     silently drops the other writer's change.
     """
     with claude_code.advisory_lock(path.parent / ".ramp-codex-config.lock"):
+        yield
+
+
+@contextmanager
+def _hermes_config_lock():
+    """Serialize every Hermes setup transaction against one Hermes home.
+
+    Configure, refresh, and unconfigure each read-check-write the Hermes
+    config, the .env credential, and the receipt as one logical transaction;
+    without the lock a session-start detached refresh interleaving with an
+    unconfigure can re-enroll Hermes mid-restore or send the credential to a
+    just-restored pre-Router endpoint.
+    """
+    lock_dir = hermes_agent.hermes_home()
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    with claude_code.advisory_lock(lock_dir / ".ramp-router-hermes.lock"):
         yield
 
 
@@ -2935,6 +3611,8 @@ def _client_config_path(client: str) -> Path:
     """Locate one client's configuration file."""
     if client == "claude-code":
         return claude_code.settings_path()
+    if client == "hermes":
+        return hermes_agent.config_path()
     return _codex_config_path() if client == "codex" else _json_config_path(client)
 
 
@@ -2951,12 +3629,53 @@ def configured_router_clients() -> tuple[str, ...]:
         path = _client_config_path(client)
         if not (path.parent / "ramp-router-state.json").is_file():
             continue
+        if client == "hermes" and not _hermes_receipt_enrolls(
+            path.parent / "ramp-router-state.json"
+        ):
+            # A torn-down or never-promoted receipt: the key on disk is the
+            # user's (restored or never replaced), and enrolling it would
+            # let a background refresh apply a setup the user removed or
+            # never completed.
+            continue
         try:
             _stored_router_api_key(client, path)
         except click.ClickException:
             continue
         configured.append(client)
     return tuple(configured)
+
+
+def _hermes_receipt_enrolls(state_path: Path) -> bool:
+    """Report whether a Hermes receipt describes a live, completed setup.
+
+    Two receipt shapes must never enroll Hermes in refresh: one carrying
+    the terminal teardown mark (the restore may already have completed),
+    and one holding only pending ownership markers — a first configure
+    that failed before promotion, where the key on disk can still be the
+    untouched pre-Router credential that refresh would otherwise pair with
+    whatever endpoint is configured. Unreadable and non-object receipts
+    fail closed for the same reason: enrollment happens before any receipt
+    parsing on the refresh path, so an optimistic answer would transmit
+    the stored key before the corrupt state is ever reported. Explicit
+    configure and unconfigure still read the receipt themselves and
+    surface the corruption.
+    """
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(state, dict):
+        return False
+    if state.get("unconfigured") is True:
+        return False
+    if state.get("pending_provider_entries") or state.get("pending_env_key_sha256s"):
+        # A generation is mid-write: a reconfigure toward a new endpoint
+        # writes the new key before the provider entry, so refresh here
+        # could pair that credential with the previous generation's
+        # endpoint. Explicit configure and unconfigure are the recovery
+        # paths for an interrupted attempt.
+        return False
+    return state.get("written_provider_entry") is not None
 
 
 def _stored_router_api_key_choices() -> list[tuple[str, tuple[str, ...]]]:
@@ -2966,9 +3685,19 @@ def _stored_router_api_key_choices() -> list[tuple[str, tuple[str, ...]]]:
     for client in configured_router_clients():
         path = _client_config_path(client)
         try:
-            if _stored_router_base_url(client, path) != active_url:
-                continue
-            api_key = _stored_router_api_key(client, path)
+            # For Hermes, the receipt recheck, endpoint read, and key read
+            # form one locked transaction: a concurrent unconfigure between
+            # them could pair the old Router endpoint with the restored
+            # pre-Router credential and offer it here for reuse.
+            guard = _hermes_config_lock() if client == "hermes" else nullcontext()
+            with guard:
+                if client == "hermes" and not _hermes_receipt_enrolls(
+                    path.parent / "ramp-router-state.json"
+                ):
+                    continue
+                if _stored_router_base_url(client, path) != active_url:
+                    continue
+                api_key = _stored_router_api_key(client, path)
         except click.ClickException:
             continue
         api_keys.setdefault(api_key, []).append(client)
@@ -3033,6 +3762,19 @@ def _stored_router_base_url(client: str, path: Path) -> str | None:
     elif client == "pi":
         config = _read_json_config(client, path.parent / PI_PLUGIN_CONFIG_FILE)
         base_url = config.get("baseUrl")
+    elif client == "hermes":
+        # Unreadable or missing must not degrade to None here: the refresh
+        # caller answers None with the active/default Router endpoint, which
+        # would transmit this setup's stored credential to a different
+        # environment. Raising records a per-client failure instead.
+        base_url = hermes_agent.read_config_json(
+            f"providers.{HERMES_ROUTER_PROVIDER}.base_url"
+        )
+        if not isinstance(base_url, str) or not base_url.strip():
+            raise click.ClickException(
+                "Could not read the Router endpoint from the Hermes "
+                "configuration. Run 'ramp router configure hermes' to repair it."
+            )
 
     if isinstance(base_url, str) and base_url.strip():
         return base_url.strip().rstrip("/")
@@ -3068,6 +3810,10 @@ def _stored_router_api_key(client: str, path: Path) -> str:
             credential = auth.get(ROUTER_PROVIDER)
             if isinstance(credential, dict):
                 api_key = credential.get("key")
+        elif client == "hermes":
+            # Read straight from Hermes's .env: no subprocess, so receipt
+            # scans stay cheap and work even when the binary is missing.
+            api_key = hermes_agent.read_env_value(hermes_agent.ROUTER_KEY_ENV)
         else:
             raise click.ClickException(
                 f"Refreshing {CLIENT_NAMES[client]} is not supported by this CLI."
@@ -3091,6 +3837,17 @@ def _configured_model(client: str, path: Path) -> str | None:
     elif client == "codex":
         _, config = _read_codex_config(path)
         model = config.get("model")
+    elif client == "hermes":
+        # A read failure propagates to the per-client failure handler:
+        # suppressing it here made refresh silently replace the user's
+        # selected model with the preferred default.
+        config = hermes_agent.read_config_json("model")
+        model = (
+            config.get("default")
+            if isinstance(config, dict)
+            and config.get("provider") == HERMES_ROUTER_PROVIDER
+            else None
+        )
     else:
         config = _read_json_config(client, path)
         if client == "opencode":
@@ -3143,6 +3900,8 @@ def _configure_client(
     selected_model: str | None = None,
     claude_model_view: str | None = None,
     preserve_model_view_ownership: bool = False,
+    hermes_require_receipt: bool = False,
+    hermes_lock_held: bool = False,
 ) -> tuple[Path, str, bool]:
     """Configure one client, reporting whether it replaced an outdated setup."""
     if client == "claude-code":
@@ -3171,6 +3930,25 @@ def _configure_client(
             selected_model=selected_model,
         )
         return path, default_model, repaired
+
+    if client == "hermes":
+        path = _client_config_path(client)
+        default_model = _preferred_model(models, selected_model)
+        # Refresh already holds the Hermes config lock around its reads and
+        # this write; the advisory flock is per open file and not reentrant,
+        # so it routes around the lock-taking wrapper instead of deadlocking
+        # on a second acquisition.
+        hermes_configure = (
+            _configure_hermes_locked if hermes_lock_held else _configure_hermes
+        )
+        hermes_configure(
+            path,
+            api_key,
+            default_model,
+            base_url=base_url,
+            require_receipt=hermes_require_receipt,
+        )
+        return path, default_model, False
 
     path = _json_config_path(client)
     default_model = _preferred_model(models, selected_model)

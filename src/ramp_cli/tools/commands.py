@@ -70,8 +70,8 @@ CLI_RESOURCE_CATEGORIES = frozenset(
         "business",
         "cards",
         "funds",
-        "procurement_requests",
-        "purchase_orders",
+        "procurement-requests",
+        "purchase-orders",
         "receipts",
         "reimbursements",
         "requests",
@@ -104,6 +104,11 @@ _PARAM_ALIASES: dict[str, list[str]] = {
     "page_size": ["--limit"],
     "limit": ["--page_size"],
 }
+
+
+def cli_category_name(category: str) -> str:
+    """Return the canonical kebab-case CLI name for an OpenAPI category."""
+    return category.replace("_", "-")
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,7 +168,11 @@ def resolve_tool_command_names(
                 if granted_scopes
                 else []
             )
-            native_peers = [peer for peer in peers if peer.category == group_name]
+            native_peers = [
+                peer
+                for peer in peers
+                if cli_category_name(peer.category) == cli_category_name(group_name)
+            ]
             preferred_peer = (
                 authorized_peers[0]
                 if len(authorized_peers) == 1
@@ -184,7 +193,7 @@ def resolve_cli_tool_groups(tools: list[ToolDef]) -> dict[str, list[ToolDef]]:
 
     merged: dict[str, list[ToolDef]] = {}
     for category, category_tools in source_categories.items():
-        target = CATEGORY_REMAP.get(category, category)
+        target = cli_category_name(CATEGORY_REMAP.get(category, category))
         merged.setdefault(target, []).extend(category_tools)
 
     groups: dict[str, list[ToolDef]] = {}

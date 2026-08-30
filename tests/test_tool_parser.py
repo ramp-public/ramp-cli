@@ -756,6 +756,25 @@ class TestEdgeCases:
         assert tool is not None
         assert tool.name == "get-status"
 
+    @pytest.mark.parametrize(
+        ("category", "expected"),
+        [
+            pytest.param("purchase_orders", "purchase_orders", id="snake-case"),
+            pytest.param("purchase-orders", "purchase-orders", id="kebab-case"),
+            pytest.param("transactions", "transactions", id="single-word"),
+        ],
+    )
+    def test_openapi_categories_preserve_raw_names(self, category, expected):
+        tool = _parse_endpoint(
+            "/developer/v1/agent-tools/test",
+            "get",
+            {"summary": "Test", "tags": ["Agent Tool", category]},
+            {},
+        )
+
+        assert tool is not None
+        assert tool.category == expected
+
     def test_empty_spec(self):
         assert parse_spec_dict({}) == []
 

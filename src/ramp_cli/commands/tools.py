@@ -12,7 +12,11 @@ from ramp_cli.output.help import BoxHelpFormatter
 from ramp_cli.specs import AGENT_TOOL_DEFINITION
 from ramp_cli.specs.sync import fetch_spec, maybe_sync
 from ramp_cli.tools.availability import fetch_availability
-from ramp_cli.tools.commands import resolve_cli_tool_groups, resolve_tool_command_names
+from ramp_cli.tools.commands import (
+    cli_category_name,
+    resolve_cli_tool_groups,
+    resolve_tool_command_names,
+)
 from ramp_cli.tools.parser import load_component_schema
 from ramp_cli.tools.registry import list_tool_defs, reload
 
@@ -78,9 +82,12 @@ def tools_list(ctx: click.Context) -> None:
             ):
                 if _is_business_disabled(tool):
                     continue
+                raw_category = tool.category or "general"
                 record = {
                     "name": name,
-                    "category": cat,
+                    "category": (
+                        raw_category if cli_category_name(raw_category) == cat else cat
+                    ),
                     "description": tool.description,
                 }
                 if snapshot:
@@ -130,7 +137,7 @@ def tools_list(ctx: click.Context) -> None:
                 continue
             total += len(dl_rows)
             visible_categories += 1
-            with formatter.section(cat.replace("_", " ").title()):
+            with formatter.section(cat.replace("-", " ").title()):
                 formatter.write_dl(dl_rows)
         click.echo(formatter.getvalue(), nl=False)
     finally:
@@ -146,6 +153,7 @@ def tools_schema(ctx: click.Context, category: str, tool_name: str) -> None:
     """Print the OpenAPI request schema for CATEGORY TOOL_NAME."""
     env: str = ctx.obj["env"]
     maybe_sync(env, force=True)
+    category = cli_category_name(category)
 
     categories = resolve_cli_tool_groups(list_tool_defs(env))
     category_tools = categories.get(category, [])

@@ -6508,6 +6508,8 @@ def test_client_picker_offers_everything_when_no_agent_is_found(monkeypatch, cap
     monkeypatch.setattr(router_module, "_installed_clients", lambda: ())
 
     assert router_module._pick_installed_clients() == ("pi",)
+    # Hermes is absent: this machine was just proven to lack its
+    # executable, and Hermes setup cannot run without it.
     assert [choice.value for choice in captured["choices"]] == [
         "claude-code",
         "codex",
@@ -6548,19 +6550,44 @@ def test_model_picker_names_the_selected_agents(monkeypatch, clients, subject):
     ]
 
 
-def test_installed_clients_finds_agents_on_path_or_with_a_config_dir(
-    tmp_path, monkeypatch
+def test_installed_clients_requires_each_agent_executable(tmp_path, monkeypatch):
+    # Stale configuration from any supported agent is not installation evidence.
+    for client in router_module.CLIENT_EXECUTABLES:
+        router_module._client_config_path(client).parent.mkdir(
+            parents=True, exist_ok=True
+        )
+    monkeypatch.setattr(
+        router_module.shutil,
+        "which",
+        lambda name: None,
+    )
+
+    assert router_module._installed_clients() == ()
+
+    executables = set(router_module.CLIENT_EXECUTABLES.values())
+    monkeypatch.setattr(
+        router_module.shutil,
+        "which",
+        lambda name: f"/usr/local/bin/{name}" if name in executables else None,
+    )
+
+    assert router_module._installed_clients() == tuple(router_module.CLIENT_NAMES)
+
+
+def test_client_picker_ignores_stale_pi_config_beside_installed_agent(
+    monkeypatch,
 ):
-    # Codex is on PATH. Pi is installed somewhere PATH does not reach but has
-    # already written its directory. The other two are absent entirely.
-    (tmp_path / "pi").mkdir(parents=True)
+    router_module._client_config_path("pi").parent.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(
         router_module.shutil,
         "which",
         lambda name: "/usr/local/bin/codex" if name == "codex" else None,
     )
+    monkeypatch.setattr(claude_cowork, "is_available", lambda: False)
+    captured = _capture_picker(monkeypatch, ["codex"])
 
-    assert router_module._installed_clients() == ("codex", "pi")
+    assert router_module._pick_installed_clients() == ("codex",)
+    assert [choice.value for choice in captured["choices"]] == ["codex"]
 
 
 def test_client_picker_does_not_inverse_video_every_checked_row():
@@ -6646,7 +6673,10 @@ def test_configure_json_output_bypasses_the_picker(tmp_path, monkeypatch):
 
     assert configured.exit_code == 0, configured.output
     payload = json.loads(configured.output)
-    assert len(payload["data"][0]["clients"]) == len(router_module.CLIENT_NAMES)
+    configured_clients = {item["client"] for item in payload["data"][0]["clients"]}
+    # Hermes is set up through its own executable, absent here, so a bare run
+    # skips it rather than failing; every other agent is configured.
+    assert configured_clients == set(router_module.CLIENT_NAMES) - {"hermes"}
 
 
 def test_unconfigure_picker_starts_with_no_configured_agents_selected(

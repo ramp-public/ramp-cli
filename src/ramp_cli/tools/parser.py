@@ -270,6 +270,7 @@ def _parse_endpoint(
 ) -> ToolDef | None:
     summary = method_def.get("summary", "")
     tool_name = name or _operation_name(path, method, method_def)
+    category = category or _extract_category(method_def.get("tags", []))
     response_ref = _response_ref(method_def)
     all_parameters = [*(path_params or []), *method_def.get("parameters", [])]
     operation_params = _parse_operation_params(all_parameters, schemas)
@@ -289,7 +290,7 @@ def _parse_endpoint(
             http_method=method,
             summary=summary,
             description=schema_def.get("description", summary),
-            category=category or _extract_category(method_def.get("tags", [])),
+            category=category,
             alias=method_def.get("x-alias", ""),
             params=_sort_params([*operation_params, *body_params]),
             required_scopes=_extract_scopes(method_def),
@@ -316,7 +317,7 @@ def _parse_endpoint(
             http_method=method,
             summary=summary,
             description=request_schema.get("description", summary),
-            category=category or _extract_category(method_def.get("tags", [])),
+            category=category,
             alias=method_def.get("x-alias", ""),
             params=_sort_params([*operation_params, *body_params]),
             required_scopes=_extract_scopes(method_def),
@@ -337,7 +338,7 @@ def _parse_endpoint(
         http_method=method,
         summary=summary,
         description=method_def.get("description", summary),
-        category=category or _extract_category(method_def.get("tags", [])),
+        category=category,
         alias=method_def.get("x-alias", ""),
         params=_sort_params(operation_params),
         required_scopes=_extract_scopes(method_def),

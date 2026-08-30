@@ -15,7 +15,6 @@ import {
   type RefreshModelsContext,
   type ThinkingLevelMap,
 } from "@earendil-works/pi-ai"
-import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy"
 
 import {
   closeSync,
@@ -86,6 +85,25 @@ const PI_THINKING_LEVELS = [
 ] as const
 
 type RouterModel = Model<"openai-responses">
+
+async function hostOpenAIResponsesApi(): Promise<ProviderStreams> {
+  // Pi only makes its public package roots available to path-installed
+  // extensions. Resolve the built-in adapter through the host runtime instead
+  // of importing an SDK subpath that does not exist beside this package.
+  const runtime = await ModelRuntime.create({
+    modelsPath: null,
+    refreshOnCreate: false,
+    allowModelNetwork: false,
+  })
+  const provider = runtime.getProvider("openai")
+  if (!provider) throw new Error("Pi's OpenAI Responses provider is unavailable")
+
+  return {
+    stream: (model, context, options) => provider.stream(model, context, options),
+    streamSimple: (model, context, options) =>
+      provider.streamSimple(model, context, options),
+  }
+}
 
 /**
  * The isolated credential-runtime options used below landed in Pi 0.84.1.
@@ -496,14 +514,16 @@ function routerProvider(
       ...(composed.compat === undefined ? {} : { compat: composed.compat }),
     }
   }
-  const responsesApi: ProviderStreams = openAIResponsesApi()
+  let responsesApi: Promise<ProviderStreams> | undefined
+  const getResponsesApi = () =>
+    (responsesApi ??= hostOpenAIResponsesApi())
   const guardedApi: ProviderStreams = {
     stream: (model, context, options) =>
       lazyStream(model, async () => {
         const requestOptions = snapshotRequestOptions(options)
         const canonical = requestModel(model as RouterModel, requestOptions)
         const expectedModelID = canonical.id
-        return responsesApi.stream(
+        return (await getResponsesApi()).stream(
           canonical,
           context,
           guardedRequestOptions(expectedModelID, requestOptions),
@@ -514,41 +534,12 @@ function routerProvider(
         const requestOptions = snapshotRequestOptions(options)
         const canonical = requestModel(model as RouterModel, requestOptions)
         const expectedModelID = canonical.id
-        return responsesApi.streamSimple(
+        return (await getResponsesApi()).streamSimple(
           canonical,
           context,
           guardedRequestOptions(expectedModelID, requestOptions),
         )
       }),
-    ...(responsesApi.fetchDeferred
-      ? {
-          fetchDeferred: (model, handle, options) =>
-            lazyStream(model, async () => {
-              const requestOptions = snapshotRequestOptions(options)
-              const canonical = requestModel(model as RouterModel, requestOptions)
-              const expectedModelID = canonical.id
-              return responsesApi.fetchDeferred!(
-                canonical,
-                handle,
-                guardedRequestOptions(expectedModelID, requestOptions),
-              )
-            }),
-        }
-      : {}),
-    ...(responsesApi.cancelDeferred
-      ? {
-          cancelDeferred: async (model, handle, options) => {
-            const requestOptions = snapshotRequestOptions(options)
-            const canonical = requestModel(model as RouterModel, requestOptions)
-            const expectedModelID = canonical.id
-            await responsesApi.cancelDeferred!(
-              canonical,
-              handle,
-              guardedRequestOptions(expectedModelID, requestOptions),
-            )
-          },
-        }
-      : {}),
   }
   const provider = createProvider({
     id: PROVIDER_ID,

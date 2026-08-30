@@ -104,7 +104,7 @@ cannot be overridden by a conflicting `--profile` flag.
 | `cards`           | `list`, `activate`, `lock` (aliases also under `funds`)      |
 | `funds`           | `list`, `activate`, `creds`, `lock`                          |
 | `general`         | `comment`, `explain`, `help-center`, `policy`                |
-| `purchase_orders` | `search`, `get`                                              |
+| `purchase-orders` | `search`, `get`                                              |
 | `receipts`        | `upload`, `attach`                                           |
 | `reimbursements`  | `list`, `pending`, `submit`, `approve`, `edit`               |
 | `requests`        | `pending`, `approve`                                         |

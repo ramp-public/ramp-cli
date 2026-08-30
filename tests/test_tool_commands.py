@@ -810,7 +810,7 @@ class TestBuildToolCommand:
             cli,
             [
                 "--agent",
-                "procurement_requests",
+                "procurement-requests",
                 "get",
                 "--json",
                 json.dumps(request_body),
@@ -846,7 +846,7 @@ class TestBuildToolCommand:
             cli,
             [
                 "--agent",
-                "procurement_requests",
+                "procurement-requests",
                 "delete",
                 "--json",
                 json.dumps(request_body),
@@ -1804,6 +1804,43 @@ class TestCLIIntegration:
         # cards is its own resource group; agent_cards is remapped into funds
         assert "cards" in result.output
         assert "agent_cards" not in result.output
+        assert "procurement-requests" in result.output
+        assert "purchase-orders" in result.output
+        assert "procurement_requests" not in result.output
+        assert "purchase_orders" not in result.output
+
+    @pytest.mark.parametrize(
+        ("canonical", "legacy", "tool_name"),
+        [
+            pytest.param(
+                "procurement-requests",
+                "procurement_requests",
+                "draft",
+                id="procurement-requests",
+            ),
+            pytest.param(
+                "purchase-orders",
+                "purchase_orders",
+                "search",
+                id="purchase-orders",
+            ),
+        ],
+    )
+    def test_generated_multiword_category_legacy_alias_builds_same_request(
+        self, monkeypatch, canonical, legacy, tool_name
+    ):
+        _use_bundled_spec(monkeypatch)
+        runner = CliRunner()
+        args = [tool_name, "--dry_run", "--rationale", "test"]
+
+        canonical_result = runner.invoke(cli, ["--agent", canonical, *args])
+        legacy_result = runner.invoke(cli, ["--agent", legacy, *args])
+
+        assert canonical_result.exit_code == 0, canonical_result.output
+        assert legacy_result.exit_code == 0, legacy_result.output
+        canonical_request = json.loads(canonical_result.output)["data"][0]
+        legacy_request = json.loads(legacy_result.output)["data"][0]
+        assert canonical_request == legacy_request
 
     def test_tasks_singleton_stays_resource(self, monkeypatch):
         task_tool = ToolDef(
@@ -2206,7 +2243,7 @@ class TestCLIIntegration:
     ):
         _use_bundled_spec(monkeypatch)
         runner = CliRunner()
-        help_result = runner.invoke(cli, ["procurement_requests", "draft", "--help"])
+        help_result = runner.invoke(cli, ["procurement-requests", "draft", "--help"])
         assert help_result.exit_code == 0, help_result.output
         assert "--clear_change_request_field_ids" in help_result.output
         assert "change_request_answers" in help_result.output
@@ -2221,7 +2258,7 @@ class TestCLIIntegration:
                 "--agent",
                 "--env",
                 "sandbox",
-                "procurement_requests",
+                "procurement-requests",
                 "draft",
                 "--json",
                 json.dumps(
@@ -2252,7 +2289,7 @@ class TestCLIIntegration:
                 "--agent",
                 "--env",
                 "sandbox",
-                "procurement_requests",
+                "procurement-requests",
                 "draft",
                 "--json",
                 json.dumps(
@@ -2344,7 +2381,7 @@ class TestCLIIntegration:
                 "--agent",
                 "--env",
                 "sandbox",
-                "procurement_requests",
+                "procurement-requests",
                 "upload-file",
                 "quote_upload",
                 "spend-request-uuid",
@@ -2380,7 +2417,7 @@ class TestCLIIntegration:
                 "--agent",
                 "--env",
                 "sandbox",
-                "procurement_requests",
+                "procurement-requests",
                 "submit",
                 "spend-request-uuid",
                 "--confirmed",
@@ -2804,7 +2841,7 @@ class TestCLIIntegration:
         result = runner.invoke(
             cli,
             [
-                "purchase_orders",
+                "purchase-orders",
                 "search",
                 "--dry_run",
                 "--rationale",
@@ -2820,7 +2857,7 @@ class TestCLIIntegration:
         result = runner.invoke(
             cli,
             [
-                "purchase_orders",
+                "purchase-orders",
                 "search",
                 "--dry_run",
                 "--rationale",
