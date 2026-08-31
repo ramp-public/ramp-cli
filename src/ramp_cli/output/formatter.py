@@ -157,6 +157,16 @@ def truncate(s: str, max_len: int) -> str:
 # When a category match exists, these replace the generic priority list.
 # Fields not present in the response are silently skipped.
 CATEGORY_DISPLAY_FIELDS: dict[str, list[str]] = {
+    "agent": [
+        "name",
+        "status",
+        "description",
+        "owner",
+        "roles",
+        "last_accessed_at",
+        "created_at",
+        "id",
+    ],
     "transactions": [
         "amount",
         "merchant_name",
