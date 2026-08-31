@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import io
 import json
 import os
@@ -2772,6 +2773,7 @@ def test_listing_order_does_not_choose_the_default_model():
             id=identifier,
             metadata=router_module.RouterModelMetadata(
                 request_name=identifier,
+                provider_model=identifier,
                 display_name=identifier,
                 description="",
                 listing_order=order,
@@ -2802,6 +2804,7 @@ def test_a_router_without_the_default_still_configures_something():
             id=identifier,
             metadata=router_module.RouterModelMetadata(
                 request_name=identifier,
+                provider_model=identifier,
                 display_name=identifier,
                 description="",
                 listing_order=0,
@@ -5200,6 +5203,9 @@ def _capture_picker(monkeypatch, answer):
         return Prompt()
 
     monkeypatch.setattr(router_module.questionary, "checkbox", checkbox)
+    # Pinned so the offered lines depend on the test, not on whether the
+    # machine running the suite happens to have Cursor installed.
+    monkeypatch.setattr(router_module, "_cursor_is_installed", lambda: False)
     return captured
 
 
@@ -6214,6 +6220,20 @@ def test_configure_picker_starts_with_no_installed_agents_selected(monkeypatch):
     ]
     assert captured["validate"](["codex"]) is True
     assert captured["validate"]([]) == "Select at least one agent."
+
+
+def test_client_picker_offers_cursor_when_installed(monkeypatch):
+    # Cursor's setup is guided rather than written, but it starts from the
+    # same credential, so an installed Cursor earns a line in the picker.
+    captured = _capture_picker(monkeypatch, ["cursor"])
+    monkeypatch.setattr(router_module, "_installed_clients", lambda: ("codex",))
+    monkeypatch.setattr(router_module, "_cursor_is_installed", lambda: True)
+
+    assert router_module._pick_installed_clients() == ("cursor",)
+    assert [(choice.title, choice.value) for choice in captured["choices"]] == [
+        ("Codex (CLI + desktop app)", "codex"),
+        ("Cursor", "cursor"),
+    ]
 
 
 def test_client_picker_never_lists_cowork_as_its_own_line(monkeypatch):
@@ -7645,48 +7665,14 @@ def test_configure_shows_strategy_guidance_for_each_client(
 
     assert result.exit_code == 0, result.output
     notice = (
-        "Enable the Nvidia NeMo Switchyard strategy at "
-        "https://app.router.com/strategies for cost savings"
+        "Enable the Nvidia NeMo Switchyard strategy with "
+        "'ramp router strategies' for cost savings"
     )
     lines = click.unstyle(result.output).splitlines()
     notice_index = lines.index(notice)
     assert lines[notice_index - 1] == ""
     assert lines[notice_index + 1] == "Router credits remaining: $23.77"
     assert click.style(notice, fg=(228, 242, 33)) in result.output
-
-
-def test_configure_strategy_guidance_uses_the_configured_router_origin(
-    tmp_path, monkeypatch
-):
-    config_path = tmp_path / "opencode.json"
-    base_url = "https://qa-router.example/v1"
-    monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
-    monkeypatch.setenv("RAMP_ROUTER_BASE_URL", base_url)
-    _mock_models(monkeypatch, base_url=base_url)
-    _mock_balance(
-        monkeypatch,
-        lambda url: httpx.Response(
-            200,
-            json=_balance_payload(
-                switchyard_routing_enabled=False,
-                cost_efficient_routing_enabled=True,
-            ),
-            request=httpx.Request("GET", url),
-        ),
-        origin="https://qa-router.example",
-    )
-
-    result = CliRunner().invoke(
-        cli,
-        ["--human", "router", "configure", "opencode", "--api-key", "router-secret"],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert (
-        "Enable the Nvidia NeMo Switchyard strategy at "
-        "https://qa-router.example/strategies for cost savings"
-        in click.unstyle(result.output)
-    )
 
 
 def test_configure_skips_the_credits_line_when_router_does_not_serve_one(
@@ -7814,20 +7800,20 @@ def test_fetch_configure_summary_keeps_credits_from_an_older_router(monkeypatch)
         (
             False,
             False,
-            "Enable Nvidia NeMo Switchyard and Cost-Efficient strategies at "
-            "https://app.router.com/strategies for cost savings",
+            "Enable Nvidia NeMo Switchyard and Cost-Efficient strategies with "
+            "'ramp router strategies' for cost savings",
         ),
         (
             False,
             True,
-            "Enable the Nvidia NeMo Switchyard strategy at "
-            "https://app.router.com/strategies for cost savings",
+            "Enable the Nvidia NeMo Switchyard strategy with "
+            "'ramp router strategies' for cost savings",
         ),
         (
             True,
             False,
-            "Enable the Cost-Efficient strategy at "
-            "https://app.router.com/strategies for cost savings",
+            "Enable the Cost-Efficient strategy with 'ramp router strategies' "
+            "for cost savings",
         ),
         (True, True, None),
         (None, None, None),
@@ -7842,7 +7828,6 @@ def test_strategy_savings_notice_only_names_missing_strategies(
         router_module._strategy_savings_notice(
             switchyard_routing_enabled=switchyard_enabled,
             cost_efficient_routing_enabled=cost_efficient_enabled,
-            strategies_url="https://app.router.com/strategies",
         )
         == expected
     )
@@ -7852,3 +7837,823 @@ def test_format_credits_usd():
     assert router_module._format_credits_usd(Decimal("1234.5")) == "$1,234.50"
     assert router_module._format_credits_usd(Decimal("0")) == "$0.00"
     assert router_module._format_credits_usd(Decimal("-3.2")) == "-$3.20"
+
+
+_STRATEGY_SETTINGS_PAYLOAD = {
+    "allow_flex_tier_default": True,
+    "switchyard_routing_enabled": False,
+}
+
+
+def test_strategy_list_reports_each_strategy(monkeypatch):
+    captured = {}
+
+    def get(url, *, headers, timeout):
+        captured["request"] = (url, headers["Authorization"])
+        return httpx.Response(
+            200, json=_STRATEGY_SETTINGS_PAYLOAD, request=httpx.Request("GET", url)
+        )
+
+    monkeypatch.setattr("ramp_cli.commands.router.httpx.get", get)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "strategies", "list", "--api-key", "router-secret"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["request"] == (
+        "https://app.router.com/session-usage/strategies",
+        "Bearer router-secret",
+    )
+    lines = result.output.strip().splitlines()
+    assert any(
+        line.startswith("cost-efficient-routing") and "enabled" in line
+        for line in lines
+    )
+    assert any(
+        line.startswith("switchyard-routing") and "disabled" in line for line in lines
+    )
+
+
+def test_strategy_list_emits_agent_json(monkeypatch):
+    monkeypatch.setattr(
+        "ramp_cli.commands.router.httpx.get",
+        lambda url, *, headers, timeout: httpx.Response(
+            200, json=_STRATEGY_SETTINGS_PAYLOAD, request=httpx.Request("GET", url)
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["-o", "json", "router", "strategies", "list", "--api-key", "router-secret"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["data"] == [
+        {
+            "strategies": [
+                {"name": "cost-efficient-routing", "enabled": True},
+                {"name": "switchyard-routing", "enabled": False},
+            ]
+        }
+    ]
+
+
+def test_strategy_enable_patches_only_named_strategies(monkeypatch):
+    captured = {}
+
+    def patch(url, *, headers, json, timeout):
+        captured["request"] = (url, headers["Authorization"], json)
+        return httpx.Response(
+            200,
+            json={**_STRATEGY_SETTINGS_PAYLOAD, "switchyard_routing_enabled": True},
+            request=httpx.Request("PATCH", url),
+        )
+
+    monkeypatch.setattr("ramp_cli.commands.router.httpx.patch", patch)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "strategies",
+            "enable",
+            "switchyard-routing",
+            "--api-key",
+            "router-secret",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["request"] == (
+        "https://app.router.com/session-usage/strategies",
+        "Bearer router-secret",
+        {"switchyard_routing_enabled": True},
+    )
+    assert "Enabled NVIDIA NeMo Switchyard." in result.output
+
+
+def test_strategy_disable_patches_false(monkeypatch):
+    captured = {}
+
+    def patch(url, *, headers, json, timeout):
+        captured["json"] = json
+        return httpx.Response(
+            200,
+            json={**_STRATEGY_SETTINGS_PAYLOAD, "allow_flex_tier_default": False},
+            request=httpx.Request("PATCH", url),
+        )
+
+    monkeypatch.setattr("ramp_cli.commands.router.httpx.patch", patch)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "strategies",
+            "disable",
+            "cost-efficient-routing",
+            "--api-key",
+            "router-secret",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["json"] == {"allow_flex_tier_default": False}
+    assert "Disabled Cost-efficient routing." in result.output
+
+
+def test_strategy_enable_reports_a_change_router_declined(monkeypatch):
+    # Router answers with the effective state, which can decline a change.
+    monkeypatch.setattr(
+        "ramp_cli.commands.router.httpx.patch",
+        lambda url, *, headers, json, timeout: httpx.Response(
+            200, json=_STRATEGY_SETTINGS_PAYLOAD, request=httpx.Request("PATCH", url)
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "strategies",
+            "enable",
+            "switchyard-routing",
+            "--api-key",
+            "router-secret",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "did not leave NVIDIA NeMo Switchyard enabled" in result.output
+
+
+def test_strategy_enable_requires_a_strategy_name():
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "strategies", "enable", "--api-key", "router-secret"],
+    )
+
+    assert result.exit_code != 0
+    assert "Name at least one strategy" in result.output
+
+
+def test_strategy_commands_need_a_configured_key(monkeypatch):
+    monkeypatch.setattr(router_module, "_stored_router_api_key_choices", lambda: [])
+
+    result = CliRunner().invoke(cli, ["--human", "router", "strategies", "list"])
+
+    assert result.exit_code != 0
+    assert "ramp router configure" in result.output
+
+
+def test_strategy_subcommands_inherit_the_group_api_key(monkeypatch):
+    monkeypatch.setattr(router_module, "_stored_router_api_key_choices", lambda: [])
+    captured = {}
+
+    def patch(url, *, headers, json, timeout):
+        captured["authorization"] = headers["Authorization"]
+        return httpx.Response(
+            200,
+            json={**_STRATEGY_SETTINGS_PAYLOAD, "switchyard_routing_enabled": True},
+            request=httpx.Request("PATCH", url),
+        )
+
+    monkeypatch.setattr("ramp_cli.commands.router.httpx.patch", patch)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "strategies",
+            "--api-key",
+            "group-secret",
+            "enable",
+            "switchyard-routing",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["authorization"] == "Bearer group-secret"
+
+
+def test_group_api_key_flag_beats_the_environment_variable(monkeypatch):
+    # Subcommands also bind the env var, so without explicit precedence an
+    # ambient environment value would override the flag the user typed.
+    monkeypatch.setenv(router_module.CONFIGURE_KEY_ENV, "environment-secret")
+    monkeypatch.setattr(router_module, "_stored_router_api_key_choices", lambda: [])
+    captured = {}
+
+    def get(url, *, headers, timeout):
+        captured["authorization"] = headers["Authorization"]
+        return httpx.Response(
+            200, json=_STRATEGY_SETTINGS_PAYLOAD, request=httpx.Request("GET", url)
+        )
+
+    monkeypatch.setattr("ramp_cli.commands.router.httpx.get", get)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "strategies", "--api-key", "group-secret", "list"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["authorization"] == "Bearer group-secret"
+
+
+def test_strategy_commands_reject_a_blank_api_key(monkeypatch):
+    # A blank key (for example an unset shell variable) must not silently
+    # fall back to a stored key and change that account instead.
+    monkeypatch.setattr(
+        router_module,
+        "_stored_router_api_key_choices",
+        lambda: [("stored-secret", ("codex",))],
+    )
+    monkeypatch.setattr(
+        "ramp_cli.commands.router.httpx.get",
+        lambda url, *, headers, timeout: pytest.fail("no request should be sent"),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "strategies", "list", "--api-key", ""],
+    )
+
+    assert result.exit_code != 0
+    assert "empty" in result.output
+    assert "stored-secret" not in result.output
+
+
+def test_strategy_list_json_includes_the_selectable_switchyard_options(monkeypatch):
+    monkeypatch.setattr(
+        "ramp_cli.commands.router.httpx.get",
+        lambda url, *, headers, timeout: httpx.Response(
+            200, json=_switchyard_payload(), request=httpx.Request("GET", url)
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["-o", "json", "router", "strategies", "list", "--api-key", "router-secret"],
+    )
+
+    assert result.exit_code == 0, result.output
+    switchyard = json.loads(result.output)["data"][0]["switchyard"]
+    assert [option["id"] for option in switchyard["efficient_models"]] == [
+        "openai:gpt-5.6-luna",
+        "fireworks:kimi-k2",
+        "fireworks:qwen-lite",
+    ]
+    assert [preset["name"] for preset in switchyard["sensitivity_configs"]] == [
+        "aggressive",
+        "balanced",
+        "conservative",
+        "strict",
+    ]
+
+
+def test_strategy_list_explains_missing_endpoint(monkeypatch):
+    monkeypatch.setattr(
+        "ramp_cli.commands.router.httpx.get",
+        lambda url, *, headers, timeout: httpx.Response(
+            404, json={}, request=httpx.Request("GET", url)
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "strategies", "list", "--api-key", "router-secret"],
+    )
+
+    assert result.exit_code != 0
+    assert "doesn't support strategy management" in result.output
+
+
+def test_bare_strategies_shows_the_config_when_it_cannot_prompt(monkeypatch):
+    monkeypatch.setattr(
+        "ramp_cli.commands.router.httpx.get",
+        lambda url, *, headers, timeout: httpx.Response(
+            200, json=_STRATEGY_SETTINGS_PAYLOAD, request=httpx.Request("GET", url)
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "strategies", "--api-key", "router-secret"],
+    )
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.strip().splitlines()
+    assert any(
+        line.startswith("cost-efficient-routing") and "enabled" in line
+        for line in lines
+    )
+    assert any(
+        line.startswith("switchyard-routing") and "disabled" in line for line in lines
+    )
+
+
+def test_bare_strategies_toggles_interactively(monkeypatch):
+    monkeypatch.setattr(router_module, "_can_draw_picker", lambda _ctx: True)
+    monkeypatch.setattr(
+        "ramp_cli.commands.router.httpx.get",
+        lambda url, *, headers, timeout: httpx.Response(
+            200, json=_STRATEGY_SETTINGS_PAYLOAD, request=httpx.Request("GET", url)
+        ),
+    )
+    captured = {}
+
+    def patch(url, *, headers, json, timeout):
+        captured["json"] = json
+        return httpx.Response(
+            200,
+            json={"allow_flex_tier_default": False, "switchyard_routing_enabled": True},
+            request=httpx.Request("PATCH", url),
+        )
+
+    monkeypatch.setattr("ramp_cli.commands.router.httpx.patch", patch)
+    # The picker opens with the current state pre-checked; the user flips both.
+    picker = _capture_picker(monkeypatch, ["switchyard-routing"])
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "strategies", "--api-key", "router-secret"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [(choice.value, choice.checked) for choice in picker["choices"]] == [
+        ("cost-efficient-routing", True),
+        ("switchyard-routing", False),
+    ]
+    assert captured["json"] == {
+        "allow_flex_tier_default": False,
+        "switchyard_routing_enabled": True,
+    }
+    assert "Disabled Cost-efficient routing." in result.output
+    assert "Enabled NVIDIA NeMo Switchyard." in result.output
+
+
+def test_bare_strategies_reports_when_nothing_changed(monkeypatch):
+    monkeypatch.setattr(router_module, "_can_draw_picker", lambda _ctx: True)
+    monkeypatch.setattr(
+        "ramp_cli.commands.router.httpx.get",
+        lambda url, *, headers, timeout: httpx.Response(
+            200, json=_STRATEGY_SETTINGS_PAYLOAD, request=httpx.Request("GET", url)
+        ),
+    )
+    monkeypatch.setattr(
+        "ramp_cli.commands.router.httpx.patch",
+        lambda url, *, headers, json, timeout: pytest.fail("nothing should be sent"),
+    )
+    _capture_picker(monkeypatch, ["cost-efficient-routing"])
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "strategies", "--api-key", "router-secret"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "No strategy changes." in result.output
+
+
+_SWITCHYARD_STATE = {
+    "config": {
+        "efficient_model": None,
+        "confidence_threshold": None,
+        "picker": None,
+        "sensitivity_config_name": None,
+        "effort": None,
+    },
+    "defaults": {
+        "efficient_model": "openai:gpt-5.6-luna",
+        "effort": "high",
+        "sensitivity_config_name": "balanced",
+        "picker": "efficient_first",
+        "confidence_threshold": 0.35,
+    },
+    "efficient_models": [
+        {
+            "id": "openai:gpt-5.6-luna",
+            "display_name": "GPT-5.6 Luna",
+            "efforts": ["low", "medium", "high"],
+        },
+        {
+            "id": "fireworks:kimi-k2",
+            "display_name": "Kimi K2",
+            "efforts": ["none", "low"],
+        },
+        {"id": "fireworks:qwen-lite", "display_name": "Qwen Lite", "efforts": []},
+    ],
+    "sensitivity_configs": [
+        {
+            "name": "aggressive",
+            "picker": "efficient_first",
+            "confidence_threshold": 0.5,
+        },
+        {"name": "balanced", "picker": "efficient_first", "confidence_threshold": 0.35},
+        {
+            "name": "conservative",
+            "picker": "efficient_first",
+            "confidence_threshold": 0.2,
+        },
+        {"name": "strict", "picker": "capable_first", "confidence_threshold": 0.2},
+    ],
+}
+
+
+def _switchyard_payload(config_overrides=None, enabled=False):
+    state = copy.deepcopy(_SWITCHYARD_STATE)
+    if config_overrides:
+        state["config"].update(config_overrides)
+    return {
+        **_STRATEGY_SETTINGS_PAYLOAD,
+        "switchyard_routing_enabled": enabled,
+        "switchyard": state,
+    }
+
+
+def _sequence_selects(monkeypatch, answers):
+    """Answer each questionary.select in order, recording how it was built."""
+    calls = []
+
+    def select(message, **kwargs):
+        calls.append({"message": message, **kwargs})
+        answer = answers[len(calls) - 1]
+
+        class Prompt:
+            def ask(self):
+                return answer
+
+        return Prompt()
+
+    monkeypatch.setattr(router_module.questionary, "select", select)
+    return calls
+
+
+def test_strategy_list_shows_the_switchyard_configuration(monkeypatch):
+    monkeypatch.setattr(
+        "ramp_cli.commands.router.httpx.get",
+        lambda url, *, headers, timeout: httpx.Response(
+            200, json=_switchyard_payload(), request=httpx.Request("GET", url)
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "strategies", "list", "--api-key", "router-secret"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "model: GPT-5.6 Luna (default)" in result.output
+    assert "thinking: high (default)" in result.output
+    assert "sensitivity: balanced (default)" in result.output
+
+
+def test_bare_strategies_offers_the_default_switchyard_config(monkeypatch):
+    monkeypatch.setattr(router_module, "_can_draw_picker", lambda _ctx: True)
+    monkeypatch.setattr(
+        "ramp_cli.commands.router.httpx.get",
+        lambda url, *, headers, timeout: httpx.Response(
+            200, json=_switchyard_payload(), request=httpx.Request("GET", url)
+        ),
+    )
+    captured = {}
+
+    def patch(url, *, headers, json, timeout):
+        captured["json"] = json
+        return httpx.Response(
+            200,
+            json=_switchyard_payload(enabled=True),
+            request=httpx.Request("PATCH", url),
+        )
+
+    monkeypatch.setattr("ramp_cli.commands.router.httpx.patch", patch)
+    _capture_picker(monkeypatch, ["cost-efficient-routing", "switchyard-routing"])
+    selects = _sequence_selects(monkeypatch, ["default"])
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "strategies", "--api-key", "router-secret"],
+    )
+
+    assert result.exit_code == 0, result.output
+    # The default option says exactly what the default is.
+    default_title = selects[0]["choices"][0].title
+    assert "GPT-5.6 Luna model, high thinking, balanced sensitivity" in default_title
+    assert captured["json"] == {
+        "switchyard_routing_enabled": True,
+        "switchyard_config": None,
+    }
+    assert "Enabled NVIDIA NeMo Switchyard." in result.output
+    assert "Switchyard: model: GPT-5.6 Luna (default)" in result.output
+
+
+def test_bare_strategies_configures_switchyard_custom(monkeypatch):
+    monkeypatch.setattr(router_module, "_can_draw_picker", lambda _ctx: True)
+    monkeypatch.setattr(
+        "ramp_cli.commands.router.httpx.get",
+        lambda url, *, headers, timeout: httpx.Response(
+            200, json=_switchyard_payload(), request=httpx.Request("GET", url)
+        ),
+    )
+    captured = {}
+
+    def patch(url, *, headers, json, timeout):
+        captured["json"] = json
+        return httpx.Response(
+            200,
+            json=_switchyard_payload(
+                {
+                    "efficient_model": "fireworks:kimi-k2",
+                    "effort": "low",
+                    "sensitivity_config_name": "strict",
+                    "picker": "capable_first",
+                    "confidence_threshold": 0.2,
+                },
+                enabled=True,
+            ),
+            request=httpx.Request("PATCH", url),
+        )
+
+    monkeypatch.setattr("ramp_cli.commands.router.httpx.patch", patch)
+    _capture_picker(monkeypatch, ["cost-efficient-routing", "switchyard-routing"])
+    selects = _sequence_selects(
+        monkeypatch, ["custom", "fireworks:kimi-k2", "low", "strict"]
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "strategies", "--api-key", "router-secret"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["json"] == {
+        "switchyard_routing_enabled": True,
+        "switchyard_config": {
+            "efficient_model": "fireworks:kimi-k2",
+            "effort": "low",
+            "sensitivity_config_name": "strict",
+        },
+    }
+    # Model choices show display names only — no provider or catalog id.
+    assert [choice.title for choice in selects[1]["choices"]] == [
+        "GPT-5.6 Luna — default",
+        "Kimi K2",
+        "Qwen Lite",
+    ]
+    # The thinking picker offers only the chosen model's advertised efforts,
+    # after the no-override entry.
+    thinking_values = [choice.value for choice in selects[2]["choices"]]
+    assert thinking_values == ["", "none", "low"]
+    # The sensitivity picker shows the four plain levels, balanced preselected.
+    assert [choice.title for choice in selects[3]["choices"]] == [
+        "aggressive (favors efficient model)",
+        "balanced",
+        "conservative",
+        "strict (favors frontier model)",
+    ]
+    assert selects[3]["default"] == "balanced"
+    assert (
+        "Switchyard: model: Kimi K2 · thinking: low · sensitivity: strict"
+        in result.output
+    )
+
+
+def test_bare_strategies_skips_the_thinking_prompt_without_advertised_efforts(
+    monkeypatch,
+):
+    monkeypatch.setattr(router_module, "_can_draw_picker", lambda _ctx: True)
+    monkeypatch.setattr(
+        "ramp_cli.commands.router.httpx.get",
+        lambda url, *, headers, timeout: httpx.Response(
+            200, json=_switchyard_payload(), request=httpx.Request("GET", url)
+        ),
+    )
+    captured = {}
+
+    def patch(url, *, headers, json, timeout):
+        captured["json"] = json
+        return httpx.Response(
+            200,
+            json=_switchyard_payload(
+                {
+                    "efficient_model": "fireworks:qwen-lite",
+                    "sensitivity_config_name": "balanced",
+                },
+                enabled=True,
+            ),
+            request=httpx.Request("PATCH", url),
+        )
+
+    monkeypatch.setattr("ramp_cli.commands.router.httpx.patch", patch)
+    _capture_picker(monkeypatch, ["cost-efficient-routing", "switchyard-routing"])
+    # No thinking answer: a model with no advertised efforts must not prompt.
+    selects = _sequence_selects(
+        monkeypatch, ["custom", "fireworks:qwen-lite", "balanced"]
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "strategies", "--api-key", "router-secret"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(selects) == 3
+    assert captured["json"]["switchyard_config"] == {
+        "efficient_model": "fireworks:qwen-lite",
+        "effort": None,
+        "sensitivity_config_name": "balanced",
+    }
+
+
+def test_bare_strategies_preselects_a_retained_custom_sensitivity(monkeypatch):
+    monkeypatch.setattr(router_module, "_can_draw_picker", lambda _ctx: True)
+    monkeypatch.setattr(
+        "ramp_cli.commands.router.httpx.get",
+        lambda url, *, headers, timeout: httpx.Response(
+            200,
+            json=_switchyard_payload(
+                {
+                    "sensitivity_config_name": "strict",
+                    "picker": "capable_first",
+                    "confidence_threshold": 0.2,
+                }
+            ),
+            request=httpx.Request("GET", url),
+        ),
+    )
+    monkeypatch.setattr(
+        "ramp_cli.commands.router.httpx.patch",
+        lambda url, *, headers, json, timeout: httpx.Response(
+            200,
+            json=_switchyard_payload(
+                {
+                    "sensitivity_config_name": "strict",
+                    "picker": "capable_first",
+                    "confidence_threshold": 0.2,
+                },
+                enabled=True,
+            ),
+            request=httpx.Request("PATCH", url),
+        ),
+    )
+    _capture_picker(monkeypatch, ["cost-efficient-routing", "switchyard-routing"])
+    selects = _sequence_selects(
+        monkeypatch, ["custom", "openai:gpt-5.6-luna", "", "strict"]
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "strategies", "--api-key", "router-secret"],
+    )
+
+    assert result.exit_code == 0, result.output
+    # Re-enabling must not silently rewrite a retained custom sensitivity:
+    # the stored value stays preselected instead of balanced.
+    assert selects[3]["default"] == "strict"
+
+
+def test_strategy_enable_sends_switchyard_config_flags(monkeypatch):
+    captured = {}
+
+    def patch(url, *, headers, json, timeout):
+        captured["json"] = json
+        return httpx.Response(
+            200,
+            json=_switchyard_payload(
+                {
+                    "efficient_model": "fireworks:kimi-k2",
+                    "effort": "low",
+                    "sensitivity_config_name": "strict",
+                    "picker": "capable_first",
+                    "confidence_threshold": 0.2,
+                },
+                enabled=True,
+            ),
+            request=httpx.Request("PATCH", url),
+        )
+
+    monkeypatch.setattr("ramp_cli.commands.router.httpx.patch", patch)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "strategies",
+            "enable",
+            "switchyard-routing",
+            "--model",
+            "fireworks:kimi-k2",
+            "--thinking",
+            "low",
+            "--sensitivity",
+            "strict",
+            "--api-key",
+            "router-secret",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["json"] == {
+        "switchyard_routing_enabled": True,
+        "switchyard_config": {
+            "efficient_model": "fireworks:kimi-k2",
+            "effort": "low",
+            "sensitivity_config_name": "strict",
+        },
+    }
+    assert "Enabled NVIDIA NeMo Switchyard." in result.output
+    assert (
+        "Switchyard: model: Kimi K2 · thinking: low · sensitivity: strict"
+        in result.output
+    )
+
+
+def test_strategy_enable_default_config_resets_overrides(monkeypatch):
+    captured = {}
+
+    def patch(url, *, headers, json, timeout):
+        captured["json"] = json
+        return httpx.Response(
+            200,
+            json=_switchyard_payload(enabled=True),
+            request=httpx.Request("PATCH", url),
+        )
+
+    monkeypatch.setattr("ramp_cli.commands.router.httpx.patch", patch)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "strategies",
+            "enable",
+            "switchyard-routing",
+            "--default-config",
+            "--api-key",
+            "router-secret",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["json"] == {
+        "switchyard_routing_enabled": True,
+        "switchyard_config": None,
+    }
+
+
+def test_strategy_enable_rejects_config_flags_without_switchyard():
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "strategies",
+            "enable",
+            "cost-efficient-routing",
+            "--model",
+            "fireworks:kimi-k2",
+            "--api-key",
+            "router-secret",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "include switchyard-routing" in result.output
+
+
+def test_strategy_enable_surfaces_router_config_validation_errors(monkeypatch):
+    monkeypatch.setattr(
+        "ramp_cli.commands.router.httpx.patch",
+        lambda url, *, headers, json, timeout: httpx.Response(
+            422,
+            json={"error": {"message": "Unknown Switchyard efficient model `oops`."}},
+            request=httpx.Request("PATCH", url),
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "strategies",
+            "enable",
+            "switchyard-routing",
+            "--model",
+            "oops",
+            "--api-key",
+            "router-secret",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "Unknown Switchyard efficient model `oops`." in result.output

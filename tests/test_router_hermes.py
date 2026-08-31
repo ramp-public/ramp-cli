@@ -559,6 +559,9 @@ def test_fallback_picker_offers_hermes_when_its_binary_exists(monkeypatch):
 
     monkeypatch.setattr(router_module.questionary, "checkbox", checkbox)
     monkeypatch.setattr(router_module, "_installed_clients", lambda: ())
+    # Pinned so the offered lines depend on the test, not on whether the
+    # machine running the suite happens to have Cursor installed.
+    monkeypatch.setattr(router_module, "_cursor_is_installed", lambda: False)
     monkeypatch.setattr(hermes_agent, "hermes_executable", lambda: "/fake/hermes")
 
     assert router_module._pick_installed_clients() == ("hermes",)

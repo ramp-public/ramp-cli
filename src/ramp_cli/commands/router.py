@@ -121,7 +121,17 @@ CLIENT_EXECUTABLES = {
 # set up through Claude Desktop's profile library rather than through the
 # config-path machinery the coding agents share.
 COWORK_CLIENT = "cowork"
-AGENT_NAMES = {**CLIENT_NAMES, COWORK_CLIENT: "Claude Cowork"}
+# Cursor also joins the pickers without a CLIENT_NAMES entry: it keeps its
+# provider settings in its own account-synced UI, so there is no config file
+# the config-path machinery could write or restore. Configure provisions the
+# credential and prints the two fields to paste; unconfigure prints how to
+# undo them.
+CURSOR_CLIENT = "cursor"
+AGENT_NAMES = {
+    **CLIENT_NAMES,
+    COWORK_CLIENT: "Claude Cowork",
+    CURSOR_CLIENT: "Cursor",
+}
 ArtifactClaim = Literal["create", "replace"]
 
 
@@ -149,6 +159,11 @@ class RouterConfigureSummary:
 @dataclass(frozen=True)
 class RouterModelMetadata:
     request_name: str
+    # The provider's own spelling of the model, as Router's catalog carries
+    # it. Alias candidates are stored provider-qualified against this
+    # spelling, which for rolling names such as claude-sonnet-4-5 is a dated
+    # snapshot rather than the request name itself.
+    provider_model: str
     display_name: str
     description: str
     listing_order: int
@@ -200,6 +215,7 @@ def _model_metadata(raw: object, identifier: str) -> RouterModelMetadata:
     order = listing.get("order")
     return RouterModelMetadata(
         request_name=raw.get("request_name") or "",
+        provider_model=raw.get("provider_model") or "",
         display_name=raw.get("display_name") or "",
         description=raw.get("description") or "",
         listing_order=order if isinstance(order, int) else sys.maxsize,
@@ -803,18 +819,28 @@ def _pick_installed_clients() -> tuple[str, ...]:
         # available Cowork earns it a place even where Claude Code itself
         # was not detected.
         candidates = (*candidates, "claude-code")
+    cursor_installed = _cursor_is_installed()
     if not candidates:
-        # Offering nothing would end the command on a machine where detection
-        # simply missed, and configuring an agent before installing it is a
-        # supported thing to do. Hermes is the exception: its setup runs
-        # through the hermes executable, so a machine detection just proved
-        # has neither the binary nor a config directory can only fail on it.
-        click.echo("No coding agents found. Showing every agent Router supports.")
-        candidates = tuple(
-            client
-            for client in CLIENT_NAMES
-            if client != "hermes" or hermes_agent.hermes_executable() is not None
-        )
+        if cursor_installed:
+            # Cursor's setup is guided rather than written, but it starts
+            # from the same credential, so it earns a line in the same
+            # picker — and an installed Cursor means an agent WAS found.
+            candidates = (CURSOR_CLIENT,)
+        else:
+            # Offering nothing would end the command on a machine where
+            # detection simply missed, and configuring an agent before
+            # installing it is a supported thing to do. Hermes is the
+            # exception: its setup runs through the hermes executable, so a
+            # machine detection just proved has neither the binary nor a
+            # config directory can only fail on it.
+            click.echo("No coding agents found. Showing every agent Router supports.")
+            candidates = tuple(
+                client
+                for client in CLIENT_NAMES
+                if client != "hermes" or hermes_agent.hermes_executable() is not None
+            )
+    elif cursor_installed:
+        candidates = (*candidates, CURSOR_CLIENT)
     # The list says which apps an entry covers, so nobody has to think of
     # Claude Code and Claude Desktop as two separate things to configure.
     titles = dict(AGENT_NAMES)
@@ -1149,6 +1175,16 @@ def _run_configure(
     if setup_file is None and api_key is None and _can_prompt(ctx, fmt):
         api_key = _pick_stored_router_api_key()
     if setup_file is None and api_key is None:
+        if clients == (CURSOR_CLIENT,) and not _clipboard_available():
+            # A Cursor-only setup stores the key nowhere: no agent config
+            # file will hold it, so the clipboard is the only handoff. With
+            # no working helper, browser setup would mint a key with nowhere
+            # to go; 'ramp router cursor --show-key' prints one instead.
+            raise click.UsageError(
+                "No clipboard tool was found, so a newly created key would "
+                "have nowhere to go. Run 'ramp router cursor --show-key' to "
+                "print a key, or pass --api-key with an existing key."
+            )
         api_key = acquire_router_api_key(router_ui_url(), no_browser=no_browser)
         browser_acquired_key = True
     api_key = api_key.strip()
@@ -1268,6 +1304,30 @@ def _run_configure(
                     }
                 )
                 continue
+            if item == CURSOR_CLIENT:
+                # Cursor holds its settings in its own account-synced UI, so
+                # there is no file to write: the credential is provisioned and
+                # the two fields to paste are reported instead.
+                suggested = _cursor_suggested_model(models)
+                claude_aliases = _ensure_claude_aliases(api_key, base_url, models)
+                results.append(
+                    {
+                        "client": item,
+                        "provider": ROUTER_PROVIDER,
+                        "suggested_model": suggested,
+                        "models_available": len(models),
+                        "claude_aliases": claude_aliases,
+                        "api_key_on_clipboard": _copy_to_clipboard(api_key),
+                        "instructions": _cursor_setup_steps(
+                            base_url, suggested, claude_aliases
+                        ),
+                        "note_lines": _cursor_note_lines(
+                            models, claude_aliases, base_url=base_url
+                        ),
+                        "setup_file_deleted": setup_file is not None,
+                    }
+                )
+                continue
             try:
                 configure_options = {"base_url": base_url}
                 if item == "claude-code":
@@ -1292,7 +1352,23 @@ def _run_configure(
                 "original_setup_command": _original_setup_command(item, path),
             }
             results.append(result)
-        if setup_file is not None and not failures:
+        # A Cursor-only run writes the key to no agent config, so when the
+        # clipboard also failed to take it, the setup file is the only copy
+        # of the credential left; deleting it would strand the user with a
+        # key nothing can hand over.
+        setup_file_holds_the_only_key = (
+            bool(results)
+            and all(result["client"] == CURSOR_CLIENT for result in results)
+            and not any(result["api_key_on_clipboard"] for result in results)
+        )
+        if setup_file is not None and not failures and setup_file_holds_the_only_key:
+            for result in results:
+                result["setup_file_deleted"] = False
+        if (
+            setup_file is not None
+            and not failures
+            and not setup_file_holds_the_only_key
+        ):
             try:
                 setup_file.unlink()
             except OSError as exc:
@@ -1323,14 +1399,19 @@ def _run_configure(
             payload = {**payload, "client": claude_cowork.GATEWAY_CLIENT}
         print_agent_json(payload, pagination=None)
     elif not failures:
-        connected_names = _human_join(
-            [AGENT_NAMES[result["client"]] for result in results]
-        )
+        connected = [result for result in results if result["client"] != CURSOR_CLIENT]
         model_count = results[0]["models_available"]
         model_label = "model" if model_count == 1 else "models"
-        click.echo(f"Connected to: {connected_names}")
-        if all(result["client"] == COWORK_CLIENT for result in results):
-            # Cowork keeps its own model selection, so nothing was "added".
+        if connected:
+            connected_names = _human_join(
+                [AGENT_NAMES[result["client"]] for result in connected]
+            )
+            click.echo(f"Connected to: {connected_names}")
+        if all(
+            result["client"] in (COWORK_CLIENT, CURSOR_CLIENT) for result in results
+        ):
+            # Cowork keeps its own model selection and Cursor's list is
+            # chosen by hand, so nothing was "added".
             click.echo(f"{model_count} {model_label} discovered.")
         else:
             click.echo(
@@ -1338,10 +1419,47 @@ def _run_configure(
             )
         if cowork_note:
             click.echo(cowork_note)
+        cursor_result = next(
+            (result for result in results if result["client"] == CURSOR_CLIENT), None
+        )
+        if cursor_result:
+            click.echo()
+            if cursor_result["api_key_on_clipboard"]:
+                click.echo("Cursor: your Router API key is on the clipboard.")
+            elif browser_acquired_key and all(
+                result["client"] == CURSOR_CLIENT for result in results
+            ):
+                # No agent config file took the key either, so this browser
+                # key exists nowhere the user can reach; ask before printing.
+                _offer_undelivered_browser_key(api_key)
+            elif setup_file is not None and setup_file_holds_the_only_key:
+                click.echo(
+                    "Cursor: no clipboard tool could take the key, so the "
+                    f"setup file {setup_file} was kept. Run configure again "
+                    "once a clipboard tool is available, or run "
+                    "'ramp router cursor --show-key' to print a key."
+                )
+            else:
+                click.echo(
+                    "Cursor: no clipboard tool was found; run "
+                    "'ramp router cursor --show-key' to print the key."
+                )
+            _echo_cursor_guidance(cursor_result["instructions"])
+            show_notice("NOTE", cursor_result["note_lines"])
         if notice:
             show_notice("NOTICE", notice)
 
     if failures:
+        cursor_result = next(
+            (result for result in results if result["client"] == CURSOR_CLIENT), None
+        )
+        if cursor_result is not None and cursor_result["api_key_on_clipboard"]:
+            # The key was copied before the failing client ran; a failed run
+            # must not leave a credential on the clipboard unannounced.
+            click.echo(
+                "Cursor: your Router API key is already on the clipboard; run "
+                "'ramp router cursor' to finish Cursor setup."
+            )
         # Configuration is written before the agent-specific steps, so a
         # partial failure is recoverable; the user has no reason to guess that.
         raise click.ClickException(
@@ -1363,7 +1481,6 @@ def _run_configure(
             strategy_notice = _strategy_savings_notice(
                 switchyard_routing_enabled=summary.switchyard_routing_enabled,
                 cost_efficient_routing_enabled=summary.cost_efficient_routing_enabled,
-                strategies_url=f"{_statusline_origin(base_url)}/strategies",
             )
             remaining_credits = summary.remaining_credits
             if strategy_notice is not None or remaining_credits is not None:
@@ -1562,6 +1679,467 @@ def router_refresh(ctx: click.Context) -> None:
 
     if failures:
         raise click.ClickException("Could not refresh " + "; ".join(failures))
+
+
+def _cursor_is_installed() -> bool:
+    """Report whether Cursor appears to be present on this machine."""
+    return bool(shutil.which("cursor")) or Path("/Applications/Cursor.app").exists()
+
+
+def _cursor_suggested_model(models: list[RouterModel]) -> str | None:
+    """Pick a starting model id Cursor's override can actually serve."""
+    suggested = next(
+        (model for model in models if model.metadata.request_name == DEFAULT_MODEL),
+        None,
+    )
+    if suggested is None:
+        # Cursor never routes claude- ids through the override, so a Claude
+        # entry would recommend a model the override cannot serve.
+        suggested = next(
+            (
+                model
+                for model in models
+                if not model.metadata.request_name.startswith("claude-")
+            ),
+            None,
+        )
+    # A catalog with no non-claude entries has nothing the override can
+    # serve directly; suggesting the absent default would 404 in Cursor.
+    return suggested.metadata.request_name if suggested else None
+
+
+def _ensure_claude_aliases(
+    api_key: str,
+    base_url: str,
+    models: list[RouterModel],
+) -> dict[str, str]:
+    """Give every Claude catalog model an alias name Cursor can route.
+
+    Cursor never sends model ids beginning with claude- through its base-URL
+    override, and its backend also pattern-matches custom model names against
+    its own catalog: a bare `fable-5` is treated as Claude Fable 5 and
+    inherits the org's model policy ("ask your admin"), while a name that no
+    longer resembles a catalog entry passes straight through the override.
+    Each Claude model is therefore offered under its id with the claude-
+    prefix swapped for ramp- (claude-fable-5 becomes ramp-fable-5, verified
+    to evade the matcher where fable-5 is blocked), created through Router's
+    API-key self-service surface. Returns the usable alias names mapped to
+    the models they route. Alias creation is a bonus on top of a working
+    setup, so every failure here — an older Router 404ing the surface, a
+    network error, a name the user already spent — reads as "fewer aliases",
+    never as a failed setup; guidance for models left without an alias falls
+    back to the dashboard.
+    """
+    claude_models = [
+        model for model in models if model.metadata.request_name.startswith("claude-")
+    ]
+    if not claude_models:
+        return {}
+    origin = _statusline_origin(base_url)
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        response = httpx.get(
+            f"{origin}/self-service/model-aliases", headers=headers, timeout=10
+        )
+    except httpx.HTTPError:
+        return {}
+    if response.status_code != 200:
+        return {}
+    try:
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return {}
+        existing = {
+            alias["name"]: [
+                value
+                for value in alias.get("candidate_models", [])
+                if isinstance(value, str)
+            ]
+            for alias in payload.get("data", [])
+            if isinstance(alias, dict) and isinstance(alias.get("name"), str)
+        }
+    except (ValueError, TypeError):
+        return {}
+    aliases: dict[str, str] = {}
+    for model in claude_models:
+        model_name = model.metadata.request_name
+        alias_name = f"ramp-{model_name.removeprefix('claude-')}"
+        if alias_name in existing:
+            # The name is only offered as this model's route when it in fact
+            # routes there; a name the user already spent on something else
+            # stays theirs and simply is not advertised.
+            if any(
+                _candidate_routes_model(value, model) for value in existing[alias_name]
+            ):
+                aliases[alias_name] = model_name
+            continue
+        try:
+            created = httpx.post(
+                f"{origin}/self-service/model-aliases",
+                headers=headers,
+                json={"name": alias_name, "candidate_models": [model_name]},
+                timeout=10,
+            )
+        except httpx.HTTPError:
+            continue
+        if created.status_code == 201:
+            aliases[alias_name] = model_name
+    return aliases
+
+
+def _candidate_routes_model(candidate: str, model: RouterModel) -> bool:
+    """True when a provider-qualified alias candidate routes exactly this model.
+
+    Candidates read ``provider:provider-model`` with an optional trailing
+    ``:service-tier``, and the stored spelling is the provider's own — which
+    for a rolling request name such as claude-sonnet-4-5 is the dated
+    snapshot it currently points at (claude-sonnet-4-5-20250929). Matching
+    against the model's provider_model from ``GET /v1/models`` therefore
+    recognizes the aliases this command creates, while still refusing
+    lookalikes that are genuinely different catalog entries: the separate
+    model claude-haiku-4-5-20251001 is not a route for claude-haiku-4-5,
+    whose own provider_model carries no date.
+    """
+    _, separator, qualified = candidate.partition(":")
+    segment = qualified if separator else candidate
+    request_name = model.metadata.request_name
+    provider_model = model.metadata.provider_model or request_name
+    return (
+        segment == provider_model
+        or segment.startswith(f"{provider_model}:")
+        or segment == request_name
+        or segment.startswith(f"{request_name}:")
+    )
+
+
+def _cursor_setup_steps(
+    base_url: str,
+    suggested_name: str | None,
+    claude_aliases: dict[str, str] | None = None,
+) -> list[str]:
+    """The fields Cursor actually has, in the order its UI presents them."""
+    steps = [
+        "Open Cursor Settings (Cmd/Ctrl+Shift+J) and go to Models, then API Keys.",
+        'Paste the key into the "OpenAI API Key" field.',
+        f'Toggle on "Override OpenAI Base URL" and set it to: {base_url}',
+        'Toggle on "OpenAI API Key" and confirm "Enable OpenAI API Key".',
+        (
+            "In the model list, enable or add the Router models to use."
+            + (f" Suggested start: {suggested_name}" if suggested_name else "")
+        ),
+    ]
+    if claude_aliases:
+        steps.append(
+            "For Claude models, add these alias names instead of the claude- "
+            "ids Cursor refuses to route: " + ", ".join(sorted(claude_aliases))
+        )
+    steps.append("Pick the model in Cursor's chat model picker.")
+    return steps
+
+
+def _cursor_removal_steps() -> list[str]:
+    """Undo the same fields setup filled in, in the same place."""
+    return [
+        "Open Cursor Settings (Cmd/Ctrl+Shift+J) and go to Models, then API Keys.",
+        (
+            'Toggle off "OpenAI API Key" — or, if you used your own OpenAI '
+            "key before Ramp Router, paste that key back instead."
+        ),
+        (
+            'Toggle off "Override OpenAI Base URL" — or restore the URL you '
+            "used before Ramp Router, if you had one."
+        ),
+        (
+            "In the model list, remove any Router models you added and "
+            "re-disable any you enabled for Router."
+        ),
+        (
+            "Alias names created during setup stay on your Router account; "
+            "remove any you no longer want at "
+            f"{_statusline_origin(router_base_url())}/strategies."
+        ),
+    ]
+
+
+def _cursor_note_lines(
+    models: list[RouterModel],
+    claude_aliases: dict[str, str] | None = None,
+    *,
+    base_url: str | None = None,
+) -> list[str]:
+    lines = [
+        "Cursor sends base-URL-override requests from Cursor's servers, so",
+        "the Router key transits Cursor's backend, as with any BYOK provider.",
+        "Tab autocomplete and Cursor's own models keep using Cursor's backend.",
+    ]
+    claude_models = [
+        model.metadata.request_name
+        for model in models
+        if model.metadata.request_name.startswith("claude-")
+    ]
+    if not claude_models:
+        # No Claude models in this catalog means no aliases to talk about;
+        # pointing at the dashboard would ask the user to fix nothing.
+        return lines
+    lines.extend(
+        [
+            "Cursor never routes model ids beginning with claude- through the",
+            "override; Claude models are reached through Router alias names.",
+        ]
+    )
+    aliases = claude_aliases or {}
+    for alias_name, model_name in sorted(aliases.items()):
+        lines.append(f"  {alias_name} -> {model_name}")
+    # Any Claude model left without an advertised alias — the surface was
+    # unreachable, its name was already spent, or creation failed — stays
+    # reachable only through a dashboard-made alias, so say which ones.
+    missing = sorted(name for name in claude_models if name not in aliases.values())
+    if missing:
+        # A custom deployment manages its aliases on its own origin; sending
+        # those users to app.router.com would point at the wrong dashboard.
+        strategies_origin = (
+            _statusline_origin(base_url) if base_url else router_ui_url()
+        )
+        lines.append(
+            f"Create alias names at {strategies_origin}/strategies for: "
+            + ", ".join(missing)
+        )
+    return lines
+
+
+def _echo_cursor_guidance(steps: list[str]) -> None:
+    click.echo("Cursor keeps these settings in its own UI, so finish there:")
+    for number, step in enumerate(steps, start=1):
+        click.echo(f"  {number}. {step}")
+
+
+@router_group.command(
+    "cursor",
+    help="Guided Ramp Router setup for Cursor's OpenAI base-URL override",
+)
+@click.option(
+    "--api-key",
+    metavar="KEY",
+    envvar=CONFIGURE_KEY_ENV,
+    help=(
+        "Ramp Router API key. Opens browser setup when omitted. "
+        f"Set {CONFIGURE_KEY_ENV} instead to keep it out of shell history."
+    ),
+)
+@click.option(
+    "--no-browser",
+    is_flag=True,
+    help="Print the Router setup URL instead of opening a browser.",
+)
+@click.option(
+    "--show-key",
+    is_flag=True,
+    help="Print the API key instead of only copying it to the clipboard.",
+)
+@click.pass_context
+def router_cursor(
+    ctx: click.Context,
+    api_key: str | None,
+    no_browser: bool,
+    show_key: bool,
+) -> None:
+    """Provision a Router key and walk through Cursor's two BYOK fields.
+
+    Cursor keeps its provider settings inside its own account-synced UI and
+    sends base-URL-override traffic from Cursor's servers, so there is no
+    config file this command could write and no local proxy that could sit in
+    between. What remains automatable is the credential and the exact values
+    to paste, which is precisely what this does.
+    """
+    fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
+    # Click has already copied any configured value into api_key. Drop the
+    # secret from the environment before anything here spawns a child: the
+    # clipboard helper below inherits what this process still carries.
+    os.environ.pop(CONFIGURE_KEY_ENV, None)
+    if api_key is not None:
+        # A flag- or environment-supplied key is known now, so an empty one
+        # is named as the invalid input before any browser or network work.
+        api_key = api_key.strip()
+        if not api_key:
+            raise click.BadParameter(
+                "cannot be empty", param_hint="'--api-key'"
+            ) from None
+    if ctx.obj["no_input"] and api_key is None:
+        raise click.UsageError(
+            "Pass --api-key when using non-interactive mode, or set "
+            f"{CONFIGURE_KEY_ENV} to keep the key out of shell history "
+            f"and process listings. Create a key at {router_ui_url()}."
+        )
+    browser_acquired_key = False
+    if api_key is None and _can_prompt(ctx, fmt):
+        api_key = _pick_stored_router_api_key()
+    if api_key is None:
+        if fmt == "json":
+            # Machine output must stay non-interactive: browser setup waits on
+            # a human for up to fifteen minutes, which is not an answer JSON
+            # callers can parse. Redirected human output still reaches the
+            # browser flow, the same as configure.
+            raise click.UsageError(
+                "Pass --api-key when requesting JSON output, or set "
+                f"{CONFIGURE_KEY_ENV}. Create a key at {router_ui_url()}."
+            )
+        if not show_key and not _clipboard_available():
+            # Browser setup mints a key this machine has no way to hand over:
+            # no clipboard can take it and nothing stores it, and printing a
+            # secret nobody asked to see is not an answer. Refusing before
+            # the browser opens means no key is created only to be orphaned.
+            raise click.UsageError(
+                "No clipboard tool was found, so a newly created key would "
+                "have nowhere to go. Rerun with --show-key to print the key, "
+                "or pass --api-key with an existing key."
+            )
+        api_key = acquire_router_api_key(router_ui_url(), no_browser=no_browser)
+        browser_acquired_key = True
+    api_key = api_key.strip()
+    if not api_key:
+        # A user-supplied key was validated above, so what is empty here came
+        # back from browser setup or a stored credential.
+        raise click.ClickException("Ramp Router did not return an API key.")
+    base_url = router_base_url()
+    models = _fetch_models(api_key, wait_for_key=browser_acquired_key)
+    suggested_name = _cursor_suggested_model(models)
+    claude_aliases = _ensure_claude_aliases(api_key, base_url, models)
+    key_on_clipboard = False if show_key else _copy_to_clipboard(api_key)
+    steps = _cursor_setup_steps(base_url, suggested_name, claude_aliases)
+    if fmt == "json":
+        payload = {
+            "client": "cursor",
+            "base_url": base_url,
+            "models_available": len(models),
+            "suggested_model": suggested_name,
+            "claude_aliases": claude_aliases,
+            "api_key_on_clipboard": key_on_clipboard,
+            "instructions": steps,
+        }
+        if show_key:
+            payload["api_key"] = api_key
+        print_agent_json(payload, pagination=None)
+        return
+    click.echo("Connecting Ramp Router to Cursor")
+    click.echo()
+    if show_key:
+        click.echo(f"Router API key: {api_key}")
+    elif key_on_clipboard:
+        click.echo("Your Router API key is on the clipboard.")
+    elif browser_acquired_key:
+        # The helper existed at preflight but delivery failed (for example a
+        # session with no usable display). The key exists nowhere else, so
+        # the consented print is the remaining safe handoff.
+        _offer_undelivered_browser_key(api_key)
+    else:
+        click.echo(
+            "No clipboard tool was found; rerun with --show-key to print the key."
+        )
+    click.echo()
+    _echo_cursor_guidance(steps)
+    click.echo()
+    model_count = len(models)
+    model_label = "model is" if model_count == 1 else "models are"
+    click.echo(
+        f"{model_count} {model_label} available; any Router model id outside the "
+        "claude- prefix works as a custom model name in Cursor."
+    )
+    show_notice("NOTE", _cursor_note_lines(models, claude_aliases, base_url=base_url))
+    summary = _fetch_configure_summary(api_key, base_url=base_url)
+    if summary is not None and summary.remaining_credits is not None:
+        click.secho(
+            "Router credits remaining: "
+            f"{_format_credits_usd(summary.remaining_credits)}",
+            fg=_RAMP_YELLOW,
+        )
+
+
+_CLIPBOARD_COMMANDS: tuple[list[str], ...] = (
+    ["pbcopy"],
+    ["clip"],
+    ["wl-copy"],
+    ["xclip", "-selection", "clipboard"],
+)
+
+
+def _clipboard_available() -> bool:
+    """Whether any supported clipboard helper exists, without touching it.
+
+    Deliberately a presence check and nothing more: any probe write would
+    destroy clipboard flavors no text read can restore (images, HTML, RTF,
+    file lists). The common failure — no helper installed at all — is caught
+    here with zero side effects; the rare present-but-broken helper is
+    handled after the fact by _offer_undelivered_browser_key, which asks
+    before disclosing anything.
+    """
+    return any(shutil.which(command[0]) is not None for command in _CLIPBOARD_COMMANDS)
+
+
+def _terminal_is_interactive() -> bool:
+    """Whether a human is on stdin AND the output lands on their terminal.
+
+    Both ends matter for disclosing a secret: a piped stdin cannot consent,
+    and a redirected stdout would write the answer into a file or transcript
+    the prompt never mentioned.
+    """
+    try:
+        return (
+            click.get_text_stream("stdin").isatty()
+            and click.get_text_stream("stdout").isatty()
+        )
+    except (OSError, ValueError):
+        return False
+
+
+def _offer_undelivered_browser_key(api_key: str) -> bool:
+    """Consented last-resort handoff for a browser key no clipboard took.
+
+    The key was minted moments ago and stored nowhere, so silence would
+    orphan it — but printing a secret is opt-in, so the prompt is the opt-in.
+    Consent must come from a person: a piped stdin cannot answer, so the
+    prompt is only offered on an interactive terminal, and only when stdout
+    is that terminal rather than a redirect that would capture the key.
+    Returns True when the user consented and the key was printed; on decline,
+    EOF, or a non-interactive stream the key stays undisclosed and the
+    guidance treats it as unused.
+    """
+    consented = False
+    if _terminal_is_interactive():
+        try:
+            consented = click.confirm(
+                "The clipboard copy failed. Print the new key to the terminal instead?",
+                default=False,
+            )
+        except (click.Abort, EOFError):
+            consented = False
+    if consented:
+        click.echo(f"Router API key: {api_key}")
+        return True
+    click.echo(
+        "The new key was not delivered and remains unused. Rerun with "
+        f"--show-key to print a fresh key, and manage keys at {router_ui_url()}."
+    )
+    return False
+
+
+def _copy_to_clipboard(text: str) -> bool:
+    """Best-effort clipboard copy so the key never has to hit the terminal."""
+    for command in _CLIPBOARD_COMMANDS:
+        if shutil.which(command[0]) is None:
+            continue
+        try:
+            subprocess.run(
+                command,
+                input=text.encode(),
+                check=True,
+                timeout=5,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        return True
+    return False
 
 
 @router_group.command(
@@ -1927,6 +2505,674 @@ def _resolve_subagent_model(value: str, models: list[RouterModel], flag: str) ->
     )
 
 
+# CLI strategy names, in the order the web strategies page presents them,
+# mapped to the field the Router strategy-settings API stores each one under.
+# Only these two are manageable over an API key; Shadow models stay
+# browser-only because enabling them requires the content-recording consent
+# flow that only the web app presents.
+STRATEGY_SETTINGS = {
+    "cost-efficient-routing": "allow_flex_tier_default",
+    "switchyard-routing": "switchyard_routing_enabled",
+}
+STRATEGY_TITLES = {
+    "cost-efficient-routing": "Cost-efficient routing",
+    "switchyard-routing": "NVIDIA NeMo Switchyard",
+}
+SWITCHYARD_STRATEGY = "switchyard-routing"
+SWITCHYARD_SENSITIVITY_NAMES = ("aggressive", "balanced", "conservative", "strict")
+# Picker labels: only the two extremes explain themselves; the mechanics
+# (picker mode, confidence threshold) stay out of the UI and remain available
+# in the JSON output for scripts.
+SWITCHYARD_SENSITIVITY_TITLES = {
+    "aggressive": "aggressive (favors efficient model)",
+    "balanced": "balanced",
+    "conservative": "conservative",
+    "strict": "strict (favors frontier model)",
+}
+# Distinguishes "no config change requested" from an explicit null config,
+# which resets Switchyard to the Router defaults.
+_NO_SWITCHYARD_CONFIG_CHANGE = object()
+
+
+@router_group.group(
+    "strategies",
+    invoke_without_command=True,
+    help=(
+        "Show and toggle Ramp Router routing strategies; run without a "
+        "subcommand to toggle interactively"
+    ),
+)
+@click.option(
+    "--api-key",
+    metavar="KEY",
+    envvar=CONFIGURE_KEY_ENV,
+    help=(
+        "Ramp Router API key naming the account to manage. Defaults to the "
+        "key stored by 'ramp router configure'."
+    ),
+)
+@click.pass_context
+def router_strategy_group(ctx: click.Context, api_key: str | None) -> None:
+    # Subcommands resolve their own --api-key; keep a group-level value so
+    # 'ramp router strategies --api-key KEY enable ...' acts on KEY's account
+    # instead of silently falling back to a stored key.
+    ctx.obj["strategies_api_key"] = api_key
+    ctx.obj["strategies_api_key_from_flag"] = (
+        ctx.get_parameter_source("api_key") == ParameterSource.COMMANDLINE
+    )
+    if ctx.invoked_subcommand is not None:
+        return
+    fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
+    key = _resolve_strategy_api_key(ctx, api_key, fmt)
+    payload = _strategy_settings_request(key)
+    if not _can_prompt(ctx, fmt):
+        # Without a terminal to toggle on, the bare command still answers the
+        # question it was asked: what is the current configuration?
+        _print_strategy_settings(fmt, payload)
+        return
+    _toggle_strategies_interactively(key, payload)
+
+
+def _toggle_strategies_interactively(key: str, payload: dict) -> None:
+    """Offer every strategy with its current state and apply what changed."""
+    settings = _strategy_states(payload)
+    selected = questionary.checkbox(
+        "Toggle Ramp Router routing strategies",
+        choices=[
+            questionary.Choice(
+                title=STRATEGY_TITLES[name],
+                value=name,
+                checked=enabled,
+            )
+            for name, enabled in settings.items()
+        ],
+        style=_PICKER_STYLE,
+        pointer=_PICKER_POINTER,
+        instruction="(space to toggle, enter to apply)",
+    ).ask()
+    if selected is None:
+        raise click.Abort()
+    desired = {name: name in selected for name in settings}
+    changes: dict[str, object] = {
+        STRATEGY_SETTINGS[name]: enabled
+        for name, enabled in desired.items()
+        if enabled != settings[name]
+    }
+    if not changes:
+        click.echo("No strategy changes.")
+        return
+    switchyard = payload.get("switchyard")
+    configure_switchyard = (
+        desired[SWITCHYARD_STRATEGY]
+        and not settings[SWITCHYARD_STRATEGY]
+        and isinstance(switchyard, dict)
+    )
+    if configure_switchyard:
+        changes["switchyard_config"] = _pick_switchyard_config(switchyard)
+    updated_payload = _strategy_settings_request(key, changes)
+    updated = _strategy_states(updated_payload)
+    withheld = []
+    for name, enabled in desired.items():
+        if enabled == settings[name]:
+            continue
+        if updated[name] != enabled:
+            withheld.append(name)
+            continue
+        verb = "Enabled" if enabled else "Disabled"
+        click.echo(f"{verb} {STRATEGY_TITLES[name]}.")
+    if configure_switchyard and SWITCHYARD_STRATEGY not in withheld:
+        updated_switchyard = updated_payload.get("switchyard")
+        if isinstance(updated_switchyard, dict):
+            click.echo(f"Switchyard: {_switchyard_summary(updated_switchyard)}")
+    if withheld:
+        raise click.ClickException(
+            _withheld_strategy_message(withheld, desired[withheld[0]])
+        )
+
+
+def _switchyard_model_display_name(switchyard: dict, model_id: str) -> str:
+    for option in switchyard.get("efficient_models") or []:
+        if isinstance(option, dict) and option.get("id") == model_id:
+            return str(option.get("display_name") or model_id)
+    # A stored model outside the offered list has no display name to show;
+    # drop the provider prefix so the raw catalog id reads as a model name.
+    _, _, provider_model = model_id.partition(":")
+    return provider_model or model_id
+
+
+def _switchyard_summary(switchyard: dict) -> str:
+    """One line saying what Switchyard would do right now."""
+    config = switchyard.get("config") or {}
+    defaults = switchyard.get("defaults") or {}
+    stored = any(value is not None for value in config.values())
+    model_id = config.get("efficient_model")
+    if model_id:
+        model_text = _switchyard_model_display_name(switchyard, model_id)
+    else:
+        default_model = str(defaults.get("efficient_model") or "")
+        model_text = (
+            f"{_switchyard_model_display_name(switchyard, default_model)} (default)"
+        )
+    if config.get("effort"):
+        thinking_text = str(config["effort"])
+    elif stored or not defaults.get("effort"):
+        # A stored config carries a thinking override only through its own
+        # effort field, so an absent one means the model's own settings.
+        thinking_text = "model's own"
+    else:
+        thinking_text = f"{defaults['effort']} (default)"
+    if config.get("sensitivity_config_name"):
+        sensitivity_text = str(config["sensitivity_config_name"])
+    elif (
+        config.get("picker") is not None
+        or config.get("confidence_threshold") is not None
+    ):
+        sensitivity_text = "custom"
+    else:
+        sensitivity_text = (
+            f"{defaults.get('sensitivity_config_name', 'balanced')} (default)"
+        )
+    return f"model: {model_text} · thinking: {thinking_text} · sensitivity: {sensitivity_text}"
+
+
+def _pick_switchyard_config(switchyard: dict) -> dict | None:
+    """Ask how Switchyard should route; ``None`` means the Router defaults."""
+    defaults = switchyard.get("defaults") or {}
+    config = switchyard.get("config") or {}
+    default_model = _switchyard_model_display_name(
+        switchyard, str(defaults.get("efficient_model") or "")
+    )
+    default_thinking = defaults.get("effort") or "model's own"
+    default_summary = (
+        f"{default_model} model, {default_thinking} thinking, "
+        f"{defaults.get('sensitivity_config_name', 'balanced')} sensitivity"
+    )
+    choice = questionary.select(
+        "How should NVIDIA NeMo Switchyard route?",
+        choices=[
+            questionary.Choice(title=f"Default — {default_summary}", value="default"),
+            questionary.Choice(
+                title="Custom — choose the model, thinking, and sensitivity",
+                value="custom",
+            ),
+        ],
+        style=_PICKER_STYLE,
+        pointer=_PICKER_POINTER,
+        instruction="(enter to confirm)",
+    ).ask()
+    if choice is None:
+        raise click.Abort()
+    if choice == "default":
+        # An explicit null resets any stored overrides so "Default" always
+        # means exactly what the Router defaults to.
+        return None
+    model_id = _pick_switchyard_model(switchyard, config, defaults)
+    return {
+        "efficient_model": model_id,
+        "effort": _pick_switchyard_thinking(switchyard, model_id, config),
+        "sensitivity_config_name": _pick_switchyard_sensitivity(switchyard, config),
+    }
+
+
+def _pick_switchyard_model(switchyard: dict, config: dict, defaults: dict) -> str:
+    options = [
+        option
+        for option in switchyard.get("efficient_models") or []
+        if isinstance(option, dict) and option.get("id")
+    ]
+    if not options:
+        raise click.ClickException(
+            "Ramp Router did not offer any Switchyard models. Please try again."
+        )
+    default_id = defaults.get("efficient_model")
+    current = config.get("efficient_model") or default_id
+    choices = [
+        questionary.Choice(
+            title=(
+                f"{_switchyard_model_display_name(switchyard, option['id'])}"
+                + (" — default" if option["id"] == default_id else "")
+            ),
+            value=option["id"],
+        )
+        for option in options
+    ]
+    selected = questionary.select(
+        "Which efficient model should Switchyard route to?",
+        choices=choices,
+        default=current if any(option["id"] == current for option in options) else None,
+        style=_PICKER_STYLE,
+        pointer=_PICKER_POINTER,
+        instruction="(enter to confirm)",
+    ).ask()
+    if selected is None:
+        raise click.Abort()
+    return selected
+
+
+def _pick_switchyard_thinking(
+    switchyard: dict, model_id: str, config: dict
+) -> str | None:
+    efforts: list[str] = []
+    for option in switchyard.get("efficient_models") or []:
+        if isinstance(option, dict) and option.get("id") == model_id:
+            efforts = [
+                effort
+                for effort in option.get("efforts") or []
+                if isinstance(effort, str)
+            ]
+            break
+    if not efforts:
+        # A model that advertises no thinking efforts has nothing to choose;
+        # asking would only offer the no-override entry.
+        return None
+    # "" stands in for no override because a cancelled prompt already
+    # answers None.
+    choices = [
+        questionary.Choice(
+            title="Model's own settings (no thinking override)", value=""
+        )
+    ]
+    choices += [questionary.Choice(title=effort, value=effort) for effort in efforts]
+    current = (
+        config.get("effort") if config.get("efficient_model") == model_id else None
+    )
+    selected = questionary.select(
+        "How much should the efficient model think?",
+        choices=choices,
+        default=current if current in efforts else "",
+        style=_PICKER_STYLE,
+        pointer=_PICKER_POINTER,
+        instruction="(enter to confirm)",
+    ).ask()
+    if selected is None:
+        raise click.Abort()
+    return selected or None
+
+
+def _pick_switchyard_sensitivity(switchyard: dict, config: dict) -> str:
+    presets = [
+        preset
+        for preset in switchyard.get("sensitivity_configs") or []
+        if isinstance(preset, dict) and preset.get("name")
+    ]
+    if not presets:
+        raise click.ClickException(
+            "Ramp Router did not offer any Switchyard sensitivity presets. Please try again."
+        )
+    choices = [
+        questionary.Choice(
+            title=SWITCHYARD_SENSITIVITY_TITLES.get(
+                preset["name"], str(preset["name"])
+            ),
+            value=preset["name"],
+        )
+        for preset in presets
+    ]
+    # A retained custom sensitivity stays preselected so re-enabling and
+    # accepting the prompts never silently rewrites it; balanced is the
+    # recommended starting point otherwise.
+    default = next(
+        (
+            name
+            for name in (config.get("sensitivity_config_name"), "balanced")
+            if any(preset["name"] == name for preset in presets)
+        ),
+        None,
+    )
+    selected = questionary.select(
+        "How sensitive should escalation between the tiers be?",
+        choices=choices,
+        default=default,
+        style=_PICKER_STYLE,
+        pointer=_PICKER_POINTER,
+        instruction="(enter to confirm)",
+    ).ask()
+    if selected is None:
+        raise click.Abort()
+    return selected
+
+
+def _resolve_strategy_api_key(ctx: click.Context, api_key: str | None, fmt: str) -> str:
+    """Choose the credential a strategy command should act for.
+
+    Strategy settings belong to the key's owning account, so the stored
+    receipt credentials are reused rather than asking the browser for a new
+    key: creating a key is never required just to flip a setting.
+    """
+    if api_key is None:
+        api_key = ctx.obj.get("strategies_api_key")
+    elif (
+        ctx.obj.get("strategies_api_key_from_flag")
+        and ctx.obj.get("strategies_api_key") is not None
+        and ctx.get_parameter_source("api_key") != ParameterSource.COMMANDLINE
+    ):
+        # The subcommand option also binds the env var, so an environment
+        # value would otherwise beat an explicit group-level --api-key.
+        api_key = ctx.obj["strategies_api_key"]
+    if api_key is not None:
+        key = api_key.strip()
+        if not key:
+            # Fall through to a stored key here and an unset shell variable
+            # would silently change a different account's strategies.
+            raise click.ClickException(
+                "The provided Ramp Router API key is empty. Pass a real key "
+                f"with --api-key, or unset {CONFIGURE_KEY_ENV} to use the "
+                "key stored by 'ramp router configure'."
+            )
+        return key
+    credentials = _stored_router_api_key_choices()
+    if not credentials:
+        raise click.ClickException(
+            "No Ramp Router API key found for this Router. Run "
+            "'ramp router configure' first, or pass --api-key "
+            f"(set {CONFIGURE_KEY_ENV} to keep it out of shell history)."
+        )
+    if len(credentials) == 1:
+        return credentials[0][0]
+    if _can_prompt(ctx, fmt):
+        choices = [
+            questionary.Choice(
+                title=(
+                    "Key used by "
+                    f"{_human_join([CLIENT_NAMES[item] for item in clients])}"
+                ),
+                value=index,
+            )
+            for index, (_, clients) in enumerate(credentials)
+        ]
+        selected = questionary.select(
+            "Which Ramp Router API key's account should this change?",
+            choices=choices,
+            style=_PICKER_STYLE,
+            pointer=_PICKER_POINTER,
+            instruction="(enter to confirm)",
+        ).ask()
+        if selected is None:
+            raise click.Abort()
+        return credentials[selected][0]
+    raise click.ClickException(
+        "Multiple Ramp Router API keys are configured. Pass --api-key "
+        f"(or set {CONFIGURE_KEY_ENV}) to choose the account to change."
+    )
+
+
+def _strategy_settings_request(
+    api_key: str, changes: dict[str, object] | None = None
+) -> dict:
+    """Read or update the key owner's strategy settings on Router.
+
+    Returns the full strategies payload with the toggle fields validated.
+    The endpoint lives on the same origin and API-key surface as the status
+    line's session-usage reads.
+    """
+    url = f"{_statusline_origin()}/session-usage/strategies"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        if changes is None:
+            response = httpx.get(url, headers=headers, timeout=10)
+        else:
+            response = httpx.patch(url, headers=headers, json=changes, timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in (401, 403):
+            raise click.ClickException(
+                "That API key wasn't accepted by Ramp Router. "
+                f"Create or copy a key at {ROUTER_UI_URL} and try again."
+            ) from None
+        if exc.response.status_code == 404:
+            raise click.ClickException(
+                "This Ramp Router doesn't support strategy management yet. "
+                f"Manage strategies at {router_ui_url()}/strategies instead."
+            ) from None
+        if exc.response.status_code == 422:
+            # Config validation errors name the exact problem (unknown model,
+            # effort the model does not advertise); surface that instead of a
+            # generic retry hint.
+            detail = None
+            try:
+                body = exc.response.json()
+                if isinstance(body, dict) and isinstance(body.get("error"), dict):
+                    detail = body["error"].get("message")
+            except ValueError:
+                detail = None
+            raise click.ClickException(
+                detail
+                if isinstance(detail, str) and detail
+                else "Ramp Router rejected the strategy request. Please try again."
+            ) from None
+        raise click.ClickException(
+            "Ramp Router couldn't process the strategy request "
+            f"(HTTP {exc.response.status_code}). Please try again."
+        ) from None
+    except (httpx.HTTPError, ValueError):
+        raise click.ClickException(
+            "We couldn't reach Ramp Router. Check your connection and try again."
+        ) from None
+
+    if not isinstance(payload, dict) or any(
+        not isinstance(payload.get(field), bool) for field in STRATEGY_SETTINGS.values()
+    ):
+        raise click.ClickException(
+            "Ramp Router returned an unexpected strategies response. Please try again."
+        )
+    return payload
+
+
+def _strategy_states(payload: dict) -> dict[str, bool]:
+    return {name: payload[field] for name, field in STRATEGY_SETTINGS.items()}
+
+
+def _print_strategy_settings(fmt: str, payload: dict) -> None:
+    settings = _strategy_states(payload)
+    switchyard = payload.get("switchyard")
+    if fmt == "json":
+        result: dict[str, object] = {
+            "strategies": [
+                {"name": name, "enabled": enabled} for name, enabled in settings.items()
+            ]
+        }
+        if isinstance(switchyard, dict):
+            result["switchyard"] = {
+                "config": switchyard.get("config"),
+                "defaults": switchyard.get("defaults"),
+                # Scripts discover valid --model and --sensitivity values
+                # here; the interactive picker gets them the same way.
+                "efficient_models": switchyard.get("efficient_models"),
+                "sensitivity_configs": switchyard.get("sensitivity_configs"),
+            }
+        print_agent_json(result, pagination=None)
+        return
+    width = max(len(name) for name in settings)
+    for name, enabled in settings.items():
+        state = "enabled" if enabled else "disabled"
+        click.echo(f"{name:<{width}}  {state:<8}  {STRATEGY_TITLES[name]}")
+        if name == SWITCHYARD_STRATEGY and isinstance(switchyard, dict):
+            click.echo(f"{'':<{width}}  {'':<8}  {_switchyard_summary(switchyard)}")
+
+
+@router_strategy_group.command(
+    "list", help="Show each routing strategy and whether it is enabled"
+)
+@click.option(
+    "--api-key",
+    metavar="KEY",
+    envvar=CONFIGURE_KEY_ENV,
+    help=(
+        "Ramp Router API key naming the account to read. Defaults to the key "
+        "stored by 'ramp router configure'."
+    ),
+)
+@click.pass_context
+def router_strategy_list(ctx: click.Context, api_key: str | None) -> None:
+    fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
+    key = _resolve_strategy_api_key(ctx, api_key, fmt)
+    _print_strategy_settings(fmt, _strategy_settings_request(key))
+
+
+def _run_strategy_update(
+    ctx: click.Context,
+    strategies: tuple[str, ...],
+    api_key: str | None,
+    *,
+    enabled: bool,
+    switchyard_config: object = _NO_SWITCHYARD_CONFIG_CHANGE,
+) -> None:
+    if not strategies:
+        raise click.UsageError(
+            "Name at least one strategy: " + ", ".join(STRATEGY_SETTINGS) + "."
+        )
+    fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
+    names = tuple(dict.fromkeys(name.lower() for name in strategies))
+    key = _resolve_strategy_api_key(ctx, api_key, fmt)
+    changes: dict[str, object] = {STRATEGY_SETTINGS[name]: enabled for name in names}
+    if switchyard_config is not _NO_SWITCHYARD_CONFIG_CHANGE:
+        changes["switchyard_config"] = switchyard_config
+    payload = _strategy_settings_request(key, changes)
+    settings = _strategy_states(payload)
+    # Router answers with the effective state, which can decline a change:
+    # Shadow models stay off for accounts whose content recording is off.
+    withheld = [name for name in names if settings[name] != enabled]
+    if fmt == "json":
+        if withheld:
+            raise click.ClickException(_withheld_strategy_message(withheld, enabled))
+        _print_strategy_settings(fmt, payload)
+        return
+    verb = "Enabled" if enabled else "Disabled"
+    for name in names:
+        if name not in withheld:
+            click.echo(f"{verb} {STRATEGY_TITLES[name]}.")
+    if (
+        switchyard_config is not _NO_SWITCHYARD_CONFIG_CHANGE
+        and SWITCHYARD_STRATEGY not in withheld
+        and isinstance(payload.get("switchyard"), dict)
+    ):
+        click.echo(f"Switchyard: {_switchyard_summary(payload['switchyard'])}")
+    if withheld:
+        raise click.ClickException(_withheld_strategy_message(withheld, enabled))
+
+
+def _withheld_strategy_message(withheld: list[str], enabled: bool) -> str:
+    titles = _human_join([STRATEGY_TITLES[name] for name in withheld])
+    state = "enabled" if enabled else "disabled"
+    return f"Ramp Router did not leave {titles} {state}. Please try again."
+
+
+@router_strategy_group.command("enable", help="Enable one or more routing strategies")
+@click.argument(
+    "strategies",
+    type=click.Choice(tuple(STRATEGY_SETTINGS), case_sensitive=False),
+    nargs=-1,
+)
+@click.option(
+    "--api-key",
+    metavar="KEY",
+    envvar=CONFIGURE_KEY_ENV,
+    help=(
+        "Ramp Router API key naming the account to change. Defaults to the key "
+        "stored by 'ramp router configure'."
+    ),
+)
+@click.option(
+    "--model",
+    "switchyard_model",
+    metavar="MODEL_ID",
+    help=(
+        "Switchyard efficient model as a catalog id such as "
+        "openai:gpt-5.6-luna. Only with switchyard-routing; run 'ramp router "
+        "strategies list -o json' to see the selectable models."
+    ),
+)
+@click.option(
+    "--thinking",
+    "switchyard_thinking",
+    metavar="EFFORT",
+    help=(
+        "Switchyard thinking effort for the efficient model (for example "
+        "low, medium, or high; 'none' actively disables reasoning). Omit to "
+        "keep each request's own settings. Only with switchyard-routing."
+    ),
+)
+@click.option(
+    "--sensitivity",
+    "switchyard_sensitivity",
+    type=click.Choice(SWITCHYARD_SENSITIVITY_NAMES, case_sensitive=False),
+    help="Switchyard sensitivity preset. Only with switchyard-routing.",
+)
+@click.option(
+    "--default-config",
+    "switchyard_default_config",
+    is_flag=True,
+    help=(
+        "Reset Switchyard to the Router defaults, discarding any stored "
+        "model, thinking, or sensitivity overrides. Only with "
+        "switchyard-routing."
+    ),
+)
+@click.pass_context
+def router_strategy_enable(
+    ctx: click.Context,
+    strategies: tuple[str, ...],
+    api_key: str | None,
+    switchyard_model: str | None,
+    switchyard_thinking: str | None,
+    switchyard_sensitivity: str | None,
+    switchyard_default_config: bool,
+) -> None:
+    config_flags = bool(
+        switchyard_model or switchyard_thinking or switchyard_sensitivity
+    )
+    if (config_flags or switchyard_default_config) and SWITCHYARD_STRATEGY not in {
+        name.lower() for name in strategies
+    }:
+        raise click.UsageError(
+            "--model, --thinking, --sensitivity, and --default-config configure "
+            f"NVIDIA NeMo Switchyard; include {SWITCHYARD_STRATEGY}."
+        )
+    if switchyard_default_config and config_flags:
+        raise click.UsageError(
+            "--default-config cannot be combined with --model, --thinking, or "
+            "--sensitivity."
+        )
+    switchyard_config: object = _NO_SWITCHYARD_CONFIG_CHANGE
+    if switchyard_default_config:
+        switchyard_config = None
+    elif config_flags:
+        config: dict[str, object] = {}
+        if switchyard_model:
+            config["efficient_model"] = switchyard_model
+        if switchyard_thinking:
+            config["effort"] = switchyard_thinking.lower()
+        if switchyard_sensitivity:
+            config["sensitivity_config_name"] = switchyard_sensitivity.lower()
+        switchyard_config = config
+    _run_strategy_update(
+        ctx, strategies, api_key, enabled=True, switchyard_config=switchyard_config
+    )
+
+
+@router_strategy_group.command("disable", help="Disable one or more routing strategies")
+@click.argument(
+    "strategies",
+    type=click.Choice(tuple(STRATEGY_SETTINGS), case_sensitive=False),
+    nargs=-1,
+)
+@click.option(
+    "--api-key",
+    metavar="KEY",
+    envvar=CONFIGURE_KEY_ENV,
+    help=(
+        "Ramp Router API key naming the account to change. Defaults to the key "
+        "stored by 'ramp router configure'."
+    ),
+)
+@click.pass_context
+def router_strategy_disable(
+    ctx: click.Context, strategies: tuple[str, ...], api_key: str | None
+) -> None:
+    _run_strategy_update(ctx, strategies, api_key, enabled=False)
+
+
 @router_group.command(
     "unconfigure",
     help="Restore coding agents and Claude Cowork; omit names to choose interactively",
@@ -1967,6 +3213,11 @@ def _run_unconfigure(
             # Claude entry is the only interactive road to it, so the entry
             # is offered even where Claude Code itself holds no receipt.
             candidates = ("claude-code", *candidates)
+        if _cursor_is_installed():
+            # Cursor's guided setup leaves no receipt to prove itself, so an
+            # installed Cursor is the best evidence available. The entry
+            # prints the guided removal steps, which is all removal is.
+            candidates = (*candidates, CURSOR_CLIENT)
         if candidates:
             # One Claude entry covers both Claude apps and the Codex entry
             # covers the Codex CLI and app, exactly as the configure picker
@@ -2020,6 +3271,17 @@ def _run_unconfigure(
     )
     try:
         for item in clients:
+            if item == CURSOR_CLIENT:
+                # Nothing on disk to restore: Cursor holds its settings in its
+                # own account-synced UI, so removal is guided like setup was.
+                results.append(
+                    {
+                        "client": item,
+                        "removed": False,
+                        "instructions": _cursor_removal_steps(),
+                    }
+                )
+                continue
             if item == COWORK_CLIENT:
                 try:
                     claude_cowork.unconfigure()
@@ -2082,15 +3344,24 @@ def _run_unconfigure(
             payload = {"clients": results}
         print_agent_json(payload, pagination=None)
     elif results:
-        restored_names = _human_join(
-            [AGENT_NAMES[result["client"]] for result in results]
-        )
-        click.echo(
-            "Removed Ramp Router and restored your previous settings for: "
-            f"{restored_names}."
-        )
+        restored = [result for result in results if result["client"] != CURSOR_CLIENT]
+        if restored:
+            restored_names = _human_join(
+                [AGENT_NAMES[result["client"]] for result in restored]
+            )
+            click.echo(
+                "Removed Ramp Router and restored your previous settings for: "
+                f"{restored_names}."
+            )
         if any(result["client"] == COWORK_CLIENT for result in results):
             click.echo("Claude Desktop was restarted.")
+        cursor_result = next(
+            (result for result in results if result["client"] == CURSOR_CLIENT), None
+        )
+        if cursor_result:
+            click.echo("Cursor keeps its settings in its own UI, so undo it there:")
+            for number, step in enumerate(cursor_result["instructions"], start=1):
+                click.echo(f"  {number}. {step}")
     if failures:
         raise click.ClickException("Could not unconfigure " + "; ".join(failures))
 
@@ -2981,23 +4252,23 @@ def _strategy_savings_notice(
     *,
     switchyard_routing_enabled: bool | None,
     cost_efficient_routing_enabled: bool | None,
-    strategies_url: str,
 ) -> str | None:
     switchyard_missing = switchyard_routing_enabled is False
     cost_efficient_missing = cost_efficient_routing_enabled is False
     if switchyard_missing and cost_efficient_missing:
         return (
-            "Enable Nvidia NeMo Switchyard and Cost-Efficient strategies at "
-            f"{strategies_url} for cost savings"
+            "Enable Nvidia NeMo Switchyard and Cost-Efficient strategies with "
+            "'ramp router strategies' for cost savings"
         )
     if switchyard_missing:
         return (
-            "Enable the Nvidia NeMo Switchyard strategy at "
-            f"{strategies_url} for cost savings"
+            "Enable the Nvidia NeMo Switchyard strategy with "
+            "'ramp router strategies' for cost savings"
         )
     if cost_efficient_missing:
         return (
-            f"Enable the Cost-Efficient strategy at {strategies_url} for cost savings"
+            "Enable the Cost-Efficient strategy with 'ramp router strategies' "
+            "for cost savings"
         )
     return None
 
