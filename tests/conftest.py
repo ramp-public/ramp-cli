@@ -22,6 +22,13 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "pi"))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "conductor"))
+    # Conductor detection consults its application-support directory; pointing
+    # it into the sandbox keeps a developer's real Conductor invisible and
+    # gives tests full control over what "installed" means.
+    monkeypatch.setenv(
+        "RAMP_CONDUCTOR_APP_SUPPORT", str(tmp_path / "conductor-app-support")
+    )
     # Hermes is configured through its own `hermes config` executable rather
     # than direct file writes, so a developer with Hermes installed would
     # otherwise have tests drive the real binary against their real setup.

@@ -6591,7 +6591,10 @@ def test_installed_clients_requires_each_agent_executable(tmp_path, monkeypatch)
         lambda name: f"/usr/local/bin/{name}" if name in executables else None,
     )
 
-    assert router_module._installed_clients() == tuple(router_module.CLIENT_NAMES)
+    # Conductor is the one client with no PATH executable: its app-level
+    # detection joins the picker separately, so command detection covers
+    # exactly the executable-backed agents.
+    assert router_module._installed_clients() == tuple(router_module.CLIENT_EXECUTABLES)
 
 
 def test_client_picker_ignores_stale_pi_config_beside_installed_agent(
@@ -6695,8 +6698,12 @@ def test_configure_json_output_bypasses_the_picker(tmp_path, monkeypatch):
     payload = json.loads(configured.output)
     configured_clients = {item["client"] for item in payload["data"][0]["clients"]}
     # Hermes is set up through its own executable, absent here, so a bare run
-    # skips it rather than failing; every other agent is configured.
-    assert configured_clients == set(router_module.CLIENT_NAMES) - {"hermes"}
+    # skips it rather than failing, and Conductor is skipped the same way on
+    # a machine that never had the app; every other agent is configured.
+    assert configured_clients == set(router_module.CLIENT_NAMES) - {
+        "hermes",
+        "conductor",
+    }
 
 
 def test_unconfigure_picker_starts_with_no_configured_agents_selected(

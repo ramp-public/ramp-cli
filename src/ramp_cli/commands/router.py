@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -30,7 +31,7 @@ import zstandard
 from click.core import ParameterSource
 
 from ramp_cli import claude_cowork, hermes_agent
-from ramp_cli.commands import claude_code
+from ramp_cli.commands import claude_code, conductor
 from ramp_cli.commands import router_sync as router_sync_module
 from ramp_cli.commands.router_sync import (
     SYNC_HOOK_USER_MANAGED,
@@ -105,10 +106,13 @@ CLIENT_NAMES = {
     "opencode": "OpenCode",
     "pi": "Pi",
     "hermes": "Hermes",
+    "conductor": "Conductor",
 }
 # The command each agent puts on PATH. Used to tell which agents this machine
 # actually has, so the picker does not offer to write configuration into
-# directories for agents that were never installed.
+# directories for agents that were never installed. Conductor is absent
+# deliberately: it is a macOS app with no PATH executable, so its detection
+# lives in conductor.is_installed() and joins the pickers separately.
 CLIENT_EXECUTABLES = {
     "claude-code": "claude",
     "codex": "codex",
@@ -269,6 +273,12 @@ def _human_join(values: list[str]) -> str:
 
 
 def _codex_harness_prompt(default_model: str) -> str | None:
+    return _codex_harness_prompt_from(shutil.which("codex"), default_model)
+
+
+def _codex_harness_prompt_from(
+    executable: str | Path | None, default_model: str, *, bundled: bool = False
+) -> str | None:
     """Read Codex's own harness prompt out of the installed binary.
 
     Codex replaces its prompt with whatever a catalog entry's base_instructions
@@ -277,12 +287,27 @@ def _codex_harness_prompt(default_model: str) -> str | None:
     stand-in makes the agent worse, so it comes from the user's own install and
     matches their version. Returns None when Codex is absent or says something
     unexpected, since a missing prompt is better than a wrong one.
+
+    With ``bundled``, the binary's own shipped catalog answers instead of the
+    configured provider's: a Codex already pointed at Router reports Router's
+    catalog — whose base_instructions are empty — from the ordinary command,
+    which is exactly the contamination the bundled read escapes.
     """
-    if not shutil.which("codex"):
+    if not executable:
         return None
+    command = [str(executable), "debug", "models"]
+    if bundled:
+        command = [
+            str(executable),
+            "-c",
+            f"model_provider={json.dumps('openai')}",
+            "debug",
+            "models",
+            "--bundled",
+        ]
     try:
         result = subprocess.run(
-            ["codex", "debug", "models"],
+            command,
             capture_output=True,
             text=True,
             timeout=30,
@@ -813,6 +838,10 @@ def _pick_installed_clients() -> tuple[str, ...]:
     Codex CLI and the Codex app.
     """
     candidates = _installed_clients()
+    if conductor.is_installed():
+        # Conductor ships no PATH executable, so app-level detection is what
+        # earns it a line beside the agents found by command name.
+        candidates = (*candidates, "conductor")
     cowork_available = claude_cowork.is_available()
     if cowork_available and "claude-code" not in candidates:
         # The Claude entry is the only interactive road to Cowork, so an
@@ -837,7 +866,8 @@ def _pick_installed_clients() -> tuple[str, ...]:
             candidates = tuple(
                 client
                 for client in CLIENT_NAMES
-                if client != "hermes" or hermes_agent.hermes_executable() is not None
+                if (client != "hermes" or hermes_agent.hermes_executable() is not None)
+                and (client != "conductor" or conductor.is_installed())
             )
     elif cursor_installed:
         candidates = (*candidates, CURSOR_CLIENT)
@@ -1172,6 +1202,10 @@ def _run_configure(
         # Fail before a browser opens, a key is created, or discovery puts the
         # credential on the wire for a host where Cowork setup cannot succeed.
         claude_cowork.preflight()
+    if "conductor" in requested_clients and not conductor.host_is_supported():
+        # Named on a host that cannot run Conductor: fail before a browser
+        # opens or a key is created for a setup that cannot be written.
+        raise click.ClickException("Conductor is only available on macOS.")
     if setup_file is None and api_key is None and _can_prompt(ctx, fmt):
         api_key = _pick_stored_router_api_key()
     if setup_file is None and api_key is None:
@@ -1253,6 +1287,15 @@ def _run_configure(
                 # everything" meaning everything configurable on this
                 # machine; naming hermes explicitly still reports the
                 # missing binary as the failure it is.
+                continue
+            if (
+                item == "conductor"
+                and not requested_clients
+                and not conductor.is_installed()
+            ):
+                # Conductor's setup can be written before the app exists, so
+                # naming it explicitly still preconfigures — but a bare run
+                # should not seed ~/.conductor on machines that never had it.
                 continue
             if item == COWORK_CLIENT:
                 try:
@@ -1584,7 +1627,16 @@ def router_refresh(ctx: click.Context) -> None:
             # interleaving after the key read could restore a pre-Router
             # endpoint that the discovery request would then transmit the
             # live Router credential to.
-            transaction = _hermes_config_lock() if client == "hermes" else nullcontext()
+            # Conductor shares the same shape: refresh's key and endpoint
+            # reads must not straddle a configure toward a new generation,
+            # or the old credential meets the new endpoint and the stale
+            # pair is then written back over the requested setup.
+            if client == "hermes":
+                transaction = _hermes_config_lock()
+            elif client == "conductor":
+                transaction = _conductor_settings_lock(path)
+            else:
+                transaction = nullcontext()
             with transaction:
                 if client == "hermes" and (
                     not (path.parent / "ramp-router-state.json").exists()
@@ -1598,6 +1650,12 @@ def router_refresh(ctx: click.Context) -> None:
                     # the user's restored state, not ours to read or use.
                     raise click.ClickException(
                         "Ramp Router is no longer configured in Hermes."
+                    )
+                if client == "conductor" and not _conductor_receipt_enrolls(
+                    path.parent / "ramp-router-state.json"
+                ):
+                    raise click.ClickException(
+                        "Ramp Router is no longer configured in Conductor."
                     )
                 api_key = _stored_router_api_key(client, path)
                 # The endpoint paired with the stored credential wins for
@@ -1643,6 +1701,12 @@ def router_refresh(ctx: click.Context) -> None:
                     # configure path.
                     configure_options["hermes_require_receipt"] = True
                     configure_options["hermes_lock_held"] = True
+                elif client == "conductor":
+                    # Recheck the receipt inside the Conductor settings lock
+                    # too: a concurrent unconfigure between the enrollment
+                    # scan and the write must win, not be resurrected.
+                    configure_options["conductor_require_receipt"] = True
+                    configure_options["conductor_lock_held"] = True
                 _, default_model, _ = _configure_client(
                     client, api_key, models, **configure_options
                 )
@@ -3373,6 +3437,9 @@ def _unconfigure_client(client: str, path: Path) -> None:
     if client == "hermes":
         _unconfigure_hermes(path)
         return
+    if client == "conductor":
+        _unconfigure_conductor(path)
+        return
     if client != "codex":
         _unconfigure_json_client(client, path)
         return
@@ -4144,6 +4211,659 @@ def _codex_config_path() -> Path:
     return codex_home.expanduser() / "config.toml"
 
 
+# The one credential copy both Conductor wrappers read at launch time.
+CONDUCTOR_KEY_FILENAME = "ramp-router-key"
+CONDUCTOR_CODEX_HOME = "codex-home"
+# The wrapper parks the CODEX_HOME it found here before pointing Codex at the
+# isolated home, so anything run inside a Conductor session — the sync hook
+# above all — can still find the user's own Codex setup.
+CONDUCTOR_ORIGINAL_CODEX_HOME_ENV = "RAMP_CONDUCTOR_ORIGINAL_CODEX_HOME"
+# The launcher keys in Conductor's settings this setup owns. Everything else
+# in settings.toml — the user's git, model, and script preferences — passes
+# through untouched.
+_CONDUCTOR_OWNED_SETTINGS_KEYS = (
+    "claude_code_executable_path",
+    "codex_executable_path",
+)
+_OWNED_CONDUCTOR_SETTINGS_LINE = re.compile(
+    r"^\s*[\"']?(?:claude_code_executable_path|codex_executable_path)[\"']?\s*="
+)
+
+
+def _conductor_state_path(path: Path) -> Path:
+    return path.parent / "ramp-router-state.json"
+
+
+def _conductor_settings_target(path: Path) -> Path:
+    """Resolve where a settings rewrite must land.
+
+    A dotfiles-managed settings file is a symlink; the atomic replace would
+    otherwise swap the link itself for a regular file and quietly detach
+    Conductor from the managed target, which no restore would reconnect.
+    """
+    return path.resolve() if path.is_symlink() else path
+
+
+def _conductor_receipt_enrolls(state_path: Path) -> bool:
+    """Report whether a Conductor receipt describes a live, completed setup.
+
+    Enrollment happens before any receipt parsing on the refresh path, so an
+    optimistic answer would let refresh act on a receipt it cannot restore
+    from: a terminal teardown mark (the restore may already have completed),
+    a corrupt document, or one missing the snapshot or ownership records must
+    all keep Conductor out of refresh and credential reuse. Explicit
+    configure and unconfigure still read the receipt themselves and surface
+    the corruption.
+    """
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(state, dict) or state.get("unconfigured") is True:
+        return False
+    if state.get("pending"):
+        # A generation is mid-write: configure publishes the receipt for the
+        # new endpoint before the credential beside it is replaced, so a
+        # refresh here could pair the old key with the new endpoint, or
+        # rebuild the previous setup over the requested one. Explicit
+        # configure and unconfigure are the recovery paths for an
+        # interrupted attempt.
+        return False
+    base_url = state.get("base_url")
+    written = state.get("written")
+    return (
+        isinstance(base_url, str)
+        and bool(base_url.strip())
+        and isinstance(state.get("settings"), dict)
+        and isinstance(written, dict)
+        and all(
+            isinstance(written.get(key), str) for key in _CONDUCTOR_OWNED_SETTINGS_KEYS
+        )
+    )
+
+
+@contextmanager
+def _conductor_settings_lock(path: Path):
+    """Serialize every Conductor setup transaction against one settings file.
+
+    Configure, refresh, and unconfigure each read-check-write the settings
+    and the Router artifacts beside them, so an unserialized overlap — a
+    detached session-start refresh against an unconfigure, say — could
+    resurrect a setup the user just removed or drop a concurrent edit.
+
+    The lock file sits beside the settings and derives from nothing else,
+    so every process targeting the same settings takes the same lock
+    whatever its own config root is. It is never unlinked: replacing a lock
+    file under a waiting transaction would split the lock across two
+    inodes. Detection knows to ignore a directory holding only this file.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with claude_code.advisory_lock(path.parent / conductor.LOCK_FILENAME):
+        yield
+
+
+def _conductor_claude_wrapper(key_path: Path, base_url: str | None) -> str:
+    """Render the launcher that routes Conductor's Claude Code through Router.
+
+    Conductor spawns its vendored Claude Code with the user's environment, so
+    the endpoint and credential ride the same environment variables the
+    Claude Code setup writes into settings.json — without touching the
+    user's own ~/.claude. The credential is read at launch time, so a
+    refresh that rewrites the key file needs no wrapper rewrite.
+    """
+    claude = conductor.vendored_binary("claude")
+    custom_headers = (
+        f"{GATEWAY_CLIENT_HEADER}: {claude_code.GATEWAY_CLIENT_HEADER_VALUE}"
+    )
+    return f"""#!/bin/sh
+# Written by `ramp router configure conductor`.
+# Routes Conductor's vendored Claude Code through Ramp Router.
+# Remove with `ramp router unconfigure conductor`.
+ANTHROPIC_AUTH_TOKEN="$(/bin/cat {shlex.quote(str(key_path))})" || exit 1
+export ANTHROPIC_AUTH_TOKEN
+export ANTHROPIC_BASE_URL={shlex.quote(_router_host(base_url))}
+export ANTHROPIC_CUSTOM_HEADERS={shlex.quote(custom_headers)}
+export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+unset ANTHROPIC_API_KEY
+exec {shlex.quote(str(claude))} "$@"
+"""
+
+
+def _conductor_codex_wrapper(codex_home: Path) -> str:
+    """Render the launcher that routes Conductor's Codex through Router.
+
+    Codex reads its provider from CODEX_HOME, so the wrapper points the
+    vendored binary at a Router-owned home whose config declares the Router
+    provider — leaving the user's own ~/.codex setup untouched.
+    """
+    codex = conductor.vendored_binary("codex")
+    return f"""#!/bin/sh
+# Written by `ramp router configure conductor`.
+# Routes Conductor's vendored Codex through Ramp Router by pointing it at a
+# Router-owned CODEX_HOME.
+# Remove with `ramp router unconfigure conductor`.
+export {CONDUCTOR_ORIGINAL_CODEX_HOME_ENV}="${{CODEX_HOME:-}}"
+export CODEX_HOME={shlex.quote(str(codex_home))}
+exec {shlex.quote(str(codex))} "$@"
+"""
+
+
+def _conductor_codex_home_config(
+    codex_home: Path,
+    key_path: Path,
+    default_model: str,
+    base_url: str | None,
+    instructions_path: Path | None = None,
+    standalone_codex_home: Path | None = None,
+) -> str:
+    """Render the config for the Router-owned CODEX_HOME Conductor spawns.
+
+    The provider block is the same one written into a user's own Codex, so
+    Router answers with the catalog shape Codex expects; the catalog snapshot
+    keeps the picker authoritative between refreshes, exactly as it does for
+    the first-party Codex setup.
+    """
+    catalog_path = codex_home / CODEX_ROUTER_CATALOG
+    root_lines = "".join(
+        f"{key} = {json.dumps(value)}\n"
+        for key, value in (
+            ("model", default_model),
+            ("model_provider", ROUTER_PROVIDER),
+            ("model_catalog_json", str(catalog_path)),
+            (
+                "model_instructions_file",
+                str(instructions_path) if instructions_path else None,
+            ),
+        )
+        if value is not None
+    )
+    rendered = f"{root_lines}\n{_codex_provider(key_path, base_url)}"
+    # The same session-start sync the first-party Codex setup registers: the
+    # vendored Codex hosts this home, so the codex-shaped hook output is the
+    # right one, and the detached refresh it spawns covers every enrolled
+    # client — including this setup's catalog, prompt, and default model.
+    # The hook runs inside the wrapper's environment, where CODEX_HOME names
+    # this isolated home; the sync is handed the user's own Codex home
+    # instead, or the detached refresh would look for the standalone setup
+    # here, find no receipt, and skip it while holding the cooldown.
+    sync_command = _conductor_sync_hook_command(
+        standalone_codex_home or Path.home() / ".codex"
+    )
+    if sync_command is not None:
+        rendered += f"\n{_render_codex_sync_hook_group(sync_command)}"
+    return rendered
+
+
+def _standalone_codex_home(codex_home: Path, recorded: object) -> Path:
+    """Locate the user's own Codex home for the sync hook to refresh.
+
+    From a normal shell the environment answers, custom CODEX_HOME included.
+    From inside a Conductor session the environment names this isolated home,
+    so the receipt's earlier answer is carried forward; failing that, the
+    original value the wrapper parked; failing that, the default.
+    """
+    from_environment = _codex_config_path().parent
+    if not _same_path(from_environment, codex_home):
+        return from_environment
+    if isinstance(recorded, str) and recorded.strip():
+        return Path(recorded)
+    parked = os.environ.get(CONDUCTOR_ORIGINAL_CODEX_HOME_ENV, "").strip()
+    if parked:
+        return Path(parked).expanduser()
+    return Path.home() / ".codex"
+
+
+def _conductor_sync_hook_command(standalone_codex_home: Path) -> str | None:
+    if os.name == "nt":
+        return None
+    executable = router_sync_module.ramp_executable()
+    if executable is None:
+        return None
+    quoted = shlex.quote(str(executable))
+    # Expanded when the hook runs: the wrapper parks the CODEX_HOME each
+    # session was launched with, so a standalone home that differs from the
+    # one recorded at configure time still gets refreshed.
+    fallback = _double_quoted(str(standalone_codex_home))
+    home_value = f'"${{{CONDUCTOR_ORIGINAL_CODEX_HOME_ENV}:-{fallback}}}"'
+    return (
+        f"[ -x {quoted} ] && CODEX_HOME={home_value} {quoted} "
+        f"{router_sync_module.SYNC_HOOK_MARKER} --client {CODEX_CLIENT_NAME} || true"
+    )
+
+
+def _double_quoted(value: str) -> str:
+    """Escape a value for use inside a POSIX double-quoted string."""
+    return re.sub(r'([\\"$`])', r"\\\1", value)
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    try:
+        return left.resolve() == right.resolve()
+    except OSError:
+        return left == right
+
+
+# Basic multiline strings may escape their own delimiter; literal ones cannot.
+_TOML_MULTILINE_DELIMITERS = (
+    ('"""', re.compile(r'(?<!\\)"""')),
+    ("'''", re.compile(r"'''")),
+)
+
+
+def _toml_line_without_comment(line: str) -> str:
+    """Drop a trailing TOML comment, leaving quoted text alone.
+
+    Good enough for delimiter counting: a ``#`` inside a basic or literal
+    string is content, one outside is a comment whose text — say, docs
+    quoting the multiline syntax — must not open a phantom string.
+    """
+    quote: str | None = None
+    escaped = False
+    for index, char in enumerate(line):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\" and quote == '"':
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif char in ('"', "'"):
+            quote = char
+        elif char == "#":
+            return line[:index]
+    return line
+
+
+def _conductor_root_span(lines: list[str]) -> tuple[list[int], int]:
+    """Locate the root-scope lines a rewrite may touch.
+
+    Returns the indexes of root lines that are not inside a multiline string,
+    and the index of the first table header. A multiline string's body is
+    user prose to the parser, so a line in it that looks like an owned key or
+    a table header must neither be dropped nor end the root scope.
+    """
+    editable: list[int] = []
+    open_delimiter: re.Pattern[str] | None = None
+    for index, line in enumerate(lines):
+        if open_delimiter is not None:
+            if open_delimiter.search(line):
+                open_delimiter = None
+            continue
+        if _TABLE_HEADER.match(line):
+            return editable, index
+        editable.append(index)
+        code = _toml_line_without_comment(line)
+        for _, pattern in _TOML_MULTILINE_DELIMITERS:
+            if len(pattern.findall(code)) % 2 == 1:
+                open_delimiter = pattern
+                break
+    return editable, len(lines)
+
+
+def _render_conductor_settings(settings_text: str, values: dict[str, str]) -> str:
+    """Rewrite Conductor's settings with the owned launcher keys replaced.
+
+    Only root-scope lines for the two owned keys are dropped; every other
+    byte — comments, formatting, tables — passes through unchanged, the same
+    contract the Codex rewrite keeps for config.toml. TOML requires root
+    keys before the first table header, so the owned lines land there.
+    """
+    lines = settings_text.splitlines(keepends=True)
+    editable, header_index = _conductor_root_span(lines)
+    root = "".join(
+        line
+        for index, line in enumerate(lines[:header_index])
+        if index not in editable or not _OWNED_CONDUCTOR_SETTINGS_LINE.match(line)
+    )
+    if root and not root.endswith("\n"):
+        root += "\n"
+    owned = "".join(f"{key} = {json.dumps(value)}\n" for key, value in values.items())
+    return root + owned + "".join(lines[header_index:])
+
+
+def _verified_conductor_settings(
+    settings_text: str, values: dict[str, str], path: Path
+) -> str:
+    """Render the settings rewrite and prove it means what it says.
+
+    The line filter is deliberately simple, so a document whose structure
+    defeats it could drop or displace user content while still parsing.
+    Proof comes from the parser, not the filter: the rendered document must
+    carry exactly the owned launcher keys requested, and every value this
+    setup does not own must parse identically to how it parsed before.
+    Whatever a future TOML construct does to the filter, a silent change to
+    the user's settings becomes a refusal.
+    """
+    rendered = _render_conductor_settings(settings_text, values)
+    try:
+        original = tomllib.loads(settings_text)
+        parsed = tomllib.loads(rendered)
+    except tomllib.TOMLDecodeError as exc:
+        raise click.ClickException(
+            f"Rewriting the Conductor settings at {path} would produce "
+            f"invalid TOML ({exc}); no changes were made."
+        ) from None
+    if any(
+        parsed.get(key) != values.get(key) for key in _CONDUCTOR_OWNED_SETTINGS_KEYS
+    ):
+        raise click.ClickException(
+            f"The structure of the Conductor settings at {path} defeated the "
+            "launcher rewrite; no changes were made. Move any unusual "
+            "root-level content below a table header and try again."
+        )
+    owned = set(_CONDUCTOR_OWNED_SETTINGS_KEYS)
+    if {k: v for k, v in original.items() if k not in owned} != {
+        k: v for k, v in parsed.items() if k not in owned
+    }:
+        raise click.ClickException(
+            f"Rewriting the Conductor settings at {path} would alter settings "
+            "this setup does not own; no changes were made. Move any unusual "
+            "root-level content below a table header and try again."
+        )
+    return rendered
+
+
+def _read_conductor_settings(path: Path) -> tuple[str, dict]:
+    """Read Conductor's settings, refusing to edit a file TOML cannot parse."""
+    try:
+        settings_text = path.read_text(encoding="utf-8") if path.exists() else ""
+    except (OSError, UnicodeError) as exc:
+        raise click.ClickException(
+            f"Could not read the Conductor settings at {path}: {exc}"
+        ) from None
+    try:
+        return settings_text, tomllib.loads(settings_text)
+    except tomllib.TOMLDecodeError as exc:
+        raise click.ClickException(
+            f"The Conductor settings at {path} are not valid TOML: {exc}"
+        ) from None
+
+
+def _configure_conductor(
+    path: Path,
+    api_key: str,
+    default_model: str,
+    base_url: str | None = None,
+    require_receipt: bool = False,
+    lock_held: bool = False,
+) -> None:
+    """Point Conductor's vendored agents at Ramp Router.
+
+    Conductor is a launcher rather than a model client: each workspace spawns
+    the Claude Code and Codex binaries it vendors, and its settings accept
+    replacement executables for both. This writes two wrappers under the
+    Router-owned ~/.conductor/ramp-router/ — Claude Code routed by
+    environment, Codex through an isolated CODEX_HOME — and points the
+    settings at them, so Conductor's Router setup is added and removed
+    independently of the user's own Claude Code and Codex setups.
+    """
+    if not conductor.host_is_supported():
+        raise click.ClickException("Conductor is only available on macOS.")
+    # Everything slow happens before the settings lock is taken: a bad key or
+    # unreachable Router leaves no partial setup behind, and the lock never
+    # waits on the network.
+    router_catalog = _render_codex_catalog(
+        _fetch_codex_catalog(api_key, base_url=base_url), default_model
+    )
+    vendored_codex = conductor.vendored_binary("codex")
+    harness_prompt = _codex_harness_prompt_from(
+        # Only the binary Conductor actually spawns: a standalone Codex on
+        # PATH may be another version, and its prompt would then outlive the
+        # preconfigure and mismatch the vendored binary once it arrives.
+        vendored_codex if vendored_codex.is_file() else None,
+        default_model,
+        # The isolated home is fresh, so the native bundled prompt is the
+        # right one — and the binary consulted may itself already be pointed
+        # at Router, whose catalog carries no instructions at all.
+        bundled=True,
+    )
+    artifacts = path.parent / "ramp-router"
+    codex_home = artifacts / CONDUCTOR_CODEX_HOME
+    key_path = artifacts / CONDUCTOR_KEY_FILENAME
+    wrappers = {
+        "claude_code_executable_path": (
+            artifacts / "claude-code",
+            _conductor_claude_wrapper(key_path, base_url),
+        ),
+        "codex_executable_path": (
+            artifacts / "codex",
+            _conductor_codex_wrapper(codex_home),
+        ),
+    }
+    written = {key: str(wrapper) for key, (wrapper, _) in wrappers.items()}
+    # Refresh already holds the settings lock around its reads and this
+    # write; the advisory flock is per open file and not reentrant, so it
+    # routes around a second acquisition instead of deadlocking on it.
+    transaction = nullcontext() if lock_held else _conductor_settings_lock(path)
+    with transaction:
+        previous_state = _read_state_file(_conductor_state_path(path))
+        if require_receipt and not _conductor_receipt_enrolls(
+            _conductor_state_path(path)
+        ):
+            # A concurrent unconfigure finished between refresh's enrollment
+            # scan and this lock: nothing is left to refresh, and rebuilding
+            # the setup here would resurrect what the user just removed. A
+            # receipt that survives but cannot vouch for a restore — torn
+            # down, corrupt, or incomplete — backs refresh off the same way,
+            # since a refresh over it could poison the restore snapshot.
+            raise click.ClickException(
+                "Ramp Router is no longer configured in Conductor."
+            )
+        # Read inside the lock and after the network work, so nothing edits
+        # the settings between this read and the write below.
+        settings_text, parsed = _read_conductor_settings(path)
+        previous = previous_state.get("settings")
+        if not isinstance(previous, dict):
+            previous = {}
+        # What the first configure found: the settings file may be this
+        # command's own creation on a machine being preconfigured, and
+        # unconfigure should not leave an empty one behind for detection to
+        # read as an installed Conductor.
+        created = previous_state.get("created")
+        if not isinstance(created, dict):
+            # lexists: a user's symlink whose target does not exist yet is
+            # still the user's, and must never be unlinked as ours.
+            created = {"settings_file": not os.path.lexists(path)}
+        standalone_codex_home = _standalone_codex_home(
+            codex_home, previous_state.get("standalone_codex_home")
+        )
+        recorded = previous_state.get("written")
+        if not isinstance(recorded, dict):
+            recorded = {}
+        values = dict(written)
+        for key in _CONDUCTOR_OWNED_SETTINGS_KEYS:
+            if key not in previous:
+                # The first configure records what stood here; repeat
+                # configures carry it forward, so unconfigure restores the
+                # pre-Router launchers rather than an earlier run's wrappers.
+                # Our own wrapper path is never the user's launcher: a repair
+                # configure over a lost receipt must not snapshot the active
+                # Router setup as what unconfigure should restore.
+                value = parsed.get(key)
+                previous[key] = (
+                    {"present": True, "value": value}
+                    if isinstance(value, str) and value != written[key]
+                    else {"present": False}
+                )
+            current = parsed.get(key)
+            if require_receipt:
+                if isinstance(current, str) and current != recorded.get(key):
+                    # The user re-pointed this launcher since configure.
+                    # Refresh keeps the artifacts fresh for whenever they
+                    # point back, but re-imposing the wrapper would undo
+                    # their choice; only an explicit configure does that.
+                    values[key] = current
+                elif current is None and isinstance(recorded.get(key), str):
+                    # The user deleted this launcher line since configure;
+                    # writing the wrapper back would reverse that removal.
+                    values.pop(key, None)
+        rendered = _verified_conductor_settings(settings_text, values, path)
+        receipt = {
+            "base_url": (base_url or router_base_url()).rstrip("/"),
+            "settings": previous,
+            "written": written,
+            "created": created,
+            "standalone_codex_home": str(standalone_codex_home),
+        }
+        # Conductor rewrites its own settings file, so the private-file
+        # mode would be surprising here; the file holds no secret. An
+        # existing file keeps whatever mode the user gave it.
+        settings_target = _conductor_settings_target(path)
+        try:
+            settings_mode = stat.S_IMODE(settings_target.stat().st_mode)
+        except OSError:
+            settings_mode = 0o644
+        try:
+            codex_home.mkdir(parents=True, exist_ok=True)
+            # The receipt lands first, marked pending: an interruption after
+            # it leaves a setup unconfigure knows how to remove, while the
+            # mark keeps refresh and credential reuse away from a generation
+            # whose endpoint and key are not yet the same generation.
+            _write_private_file(
+                _conductor_state_path(path),
+                json.dumps({**receipt, "pending": True}, indent=2) + "\n",
+            )
+            _write_private_file(key_path, api_key)
+            for wrapper, content in wrappers.values():
+                _write_private_file(wrapper, content)
+                wrapper.chmod(0o755)
+            instructions_path = codex_home / "ramp-router-instructions.md"
+            if harness_prompt is not None:
+                _write_private_file(instructions_path, harness_prompt)
+            else:
+                instructions_path.unlink(missing_ok=True)
+            _write_private_file(
+                codex_home / "config.toml",
+                _conductor_codex_home_config(
+                    codex_home,
+                    key_path,
+                    default_model,
+                    base_url,
+                    instructions_path=(
+                        instructions_path if harness_prompt is not None else None
+                    ),
+                    standalone_codex_home=standalone_codex_home,
+                ),
+            )
+            _write_private_file(codex_home / CODEX_ROUTER_CATALOG, router_catalog)
+            # The settings write is the activation step, so it lands last:
+            # every artifact a wrapper references already exists once
+            # Conductor can spawn one.
+            _write_private_file(settings_target, rendered)
+            settings_target.chmod(settings_mode)
+            # Promotion: key, artifacts, and settings now all describe this
+            # generation, so the receipt may enroll it.
+            _write_private_file(
+                _conductor_state_path(path), json.dumps(receipt, indent=2) + "\n"
+            )
+        except OSError as exc:
+            raise click.ClickException(
+                f"Could not write the Conductor Router setup: {exc}"
+            ) from None
+
+
+def _unconfigure_conductor(path: Path) -> None:
+    state_path = _conductor_state_path(path)
+    if not state_path.exists():
+        raise click.ClickException("Ramp Router is not configured in Conductor.")
+    with _conductor_settings_lock(path):
+        state = _read_state_file(state_path)
+        written = state.get("written")
+        if not isinstance(written, dict) or any(
+            not isinstance(written.get(key), str)
+            for key in _CONDUCTOR_OWNED_SETTINGS_KEYS
+        ):
+            # An unreadable receipt cannot say which launcher values are
+            # Router's, so a restore here could mistake the wrappers for user
+            # replacements and keep them while deleting the files they run.
+            # Failing closed leaves a working setup and a repair path.
+            raise click.ClickException(
+                f"The Conductor Router receipt at {state_path} is unreadable. "
+                "Run 'ramp router configure conductor' to repair it, then "
+                "unconfigure again."
+            )
+        previous = state.get("settings")
+        if not isinstance(previous, dict):
+            previous = {}
+        created = state.get("created")
+        if not isinstance(created, dict):
+            created = {}
+        # The teardown mark lands before anything is restored or removed: an
+        # interruption anywhere past this point leaves a receipt refresh will
+        # not enroll, while a rerun of unconfigure still finishes the
+        # cleanup from the same records.
+        try:
+            _write_private_file(
+                state_path, json.dumps({**state, "unconfigured": True}, indent=2) + "\n"
+            )
+        except OSError as exc:
+            raise click.ClickException(
+                f"Could not remove the Conductor Router setup: {exc}"
+            ) from None
+        settings_text, parsed = _read_conductor_settings(path)
+        values: dict[str, str] = {}
+        for key in _CONDUCTOR_OWNED_SETTINGS_KEYS:
+            current = parsed.get(key)
+            if isinstance(current, str) and current != written.get(key):
+                # The user re-pointed this launcher since configure; their
+                # edit outranks the restore, the same way the other agents
+                # keep user changes to owned settings.
+                values[key] = current
+                continue
+            prior = previous.get(key)
+            if (
+                isinstance(prior, dict)
+                and prior.get("present")
+                and isinstance(prior.get("value"), str)
+            ):
+                values[key] = prior["value"]
+        artifacts = path.parent / "ramp-router"
+        codex_home = artifacts / CONDUCTOR_CODEX_HOME
+        # A file this command created is removed only while it still holds
+        # nothing but the owned keys: preferences Conductor or the user added
+        # since are theirs, and the file stays for them.
+        remainder = _render_conductor_settings(settings_text, {}).strip()
+        remove_created_file = (
+            bool(created.get("settings_file")) and not values and not remainder
+        )
+        try:
+            if remove_created_file:
+                path.unlink(missing_ok=True)
+            elif path.exists() or values:
+                settings_target = _conductor_settings_target(path)
+                try:
+                    settings_mode = stat.S_IMODE(settings_target.stat().st_mode)
+                except OSError:
+                    settings_mode = 0o644
+                _write_private_file(
+                    settings_target,
+                    _verified_conductor_settings(settings_text, values, path),
+                )
+                settings_target.chmod(settings_mode)
+            for stale in (
+                artifacts / "claude-code",
+                artifacts / "codex",
+                artifacts / CONDUCTOR_KEY_FILENAME,
+                codex_home / "config.toml",
+                codex_home / CODEX_ROUTER_CATALOG,
+                codex_home / "ramp-router-instructions.md",
+            ):
+                stale.unlink(missing_ok=True)
+            for directory in (codex_home, artifacts):
+                # The isolated home accumulates Codex's own session state
+                # while Conductor runs; that is the user's history, so the
+                # directories leave only when nothing else lives in them.
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
+            state_path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise click.ClickException(
+                f"Could not remove the Conductor Router setup: {exc}"
+            ) from None
+
+
 @contextmanager
 def codex_config_lock(path: Path):
     """Serialize every read-modify-write of the Codex config.toml.
@@ -4884,6 +5604,8 @@ def _client_config_path(client: str) -> Path:
         return claude_code.settings_path()
     if client == "hermes":
         return hermes_agent.config_path()
+    if client == "conductor":
+        return conductor.settings_path()
     return _codex_config_path() if client == "codex" else _json_config_path(client)
 
 
@@ -4907,6 +5629,13 @@ def configured_router_clients() -> tuple[str, ...]:
             # user's (restored or never replaced), and enrolling it would
             # let a background refresh apply a setup the user removed or
             # never completed.
+            continue
+        if client == "conductor" and not _conductor_receipt_enrolls(
+            path.parent / "ramp-router-state.json"
+        ):
+            # Same reasoning as Hermes: a torn-down, corrupt, or incomplete
+            # receipt must not enroll a refresh that could resurrect a
+            # removed setup or poison the restore snapshot.
             continue
         try:
             _stored_router_api_key(client, path)
@@ -4960,9 +5689,18 @@ def _stored_router_api_key_choices() -> list[tuple[str, tuple[str, ...]]]:
             # form one locked transaction: a concurrent unconfigure between
             # them could pair the old Router endpoint with the restored
             # pre-Router credential and offer it here for reuse.
-            guard = _hermes_config_lock() if client == "hermes" else nullcontext()
+            if client == "hermes":
+                guard = _hermes_config_lock()
+            elif client == "conductor":
+                guard = _conductor_settings_lock(path)
+            else:
+                guard = nullcontext()
             with guard:
                 if client == "hermes" and not _hermes_receipt_enrolls(
+                    path.parent / "ramp-router-state.json"
+                ):
+                    continue
+                if client == "conductor" and not _conductor_receipt_enrolls(
                     path.parent / "ramp-router-state.json"
                 ):
                     continue
@@ -5046,6 +5784,19 @@ def _stored_router_base_url(client: str, path: Path) -> str | None:
                 "Could not read the Router endpoint from the Hermes "
                 "configuration. Run 'ramp router configure hermes' to repair it."
             )
+    elif client == "conductor":
+        # The wrappers derive both agents' endpoints from one recorded base,
+        # so the receipt is the single authoritative copy. Unreadable or
+        # missing must not degrade to None: the refresh caller answers None
+        # with the active/default Router endpoint, which would transmit this
+        # setup's stored credential to a different environment.
+        state = _read_state_file(path.parent / "ramp-router-state.json")
+        base_url = state.get("base_url")
+        if not isinstance(base_url, str) or not base_url.strip():
+            raise click.ClickException(
+                "Could not read the Router endpoint from the Conductor "
+                "setup. Run 'ramp router configure conductor' to repair it."
+            )
 
     if isinstance(base_url, str) and base_url.strip():
         return base_url.strip().rstrip("/")
@@ -5085,6 +5836,10 @@ def _stored_router_api_key(client: str, path: Path) -> str:
             # Read straight from Hermes's .env: no subprocess, so receipt
             # scans stay cheap and work even when the binary is missing.
             api_key = hermes_agent.read_env_value(hermes_agent.ROUTER_KEY_ENV)
+        elif client == "conductor":
+            api_key = (path.parent / "ramp-router" / CONDUCTOR_KEY_FILENAME).read_text(
+                encoding="utf-8"
+            )
         else:
             raise click.ClickException(
                 f"Refreshing {CLIENT_NAMES[client]} is not supported by this CLI."
@@ -5119,6 +5874,10 @@ def _configured_model(client: str, path: Path) -> str | None:
             and config.get("provider") == HERMES_ROUTER_PROVIDER
             else None
         )
+    elif client == "conductor":
+        # Conductor's own UI chooses a model per chat, so the setup pins
+        # nothing a refresh could preserve.
+        model = None
     else:
         config = _read_json_config(client, path)
         if client == "opencode":
@@ -5173,6 +5932,8 @@ def _configure_client(
     preserve_model_view_ownership: bool = False,
     hermes_require_receipt: bool = False,
     hermes_lock_held: bool = False,
+    conductor_require_receipt: bool = False,
+    conductor_lock_held: bool = False,
 ) -> tuple[Path, str, bool]:
     """Configure one client, reporting whether it replaced an outdated setup."""
     if client == "claude-code":
@@ -5218,6 +5979,19 @@ def _configure_client(
             default_model,
             base_url=base_url,
             require_receipt=hermes_require_receipt,
+        )
+        return path, default_model, False
+
+    if client == "conductor":
+        path = _client_config_path(client)
+        default_model = _preferred_model(models, selected_model)
+        _configure_conductor(
+            path,
+            api_key,
+            default_model,
+            base_url=base_url,
+            require_receipt=conductor_require_receipt,
+            lock_held=conductor_lock_held,
         )
         return path, default_model, False
 
