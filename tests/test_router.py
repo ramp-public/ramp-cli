@@ -5274,6 +5274,642 @@ def test_unconfigure_moves_router_created_conversations_to_the_restored_provider
     assert _codex_session_provider(archived) == "openai"
 
 
+def test_configure_codex_retags_archived_sessions_and_unconfigure_restores_them(
+    tmp_path, monkeypatch
+):
+    # Codex's Archived chats list applies the same provider filter as the live
+    # sidebar, so an archived transcript left on the old provider is invisible
+    # the whole time Router is configured.
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model_provider = "openai"\n')
+    live = _write_codex_session(codex_home / "sessions", "live.jsonl", "live", "openai")
+    archived = _write_codex_session(
+        codex_home / "archived_sessions", "filed.jsonl", "filed", "openai"
+    )
+    database_path = codex_home / "state_5.sqlite"
+    with sqlite3.connect(database_path) as database:
+        database.execute(
+            "CREATE TABLE threads ("
+            "id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, "
+            "model_provider TEXT NOT NULL)"
+        )
+        database.executemany(
+            "INSERT INTO threads VALUES (?, ?, ?)",
+            [("live", str(live), "openai"), ("filed", str(archived), "openai")],
+        )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+
+    assert configured.exit_code == 0, configured.output
+    assert _codex_session_provider(live) == "ramp-router"
+    assert _codex_session_provider(archived) == "ramp-router"
+    with sqlite3.connect(database_path) as database:
+        assert database.execute(
+            "SELECT id, model_provider FROM threads ORDER BY id"
+        ).fetchall() == [("filed", "ramp-router"), ("live", "ramp-router")]
+    state = json.loads((codex_home / "ramp-router-state.json").read_text())
+    assert {session["id"]: session["path"] for session in state["sessions"]} == {
+        "live": "sessions/live.jsonl",
+        "filed": "archived_sessions/filed.jsonl",
+    }
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert removed.exit_code == 0, removed.output
+    assert _codex_session_provider(live) == "openai"
+    assert _codex_session_provider(archived) == "openai"
+    with sqlite3.connect(database_path) as database:
+        assert database.execute(
+            "SELECT id, model_provider FROM threads ORDER BY id"
+        ).fetchall() == [("filed", "openai"), ("live", "openai")]
+
+
+def test_reconfigure_recovers_archived_router_conversations_after_unconfigure(
+    tmp_path, monkeypatch
+):
+    # Regression: unconfigure reclaims archived Router-born threads onto the
+    # restored provider, and configure used to retag only sessions/. One round
+    # trip therefore stranded every archived thread on "openai" for good and
+    # emptied the Archived chats list while Router was active.
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model_provider = "openai"\n')
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert configured.exit_code == 0, configured.output
+    during = _write_codex_session(
+        codex_home / "sessions", "during.jsonl", "during", "ramp-router"
+    )
+    archived = _write_codex_session(
+        codex_home / "archived_sessions", "filed.jsonl", "filed", "ramp-router"
+    )
+    database_path = codex_home / "state_5.sqlite"
+    with sqlite3.connect(database_path) as database:
+        database.execute(
+            "CREATE TABLE threads ("
+            "id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, "
+            "model_provider TEXT NOT NULL)"
+        )
+        database.executemany(
+            "INSERT INTO threads VALUES (?, ?, ?)",
+            [
+                ("during", str(during), "ramp-router"),
+                ("filed", str(archived), "ramp-router"),
+            ],
+        )
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+    assert removed.exit_code == 0, removed.output
+    assert _codex_session_provider(during) == "openai"
+    assert _codex_session_provider(archived) == "openai"
+
+    reconfigured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+
+    assert reconfigured.exit_code == 0, reconfigured.output
+    assert _codex_session_provider(during) == "ramp-router"
+    assert _codex_session_provider(archived) == "ramp-router"
+    with sqlite3.connect(database_path) as database:
+        assert database.execute(
+            "SELECT id, model_provider FROM threads ORDER BY id"
+        ).fetchall() == [("during", "ramp-router"), ("filed", "ramp-router")]
+
+
+def test_configure_codex_retags_archived_index_row_without_transcript(
+    tmp_path, monkeypatch
+):
+    # The index is what the Archived chats list reads, and it keeps rows for
+    # threads whose transcript is gone, so an archived row is swept even when
+    # there is no file left to rewrite.
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model_provider = "openai"\n')
+    database_path = codex_home / "state_5.sqlite"
+    with sqlite3.connect(database_path) as database:
+        database.execute(
+            "CREATE TABLE threads ("
+            "id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, "
+            "model_provider TEXT NOT NULL)"
+        )
+        database.executemany(
+            "INSERT INTO threads VALUES (?, ?, ?)",
+            [
+                (
+                    "gone",
+                    str(codex_home / "archived_sessions" / "gone.jsonl"),
+                    "openai",
+                ),
+                ("elsewhere", str(tmp_path / "elsewhere" / "other.jsonl"), "openai"),
+            ],
+        )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+
+    assert configured.exit_code == 0, configured.output
+    with sqlite3.connect(database_path) as database:
+        assert database.execute(
+            "SELECT id, model_provider FROM threads ORDER BY id"
+        ).fetchall() == [("elsewhere", "openai"), ("gone", "ramp-router")]
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert removed.exit_code == 0, removed.output
+    with sqlite3.connect(database_path) as database:
+        assert database.execute(
+            "SELECT id, model_provider FROM threads ORDER BY id"
+        ).fetchall() == [("elsewhere", "openai"), ("gone", "openai")]
+
+
+def test_configure_codex_retags_compressed_archived_session(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model_provider = "openai"\n')
+    archived_dir = codex_home / "archived_sessions"
+    archived_dir.mkdir()
+    compressed = archived_dir / "filed.jsonl.zst"
+    transcript = (
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {"id": "filed", "model_provider": "openai"},
+            }
+        )
+        + "\n"
+    )
+    compressed.write_bytes(
+        zstandard.ZstdCompressor().compress(transcript.encode("utf-8"))
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+
+    def provider():
+        with zstandard.ZstdDecompressor().stream_reader(
+            io.BytesIO(compressed.read_bytes())
+        ) as reader:
+            return json.loads(reader.read())["payload"]["model_provider"]
+
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert configured.exit_code == 0, configured.output
+    assert provider() == "ramp-router"
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+    assert removed.exit_code == 0, removed.output
+    assert provider() == "openai"
+
+
+def _move_codex_transcript(transcript, destination_dir):
+    """Mimic Codex archive/unarchive: same file name, different directory."""
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    destination = destination_dir / transcript.name
+    transcript.rename(destination)
+    return destination
+
+
+def test_unconfigure_restores_receipt_transcript_codex_unarchived(
+    tmp_path, monkeypatch
+):
+    # The receipt records where a transcript lived at configure time. Codex
+    # later moving it back into sessions/ must not leave it stuck on Router
+    # while its index row goes back to the restored provider.
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model_provider = "openai"\n')
+    archived = _write_codex_session(
+        codex_home / "archived_sessions", "rollout-filed.jsonl", "filed", "openai"
+    )
+    database_path = codex_home / "state_5.sqlite"
+    with sqlite3.connect(database_path) as database:
+        database.execute(
+            "CREATE TABLE threads ("
+            "id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, "
+            "model_provider TEXT NOT NULL)"
+        )
+        database.execute(
+            "INSERT INTO threads VALUES (?, ?, ?)", ("filed", str(archived), "openai")
+        )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert configured.exit_code == 0, configured.output
+    assert _codex_session_provider(archived) == "ramp-router"
+    unarchived = _move_codex_transcript(
+        archived, codex_home / "sessions" / "2026" / "09" / "04"
+    )
+    with sqlite3.connect(database_path) as database:
+        database.execute(
+            "UPDATE threads SET rollout_path = ? WHERE id = 'filed'", (str(unarchived),)
+        )
+    # Same file name, different conversation: the lookup must not touch it.
+    decoy = _write_codex_session(
+        codex_home / "sessions" / "2026" / "09" / "05",
+        "rollout-filed.jsonl",
+        "someone-else",
+        "ramp-router",
+    )
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert removed.exit_code == 0, removed.output
+    assert _codex_session_provider(unarchived) == "openai"
+    with sqlite3.connect(database_path) as database:
+        assert database.execute(
+            "SELECT model_provider FROM threads WHERE id = 'filed'"
+        ).fetchone() == ("openai",)
+    # The decoy was born on Router and is unrecorded, so reclaim moves it; the
+    # point is that it was reclaimed as itself rather than restored as "filed".
+    assert _codex_session_provider(decoy) == "openai"
+
+
+def test_unconfigure_restores_receipt_transcript_codex_archived(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model_provider = "openai"\n')
+    live = _write_codex_session(
+        codex_home / "sessions" / "2026" / "09" / "03",
+        "rollout-live.jsonl",
+        "live",
+        "openai",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert configured.exit_code == 0, configured.output
+    assert _codex_session_provider(live) == "ramp-router"
+    archived = _move_codex_transcript(live, codex_home / "archived_sessions")
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert removed.exit_code == 0, removed.output
+    assert _codex_session_provider(archived) == "openai"
+
+    # And it is picked up again as a plain receipt entry on the way back in.
+    reconfigured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert reconfigured.exit_code == 0, reconfigured.output
+    assert _codex_session_provider(archived) == "ramp-router"
+    state = json.loads((codex_home / "ramp-router-state.json").read_text())
+    assert (
+        "live" not in state[router_module.CODEX_PREEXISTING_ROUTER_SESSIONS_STATE_KEY]
+    )
+
+
+def test_unconfigure_locates_moved_transcripts_with_one_walk(tmp_path, monkeypatch):
+    # A big archive sweep must not turn teardown into one tree walk per moved
+    # transcript: the name index is built once and shared across the pass.
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model_provider = "openai"\n')
+    transcripts = [
+        _write_codex_session(
+            codex_home / "sessions" / "2026" / "09" / "03",
+            f"rollout-{index}.jsonl",
+            f"thread-{index}",
+            "openai",
+        )
+        for index in range(5)
+    ]
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert configured.exit_code == 0, configured.output
+    moved = [
+        _move_codex_transcript(transcript, codex_home / "archived_sessions")
+        for transcript in transcripts
+    ]
+    walks = []
+    original_walk = router_module._codex_transcripts
+
+    def counting_walk(home):
+        walks.append(home)
+        return original_walk(home)
+
+    monkeypatch.setattr(router_module, "_codex_transcripts", counting_walk)
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert removed.exit_code == 0, removed.output
+    assert [_codex_session_provider(path) for path in moved] == ["openai"] * 5
+    # At most one walk to index the moved receipt transcripts plus one for the
+    # reclaim sweep; a per-transcript index would have walked five more times.
+    assert len(walks) <= 2
+
+
+def test_unconfigure_finds_transcripts_codex_moves_during_teardown(
+    tmp_path, monkeypatch
+):
+    # The name index is built at the first stale receipt path. A transcript
+    # Codex moves later in the pass is still found: misses are retried once
+    # against a refreshed index at the end of the pass, even after an earlier
+    # miss on a transcript that is simply gone.
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model_provider = "openai"\n')
+    day = codex_home / "sessions" / "2026" / "09" / "03"
+    first = _write_codex_session(day, "rollout-a.jsonl", "thread-a", "openai")
+    gone = _write_codex_session(day, "rollout-b-gone.jsonl", "thread-gone", "openai")
+    third = _write_codex_session(day, "rollout-c.jsonl", "thread-c", "openai")
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert configured.exit_code == 0, configured.output
+    first_moved = _move_codex_transcript(first, codex_home / "archived_sessions")
+    gone.unlink()
+    moved_late = []
+    original_session_path = router_module._session_path
+
+    def move_then_resolve(home, session):
+        # Codex archives thread-c right as its own receipt entry comes up,
+        # after the index was built and after the deleted thread was missed.
+        if session.get("id") == "thread-c" and not moved_late:
+            moved_late.append(
+                _move_codex_transcript(third, codex_home / "archived_sessions")
+            )
+        return original_session_path(home, session)
+
+    monkeypatch.setattr(router_module, "_session_path", move_then_resolve)
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert removed.exit_code == 0, removed.output
+    assert _codex_session_provider(first_moved) == "openai"
+    assert _codex_session_provider(moved_late[0]) == "openai"
+
+
+def test_unconfigure_rebuilds_the_index_at_most_once_for_gone_transcripts(
+    tmp_path, monkeypatch
+):
+    # Deleted transcripts must not turn teardown into one tree walk each: the
+    # misses are retried together after a single refresh at the end of the pass.
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model_provider = "openai"\n')
+    transcripts = [
+        _write_codex_session(
+            codex_home / "sessions" / "2026" / "09" / "03",
+            f"rollout-{index}.jsonl",
+            f"thread-{index}",
+            "openai",
+        )
+        for index in range(4)
+    ]
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert configured.exit_code == 0, configured.output
+    for transcript in transcripts[:3]:
+        transcript.unlink()
+    walks = []
+    original_walk = router_module._codex_transcripts
+
+    def counting_walk(home):
+        walks.append(home)
+        return original_walk(home)
+
+    monkeypatch.setattr(router_module, "_codex_transcripts", counting_walk)
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert removed.exit_code == 0, removed.output
+    assert _codex_session_provider(transcripts[3]) == "openai"
+    # Index, one end-of-pass refresh, reclaim sweep — never one per missing file.
+    assert len(walks) <= 3
+
+
+def test_configure_codex_skips_transcripts_outside_codex_home(tmp_path, monkeypatch):
+    # A sessions directory symlinked elsewhere is walked by rglob, but its files
+    # resolve outside CODEX_HOME, where the receipt could never restore them;
+    # recording them used to fail the sync and roll the whole configure back.
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model_provider = "openai"\n')
+    outside = tmp_path / "elsewhere"
+    external = _write_codex_session(outside, "rollout-ext.jsonl", "ext", "openai")
+    (codex_home / "sessions").symlink_to(outside, target_is_directory=True)
+    archived = _write_codex_session(
+        codex_home / "archived_sessions", "rollout-in.jsonl", "in", "openai"
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+
+    assert configured.exit_code == 0, configured.output
+    assert _codex_session_provider(external) == "openai"
+    assert _codex_session_provider(archived) == "ramp-router"
+    state = json.loads((codex_home / "ramp-router-state.json").read_text())
+    assert [session["id"] for session in state["sessions"]] == ["in"]
+
+
+def test_unconfigure_restores_receipt_transcript_codex_compressed(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model_provider = "openai"\n')
+    live = _write_codex_session(
+        codex_home / "sessions" / "2026" / "09" / "03",
+        "rollout-live.jsonl",
+        "live",
+        "openai",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert configured.exit_code == 0, configured.output
+    # Codex archives the thread and compresses the transcript on the way.
+    archived_dir = codex_home / "archived_sessions"
+    archived_dir.mkdir()
+    compressed = archived_dir / (live.name + ".zst")
+    compressed.write_bytes(zstandard.ZstdCompressor().compress(live.read_bytes()))
+    live.unlink()
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert removed.exit_code == 0, removed.output
+    with zstandard.ZstdDecompressor().stream_reader(
+        io.BytesIO(compressed.read_bytes())
+    ) as reader:
+        restored = reader.read()
+    assert json.loads(restored.splitlines()[0])["payload"]["model_provider"] == "openai"
+
+
+def test_unconfigure_never_relocates_outside_codex_home(tmp_path, monkeypatch):
+    # A sessions directory symlinked elsewhere is walked, but a relocated
+    # receipt transcript must resolve inside CODEX_HOME like the recorded path
+    # did, or the fallback would rewrite a file the receipt never covered.
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model_provider = "openai"\n')
+    live = _write_codex_session(
+        codex_home / "sessions" / "2026" / "09" / "03",
+        "rollout-live.jsonl",
+        "live",
+        "openai",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert configured.exit_code == 0, configured.output
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    external = outside / live.name
+    live.rename(external)
+    (codex_home / "archived_sessions").symlink_to(outside, target_is_directory=True)
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert removed.exit_code == 0, removed.output
+    assert _codex_session_provider(external) == "ramp-router"
+
+
+def test_reconfigure_upgrades_index_only_receipt_when_transcript_reappears(
+    tmp_path, monkeypatch
+):
+    # The first configure only had the index row; the receipt says so. When
+    # the transcript shows up later, the next configure must retag it and
+    # remember the original index provider for unconfigure.
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model_provider = "openai"\n')
+    rollout_path = codex_home / "archived_sessions" / "rollout-late.jsonl"
+    database_path = codex_home / "state_5.sqlite"
+    with sqlite3.connect(database_path) as database:
+        database.execute(
+            "CREATE TABLE threads ("
+            "id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, "
+            "model_provider TEXT NOT NULL)"
+        )
+        database.execute(
+            "INSERT INTO threads VALUES (?, ?, ?)",
+            ("late", str(rollout_path), "openai"),
+        )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    state_path = codex_home / "ramp-router-state.json"
+
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert configured.exit_code == 0, configured.output
+    [entry] = json.loads(state_path.read_text())["sessions"]
+    assert entry["id"] == "late" and entry["transcript_updated"] is False
+    transcript = _write_codex_session(
+        rollout_path.parent, rollout_path.name, "late", "openai"
+    )
+
+    reconfigured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+
+    assert reconfigured.exit_code == 0, reconfigured.output
+    assert _codex_session_provider(transcript) == "ramp-router"
+    [entry] = json.loads(state_path.read_text())["sessions"]
+    assert entry["transcript_updated"] is True
+    assert entry["model_provider"] == "openai"
+    assert entry["index_model_provider"] == "openai"
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert removed.exit_code == 0, removed.output
+    assert _codex_session_provider(transcript) == "openai"
+    with sqlite3.connect(database_path) as database:
+        assert database.execute("SELECT model_provider FROM threads").fetchone() == (
+            "openai",
+        )
+
+
+def test_unconfigure_reclaims_router_transcript_behind_index_only_receipt(
+    tmp_path, monkeypatch
+):
+    # An entry recorded from the index alone protects nothing at unconfigure:
+    # a Router-tagged transcript that turned up for it since must follow its
+    # index row back to the restored provider instead of staying hidden.
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model_provider = "openai"\n')
+    rollout_path = codex_home / "archived_sessions" / "rollout-late.jsonl"
+    database_path = codex_home / "state_5.sqlite"
+    with sqlite3.connect(database_path) as database:
+        database.execute(
+            "CREATE TABLE threads ("
+            "id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, "
+            "model_provider TEXT NOT NULL)"
+        )
+        # A per-thread provider that differs from the root one: the transcript
+        # must be reclaimed onto the same provider the row is restored to.
+        database.execute(
+            "INSERT INTO threads VALUES (?, ?, ?)",
+            ("late", str(rollout_path), "openrouter"),
+        )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert configured.exit_code == 0, configured.output
+    transcript = _write_codex_session(
+        rollout_path.parent, rollout_path.name, "late", "ramp-router"
+    )
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert removed.exit_code == 0, removed.output
+    assert _codex_session_provider(transcript) == "openrouter"
+    with sqlite3.connect(database_path) as database:
+        assert database.execute("SELECT model_provider FROM threads").fetchone() == (
+            "openrouter",
+        )
+
+
 def test_unconfigure_preserves_router_conversations_that_predate_configure(
     tmp_path, monkeypatch
 ):

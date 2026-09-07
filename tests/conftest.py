@@ -21,6 +21,10 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
     monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "pi"))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    # Claude Cowork state lives under ~/Library/Application Support and is
+    # reached through Path.home(), so without this a test that configures or
+    # tears down every agent edits the developer's real Cowork setup.
+    monkeypatch.setenv("RAMP_CLAUDE_DESKTOP_APP_SUPPORT", str(tmp_path / "app-support"))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "conductor"))
     # Conductor detection consults its application-support directory; pointing

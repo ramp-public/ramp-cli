@@ -321,6 +321,7 @@ class TestToolsListAvailability:
             path="/developer/v1/agent-tools/get-funds",
             http_method="POST",
             category="funds",
+            operation_id="post_get_funds",
         ),
         ToolDef(
             name="get-transactions",
@@ -329,6 +330,7 @@ class TestToolsListAvailability:
             path="/developer/v1/agent-tools/get-transactions",
             http_method="POST",
             category="transactions",
+            operation_id="post_get_transactions",
         ),
         ToolDef(
             name="get-bills",
@@ -337,6 +339,7 @@ class TestToolsListAvailability:
             path="/developer/v1/agent-tools/get-bills",
             http_method="POST",
             category="bills",
+            operation_id="post_get_bills",
         ),
     ]
 
@@ -345,13 +348,13 @@ class TestToolsListAvailability:
         return AvailabilitySnapshot(
             content_hash="sha256:abc",
             entries={
-                ("get-funds", "POST"): ToolAvailability(available=True),
-                ("get-transactions", "POST"): ToolAvailability(
+                "post_get_funds": ToolAvailability(available=True),
+                "post_get_transactions": ToolAvailability(
                     available=False,
                     unavailable_reasons=("missing_scopes",),
                     missing_scopes=("transactions:read",),
                 ),
-                ("get-bills", "POST"): ToolAvailability(
+                "post_get_bills": ToolAvailability(
                     available=False,
                     unavailable_reasons=("missing_scopes", "disabled_for_business"),
                     missing_scopes=("bills:read",),

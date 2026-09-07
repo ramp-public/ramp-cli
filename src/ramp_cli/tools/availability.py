@@ -27,7 +27,6 @@ from ramp_cli.tools.parser import ToolDef
 logger = logging.getLogger(__name__)
 
 AVAILABILITY_PATH = "/developer/v1/agent-tools/availability"
-_AGENT_TOOLS_PREFIX = "/developer/v1/agent-tools/"
 
 # Escape hatch: disables all availability lookups.
 KILL_SWITCH_ENV_VAR = "RAMP_NO_TOOL_AVAILABILITY"
@@ -65,14 +64,11 @@ class AvailabilitySnapshot:
     """One availability response, joinable against spec-derived ToolDefs."""
 
     content_hash: str
-    entries: dict[tuple[str, str], ToolAvailability]  # (tool segment, METHOD)
+    entries: dict[str, ToolAvailability]
 
     def lookup(self, tool: ToolDef) -> ToolAvailability | None:
         """Availability for a ToolDef, or None when the server did not report it."""
-        if not tool.path.startswith(_AGENT_TOOLS_PREFIX):
-            return None
-        segment = tool.path.removeprefix(_AGENT_TOOLS_PREFIX)
-        return self.entries.get((segment, tool.http_method.upper()))
+        return self.entries.get(tool.operation_id)
 
 
 def fetch_availability(
@@ -97,7 +93,7 @@ def fetch_availability(
         client = RampClient(env, profile=profile) if profile else RampClient(env)
         payload = json.loads(client.get(AVAILABILITY_PATH))
         entries = {
-            (item["tool"], item["method"].upper()): ToolAvailability(
+            item["operation_id"]: ToolAvailability(
                 available=bool(item["available"]),
                 unavailable_reasons=tuple(item.get("unavailable_reasons") or ()),
                 missing_scopes=tuple(item.get("missing_scopes") or ()),

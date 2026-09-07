@@ -214,6 +214,7 @@ class TestServerScopeErrors:
         return ToolDef(
             name="get-attention-feed",
             path="/developer/v1/agent-tools/get-attention-feed",
+            operation_id="post_get_attention_feed",
             http_method="post",
             summary="Get attention feed",
             description="Get attention feed",
@@ -292,7 +293,7 @@ class TestServerScopeErrors:
         snapshot = AvailabilitySnapshot(
             content_hash="sha256:abc",
             entries={
-                ("get-attention-feed", "POST"): ToolAvailability(
+                "post_get_attention_feed": ToolAvailability(
                     available=False,
                     unavailable_reasons=("disabled_for_business",),
                 )
@@ -316,9 +317,7 @@ class TestServerScopeErrors:
             # The tool is available, so the 4xx is about something else.
             AvailabilitySnapshot(
                 content_hash="sha256:abc",
-                entries={
-                    ("get-attention-feed", "POST"): ToolAvailability(available=True)
-                },
+                entries={"post_get_attention_feed": ToolAvailability(available=True)},
             ),
         ],
     )

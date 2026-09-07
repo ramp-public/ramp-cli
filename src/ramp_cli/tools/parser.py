@@ -82,6 +82,7 @@ class ToolDef:
     description: str  # full description from the request body schema
     category: str = ""  # from the second tag in the spec (set by core)
     alias: str = ""  # human-friendly CLI name from x-alias (e.g. "list")
+    operation_id: str = ""  # Join key for availability
     params: list[ToolParam] = field(default_factory=list)
     required_scopes: list[str] = field(default_factory=list)
     request_schema_name: str = ""
@@ -292,6 +293,7 @@ def _parse_endpoint(
             description=schema_def.get("description", summary),
             category=category,
             alias=method_def.get("x-alias", ""),
+            operation_id=method_def.get("operationId", ""),
             params=_sort_params([*operation_params, *body_params]),
             required_scopes=_extract_scopes(method_def),
             request_schema_name=schema_name,
@@ -319,6 +321,7 @@ def _parse_endpoint(
             description=request_schema.get("description", summary),
             category=category,
             alias=method_def.get("x-alias", ""),
+            operation_id=method_def.get("operationId", ""),
             params=_sort_params([*operation_params, *body_params]),
             required_scopes=_extract_scopes(method_def),
             request_schema_name=schema_name,
@@ -340,6 +343,7 @@ def _parse_endpoint(
         description=method_def.get("description", summary),
         category=category,
         alias=method_def.get("x-alias", ""),
+        operation_id=method_def.get("operationId", ""),
         params=_sort_params(operation_params),
         required_scopes=_extract_scopes(method_def),
         response_schema_name=response_ref.split("/")[-1] if response_ref else "",

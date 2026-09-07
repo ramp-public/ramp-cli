@@ -12,23 +12,24 @@ from ramp_cli.tools.availability import ToolAvailability, fetch_availability
 from ramp_cli.tools.parser import ToolDef
 
 
-def _tool(path: str = "/developer/v1/agent-tools/get-funds", method: str = "post"):
+def _tool(operation_id: str = "post_get_funds"):
     return ToolDef(
         name="get-funds",
-        path=path,
-        http_method=method,
+        path="/developer/v1/agent-tools/get-funds",
+        http_method="post",
         summary="List funds",
         description="List funds",
         category="funds",
+        operation_id=operation_id,
     )
 
 
 def _payload() -> dict:
     return {
         "content_hash": "sha256:abc",
-        "requested_tools": None,
         "tools": [
             {
+                "operation_id": "post_get_funds",
                 "tool": "get-funds",
                 "method": "POST",
                 "available": True,
@@ -36,11 +37,20 @@ def _payload() -> dict:
                 "missing_scopes": None,
             },
             {
+                "operation_id": "get_get_transactions",
                 "tool": "get-transactions",
                 "method": "GET",
                 "available": False,
                 "unavailable_reasons": ["missing_scopes", "disabled_for_business"],
                 "missing_scopes": ["transactions:read"],
+            },
+            {
+                "operation_id": "post_ask_ramp_sessions_resource",
+                "tool": "ask",
+                "method": "POST",
+                "available": False,
+                "unavailable_reasons": ["disabled_for_business"],
+                "missing_scopes": None,
             },
         ],
     }
@@ -62,7 +72,7 @@ def _mock_client(monkeypatch, **kwargs) -> MagicMock:
 
 
 class TestFetchAvailability:
-    def test_parses_response_and_joins_on_tool_defs(
+    def test_parses_response_and_joins_on_operation_id(
         self, availability_enabled, monkeypatch
     ):
         _mock_client(monkeypatch, return_value=json.dumps(_payload()).encode())
@@ -71,14 +81,10 @@ class TestFetchAvailability:
 
         assert snapshot is not None
         assert snapshot.content_hash == "sha256:abc"
-        # Joins on the path segment under /agent-tools/ plus the (case-
-        # insensitive) HTTP method.
-        entry = snapshot.lookup(_tool(method="post"))
+        entry = snapshot.lookup(_tool())
         assert entry is not None and entry.available
 
-        blocked = snapshot.lookup(
-            _tool("/developer/v1/agent-tools/get-transactions", "get")
-        )
+        blocked = snapshot.lookup(_tool("get_get_transactions"))
         assert blocked is not None and not blocked.available
         assert blocked.unavailable_reasons == (
             "missing_scopes",
@@ -86,17 +92,17 @@ class TestFetchAvailability:
         )
         assert blocked.missing_scopes == ("transactions:read",)
 
+        # Spec-exposed routes outside /agent-tools/ join the same way.
+        ask = snapshot.lookup(_tool("post_ask_ramp_sessions_resource"))
+        assert ask is not None and ask.unavailable_reasons == ("disabled_for_business",)
+
     def test_lookup_misses_are_none(self, availability_enabled, monkeypatch):
         _mock_client(monkeypatch, return_value=json.dumps(_payload()).encode())
 
         snapshot = fetch_availability("production")
 
-        # Wrong method for a known tool.
-        assert snapshot.lookup(_tool(method="delete")) is None
-        # Tool the server did not report.
-        assert snapshot.lookup(_tool("/developer/v1/agent-tools/unknown")) is None
-        # Non-agent-tools command (e.g. synthesized or hand-written path).
-        assert snapshot.lookup(_tool("/developer/v1/applications/progress")) is None
+        assert snapshot.lookup(_tool("post_unknown")) is None
+        assert snapshot.lookup(_tool("")) is None
 
     @pytest.mark.parametrize(
         "client_kwargs",

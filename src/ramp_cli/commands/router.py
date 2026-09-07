@@ -505,6 +505,11 @@ CODEX_ORIGINAL_CATALOG_STATE_KEY = "original_catalog"
 CODEX_ORIGINAL_INSTRUCTIONS_DIGEST_KEY = "original_instructions_digest"
 CODEX_ORIGINAL_INSTRUCTIONS_STATE_KEY = "original_instructions"
 CODEX_PREEXISTING_ROUTER_SESSIONS_STATE_KEY = "preexisting_router_sessions"
+# Codex keeps live transcripts under sessions/ and moves an archived thread's
+# transcript into archived_sessions/. Every pass over Codex transcripts must
+# cover both: the archived list is filtered by provider exactly like the live
+# one, so a transcript retagged in only one direction is stranded out of view.
+CODEX_SESSION_DIRECTORIES = ("sessions", "archived_sessions")
 
 
 # prompt_toolkit ships ("selected", "reverse"), which paints checked rows in
@@ -6816,19 +6821,9 @@ def _configure_codex_in_lock(
         recorded_root = existing_state.get("root")
         root_values = recorded_root if isinstance(recorded_root, dict) else {}
         if sessions or "sessions" not in existing_state:
-            existing_ids = {
-                session.get("id")
-                for session in existing_sessions
-                if isinstance(session, dict)
-            }
-            existing_state["sessions"] = [
-                *existing_sessions,
-                *(
-                    session
-                    for session in sessions
-                    if session.get("id") not in existing_ids
-                ),
-            ]
+            existing_state["sessions"] = _merge_codex_receipt_sessions(
+                existing_sessions, sessions
+            )
             saved_sessions = existing_state["sessions"]
             state_document = existing_state
 
@@ -7139,29 +7134,50 @@ def _restore_private_file(path: Path, previous: str | None) -> None:
         pass
 
 
-def _preexisting_codex_router_session_ids(home: Path) -> list[str]:
-    """Snapshot Router threads that predate this CLI-managed configuration."""
-    identifiers: set[str] = set()
-    for directory in ("sessions", "archived_sessions"):
+def _codex_transcripts(home: Path) -> Iterator[Path]:
+    """Every regular-file Codex transcript under home, live and archived.
+
+    Symlinks are skipped, each directory is walked in sorted order, and a file
+    reached through a symlinked directory that resolves outside home is left
+    alone: the receipt only ever names paths inside CODEX_HOME, and recording
+    one it cannot restore would fail the whole configure later.
+    """
+    resolved_home = home.resolve()
+    inside: dict[Path, bool] = {}
+    for directory in CODEX_SESSION_DIRECTORIES:
         root = home / directory
         if not root.is_dir():
             continue
         for transcript in sorted(root.rglob("*")):
-            if (
-                transcript.is_symlink()
-                or not transcript.is_file()
-                or not transcript.name.endswith((".jsonl", ".jsonl.zst"))
-            ):
+            if transcript.is_symlink() or not transcript.is_file():
                 continue
-            try:
-                item = _read_codex_session_meta(transcript)
-            except (OSError, UnicodeError, zstandard.ZstdError):
+            if not transcript.name.endswith((".jsonl", ".jsonl.zst")):
                 continue
-            if item is None or item["payload"].get("model_provider") != ROUTER_PROVIDER:
-                continue
-            identifier = item["payload"].get("id")
-            if isinstance(identifier, str):
-                identifiers.add(identifier)
+            parent = transcript.parent
+            if parent not in inside:
+                try:
+                    parent.resolve().relative_to(resolved_home)
+                except (OSError, RuntimeError, ValueError):
+                    inside[parent] = False
+                else:
+                    inside[parent] = True
+            if inside[parent]:
+                yield transcript
+
+
+def _preexisting_codex_router_session_ids(home: Path) -> list[str]:
+    """Snapshot Router threads that predate this CLI-managed configuration."""
+    identifiers: set[str] = set()
+    for transcript in _codex_transcripts(home):
+        try:
+            item = _read_codex_session_meta(transcript)
+        except (OSError, UnicodeError, zstandard.ZstdError):
+            continue
+        if item is None or item["payload"].get("model_provider") != ROUTER_PROVIDER:
+            continue
+        identifier = item["payload"].get("id")
+        if isinstance(identifier, str):
+            identifiers.add(identifier)
 
     database_path = home / "state_5.sqlite"
     if database_path.is_file():
@@ -7190,18 +7206,12 @@ def _preexisting_codex_router_session_ids(home: Path) -> list[str]:
 def _prepare_codex_sessions(home: Path) -> list[dict]:
     # Codex hides sessions whose provider differs from the active provider.
     # See https://github.com/openai/codex/issues/15494.
+    # Archived transcripts are covered too: the Archived chats list applies the
+    # same provider filter, and unconfigure reclaims archived threads back to
+    # the restored provider, so leaving them out here strands every archived
+    # thread on the old provider after an unconfigure/configure round trip.
     sessions = []
-    sessions_dir = home / "sessions"
-    session_paths = []
-    if sessions_dir.is_dir():
-        session_paths = sorted(
-            path
-            for path in sessions_dir.rglob("*")
-            if path.name.endswith((".jsonl", ".jsonl.zst"))
-        )
-    for session_path in session_paths:
-        if session_path.is_symlink() or not session_path.is_file():
-            continue
+    for session_path in _codex_transcripts(home):
         try:
             item = _read_codex_session_meta(session_path)
         except (OSError, UnicodeError, zstandard.ZstdError):
@@ -7229,6 +7239,44 @@ def _prepare_codex_sessions(home: Path) -> list[dict]:
 
     _record_codex_index_providers(home, sessions)
     return sessions
+
+
+def _merge_codex_receipt_sessions(
+    existing_sessions: list, discovered: list[dict]
+) -> list[dict]:
+    """Fold newly discovered transcripts into the cumulative receipt.
+
+    A thread already on the receipt keeps its entry, except when that entry was
+    recorded from the index alone because its transcript was missing at the
+    time: a transcript found for it now replaces the entry, keeping the index
+    provider recorded back then, so the transcript is retagged with this pass
+    and both it and the row are restored at unconfigure.
+    """
+    upgrades = {
+        session["id"]: session
+        for session in discovered
+        if session.get("transcript_updated", True)
+    }
+    merged: list[dict] = []
+    recorded_ids: set = set()
+    for existing in existing_sessions:
+        if not isinstance(existing, dict):
+            merged.append(existing)
+            continue
+        identifier = existing.get("id")
+        recorded_ids.add(identifier)
+        upgrade = upgrades.get(identifier)
+        if upgrade is None or existing.get("transcript_updated", True):
+            merged.append(existing)
+            continue
+        replacement = dict(upgrade)
+        if "index_model_provider" in existing:
+            replacement["index_model_provider"] = existing["index_model_provider"]
+        merged.append(replacement)
+    merged.extend(
+        session for session in discovered if session.get("id") not in recorded_ids
+    )
+    return merged
 
 
 def _record_codex_index_providers(home: Path, sessions: list[dict]) -> None:
@@ -7271,7 +7319,10 @@ def _record_codex_index_providers(home: Path, sessions: list[dict]) -> None:
                     )
                 except (TypeError, ValueError):
                     continue
-                if not relative_path.parts or relative_path.parts[0] != "sessions":
+                if (
+                    not relative_path.parts
+                    or relative_path.parts[0] not in CODEX_SESSION_DIRECTORIES
+                ):
                     continue
                 session = {
                     "path": str(relative_path),
@@ -7354,40 +7405,45 @@ def _reclaim_codex_router_sessions(
     A session the receipt does know about is skipped. One still on Router here
     is one whose restoration was declined because the user had changed it, and
     reclaiming it would override exactly the choice that declining protected.
+    An entry recorded from the index alone never had a transcript to protect:
+    a Router-tagged transcript that later appears for it was born on Router or
+    already snapshotted as preexisting, so it is reclaimed like any other,
+    onto the provider its index row is restored to so the two keep agreeing.
     """
-    recorded = {
-        session.get("id") for session in sessions if isinstance(session, dict)
-    } | set(preexisting_router_sessions)
-    for directory in ("sessions", "archived_sessions"):
-        root = home / directory
-        if not root.is_dir():
+    recorded: set = set(preexisting_router_sessions)
+    index_only_providers: dict[str, str] = {}
+    for session in sessions:
+        if not isinstance(session, dict):
             continue
-        for transcript in sorted(root.rglob("*")):
-            if transcript.is_symlink() or not transcript.is_file():
-                continue
-            if not transcript.name.endswith((".jsonl", ".jsonl.zst")):
-                continue
-            try:
-                item = _read_codex_session_meta(transcript)
-            except (OSError, UnicodeError, zstandard.ZstdError):
-                continue
-            if item is None:
-                continue
-            payload = item["payload"]
-            identifier = payload.get("id")
-            if (
-                not isinstance(identifier, str)
-                or identifier in recorded
-                or payload.get("model_provider") != ROUTER_PROVIDER
-            ):
-                continue
-            _rewrite_codex_session_provider(
-                home,
-                {"path": str(transcript.relative_to(home)), "id": identifier},
-                expected_provider=ROUTER_PROVIDER,
-                provider_present=True,
-                provider=provider,
-            )
+        identifier = session.get("id")
+        if session.get("transcript_updated", True):
+            recorded.add(identifier)
+            continue
+        index_provider = session.get("index_model_provider")
+        if isinstance(identifier, str) and isinstance(index_provider, str):
+            index_only_providers.setdefault(identifier, index_provider)
+    for transcript in _codex_transcripts(home):
+        try:
+            item = _read_codex_session_meta(transcript)
+        except (OSError, UnicodeError, zstandard.ZstdError):
+            continue
+        if item is None:
+            continue
+        payload = item["payload"]
+        identifier = payload.get("id")
+        if (
+            not isinstance(identifier, str)
+            or identifier in recorded
+            or payload.get("model_provider") != ROUTER_PROVIDER
+        ):
+            continue
+        _rewrite_codex_session_provider(
+            home,
+            {"path": str(transcript.relative_to(home)), "id": identifier},
+            expected_provider=ROUTER_PROVIDER,
+            provider_present=True,
+            provider=index_only_providers.get(identifier, provider),
+        )
     _reclaim_codex_index_rows(home, recorded, provider)
 
 
@@ -7421,9 +7477,9 @@ def _reclaim_codex_index_rows(home: Path, recorded: set, provider: str) -> None:
 
 
 def _restore_codex_sessions(home: Path, sessions: list[dict]) -> None:
-    for session in sessions:
+    def restore(session: dict, locate: _CodexTranscriptLocator) -> bool:
         if not session.get("transcript_updated", True):
-            continue
+            return True
         try:
             had_provider = session["had_model_provider"]
             provider = session.get("model_provider")
@@ -7431,20 +7487,23 @@ def _restore_codex_sessions(home: Path, sessions: list[dict]) -> None:
             raise click.ClickException(
                 "Codex session setup state is invalid."
             ) from None
-        _rewrite_codex_session_provider(
+        return _rewrite_codex_session_provider(
             home,
             session,
             expected_provider=ROUTER_PROVIDER,
             provider_present=had_provider,
             provider=provider,
+            locate=locate,
         )
+
+    _rewrite_codex_sessions_reconciled(home, sessions, restore)
     _update_codex_session_index(home, sessions, restore=True)
 
 
 def _sync_codex_sessions(home: Path, sessions: list[dict]) -> None:
-    for session in sessions:
+    def sync(session: dict, locate: _CodexTranscriptLocator) -> bool:
         if not session.get("transcript_updated", True):
-            continue
+            return True
         try:
             expected_provider = session.get("model_provider")
             provider_present = session["had_model_provider"]
@@ -7452,14 +7511,17 @@ def _sync_codex_sessions(home: Path, sessions: list[dict]) -> None:
             raise click.ClickException(
                 "Codex session setup state is invalid."
             ) from None
-        _rewrite_codex_session_provider(
+        return _rewrite_codex_session_provider(
             home,
             session,
             expected_provider=expected_provider,
             expected_present=provider_present,
             provider_present=True,
             provider=ROUTER_PROVIDER,
+            locate=locate,
         )
+
+    _rewrite_codex_sessions_reconciled(home, sessions, sync)
 
 
 def _rollback_codex_sessions(home: Path, sessions: list[dict]) -> None:
@@ -7560,6 +7622,76 @@ def _session_path(home: Path, session: dict) -> Path:
     return path
 
 
+class _CodexTranscriptLocator:
+    """Resolve receipt transcripts that Codex has moved since they were recorded.
+
+    Archiving moves a transcript from sessions/ into archived_sessions/ and
+    unarchiving moves it back, both keeping the file name. The receipt only
+    knows where the file was at configure time, so a missing path is looked
+    up by name across both directories, with or without the .zst compression
+    suffix, and accepted only when the transcript still carries the recorded
+    session id. Candidates come from _codex_transcripts, so they already
+    resolve inside CODEX_HOME like the recorded path had to.
+
+    The name index is built on the first stale path and shared by every lookup
+    in one pass, so a teardown after a large archive sweep walks the tree once
+    rather than once per moved transcript. A pass that had misses calls
+    refresh() once at its end and retries only those entries, which catches a
+    transcript Codex moved while the pass ran without paying a walk per file
+    that is truly gone.
+    """
+
+    def __init__(self, home: Path) -> None:
+        self._home = home
+        self._by_name: dict[str, list[Path]] | None = None
+
+    @staticmethod
+    def _logical_name(name: str) -> str:
+        return name.removesuffix(".zst")
+
+    def refresh(self) -> None:
+        by_name: dict[str, list[Path]] = {}
+        for transcript in _codex_transcripts(self._home):
+            by_name.setdefault(self._logical_name(transcript.name), []).append(
+                transcript
+            )
+        self._by_name = by_name
+
+    def __call__(self, session: dict, recorded: Path) -> Path | None:
+        if self._by_name is None:
+            self.refresh()
+        assert self._by_name is not None
+        session_id = session.get("id")
+        for candidate in self._by_name.get(self._logical_name(recorded.name), ()):
+            try:
+                meta = _read_codex_session_meta(candidate)
+            except (OSError, UnicodeError, zstandard.ZstdError):
+                continue
+            if meta is not None and meta["payload"].get("id") == session_id:
+                return candidate
+        return None
+
+
+def _rewrite_codex_sessions_reconciled(
+    home: Path,
+    sessions: list[dict],
+    rewrite: Callable[[dict, _CodexTranscriptLocator], bool],
+) -> None:
+    """Run one rewrite pass, then retry the entries whose transcript was missing.
+
+    Codex may move a transcript while the pass runs; the retry sees the tree as
+    it stands at the end of the pass, at the cost of one extra walk and only
+    when something was missing at all.
+    """
+    locator = _CodexTranscriptLocator(home)
+    missing = [session for session in sessions if not rewrite(session, locator)]
+    if not missing:
+        return
+    locator.refresh()
+    for session in missing:
+        rewrite(session, locator)
+
+
 def _rewrite_codex_session_provider(
     home: Path,
     session: dict,
@@ -7568,10 +7700,20 @@ def _rewrite_codex_session_provider(
     provider_present: bool,
     provider: str | None,
     expected_present: bool = True,
-) -> None:
+    locate: Callable[[dict, Path], Path | None] | None = None,
+) -> bool:
+    """Retag one receipt transcript; report whether its file was found at all.
+
+    False means the recorded path is gone and no relocation matched, so the
+    caller may retry after refreshing its view of the tree. Every other early
+    return is a transcript that exists but needs no change.
+    """
     path = _session_path(home, session)
     if not path.is_file() or path.is_symlink():
-        return
+        relocated = locate(session, path) if locate is not None else None
+        if relocated is None:
+            return False
+        path = relocated
     try:
         meta = _read_codex_session_meta(path)
     except (OSError, UnicodeError, zstandard.ZstdError) as exc:
@@ -7579,14 +7721,14 @@ def _rewrite_codex_session_provider(
             f"Could not read Codex session {path}: {exc}"
         ) from None
     if meta is None or meta["payload"].get("id") != session.get("id"):
-        return
+        return True
     payload = meta["payload"]
     current_present = "model_provider" in payload
     current_provider = payload.get("model_provider")
     if current_present == provider_present and current_provider == provider:
-        return
+        return True
     if current_present != expected_present or current_provider != expected_provider:
-        return
+        return True
 
     original = path.stat()
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -7642,6 +7784,7 @@ def _rewrite_codex_session_provider(
         except OSError:
             pass
         raise
+    return True
 
 
 def _copy_codex_session(
