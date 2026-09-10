@@ -315,6 +315,479 @@ def test_unconfigure_removes_keys_the_user_never_had(tmp_path):
     assert restored == {}
 
 
+def test_configure_caps_auto_compact_below_the_provider_input_limit(tmp_path):
+    # Router lists its 1M-class OpenAI models to Claude Code with the "[1m]"
+    # suffix, which makes the client wait until ~967K tokens to compact, while
+    # OpenAI refuses inputs above 922K. The cap has to sit under that limit.
+    path = tmp_path / "settings.json"
+    updated, state = claude_code.plan_configuration(
+        {}, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+
+    window = updated["env"][claude_code.AUTO_COMPACT_WINDOW_ENV]
+    assert window == str(claude_code.AUTO_COMPACT_WINDOW_TOKENS)
+    # Claude Code subtracts a 20K output reserve and a 13K buffer before it
+    # compacts; what remains must clear the 922K provider limit with room for
+    # the tokens one more turn adds.
+    assert int(window) - 33_000 <= 922_000 - 50_000
+    assert (
+        claude_code.plan_original_settings(state)["env"][
+            claude_code.AUTO_COMPACT_WINDOW_ENV
+        ]
+        == ""
+    )
+    assert claude_code.plan_restoration(updated, path, state) == {}
+
+
+def test_unconfigure_restores_the_users_own_auto_compact_window(tmp_path):
+    path = tmp_path / "settings.json"
+    original = {"env": {claude_code.AUTO_COMPACT_WINDOW_ENV: "1000000"}}
+
+    updated, state = claude_code.plan_configuration(
+        original, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+
+    # A window above the provider limit does not protect the session, so the
+    # cap replaces it for as long as Router is configured.
+    assert updated["env"][claude_code.AUTO_COMPACT_WINDOW_ENV] == str(
+        claude_code.AUTO_COMPACT_WINDOW_TOKENS
+    )
+    assert claude_code.plan_restoration(updated, path, state) == original
+
+
+@pytest.mark.parametrize(
+    "original",
+    [
+        {"env": {claude_code.AUTO_COMPACT_WINDOW_ENV: "500000"}},
+        # parseInt reads this as 950, which Claude Code raises to the 100K
+        # floor: a much tighter window than the cap, so it stays.
+        {"env": {claude_code.AUTO_COMPACT_WINDOW_ENV: "950k"}},
+        {"autoCompactWindow": 500000},
+    ],
+)
+def test_configure_keeps_a_tighter_auto_compact_window_the_user_set(tmp_path, original):
+    path = tmp_path / "settings.json"
+
+    updated, state = claude_code.plan_configuration(
+        original, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+
+    # The cap only ever lowers the trigger. Someone already compacting sooner
+    # keeps their setting, and the variable is not written over a setting it
+    # would otherwise silently outrank.
+    assert updated["env"].get(claude_code.AUTO_COMPACT_WINDOW_ENV) == original.get(
+        "env", {}
+    ).get(claude_code.AUTO_COMPACT_WINDOW_ENV)
+    assert updated.get("autoCompactWindow") == original.get("autoCompactWindow")
+    assert claude_code.plan_restoration(updated, path, state) == original
+
+
+@pytest.mark.parametrize(
+    "original",
+    [
+        # The setting's schema drops anything but an integer from 100K to 1M,
+        # so these leave the session on the unsafe default.
+        {"autoCompactWindow": "500k"},
+        {"autoCompactWindow": 500},
+        {"autoCompactWindow": 500000.5},
+        # Ignored by Claude Code, so the cap is still needed.
+        {"env": {claude_code.AUTO_COMPACT_WINDOW_ENV: "auto"}},
+        {"env": {claude_code.AUTO_COMPACT_WINDOW_ENV: "0"}},
+    ],
+)
+def test_configure_caps_over_windows_claude_code_would_ignore(tmp_path, original):
+    path = tmp_path / "settings.json"
+
+    updated, state = claude_code.plan_configuration(
+        original, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+
+    assert updated["env"][claude_code.AUTO_COMPACT_WINDOW_ENV] == str(
+        claude_code.AUTO_COMPACT_WINDOW_TOKENS
+    )
+    assert updated.get("autoCompactWindow") == original.get("autoCompactWindow")
+    assert claude_code.plan_restoration(updated, path, state) == original
+
+
+def test_refresh_keeps_the_cap_over_a_setting_made_tighter_later(tmp_path):
+    path = tmp_path / "settings.json"
+    configured, state = claude_code.plan_configuration(
+        {}, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+    # `/autocompact 500k` writes the setting, but the variable outranks it and
+    # cannot safely be withdrawn from inside a Claude Code session, so the cap
+    # stays; removing the entry by hand is what lets the setting take over.
+    changed_since = {**configured, "autoCompactWindow": 500000}
+
+    refreshed, fresh = claude_code.plan_configuration(
+        changed_since, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+
+    assert refreshed["env"][claude_code.AUTO_COMPACT_WINDOW_ENV] == str(
+        claude_code.AUTO_COMPACT_WINDOW_TOKENS
+    )
+    assert refreshed["autoCompactWindow"] == 500000
+    merged = claude_code.merge_states(state, fresh)
+    assert claude_code.plan_restoration(refreshed, path, merged) == {
+        "autoCompactWindow": 500000
+    }
+
+
+def test_refresh_does_not_claim_an_env_cap_the_user_lowered_themselves(tmp_path):
+    path = tmp_path / "settings.json"
+    configured, state = claude_code.plan_configuration(
+        {}, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+    # The user replaces Router's variable with a tighter one of their own.
+    changed_since = {
+        **configured,
+        "env": {**configured["env"], claude_code.AUTO_COMPACT_WINDOW_ENV: "500000"},
+    }
+
+    refreshed, fresh = claude_code.plan_configuration(
+        changed_since, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+
+    assert refreshed["env"][claude_code.AUTO_COMPACT_WINDOW_ENV] == "500000"
+    # Not written by this refresh, so not claimed: a claim would let a later
+    # unconfigure match the user's value and restore the pre-Router absence.
+    assert claude_code.AUTO_COMPACT_WINDOW_ENV not in fresh["written"]["env"]
+    merged = claude_code.merge_states(state, fresh)
+    assert claude_code.plan_restoration(refreshed, path, merged) == {
+        "env": {claude_code.AUTO_COMPACT_WINDOW_ENV: "500000"}
+    }
+
+
+def test_a_user_value_equal_to_the_cap_is_not_claimed(tmp_path):
+    path = tmp_path / "settings.json"
+    ours = str(claude_code.AUTO_COMPACT_WINDOW_TOKENS)
+    # The user happened to pick Router's number before Router ran. It is
+    # still theirs: claiming it would make a later unconfigure restore this
+    # value over whatever they do to the key afterwards.
+    configured, state = claude_code.plan_configuration(
+        {"env": {claude_code.AUTO_COMPACT_WINDOW_ENV: ours}},
+        path,
+        "https://router-api.ramp.com",
+        "secret",
+        "gpt-5.4",
+    )
+    assert claude_code.AUTO_COMPACT_WINDOW_ENV not in state["written"]["env"]
+    # They remove it; the next refresh writes the cap as a first claim.
+    removed = {**configured, "env": dict(configured["env"])}
+    removed["env"].pop(claude_code.AUTO_COMPACT_WINDOW_ENV)
+
+    refreshed, fresh = claude_code.plan_configuration(
+        removed, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+    state = claude_code.merge_states(state, fresh)
+
+    assert refreshed["env"][claude_code.AUTO_COMPACT_WINDOW_ENV] == ours
+    assert claude_code.plan_restoration(refreshed, path, state) == {}
+
+
+def test_routers_own_cap_stays_claimed_across_refreshes(tmp_path):
+    path = tmp_path / "settings.json"
+    configured, state = claude_code.plan_configuration(
+        {}, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+
+    # A refresh finds Router's value in place and leaves it; the claim from
+    # the write that put it there carries forward.
+    refreshed, fresh = claude_code.plan_configuration(
+        configured, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+    state = claude_code.merge_states(state, fresh)
+
+    assert state["written"]["env"][claude_code.AUTO_COMPACT_WINDOW_ENV] == str(
+        claude_code.AUTO_COMPACT_WINDOW_TOKENS
+    )
+    assert claude_code.plan_restoration(refreshed, path, state) == {}
+
+
+@pytest.mark.parametrize(
+    ("changed_to", "expected_after_unconfigure"),
+    [
+        # The user drops their window: the cap is written, and unconfigure
+        # leaves the key absent rather than resurrecting the old value.
+        (None, {}),
+        # The user raises it past the cap: the cap replaces it, and
+        # unconfigure puts back the raised value, not the original one.
+        ("1000000", {"env": {claude_code.AUTO_COMPACT_WINDOW_ENV: "1000000"}}),
+    ],
+)
+def test_first_claim_of_the_cap_snapshots_the_value_at_write_time(
+    tmp_path, changed_to, expected_after_unconfigure
+):
+    path = tmp_path / "settings.json"
+    original = {"env": {claude_code.AUTO_COMPACT_WINDOW_ENV: "500000"}}
+    configured, state = claude_code.plan_configuration(
+        original, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+    assert claude_code.AUTO_COMPACT_WINDOW_ENV not in state["written"]["env"]
+    # Still the user's key while Router is configured; they change it.
+    changed_since = {**configured, "env": dict(configured["env"])}
+    if changed_to is None:
+        changed_since["env"].pop(claude_code.AUTO_COMPACT_WINDOW_ENV)
+    else:
+        changed_since["env"][claude_code.AUTO_COMPACT_WINDOW_ENV] = changed_to
+
+    refreshed, fresh = claude_code.plan_configuration(
+        changed_since, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+
+    assert refreshed["env"][claude_code.AUTO_COMPACT_WINDOW_ENV] == str(
+        claude_code.AUTO_COMPACT_WINDOW_TOKENS
+    )
+    merged = claude_code.merge_states(state, fresh)
+    assert (
+        claude_code.plan_restoration(refreshed, path, merged)
+        == expected_after_unconfigure
+    )
+
+
+def test_a_refresh_that_leaves_the_users_window_releases_the_old_claim(tmp_path):
+    path = tmp_path / "settings.json"
+    configured, state = claude_code.plan_configuration(
+        {}, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+    # The user replaces Router's cap with a tighter value; a refresh leaves it.
+    tighter = {
+        **configured,
+        "env": {**configured["env"], claude_code.AUTO_COMPACT_WINDOW_ENV: "500000"},
+    }
+    left, fresh = claude_code.plan_configuration(
+        tighter, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+    state = claude_code.merge_states(state, fresh)
+    assert claude_code.AUTO_COMPACT_WINDOW_ENV not in state["written"]["env"]
+    # They later raise it past the cap; the next refresh claims the key again
+    # and must snapshot what was there at that write, not before Router.
+    raised = {
+        **left,
+        "env": {**left["env"], claude_code.AUTO_COMPACT_WINDOW_ENV: "1000000"},
+    }
+    reclaimed, fresh = claude_code.plan_configuration(
+        raised, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+    state = claude_code.merge_states(state, fresh)
+
+    assert reclaimed["env"][claude_code.AUTO_COMPACT_WINDOW_ENV] == str(
+        claude_code.AUTO_COMPACT_WINDOW_TOKENS
+    )
+    assert claude_code.plan_restoration(reclaimed, path, state) == {
+        "env": {claude_code.AUTO_COMPACT_WINDOW_ENV: "1000000"}
+    }
+
+
+def test_overlay_omits_an_unwritten_cap_so_a_shell_export_still_applies(tmp_path):
+    path = tmp_path / "settings.json"
+    # A tighter shell export is left to win, and the escape overlay must not
+    # blank the variable it never displaced.
+    _, state = claude_code.plan_configuration(
+        {},
+        path,
+        "https://router-api.ramp.com",
+        "secret",
+        "gpt-5.4",
+        shell_environment={claude_code.AUTO_COMPACT_WINDOW_ENV: "500000"},
+    )
+
+    overlay = claude_code.plan_original_settings(state)
+
+    assert claude_code.AUTO_COMPACT_WINDOW_ENV not in overlay["env"]
+    assert overlay["env"]["ANTHROPIC_BASE_URL"] == ""
+
+
+def test_configure_replaces_an_unsafe_env_value_even_beside_a_tighter_setting(
+    tmp_path,
+):
+    path = tmp_path / "settings.json"
+    # The variable outranks the setting, so this profile actually runs with a
+    # 1M window. The entry is not withdrawn (the shell beneath it cannot be
+    # seen from a session-start refresh); the cap takes its place.
+    original = {
+        "autoCompactWindow": 500000,
+        "env": {claude_code.AUTO_COMPACT_WINDOW_ENV: "1000000"},
+    }
+
+    updated, state = claude_code.plan_configuration(
+        original, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+
+    assert updated["env"][claude_code.AUTO_COMPACT_WINDOW_ENV] == str(
+        claude_code.AUTO_COMPACT_WINDOW_TOKENS
+    )
+    assert updated["autoCompactWindow"] == 500000
+    assert claude_code.plan_restoration(updated, path, state) == original
+
+
+@pytest.mark.parametrize("value", ["auto", "٩٠٠٠٠٠", "lots"])
+def test_configure_replaces_an_ignored_env_value_even_beside_a_tighter_setting(
+    tmp_path, value
+):
+    path = tmp_path / "settings.json"
+    # Claude Code ignores these today, so the setting is what runs; leaving
+    # them would bet the session on that staying true in later releases.
+    original = {
+        "autoCompactWindow": 500000,
+        "env": {claude_code.AUTO_COMPACT_WINDOW_ENV: value},
+    }
+
+    updated, state = claude_code.plan_configuration(
+        original, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+
+    assert updated["env"][claude_code.AUTO_COMPACT_WINDOW_ENV] == str(
+        claude_code.AUTO_COMPACT_WINDOW_TOKENS
+    )
+    assert claude_code.plan_restoration(updated, path, state) == original
+
+
+def test_configure_overrides_an_unsafe_window_inherited_from_the_shell(tmp_path):
+    path = tmp_path / "settings.json"
+    # Claude Code reads the shell variable when the settings file has none,
+    # and it outranks the tighter setting; the only way to defeat it here is
+    # to write the cap into the file.
+    original = {"autoCompactWindow": 500000}
+
+    updated, state = claude_code.plan_configuration(
+        original,
+        path,
+        "https://router-api.ramp.com",
+        "secret",
+        "gpt-5.4",
+        shell_environment={claude_code.AUTO_COMPACT_WINDOW_ENV: "1000000"},
+    )
+
+    assert updated["env"][claude_code.AUTO_COMPACT_WINDOW_ENV] == str(
+        claude_code.AUTO_COMPACT_WINDOW_TOKENS
+    )
+    assert claude_code.plan_restoration(updated, path, state) == original
+
+
+@pytest.mark.parametrize(
+    ("shell_value", "original"),
+    [
+        # A tighter shell value already protects the session; writing the cap
+        # over it would raise the trigger.
+        ("500000", {}),
+        # A settings-file value outranks the shell, so the unsafe shell value
+        # never takes effect.
+        ("1000000", {"env": {claude_code.AUTO_COMPACT_WINDOW_ENV: "500000"}}),
+        # Ignored by Claude Code, which then reads the tighter setting.
+        ("auto", {"autoCompactWindow": 500000}),
+    ],
+)
+def test_configure_leaves_windows_the_shell_cannot_make_unsafe(
+    tmp_path, shell_value, original
+):
+    path = tmp_path / "settings.json"
+
+    updated, state = claude_code.plan_configuration(
+        original,
+        path,
+        "https://router-api.ramp.com",
+        "secret",
+        "gpt-5.4",
+        shell_environment={claude_code.AUTO_COMPACT_WINDOW_ENV: shell_value},
+    )
+
+    assert updated["env"].get(claude_code.AUTO_COMPACT_WINDOW_ENV) == original.get(
+        "env", {}
+    ).get(claude_code.AUTO_COMPACT_WINDOW_ENV)
+    assert claude_code.AUTO_COMPACT_WINDOW_ENV not in state["written"]["env"]
+    assert claude_code.plan_restoration(updated, path, state) == original
+
+
+def test_configure_reads_the_shell_window_from_the_real_environment(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv(claude_code.AUTO_COMPACT_WINDOW_ENV, "1000000")
+    _mock_router_endpoints(monkeypatch)
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(json.dumps({"autoCompactWindow": 500000}))
+
+    runner = CliRunner()
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "claude-code", "--api-key", "secret"]
+    )
+
+    assert configured.exit_code == 0, configured.output
+    settings = json.loads(settings_path.read_text())
+    assert settings["env"][claude_code.AUTO_COMPACT_WINDOW_ENV] == str(
+        claude_code.AUTO_COMPACT_WINDOW_TOKENS
+    )
+
+
+def test_state_missing_the_auto_compact_claim_still_reads(tmp_path):
+    path = tmp_path / "settings.json"
+    _, state = claude_code.plan_configuration(
+        {"env": {claude_code.AUTO_COMPACT_WINDOW_ENV: "500000"}},
+        path,
+        "https://router-api.ramp.com",
+        "secret",
+        "gpt-5.4",
+    )
+    assert claude_code.AUTO_COMPACT_WINDOW_ENV not in state["written"]["env"]
+    claude_code.state_path(path).parent.mkdir(parents=True, exist_ok=True)
+    claude_code.state_path(path).write_text(json.dumps(state) + "\n")
+
+    assert claude_code.read_state(path) == state
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (500000, 500_000),
+        (1_000_000, 1_000_000),
+        (100_000, 100_000),
+        (500000.0, 500_000),
+        (99_999, None),
+        (1_000_001, None),
+        (500000.5, None),
+        (500, None),
+        ("500000", None),
+        ("500k", None),
+        (True, None),
+        (None, None),
+    ],
+)
+def test_setting_auto_compact_window_matches_the_settings_schema(value, expected):
+    assert claude_code.setting_auto_compact_window(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("900000", 900_000),
+        (" 500000 ", 500_000),
+        ("+500000", 500_000),
+        # Claude Code's integer reader takes integer scientific notation and
+        # separated digit groups whole before falling back to parseInt.
+        ("1e6", 1_000_000),
+        ("9.5e5", 950_000),
+        ("900,000", 900_000),
+        ("900_000", 900_000),
+        ("1.5e0", None),
+        # parseInt semantics: the leading integer is what counts.
+        ("950k", 100_000),
+        ("500", 100_000),
+        ("2000000", 1_000_000),
+        # parseInt reads ASCII digits only.
+        ("٩٠٠٠٠٠", None),
+        ("0", None),
+        ("-5", None),
+        ("auto", None),
+        ("", None),
+        (None, None),
+        (900000, None),
+    ],
+)
+def test_env_auto_compact_window_matches_parseint_and_clamping(value, expected):
+    assert claude_code.env_auto_compact_window(value) == expected
+
+
 def test_subagent_update_writes_tiers_and_unconfigure_restores_them(tmp_path):
     path = tmp_path / "settings.json"
     original = {"env": {"ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-4-5"}}
@@ -1256,6 +1729,52 @@ def test_a_reconfigure_over_legacy_state_keeps_values_set_since(monkeypatch, tmp
     settings = json.loads(settings_path.read_text())
     assert settings["statusLine"] == theirs
     assert settings["env"]["ROUTER_BASE_URL"] == "https://mine.example"
+
+
+def test_a_reconfigure_over_legacy_state_adds_the_auto_compact_cap(
+    monkeypatch, tmp_path
+):
+    # Existing setups gain the cap through the same configure/refresh path
+    # the session-start sync runs, and a state file predating it must still
+    # read and must not make unconfigure delete a window the user set since.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    _mock_router_endpoints(monkeypatch)
+    settings_path = tmp_path / "settings.json"
+    updated = _legacy_state(settings_path, {})
+    updated["env"].pop(claude_code.AUTO_COMPACT_WINDOW_ENV)
+    state = json.loads(claude_code.state_path(settings_path).read_text())
+    state["env"].pop(claude_code.AUTO_COMPACT_WINDOW_ENV)
+    state["written"]["env"].pop(claude_code.AUTO_COMPACT_WINDOW_ENV)
+    claude_code.state_path(settings_path).write_text(json.dumps(state) + "\n")
+    settings_path.write_text(
+        json.dumps(
+            {
+                **updated,
+                "env": {
+                    **updated["env"],
+                    claude_code.AUTO_COMPACT_WINDOW_ENV: "1000000",
+                },
+            }
+        )
+    )
+
+    runner = CliRunner()
+    reconfigured = runner.invoke(
+        cli, ["--human", "router", "configure", "claude-code", "--api-key", "secret"]
+    )
+    assert reconfigured.exit_code == 0, reconfigured.output
+    settings = json.loads(settings_path.read_text())
+    assert settings["env"][claude_code.AUTO_COMPACT_WINDOW_ENV] == str(
+        claude_code.AUTO_COMPACT_WINDOW_TOKENS
+    )
+
+    unconfigured = runner.invoke(
+        cli, ["--human", "router", "unconfigure", "claude-code"]
+    )
+
+    assert unconfigured.exit_code == 0, unconfigured.output
+    settings = json.loads(settings_path.read_text())
+    assert settings["env"][claude_code.AUTO_COMPACT_WINDOW_ENV] == "1000000"
 
 
 def test_a_user_status_line_never_becomes_router_state(monkeypatch, tmp_path):

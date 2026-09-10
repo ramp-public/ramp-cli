@@ -5354,6 +5354,7 @@ def _configure_claude_code(
             usage_base_url=_statusline_origin(base_url),
             statusline=statusline,
             model_view_all=model_view == "all",
+            shell_environment=os.environ,
         )
         path.parent.mkdir(parents=True, exist_ok=True)
         if previous_state is not None:

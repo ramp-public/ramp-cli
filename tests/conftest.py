@@ -46,6 +46,9 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         "RAMP_ROUTER_CONFIGURE_API_KEY",
         "RAMP_ACCESS_TOKEN",
         "RAMP_AGENT_WALLET_API_URL",
+        # Claude Code configure reads the shell's auto-compact window to decide
+        # whether the settings file must override it.
+        "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
     ):
         monkeypatch.delenv(leaked, raising=False)
     monkeypatch.setenv("RAMP_NO_TOOL_AVAILABILITY", "1")

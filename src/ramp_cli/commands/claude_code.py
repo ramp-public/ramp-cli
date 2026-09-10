@@ -7,9 +7,11 @@ writing the documented environment values and being able to put them back.
 
 import json
 import os
+import re
 import shlex
 import stat
 import tempfile
+from collections.abc import Mapping
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -59,6 +61,40 @@ SUBAGENT_DEFAULTS_STATE_KEY = "automatic_subagent_tiers"
 CUSTOM_HEADERS_STATE_KEY = "managed_custom_headers"
 _CLAUDE_AI_CONNECTORS_ENV = "ENABLE_CLAUDEAI_MCP_SERVERS"
 
+# Claude Code decides when to auto-compact from the model id alone: any id
+# carrying Router's "[1m]" suffix is treated as a 1,000,000-token window, and
+# compaction triggers 33,000 tokens (a 20,000 output reserve plus a 13,000
+# buffer) below the window, at ~967,000 tokens. Gateway-reported limits are
+# not consulted. OpenAI's 1M-class models (GPT-5.6 Luna/Sol/Terra, GPT-6
+# Astra) reject any input above 922,000 tokens, so a session can grow into
+# the 45K-token gap where every candidate refuses the request and the client
+# has not yet compacted. Pinning the window below the provider limit makes
+# Claude Code compact first: 900,000 puts the trigger at 867,000 tokens,
+# leaving ~55K for the output and tool results one turn adds between the
+# check and the send. Claude Code takes the smaller of this value and the
+# model's own window, so 200K models are unaffected. The environment
+# variable is used rather than the ``autoCompactWindow`` setting because it
+# also wins over ``/autocompact auto``, which would otherwise quietly restore
+# the unsafe default.
+AUTO_COMPACT_WINDOW_ENV = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
+AUTO_COMPACT_WINDOW_TOKENS = 900_000
+# Claude Code honors windows in this range. The ``autoCompactWindow`` setting
+# must be an integer inside it (anything else is ignored). The environment
+# variable goes through Claude Code's integer reader: integer scientific
+# notation and digit groups separated by a comma, underscore, or space are
+# read whole, anything else with JavaScript's parseInt (ASCII digits only;
+# "950k" is 950). A result that is not positive is ignored; one above the
+# upper bound is capped there and one below the lower bound is raised to it.
+_AUTO_COMPACT_WINDOW_MIN = 100_000
+_AUTO_COMPACT_WINDOW_MAX = 1_000_000
+_JS_INTEGER_MAX_LENGTH = 32
+_JS_SCIENTIFIC = re.compile(r"^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)[eE][+-]?[0-9]+$")
+_JS_DIGIT_GROUPS = re.compile(
+    r"^[+-]?[0-9]{1,3}([_,\u00A0\u202F ])[0-9]{3}(?:\1[0-9]{3})*$"
+)
+_JS_DIGIT_GROUP_SEPARATORS = re.compile(r"[_,\u00A0\u202F ]")
+_JS_LEADING_INTEGER = re.compile(r"^[+-]?[0-9]+")
+
 # Router keys are bearer tokens, so ANTHROPIC_AUTH_TOKEN is correct and
 # ANTHROPIC_API_KEY is deliberately not set: Claude Code treats them
 # differently and setting both is ambiguous.
@@ -79,6 +115,9 @@ _OWNED_ENV_KEYS = (
     # base because that points at the data plane, which does not answer the
     # session-usage endpoint the script calls.
     "ROUTER_BASE_URL",
+    # Owned so the cap Router needs can be put back to whatever the user had,
+    # and so it does not outlive the Router models it protects.
+    AUTO_COMPACT_WINDOW_ENV,
     # Owned because 'ramp router subagents' writes them, and a value naming a
     # Router-served model is meaningless once Router is unconfigured: left
     # behind, every sub-agent spawn would fail against the restored gateway.
@@ -92,6 +131,7 @@ _OWNED_ENV_KEYS = (
 _ENV_KEYS_OWNED_LATER = (
     "ROUTER_BASE_URL",
     _CLAUDE_AI_CONNECTORS_ENV,
+    AUTO_COMPACT_WINDOW_ENV,
     *SUBAGENT_ENV_KEYS,
 )
 # Keys plan_configuration itself writes. Tier settings are applied separately
@@ -284,6 +324,106 @@ def _replace_user_config_if_unchanged(path: Path, expected: str, content: str) -
 def _is_router_model(value: object) -> bool:
     """Return whether Claude Code's selected model is one of Router's aliases."""
     return isinstance(value, str) and value.startswith(_ROUTER_MODEL_PREFIX)
+
+
+def setting_auto_compact_window(value: object) -> int | None:
+    """Read the ``autoCompactWindow`` setting the way Claude Code does.
+
+    The setting's schema admits only an integer from 100K to 1M; any other
+    value, including the "500k" shorthand that ``/autocompact`` accepts at the
+    prompt before storing a number, is dropped as if unset.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    if value != int(value):
+        return None
+    tokens = int(value)
+    if not _AUTO_COMPACT_WINDOW_MIN <= tokens <= _AUTO_COMPACT_WINDOW_MAX:
+        return None
+    return tokens
+
+
+def env_auto_compact_window(value: object) -> int | None:
+    """Read ``CLAUDE_CODE_AUTO_COMPACT_WINDOW`` the way Claude Code does.
+
+    "1e6", "900,000" and "900_000" read as whole numbers; everything else
+    goes through parseInt, so "950k" means 950, not 950K, and "auto" is not a
+    number at all. A value that is not a positive integer is ignored; one
+    above 1M is capped there and one below 100K is raised to it. The returned
+    window is the one that will actually be in effect.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    tokens = None
+    if len(text) <= _JS_INTEGER_MAX_LENGTH:
+        if _JS_SCIENTIFIC.match(text):
+            number = float(text)
+            if not number.is_integer():
+                return None
+            tokens = int(number)
+        elif _JS_DIGIT_GROUPS.match(text):
+            tokens = int(_JS_DIGIT_GROUP_SEPARATORS.sub("", text))
+    if tokens is None:
+        match = _JS_LEADING_INTEGER.match(text)
+        if match is None:
+            return None
+        tokens = int(match.group())
+    if tokens <= 0:
+        return None
+    return max(_AUTO_COMPACT_WINDOW_MIN, min(_AUTO_COMPACT_WINDOW_MAX, tokens))
+
+
+def _apply_auto_compact_cap(
+    settings: dict,
+    environment: dict,
+    updated: dict,
+    inherited: str | None,
+) -> bool:
+    """Pin Claude Code's auto-compact window under the provider input limit.
+
+    A user who already compacts sooner than Router's cap keeps their own
+    setting; the cap only ever lowers the trigger, never raises it. Claude
+    Code reads the variable from the settings file first and the shell
+    second, and either outranks the ``autoCompactWindow`` setting, so a
+    tighter setting counts only where no variable defeats it.
+
+    The variable is never withdrawn, only left alone or written. The
+    session-start refresh runs inside Claude Code, whose environment already
+    carries the settings-file values, so the shell value beneath a file entry
+    cannot be seen from there; removing the entry could expose an unsafe one.
+    A file entry that is not itself a safe user window (Router's own, a value
+    above the cap, or one Claude Code ignores) is therefore replaced by the
+    cap even beside a tighter setting. With no file entry the shell value is
+    what Claude Code reads: an unsafe one is overridden, a tighter one wins.
+
+    Returns whether the variable was written. A value left as it was is not
+    claimed here, whether the user set it or an earlier configure did: a
+    claim on a user value would make a later unconfigure restore an older
+    snapshot over it, while Router's own earlier write keeps its claim in
+    the merged receipt for as long as the value still matches it.
+    """
+    ours = str(AUTO_COMPACT_WINDOW_TOKENS)
+    current = environment.get(AUTO_COMPACT_WINDOW_ENV)
+    current_window = env_auto_compact_window(current)
+    inherited_window = env_auto_compact_window(inherited)
+    env_window = current_window if current is not None else inherited_window
+    setting_window = setting_auto_compact_window(settings.get("autoCompactWindow"))
+    user_windows = [w for w in (env_window, setting_window) if w is not None]
+    if not user_windows or min(user_windows) > AUTO_COMPACT_WINDOW_TOKENS:
+        updated[AUTO_COMPACT_WINDOW_ENV] = ours
+        return True
+
+    def safe(window: int | None) -> bool:
+        return window is not None and window <= AUTO_COMPACT_WINDOW_TOKENS
+
+    if current is not None:
+        if safe(current_window):
+            return False
+    elif inherited_window is None or safe(inherited_window):
+        return False
+    updated[AUTO_COMPACT_WINDOW_ENV] = ours
+    return True
 
 
 def _environment(settings: dict, path: Path) -> dict:
@@ -507,6 +647,7 @@ def plan_configuration(
     usage_base_url: str | None = None,
     statusline: str | None = None,
     model_view_all: bool = False,
+    shell_environment: Mapping[str, str] | None = None,
 ) -> tuple[dict, dict]:
     """Return the settings to write and the state needed to undo them.
 
@@ -518,6 +659,10 @@ def plan_configuration(
     It also records what this command wrote, so unconfiguring can tell a value
     it still owns from one the user has since changed. Restoring a key whose
     value is no longer ours would undo their newer choice.
+
+    ``shell_environment`` is the environment Claude Code will inherit beneath
+    the settings file; it decides whether the auto-compact cap must override
+    a variable exported there.
     """
     environment = _environment(settings, path)
     top_level = {}
@@ -565,6 +710,10 @@ def plan_configuration(
     updated["env"].pop("ANTHROPIC_API_KEY", None)
     if usage_base_url is not None:
         updated["env"]["ROUTER_BASE_URL"] = usage_base_url
+    inherited = (shell_environment or {}).get(AUTO_COMPACT_WINDOW_ENV)
+    cap_claimed = _apply_auto_compact_cap(
+        settings, environment, updated["env"], inherited
+    )
     updated["model"] = model
     if statusline is not None and _statusline_slot_is_ours(settings, path):
         updated["statusLine"] = {"type": "command", "command": statusline}
@@ -582,6 +731,11 @@ def plan_configuration(
             key: updated.get(key) for key in _CONFIGURE_WRITTEN_TOP_LEVEL_KEYS
         },
     }
+    if not cap_claimed:
+        # Left as the user set it, so not a Router write: without a claim,
+        # restoration leaves the key alone instead of matching it against a
+        # snapshot taken before the user chose it.
+        del state["written"]["env"][AUTO_COMPACT_WINDOW_ENV]
     return updated, state
 
 
@@ -619,11 +773,23 @@ def plan_original_settings(state: dict) -> dict:
     ``model`` is the exception. It is a top-level key, where the empty-value
     rule does not apply. When the previous settings did not pin one, leave it
     out and let Claude Code resolve its default for the restored provider.
+
+    So is a key Router captured but never wrote (the auto-compact cap over a
+    tighter user window). Blanking it would hide a value the user exports in
+    the shell, which the settings file never held; left out, the overlay
+    inherits it as the user's setup did.
     """
+    written = state.get("written", {}).get("env", {})
     environment = {}
     for key in _OWNED_ENV_KEYS:
         captured = state.get("env", {}).get(key)
         if not isinstance(captured, dict):
+            continue
+        if (
+            key == AUTO_COMPACT_WINDOW_ENV
+            and key not in written
+            and not captured.get("present")
+        ):
             continue
         environment[key] = captured["value"] if captured.get("present") else ""
     overlay: dict = {"env": environment}
@@ -889,10 +1055,33 @@ def merge_states(
     written, or a status line slot Router was not managing then — takes the
     fresh snapshot instead: the old file cannot say what that key held, and
     presuming absence would delete a value the user set in the meantime.
+
+    So does a key the previous configure captured but left as the user's
+    (the auto-compact cap over a tighter user window): it stayed theirs to
+    change until this configure first claimed it, so the value to restore is
+    the one from just before this write, not the one from before Router.
     """
+    environment = {**fresh["env"], **previous["env"]}
+    for key, value in fresh["env"].items():
+        if key in fresh["written"]["env"] and key not in previous["written"]["env"]:
+            environment[key] = value
+    # A key this configure was responsible for but left alone is released
+    # when it no longer holds what Router last wrote: the user changed it, so
+    # an older claim would let unconfigure treat a value that merely matches
+    # as Router's and would stop the next real write from snapshotting at
+    # write time. One that still holds Router's write stays claimed so
+    # unconfigure can put the user's original back.
+    written_env = {**previous["written"]["env"], **fresh["written"]["env"]}
+    for key in _CONFIGURE_WRITTEN_ENV_KEYS:
+        if key in fresh["written"]["env"] or key not in previous["written"]["env"]:
+            continue
+        captured = fresh["env"].get(key, {})
+        current = captured.get("value") if captured.get("present") else None
+        if current != previous["written"]["env"][key]:
+            written_env.pop(key, None)
     merged = {
         **previous,
-        "env": {**fresh["env"], **previous["env"]},
+        "env": environment,
         "top_level": {**fresh["top_level"], **previous["top_level"]},
         # Written values advance to this configure's writes, except keys it
         # does not write: a tier the subagents command owns keeps its record,
@@ -900,7 +1089,7 @@ def merge_states(
         # Router-only model id behind.
         "written": {
             **fresh["written"],
-            "env": {**previous["written"]["env"], **fresh["written"]["env"]},
+            "env": written_env,
         },
     }
     fresh_managed_headers = dict(fresh.get(CUSTOM_HEADERS_STATE_KEY, {}))
