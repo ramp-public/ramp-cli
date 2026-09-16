@@ -9,7 +9,7 @@ import httpx
 
 from ramp_cli.auth.environment import extra_auth_headers
 from ramp_cli.auth.oauth import OAuthTokenError, TokenResponse
-from ramp_cli.config.constants import api_url
+from ramp_cli.config.constants import REQUEST_TIMEOUT, api_url
 
 TOKEN_PATH = "/developer/v1/token"
 
@@ -34,6 +34,7 @@ def login(
             **extra_auth_headers(env),
         },
         auth=httpx.BasicAuth(client_id, client_secret),
+        timeout=REQUEST_TIMEOUT,
     )
     body = _parse_response(response)
     _raise_for_error(response, body)

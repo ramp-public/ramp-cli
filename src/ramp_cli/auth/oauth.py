@@ -25,6 +25,7 @@ from ramp_cli.auth.constants import INVALID_GRANT
 from ramp_cli.auth.environment import extra_auth_headers
 from ramp_cli.config.constants import (
     PREFERRED_CALLBACK_PORT,
+    REQUEST_TIMEOUT,
     append_query_params,
     auth_setup_url,
     auth_url,
@@ -505,6 +506,7 @@ def _do_token_request(env: str, url: str, data: dict[str, str]) -> Any:
         url,
         data=data,
         headers=headers,
+        timeout=REQUEST_TIMEOUT,
     )
 
 

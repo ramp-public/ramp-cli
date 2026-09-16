@@ -36,6 +36,12 @@ PRODUCTION_APPLICATION_SIGNUP_TOKEN = (
 
 PREFERRED_CALLBACK_PORT = 19817
 
+# Client timeout should exceed the server-side timeout (60s) so we always
+# receive the server's response rather than giving up prematurely. This is
+# critical for token requests: the refresh grant rotates the refresh token
+# server-side, so abandoning a slow request loses the replacement token.
+REQUEST_TIMEOUT = 75.0
+
 
 PUBLIC_ENVIRONMENTS: dict[str, EnvironmentDefinition] = {
     ENV_SANDBOX: EnvironmentDefinition(

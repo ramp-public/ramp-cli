@@ -19,16 +19,13 @@ from ramp_cli.auth.environment import (
 from ramp_cli.auth.refresh import try_refresh
 from ramp_cli.client.agent import infer_client_name, infer_harness_name
 from ramp_cli.client.headers import agent_headers
+from ramp_cli.config.constants import REQUEST_TIMEOUT
 from ramp_cli.errors import (
     ApiError,
     AuthRequiredError,
     EnvironmentAuthRequiredError,
     RefreshFailedError,
 )
-
-# Client timeout should exceed the server-side timeout (60s) so we always
-# receive the server's response rather than giving up prematurely.
-_REQUEST_TIMEOUT = 75.0
 
 
 class AuthenticatedRampTransport:
@@ -55,7 +52,7 @@ class AuthenticatedRampTransport:
         extra_headers = self._extra_auth_headers_or_raise()
         access_token = self._get_request_access_token()
 
-        with httpx.Client(timeout=_REQUEST_TIMEOUT) as http:
+        with httpx.Client(timeout=REQUEST_TIMEOUT) as http:
             resp = self._request(
                 http,
                 method,
@@ -109,7 +106,7 @@ class AuthenticatedRampTransport:
         extra_headers = self._extra_auth_headers_or_raise()
         access_token = self._get_request_access_token()
 
-        with httpx.Client(timeout=_REQUEST_TIMEOUT) as http:
+        with httpx.Client(timeout=REQUEST_TIMEOUT) as http:
             resp = self._request_multipart(
                 http,
                 method,

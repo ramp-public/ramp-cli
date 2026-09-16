@@ -580,10 +580,11 @@ def test_refresh_tokens__classifies_ramp_refresh_not_found_as_invalid_grant(
 def test_token_request__sends_extra_auth_header(monkeypatch):
     captured = {}
 
-    def fake_post(url, data, headers):
+    def fake_post(url, data, headers, timeout):
         captured["url"] = url
         captured["data"] = data
         captured["headers"] = headers
+        captured["timeout"] = timeout
 
         class FakeResponse:
             status_code = 200
@@ -607,6 +608,9 @@ def test_token_request__sends_extra_auth_header(monkeypatch):
     assert captured["headers"]["X-Extra-Auth"] == "sandbox-token"
     assert captured["headers"]["Content-Type"] == "application/x-www-form-urlencoded"
     assert captured["data"]["client_id"]
+    # Must exceed the 60s server timeout: an abandoned refresh loses the
+    # rotated refresh token and gets the whole token family revoked.
+    assert captured["timeout"] == 75.0
 
 
 def test_try_refresh__raises_on_transient_refresh_failure(isolated_config, monkeypatch):

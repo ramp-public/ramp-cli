@@ -28,8 +28,9 @@ def test_login_uses_basic_auth_and_omits_unspecified_scope(monkeypatch) -> None:
         data: dict[str, str],
         headers: dict[str, str],
         auth: httpx.Auth,
+        timeout: float,
     ) -> httpx.Response:
-        captured.update(url=url, data=data, headers=headers, auth=auth)
+        captured.update(url=url, data=data, headers=headers, auth=auth, timeout=timeout)
         return _response(
             200,
             {
@@ -57,6 +58,7 @@ def test_login_uses_basic_auth_and_omits_unspecified_scope(monkeypatch) -> None:
 
     assert captured["url"] == ("https://standalone.example.test/developer/v1/token")
     assert captured["data"] == {"grant_type": "client_credentials"}
+    assert captured["timeout"] == 75.0
     assert captured["headers"] == {
         "Content-Type": "application/x-www-form-urlencoded",
         "X-Extra-Auth": "sandbox-token",
@@ -84,6 +86,7 @@ def test_login_sends_deduplicated_explicit_scopes(monkeypatch) -> None:
         data: dict[str, str],
         headers: dict[str, str],
         auth: httpx.Auth,
+        timeout: float,
     ) -> httpx.Response:
         captured_data.update(data)
         return _response(
