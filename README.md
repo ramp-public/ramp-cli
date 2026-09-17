@@ -148,6 +148,26 @@ ramp transactions list --transactions_to_retrieve my_transactions --agent | jq '
 ramp users me --agent | jq '.data.user_id'
 ```
 
+
+## Multi-business users
+
+The CLI stores **one OAuth token per environment** (`sandbox` or `production`).
+That token is bound to **one active business** at a time — the business you
+select during `ramp auth login` in the browser.
+
+If you belong to multiple Ramp businesses (for example, as a partner admin
+across client accounts):
+
+1. **See all memberships** — `ramp users me --agent` (returns one row per business)
+2. **Switch businesses** — run `ramp auth login` again and pick the target
+   business in the OAuth UI (this replaces the stored token for that environment)
+3. **Confirm active session** — `ramp auth status` shows authentication state;
+   compare `business_id` from `ramp users me --agent` with your intended account
+
+There is no per-business profile store in the CLI config yet — business
+selection happens in the OAuth flow. See
+[issue #1](https://github.com/ramp-public/ramp-cli/issues/1) for discussion.
+
 ## Development
 
 ```bash
