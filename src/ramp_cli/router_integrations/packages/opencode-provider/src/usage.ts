@@ -2,7 +2,14 @@ import { normalizeBaseURL } from "./discovery.ts"
 
 /** The dashboard origin paired with the production data plane. */
 const DEFAULT_USAGE_BASE_URL = "https://app.router.com"
-const DEFAULT_DATA_PLANE_BASE_URL = "https://router-api.ramp.com/v1"
+/** Deployments whose dashboard is not the data-plane host minus /v1. */
+const KNOWN_DEPLOYMENT_USAGE_URLS: Record<string, string> = {
+  "https://router-api.ramp.com/v1": DEFAULT_USAGE_BASE_URL,
+  "https://api.router.com/v1": DEFAULT_USAGE_BASE_URL,
+  "https://qa-api.router.com/v1": "https://qa.router.com",
+  "https://internal-api.router.com/v1": "https://internal.router.com",
+  "https://qa-internal-api.router.com/v1": "https://qa-internal.router.com",
+}
 const DEFAULT_USAGE_TIMEOUT_MS = 3_000
 
 export type SessionUsage = {
@@ -19,9 +26,9 @@ export type SessionUsage = {
 /**
  * Map the data-plane base URL onto the dashboard origin serving usage.
  *
- * Mirrors the Ramp CLI's own derivation for the Claude Code status line: the
- * production data plane pairs with the production dashboard, while a base-URL
- * override names a single-origin deployment where the same host serves both.
+ * Mirrors the Ramp CLI's own derivation for the Claude Code status line: known
+ * deployments pair with their dashboard, while any other base URL names a
+ * single-origin deployment where the same host serves both.
  */
 export function usageOriginFromBaseURL(baseURL: string): string {
   let normalized: string
@@ -30,8 +37,10 @@ export function usageOriginFromBaseURL(baseURL: string): string {
   } catch {
     return DEFAULT_USAGE_BASE_URL
   }
-  if (normalized === DEFAULT_DATA_PLANE_BASE_URL) return DEFAULT_USAGE_BASE_URL
-  return normalized.replace(/\/v1$/, "").replace(/\/+$/, "")
+  return (
+    KNOWN_DEPLOYMENT_USAGE_URLS[normalized] ??
+    normalized.replace(/\/v1$/, "").replace(/\/+$/, "")
+  )
 }
 
 function usageNumber(value: unknown): number | undefined {

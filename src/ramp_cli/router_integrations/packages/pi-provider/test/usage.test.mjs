@@ -4,6 +4,7 @@ import { afterEach, describe, it, mock } from "node:test"
 import {
   fetchSessionUsage,
   registerUsageWidget,
+  usageOriginFromBaseURL,
   usageWidgetLines,
 } from "../src/usage.ts"
 
@@ -42,6 +43,19 @@ function usage(overrides = {}) {
     ...overrides,
   }
 }
+
+describe("usageOriginFromBaseURL", () => {
+  it("pairs a known deployment with its own dashboard", () => {
+    assert.equal(
+      usageOriginFromBaseURL("https://internal-api.router.com/v1"),
+      "https://internal.router.com",
+    )
+    assert.equal(
+      usageOriginFromBaseURL("https://router.internal.example/v1"),
+      "https://router.internal.example",
+    )
+  })
+})
 
 describe("Pi Router session usage", () => {
   it("queries the client-agnostic usage contract with Pi's credential", async () => {
@@ -169,6 +183,7 @@ describe("registerUsageWidget", () => {
       },
       {
         baseURL: "https://router-api.ramp.com/v1",
+        ...(options.usageOrigin ? { usageOrigin: options.usageOrigin } : {}),
         resolveAPIKey: options.resolveAPIKey ?? (async () => "usage-secret"),
         fetch: fetcher,
         schedule: timer.schedule,
@@ -217,6 +232,20 @@ describe("registerUsageWidget", () => {
     timer.fireLatest()
     await flush()
     assert.equal(fetcher.mock.callCount(), 2)
+  })
+
+  it("uses the recorded dashboard origin over derivation", async () => {
+    const fetcher = mock.fn(async () => response())
+    const { context, handlers } = fixture(fetcher, {
+      usageOrigin: "https://dashboard.example",
+    })
+
+    emit(handlers, "session_start", context, { reason: "resume" })
+    await flush()
+    assert.match(
+      fetcher.mock.calls[0].arguments[0],
+      /^https:\/\/dashboard\.example\/session-usage\//,
+    )
   })
 
   it("lets a settled event fence an in-flight startup response", async () => {

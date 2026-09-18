@@ -4,7 +4,13 @@ import type {
 } from "@earendil-works/pi-coding-agent"
 
 const DEFAULT_USAGE_BASE_URL = "https://app.router.com"
-const DEFAULT_DATA_PLANE_BASE_URL = "https://router-api.ramp.com/v1"
+const KNOWN_DEPLOYMENT_USAGE_URLS: Record<string, string> = {
+  "https://router-api.ramp.com/v1": DEFAULT_USAGE_BASE_URL,
+  "https://api.router.com/v1": DEFAULT_USAGE_BASE_URL,
+  "https://qa-api.router.com/v1": "https://qa.router.com",
+  "https://internal-api.router.com/v1": "https://internal.router.com",
+  "https://qa-internal-api.router.com/v1": "https://qa-internal.router.com",
+}
 const USAGE_FETCH_TIMEOUT_MS = 3_000
 const USAGE_REFRESH_MIN_INTERVAL_MS = 5_000
 const WIDGET_KEY = "ramp-router-usage"
@@ -29,13 +35,8 @@ export type SessionUsage = {
 
 export function usageOriginFromBaseURL(baseURL: string): string {
   const normalized = baseURL.replace(/\/+$/, "")
-  if (
-    normalized === DEFAULT_DATA_PLANE_BASE_URL ||
-    normalized === DEFAULT_DATA_PLANE_BASE_URL.replace(/\/v1$/, "")
-  ) {
-    return DEFAULT_USAGE_BASE_URL
-  }
-  return normalized.replace(/\/v1$/, "")
+  const withV1 = normalized.endsWith("/v1") ? normalized : `${normalized}/v1`
+  return KNOWN_DEPLOYMENT_USAGE_URLS[withV1] ?? normalized.replace(/\/v1$/, "")
 }
 
 function usageNumber(value: unknown): number | undefined {
@@ -181,6 +182,8 @@ export function registerUsageWidget(
   pi: ExtensionAPI,
   input: {
     baseURL: string
+    /** The recorded dashboard origin, which wins over derivation from baseURL. */
+    usageOrigin?: string
     resolveAPIKey: () => Promise<string | undefined>
     fetch?: typeof globalThis.fetch
     schedule?: (callback: () => void, delayMs: number) => unknown
@@ -242,7 +245,7 @@ export function registerUsageWidget(
         activeSession(ctx) !== sessionID
       ) return
       const usage = await fetchSessionUsage({
-        usageOrigin: usageOriginFromBaseURL(input.baseURL),
+        usageOrigin: input.usageOrigin ?? usageOriginFromBaseURL(input.baseURL),
         apiKey,
         sessionID,
         ...(input.fetch ? { fetch: input.fetch } : {}),

@@ -1855,6 +1855,19 @@ def test_the_status_line_origin_follows_a_base_url_override(monkeypatch):
     monkeypatch.setenv("RAMP_ROUTER_BASE_URL", "https://qa-router.ramp.dev/v1")
     assert router_module._statusline_origin() == "https://qa-router.ramp.dev"
 
+    # Known deployments have their own dashboard host.
+    monkeypatch.setenv("RAMP_ROUTER_BASE_URL", "https://internal-api.router.com/v1")
+    assert router_module._statusline_origin() == "https://internal.router.com"
+
+    # An explicitly configured UI URL wins over any derivation.
+    monkeypatch.setenv("RAMP_ROUTER_UI_URL", "https://dashboard.example/")
+    assert router_module._statusline_origin() == "https://dashboard.example"
+
+
+def test_the_browser_handoff_follows_the_base_url_deployment(monkeypatch):
+    monkeypatch.setenv("RAMP_ROUTER_BASE_URL", "https://internal-api.router.com/v1")
+    assert router_module.router_ui_url() == "https://internal.router.com"
+
 
 _SYNC_COMMAND = (
     "[ -x /opt/ramp-cli/bin/ramp ] && /opt/ramp-cli/bin/ramp "

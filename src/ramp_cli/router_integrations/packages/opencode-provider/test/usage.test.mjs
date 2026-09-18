@@ -63,6 +63,13 @@ describe("usageOriginFromBaseURL", () => {
     )
   })
 
+  it("pairs a known deployment with its own dashboard", () => {
+    assert.equal(
+      usageOriginFromBaseURL("https://internal-api.router.com/v1"),
+      "https://internal.router.com",
+    )
+  })
+
   it("treats an override as a single-origin deployment", () => {
     assert.equal(
       usageOriginFromBaseURL("http://localhost:8002/v1/"),

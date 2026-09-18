@@ -17,6 +17,16 @@ picker lists the agents found on your machine, all selected by default:
 ramp router configure
 ```
 
+To connect to another Router deployment, pass `--base-url` (the gateway `/v1`
+URL written into agent configs) and, for a deployment the CLI does not already
+know, `--ui-url` (the web app origin used for browser setup and dashboard
+links), or set `RAMP_ROUTER_BASE_URL` and `RAMP_ROUTER_UI_URL`. The installer forwards the same flags when given
+`--router --base-url <URL> --ui-url <URL>`:
+
+```bash
+ramp router configure --base-url https://internal-api.router.com/v1 --ui-url https://internal.router.com
+```
+
 **Homebrew** (macOS and Linux):
 
 ```bash

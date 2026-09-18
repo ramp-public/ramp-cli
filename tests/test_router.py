@@ -3614,8 +3614,8 @@ def test_unconfigure_keeps_a_cost_hook_a_manual_registration_still_runs(
 def test_the_cost_hook_uses_the_overridden_router_origin(tmp_path, monkeypatch):
     codex_home = tmp_path / "codex"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
-    monkeypatch.setenv("RAMP_ROUTER_BASE_URL", "http://router.example/v1")
-    _mock_models(monkeypatch, base_url="http://router.example/v1")
+    monkeypatch.setenv("RAMP_ROUTER_BASE_URL", "https://router.example/v1")
+    _mock_models(monkeypatch, base_url="https://router.example/v1")
 
     result = CliRunner().invoke(
         cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
@@ -3624,7 +3624,91 @@ def test_the_cost_hook_uses_the_overridden_router_origin(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     (group,) = _cost_hook_groups(codex_home)
     # A base-URL override names a single-origin deployment.
-    assert "ROUTER_BASE_URL=http://router.example" in group["hooks"][0]["command"]
+    assert "ROUTER_BASE_URL=https://router.example" in group["hooks"][0]["command"]
+
+
+def test_configure_targets_the_deployment_named_by_flags(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch, base_url="https://internal-api.router.com/v1")
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure",
+            "codex",
+            "--api-key",
+            "router-secret",
+            "--base-url",
+            "https://internal-api.router.com/v1/",
+            "--ui-url",
+            "https://internal.router.com",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = tomllib.loads((codex_home / "config.toml").read_text())
+    provider = config["model_providers"]["ramp-router"]
+    assert provider["base_url"] == "https://internal-api.router.com/v1"
+    (group,) = _cost_hook_groups(codex_home)
+    assert "ROUTER_BASE_URL=https://internal.router.com" in group["hooks"][0]["command"]
+
+
+def test_configure_rejects_a_plaintext_deployment_url():
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure",
+            "codex",
+            "--api-key",
+            "router-secret",
+            "--ui-url",
+            "http://router.example",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Invalid value for '--ui-url'" in result.output
+    assert "HTTPS" in result.output
+
+
+def test_keyless_repeat_configure_with_a_deployment_override_reconfigures(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    first = runner.invoke(
+        cli,
+        ["--human", "router", "configure", "claude-code", "--api-key", "router-secret"],
+    )
+    assert first.exit_code == 0, first.output
+    _mock_models(monkeypatch, base_url="https://internal-api.router.com/v1")
+
+    result = runner.invoke(
+        cli,
+        ["--human", "router", "configure", "claude-code"]
+        + ["--base-url", "https://internal-api.router.com/v1"],
+    )
+
+    assert result.exit_code == 0, result.output
+    settings = json.loads((tmp_path / "claude" / "settings.json").read_text())
+    assert settings["env"]["ANTHROPIC_BASE_URL"] == "https://internal-api.router.com"
+
+
+def test_configure_rejects_a_gateway_url_without_the_v1_path():
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+        + ["--base-url", "https://internal-api.router.com"],
+    )
+
+    assert result.exit_code == 2
+    assert "Invalid value for '--base-url': must end in /v1" in result.output
 
 
 def _sync_hook_groups(codex_home):
@@ -8127,7 +8211,10 @@ def test_pi_is_told_which_router_to_call(tmp_path, monkeypatch):
 
     assert result.exit_code == 0, result.output
     recorded = json.loads((pi_home / "ramp-router-config.json").read_text())
-    assert recorded == {"baseUrl": "http://127.0.0.1:28362/v1"}
+    assert recorded == {
+        "baseUrl": "http://127.0.0.1:28362/v1",
+        "usageBaseUrl": "http://127.0.0.1:28362",
+    }
 
     assert runner.invoke(cli, ["--human", "router", "unconfigure", "pi"]).exit_code == 0
     assert not (pi_home / "ramp-router-config.json").exists()

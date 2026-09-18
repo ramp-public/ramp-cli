@@ -22,6 +22,7 @@ from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from pathlib import Path, PurePath
 from typing import Literal
+from urllib.parse import urlsplit
 
 import click
 import httpx
@@ -71,6 +72,15 @@ PI_PLUGIN_MODEL_CACHE_KEY_FILE = "ramp-router-model-cache-key"
 PI_PLUGIN_RUNTIME_MODELS_FILE = "ramp-router-runtime-models.json"
 ROUTER_UI_URL = "https://app.router.com"
 ROUTER_UI_URL_ENV = "RAMP_ROUTER_UI_URL"
+ROUTER_BASE_URL_ENV = BASE_URL_ENVS[0]
+# Deployments whose dashboard is not the data-plane host minus /v1.
+KNOWN_DEPLOYMENT_UI_URLS = {
+    DEFAULT_ROUTER_BASE_URL: ROUTER_UI_URL,
+    "https://api.router.com/v1": ROUTER_UI_URL,
+    "https://qa-api.router.com/v1": "https://qa.router.com",
+    "https://internal-api.router.com/v1": "https://internal.router.com",
+    "https://qa-internal-api.router.com/v1": "https://qa-internal.router.com",
+}
 ROUTER_PROVIDER = "ramp-router"
 # The provider name inside Hermes's own configuration. Hermes ships a bundled
 # ``router`` provider profile (hermes-agent plugins/model-providers/router),
@@ -1010,6 +1020,30 @@ def router_unconfigure_cowork(ctx: click.Context) -> None:
     _run_unconfigure(ctx, clients=(COWORK_CLIENT,), legacy_cowork_alias=True)
 
 
+def _validate_deployment_url(
+    ctx: click.Context, param: click.Parameter, value: str | None
+) -> str | None:
+    if value is None:
+        return None
+    value = value.strip().rstrip("/")
+    parsed = urlsplit(value)
+    loopback = parsed.hostname in ("localhost", "127.0.0.1")
+    if not parsed.hostname or parsed.scheme not in (
+        ("https", "http") if loopback else ("https",)
+    ):
+        raise click.BadParameter(
+            "must be an HTTPS URL (http:// is allowed only for localhost)"
+        )
+    expected_path = "/v1" if param.name == "base_url" else ""
+    if parsed.path != expected_path or parsed.query or parsed.fragment:
+        raise click.BadParameter(
+            "must end in /v1 with no query or fragment"
+            if expected_path
+            else "must be an origin with no path, query, or fragment"
+        )
+    return value
+
+
 @router_group.command(
     "configure",
     help="Configure coding agents and Claude Cowork; omit names to choose interactively",
@@ -1043,6 +1077,20 @@ def router_unconfigure_cowork(ctx: click.Context) -> None:
     type=click.Choice(("compact", "all"), case_sensitive=False),
     help="Models shown by Claude Code: recommended compact list or all models.",
 )
+@click.option(
+    "--base-url",
+    metavar="URL",
+    envvar=ROUTER_BASE_URL_ENV,
+    callback=_validate_deployment_url,
+    help="Router gateway /v1 URL written into agent configs (HTTPS).",
+)
+@click.option(
+    "--ui-url",
+    metavar="URL",
+    envvar=ROUTER_UI_URL_ENV,
+    callback=_validate_deployment_url,
+    help="Router web app origin for browser setup and dashboard links (HTTPS).",
+)
 @click.pass_context
 def router_configure(
     ctx: click.Context,
@@ -1051,7 +1099,14 @@ def router_configure(
     api_key: str | None,
     no_browser: bool,
     claude_models: str | None,
+    base_url: str | None,
+    ui_url: str | None,
 ) -> None:
+    # The rest of this module resolves the deployment from these variables.
+    if base_url:
+        os.environ[ROUTER_BASE_URL_ENV] = base_url
+    if ui_url:
+        os.environ[ROUTER_UI_URL_ENV] = ui_url
     _run_configure(
         ctx,
         clients=clients,
@@ -1060,6 +1115,7 @@ def router_configure(
         no_browser=no_browser,
         claude_models=claude_models,
         api_key_source=ctx.get_parameter_source("api_key"),
+        deployment_override=bool(base_url or ui_url),
     )
 
 
@@ -1073,6 +1129,7 @@ def _run_configure(
     claude_models: str | None,
     api_key_source: ParameterSource | None,
     legacy_cowork_alias: bool = False,
+    deployment_override: bool = False,
 ) -> None:
     if (
         setup_file is not None
@@ -1121,10 +1178,12 @@ def _run_configure(
         and existing_claude
         and setup_file is None
         and api_key is None
+        and not deployment_override
     ):
         # A repeat configure changes only the presentation preference. It does
         # not need a new key, a model request, or another pass over auth and
-        # discovery settings that are already configured.
+        # discovery settings that are already configured. A new deployment is
+        # a full reconfigure, not a preference change.
         _stored_router_api_key("claude-code", claude_path)
         current_view = claude_code.model_view(
             claude_code.read_settings(claude_path), claude_path
@@ -2987,7 +3046,7 @@ def _strategy_settings_request(
         if exc.response.status_code in (401, 403):
             raise click.ClickException(
                 "That API key wasn't accepted by Ramp Router. "
-                f"Create or copy a key at {ROUTER_UI_URL} and try again."
+                f"Create or copy a key at {router_ui_url()} and try again."
             ) from None
         if exc.response.status_code == 404:
             raise click.ClickException(
@@ -4902,18 +4961,27 @@ def _statusline_origin(base_url: str | None = None) -> str:
     """The origin serving the cost scripts and their session-usage endpoint.
 
     The data plane behind the agents' base URLs serves neither, which is why
-    ROUTER_BASE_URL is written explicitly. A base-URL override names a
-    single-origin deployment, so the same host serves everything there.
+    ROUTER_BASE_URL is written explicitly. An explicitly configured UI URL
+    wins; otherwise known deployments map to their dashboard, and any other
+    base URL names a single-origin deployment serving everything itself.
     """
+    configured_ui = os.environ.get(ROUTER_UI_URL_ENV, "").strip()
+    if configured_ui:
+        return configured_ui.rstrip("/")
     base = (base_url or router_base_url()).rstrip("/")
-    if base == DEFAULT_ROUTER_BASE_URL:
-        return router_ui_url()
+    known = KNOWN_DEPLOYMENT_UI_URLS.get(base)
+    if known:
+        return known
     return base.removesuffix("/v1").rstrip("/")
 
 
 def router_ui_url() -> str:
-    """Return the Router browser origin, allowing local end-to-end testing."""
-    return os.environ.get(ROUTER_UI_URL_ENV, ROUTER_UI_URL).rstrip("/")
+    """Return the browser origin paired with the configured Router.
+
+    A key minted on one deployment's dashboard is not valid on another
+    gateway, so the handoff follows the same resolution as dashboard links.
+    """
+    return _statusline_origin()
 
 
 def _fetch_configure_summary(
@@ -6246,7 +6314,10 @@ def _configure_plugin_client(
             (auth_path, auth),
             (
                 path.parent / PI_PLUGIN_CONFIG_FILE,
-                {"baseUrl": base_url or router_base_url()},
+                {
+                    "baseUrl": base_url or router_base_url(),
+                    "usageBaseUrl": _statusline_origin(base_url),
+                },
             ),
         ]
         if models_path.exists():
@@ -6580,7 +6651,7 @@ def _fetch_models(
         if exc.response.status_code in (401, 403):
             raise click.ClickException(
                 "That API key wasn't accepted by Ramp Router. "
-                f"Create or copy a key at {ROUTER_UI_URL} and try again."
+                f"Create or copy a key at {router_ui_url()} and try again."
             ) from None
         raise click.ClickException(
             "Ramp Router couldn't validate the key "
@@ -6640,7 +6711,7 @@ def _fetch_codex_catalog(api_key: str, *, base_url: str | None = None) -> dict:
         if exc.response.status_code in (401, 403):
             raise click.ClickException(
                 "That API key wasn't accepted by Ramp Router. "
-                f"Create or copy a key at {ROUTER_UI_URL} and try again."
+                f"Create or copy a key at {router_ui_url()} and try again."
             ) from None
         raise click.ClickException(
             "Ramp Router couldn't load the Codex model catalog "

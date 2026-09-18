@@ -322,19 +322,26 @@ function piHome(): string {
 }
 
 /** Read the Router that "ramp router configure pi" recorded, if it did. */
-function configuredBaseURL(): string | undefined {
+function configuredRouter(): { baseUrl?: string; usageBaseUrl?: string } {
   const home = piHome()
   try {
     const parsed: unknown = JSON.parse(readFileSync(join(home, CONFIG_FILE), "utf8"))
     if (parsed && typeof parsed === "object") {
-      const value = (parsed as { baseUrl?: unknown }).baseUrl
-      if (typeof value === "string" && value.trim()) return value.trim()
+      const record = parsed as { baseUrl?: unknown; usageBaseUrl?: unknown }
+      return {
+        ...(typeof record.baseUrl === "string" && record.baseUrl.trim()
+          ? { baseUrl: record.baseUrl.trim() }
+          : {}),
+        ...(typeof record.usageBaseUrl === "string" && record.usageBaseUrl.trim()
+          ? { usageBaseUrl: record.usageBaseUrl.trim() }
+          : {}),
+      }
     }
   } catch {
     // Absent, unreadable or malformed all mean the same thing: nothing was
     // recorded, so fall through to the environment and then the default.
   }
-  return undefined
+  return {}
 }
 
 type CatalogGeneration = { current: number }
@@ -1148,9 +1155,14 @@ async function discoverModels(
 export default async function registerRouterProvider(pi: ExtensionAPI): Promise<void> {
   // The environment still wins, so a one-off run against another stack does
   // not require rewriting the file.
+  const environmentBaseUrl = firstEnvironmentValue(BASE_URL_ENVS)
+  const configured = configuredRouter()
   const baseUrl = normalizeBaseURL(
-    firstEnvironmentValue(BASE_URL_ENVS) ?? configuredBaseURL() ?? DEFAULT_BASE_URL,
+    environmentBaseUrl ?? configured.baseUrl ?? DEFAULT_BASE_URL,
   )
+  // A recorded dashboard belongs to the recorded Router, not to an
+  // environment override aimed at another stack.
+  const usageOrigin = environmentBaseUrl ? undefined : configured.usageBaseUrl
 
   // Resolve Router's credential through Pi's own auth machinery without
   // refreshing any provider. The private cache is scoped to both endpoint and
@@ -1212,7 +1224,11 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
     startupCredentialIdentity,
   )
   pi.registerProvider(registeredProvider)
-  registerUsageWidget(pi, { baseURL: baseUrl, resolveAPIKey: routerApiKey })
+  registerUsageWidget(pi, {
+    baseURL: baseUrl,
+    ...(usageOrigin ? { usageOrigin } : {}),
+    resolveAPIKey: routerApiKey,
+  })
 
   // Extension factories run before session_start, which is the first point at
   // which Pi exposes its ModelRegistry. A cached startup refresh can update the

@@ -42,6 +42,7 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     # stack would otherwise change what the tests assert.
     for leaked in (
         "RAMP_ROUTER_BASE_URL",
+        "RAMP_ROUTER_UI_URL",
         "LLM_GATEWAY_BASE_URL",
         "RAMP_ROUTER_CONFIGURE_API_KEY",
         "RAMP_ACCESS_TOKEN",
