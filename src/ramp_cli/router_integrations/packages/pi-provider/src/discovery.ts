@@ -211,6 +211,17 @@ export function parseRouterMetadata(
   }
 }
 
+/**
+ * Router also lists non-LLM tools (TypeSafe answers only on /v1/systemone).
+ * A Router without the surfaces field predates the distinction, so its rows
+ * pass unless the owner identifies them.
+ */
+function servesResponses(raw: OpenAIModel): boolean {
+  if (raw.owned_by === "typesafe") return false
+  const surfaces = record(raw.router).surfaces
+  return !Array.isArray(surfaces) || surfaces.includes("responses")
+}
+
 export async function discoverRouterModels(input: {
   baseURL: string
   apiKey: string
@@ -260,7 +271,7 @@ export async function discoverRouterModels(input: {
     if (identifier.length === 0) {
       throw new Error("Ramp Router model discovery returned a model without an id")
     }
-    if (models.has(identifier)) {
+    if (models.has(identifier) || !servesResponses(raw)) {
       // Keep the first, matching the CLI, so both agree on which entry won.
       continue
     }

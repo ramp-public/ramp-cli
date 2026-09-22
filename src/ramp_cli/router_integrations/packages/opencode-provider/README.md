@@ -3,7 +3,9 @@
 This local npm package registers Ramp Router as a native OpenCode provider.
 When OpenCode starts, the plugin authenticates to `GET /v1/models` and exposes
 exactly the models available to the configured Router API key. Model requests
-use the OpenAI Responses API.
+use the OpenAI Responses API. Rows Router marks as unable to serve Responses
+traffic (for example TypeSafe, which answers only on `/v1/systemone`) are
+left out.
 
 The recommended installer is:
 

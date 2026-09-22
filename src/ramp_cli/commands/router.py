@@ -6705,7 +6705,7 @@ def _fetch_models(
             raise click.ClickException(
                 "Ramp Router returned a model without an id. Please try again."
             )
-        if identifier in discovered:
+        if identifier in discovered or not _serves_responses(model):
             continue
         discovered[identifier] = RouterModel(
             id=identifier, metadata=_model_metadata(model.get("router"), identifier)
@@ -6713,6 +6713,20 @@ def _fetch_models(
     if not discovered:
         raise click.ClickException("No models are available for this Ramp Router key.")
     return list(discovered.values())
+
+
+def _serves_responses(model: dict) -> bool:
+    """Keep only models a coding agent can call for chat/Responses traffic.
+
+    Router also lists non-LLM tools (TypeSafe answers only on /v1/systemone);
+    a Router without the ``surfaces`` field predates the distinction, so its
+    rows pass unless the owner identifies them.
+    """
+    if model.get("owned_by") == "typesafe":
+        return False
+    metadata = model.get("router")
+    surfaces = metadata.get("surfaces") if isinstance(metadata, dict) else None
+    return not isinstance(surfaces, list) or "responses" in surfaces
 
 
 def _fetch_codex_catalog(api_key: str, *, base_url: str | None = None) -> dict:

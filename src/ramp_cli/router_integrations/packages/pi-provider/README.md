@@ -3,7 +3,9 @@
 This local npm package registers Ramp Router as a native dynamic Pi provider.
 Pi refreshes authenticated `GET /v1/models` discovery through its provider
 credential store and caches exactly the models available to the configured
-Router API key. Model requests use the OpenAI Responses API.
+Router API key. Model requests use the OpenAI Responses API. Rows Router
+marks as unable to serve Responses traffic (for example TypeSafe, which
+answers only on `/v1/systemone`) are left out.
 
 Router sessions also show a native widget above Pi's editor after settled
 turns. It reports Switchyard routing, Router's last routed model and provider,

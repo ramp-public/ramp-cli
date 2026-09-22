@@ -7910,6 +7910,40 @@ def test_a_model_without_an_id_is_an_error(monkeypatch):
         router_module._fetch_models("router-secret")
 
 
+@pytest.mark.parametrize(
+    ("owned_by", "surfaces"),
+    [("router", ["systemone"]), ("typesafe", None)],
+)
+def test_models_that_cannot_serve_responses_are_left_out(
+    monkeypatch, owned_by, surfaces
+):
+    llm = _router_metadata("gpt-5.4")
+    tool = _router_metadata("jev-1.13")
+    if surfaces is not None:
+        llm["surfaces"] = ["responses", "messages"]
+        tool["surfaces"] = surfaces
+    payload = {
+        "data": [
+            {"id": "gpt-5.4", "owned_by": "openai", "router": llm},
+            {"id": "jev-1.13", "owned_by": owned_by, "router": tool},
+        ]
+    }
+
+    class _Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return payload
+
+    monkeypatch.setattr(router_module.httpx, "get", lambda *a, **k: _Response())
+
+    models = router_module._fetch_models("router-secret")
+    assert [model.id for model in models] == ["gpt-5.4"]
+
+
 def test_codex_keeps_its_own_harness_prompt(tmp_path, monkeypatch):
     # Codex replaces its prompt with whatever base_instructions says, and its
     # own runs to ~18k characters of editing and tool rules. Router sends an

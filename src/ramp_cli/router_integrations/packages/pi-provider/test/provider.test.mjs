@@ -144,6 +144,32 @@ describe("discoverRouterModels", () => {
         !error.message.includes("private response body"),
     )
   })
+
+  it("leaves out models that cannot serve Responses traffic", async () => {
+    const fetcher = mock.fn(async () =>
+      new Response(
+        JSON.stringify({
+          data: [
+            { id: "gpt-5.4", owned_by: "openai", router: routerMetadata("gpt-5.4") },
+            {
+              id: "jev-by-surface",
+              owned_by: "router",
+              router: { ...routerMetadata("jev-by-surface"), surfaces: ["systemone"] },
+            },
+            { id: "jev-by-owner", owned_by: "typesafe", router: routerMetadata("jev-by-owner") },
+          ],
+        }),
+        { status: 200 },
+      ),
+    )
+
+    const discovered = await discoverRouterModels({
+      baseURL: "http://localhost:8002",
+      apiKey: "test-secret",
+      fetch: fetcher,
+    })
+    assert.deepEqual(discovered.map(({ id }) => id), ["gpt-5.4"])
+  })
 })
 
 describe("Pi provider extension", () => {
