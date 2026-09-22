@@ -122,6 +122,7 @@ describe("fetchSessionUsage", () => {
       usageOrigin: "https://app.router.com",
       apiKey: "usage-secret",
       sessionID: "ses_123",
+      rampCliVersion: "0.2.38",
       fetch: fetcher,
     })
 
@@ -144,6 +145,7 @@ describe("fetchSessionUsage", () => {
     )
     assert.deepEqual(fetcher.mock.calls[0].arguments[1].headers, {
       authorization: "Bearer usage-secret",
+      "X-Gateway-Ramp-Cli-Version": "0.2.38",
     })
   })
 

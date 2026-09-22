@@ -20,7 +20,7 @@ import zstandard
 from click.testing import CliRunner
 
 import ramp_cli.commands.router as router_module
-from ramp_cli import claude_cowork
+from ramp_cli import __version__, claude_cowork
 from ramp_cli.commands import claude_code
 from ramp_cli.commands.router import DEFAULT_ROUTER_BASE_URL as ROUTER_BASE_URL
 from ramp_cli.config.settings import config_dir
@@ -44,6 +44,13 @@ def _complete_browser_key_setup(monkeypatch, tmp_path_factory):
         "RAMP_CLAUDE_DESKTOP_APP_SUPPORT",
         str(tmp_path_factory.mktemp("claude-app-support")),
     )
+
+
+# What every request the CLI itself makes to Router carries.
+_TELEMETRY_HEADERS = {
+    "X-Gateway-Ramp-Cli-Version": __version__,
+    "User-Agent": f"ramp-cli/{__version__}",
+}
 
 
 def _router_metadata(identifier, **overrides):
@@ -102,10 +109,12 @@ def _mock_models(
             return httpx.Response(404, request=httpx.Request("GET", url))
         assert url == f"{base_url}/models"
         assert headers["Authorization"] == f"Bearer {key}"
+        assert headers.items() >= _TELEMETRY_HEADERS.items()
         assert set(headers) <= {
             "Authorization",
             "X-Gateway-Client",
             "X-Gateway-Model-View",
+            *_TELEMETRY_HEADERS,
         }
         if "X-Gateway-Client" in headers:
             assert headers["X-Gateway-Client"] in {
@@ -1320,6 +1329,7 @@ def test_fetch_models_can_request_the_claude_cowork_projection(monkeypatch):
         f"{ROUTER_BASE_URL}/models",
         {
             "Authorization": "Bearer router-secret",
+            **_TELEMETRY_HEADERS,
             "X-Gateway-Client": "claude-cowork",
         },
         10,
@@ -1403,6 +1413,7 @@ def test_refresh_reapplies_only_clients_with_router_receipts(tmp_path, monkeypat
             "baseURL": ROUTER_BASE_URL,
             "usageBaseURL": "https://app.router.com",
             "apiKey": "keep-me",
+            "rampCliVersion": __version__,
             "rampExecutable": "/opt/ramp-cli/bin/ramp",
         },
     ]
@@ -1801,6 +1812,7 @@ def test_configure_claude_fetches_exhaustive_view_but_writes_compact(
     assert [headers for url, headers in requests if url.endswith("/models")] == [
         {
             "Authorization": "Bearer router-secret",
+            **_TELEMETRY_HEADERS,
             "X-Gateway-Client": "claude-code",
             "X-Gateway-Model-View": "all",
         }
@@ -1843,6 +1855,7 @@ def test_configure_claude_all_models_sets_wire_header(tmp_path, monkeypatch):
     assert [headers for url, headers in requests if url.endswith("/models")] == [
         {
             "Authorization": "Bearer router-secret",
+            **_TELEMETRY_HEADERS,
             "X-Gateway-Client": "claude-code",
             "X-Gateway-Model-View": "all",
         }
@@ -1858,6 +1871,7 @@ def test_configure_claude_all_models_sets_wire_header(tmp_path, monkeypatch):
     assert [headers for url, headers in requests if url.endswith("/models")] == [
         {
             "Authorization": "Bearer router-secret",
+            **_TELEMETRY_HEADERS,
             "X-Gateway-Client": "claude-code",
             "X-Gateway-Model-View": "all",
         }
@@ -2743,8 +2757,12 @@ def test_configure_codex_writes_router_provider(tmp_path, monkeypatch):
         # Router answers with Codex's own catalog shape only for a client that
         # declares itself. That shape carries no harness prompt, so it must
         # arrive with the model_instructions_file written below and never on
-        # its own.
-        "http_headers": {"X-Gateway-Client": "codex"},
+        # its own. Codex talks to Router directly, so the CLI version it
+        # reports is the one that wrote this block.
+        "http_headers": {
+            "X-Gateway-Client": "codex",
+            "X-Gateway-Ramp-Cli-Version": __version__,
+        },
     }
     assert config["model_provider"] == "ramp-router"
     assert config["model"] == "a"
@@ -4824,6 +4842,9 @@ def test_configure_opencode_installs_plugin_and_preserves_config(tmp_path, monke
             # display queries; the data plane does not serve it.
             "usageBaseURL": "https://app.router.com",
             "apiKey": "router-secret",
+            # OpenCode calls Router directly, so the plugin reports the CLI
+            # version recorded here rather than one it could observe.
+            "rampCliVersion": __version__,
             "rampExecutable": "/opt/ramp-cli/bin/ramp",
         },
     ]
@@ -8195,6 +8216,42 @@ def test_a_current_setup_is_not_marked_as_replaced(tmp_path, monkeypatch):
     assert json.loads(again.output)["data"][0]["replaced_outdated_setup"] is False
 
 
+@pytest.mark.parametrize(
+    "recorded_headers",
+    [
+        '{ "X-Gateway-Client" = "codex" }',
+        '{ "X-Gateway-Client" = "codex", "X-Gateway-Ramp-Cli-Version" = "0.1.0" }',
+    ],
+)
+def test_a_setup_written_by_an_earlier_cli_reports_the_installed_version(
+    tmp_path, monkeypatch, recorded_headers
+):
+    # Codex sends the version baked into its config, not the version of the
+    # CLI on disk, so a block from before the upgrade keeps reporting the old
+    # one until it is rewritten.
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir(parents=True)
+    (codex_home / "config.toml").write_text(
+        "[model_providers.ramp-router]\n"
+        'name = "Ramp Router"\n'
+        'base_url = "https://router-api.ramp.com/v1"\n'
+        'wire_api = "responses"\n'
+        f"http_headers = {recorded_headers}\n"
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli, ["router", "configure", "codex", "--api-key", "router-secret"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["data"][0]["replaced_outdated_setup"] is True
+    config = tomllib.loads((codex_home / "config.toml").read_text())
+    headers = config["model_providers"]["ramp-router"]["http_headers"]
+    assert headers["X-Gateway-Ramp-Cli-Version"] == __version__
+
+
 def test_pi_is_told_which_router_to_call(tmp_path, monkeypatch):
     # Pi gives an extension no configuration, so without this the base URL
     # could only come from the environment, which means setting it again in
@@ -8214,6 +8271,7 @@ def test_pi_is_told_which_router_to_call(tmp_path, monkeypatch):
     assert recorded == {
         "baseUrl": "http://127.0.0.1:28362/v1",
         "usageBaseUrl": "http://127.0.0.1:28362",
+        "rampCliVersion": __version__,
     }
 
     assert runner.invoke(cli, ["--human", "router", "unconfigure", "pi"]).exit_code == 0
@@ -8301,7 +8359,10 @@ def _mock_balance(monkeypatch, respond, *, origin="https://app.router.com"):
             assert url == (
                 f"{origin}/session-usage/usage/balance?include_strategy_settings=true"
             )
-            assert headers == {"Authorization": "Bearer router-secret"}
+            assert headers == {
+                "Authorization": "Bearer router-secret",
+                **_TELEMETRY_HEADERS,
+            }
             assert timeout == 5
             return respond(url)
         return inner(url, headers=headers, timeout=timeout)

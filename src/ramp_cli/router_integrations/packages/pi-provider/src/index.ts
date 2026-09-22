@@ -34,7 +34,11 @@ import { createHmac, randomBytes, randomUUID } from "node:crypto"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
-import { discoverRouterModels, normalizeBaseURL } from "./discovery.ts"
+import {
+  RAMP_CLI_VERSION_HEADER,
+  discoverRouterModels,
+  normalizeBaseURL,
+} from "./discovery.ts"
 import type { RouterModel as DiscoveredModel } from "./discovery.ts"
 import { registerUsageWidget } from "./usage.ts"
 
@@ -50,6 +54,7 @@ const MAX_SESSION_HEADER_BYTES = 4096
 const SESSION_ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/
 const LINEAGE_HEADERS = [
   "X-Gateway-Client",
+  RAMP_CLI_VERSION_HEADER,
   "X-Session-Id",
   "X-Parent-Session-Id",
   "X-Forked-From-Session-Id",
@@ -322,18 +327,29 @@ function piHome(): string {
 }
 
 /** Read the Router that "ramp router configure pi" recorded, if it did. */
-function configuredRouter(): { baseUrl?: string; usageBaseUrl?: string } {
+function configuredRouter(): {
+  baseUrl?: string
+  usageBaseUrl?: string
+  rampCliVersion?: string
+} {
   const home = piHome()
   try {
     const parsed: unknown = JSON.parse(readFileSync(join(home, CONFIG_FILE), "utf8"))
     if (parsed && typeof parsed === "object") {
-      const record = parsed as { baseUrl?: unknown; usageBaseUrl?: unknown }
+      const record = parsed as {
+        baseUrl?: unknown
+        usageBaseUrl?: unknown
+        rampCliVersion?: unknown
+      }
       return {
         ...(typeof record.baseUrl === "string" && record.baseUrl.trim()
           ? { baseUrl: record.baseUrl.trim() }
           : {}),
         ...(typeof record.usageBaseUrl === "string" && record.usageBaseUrl.trim()
           ? { usageBaseUrl: record.usageBaseUrl.trim() }
+          : {}),
+        ...(typeof record.rampCliVersion === "string" && record.rampCliVersion.trim()
+          ? { rampCliVersion: record.rampCliVersion.trim() }
           : {}),
       }
     }
@@ -365,6 +381,7 @@ function routerProvider(
   models: readonly RouterModel[],
   catalogGeneration: CatalogGeneration,
   initialCredentialIdentity?: string,
+  rampCliVersion?: string,
 ) {
   // Pi's generic dynamic-provider helper restores models-store.json by only
   // provider ID. That store carries neither Router URL nor credential scope,
@@ -626,6 +643,7 @@ function routerProvider(
       const discovered = await discoverRouterModels({
         baseURL: baseUrl,
         apiKey,
+        ...(rampCliVersion ? { rampCliVersion } : {}),
         ...(signal ? { signal } : {}),
       })
       if (signal.aborted) return
@@ -1142,11 +1160,13 @@ function writeModelCache(
 async function discoverModels(
   baseUrl: string,
   apiKey: string,
+  rampCliVersion: string | undefined,
   signal?: AbortSignal,
 ): Promise<RouterModel[]> {
   const discovered = await discoverRouterModels({
     baseURL: baseUrl,
     apiKey,
+    ...(rampCliVersion ? { rampCliVersion } : {}),
     ...(signal ? { signal } : {}),
   })
   return discovered.map((model) => toPiModel(model, baseUrl))
@@ -1163,6 +1183,7 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
   // A recorded dashboard belongs to the recorded Router, not to an
   // environment override aimed at another stack.
   const usageOrigin = environmentBaseUrl ? undefined : configured.usageBaseUrl
+  const rampCliVersion = configured.rampCliVersion
 
   // Resolve Router's credential through Pi's own auth machinery without
   // refreshing any provider. The private cache is scoped to both endpoint and
@@ -1191,6 +1212,7 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
       startupModels = await discoverModels(
         baseUrl,
         apiKey,
+        rampCliVersion,
         AbortSignal.timeout(STARTUP_DISCOVERY_TIMEOUT_MS),
       )
       if (!(await routerCredentialIsCurrent(apiKey))) {
@@ -1222,11 +1244,13 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
     startupModels,
     catalogGeneration,
     startupCredentialIdentity,
+    rampCliVersion,
   )
   pi.registerProvider(registeredProvider)
   registerUsageWidget(pi, {
     baseURL: baseUrl,
     ...(usageOrigin ? { usageOrigin } : {}),
+    ...(rampCliVersion ? { rampCliVersion } : {}),
     resolveAPIKey: routerApiKey,
   })
 
@@ -1273,7 +1297,7 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
   // private cache is an optional next-launch optimization, not a prerequisite
   // for using the newer catalog in this process.
   if (apiKey && backgroundGeneration !== undefined) {
-    void discoverModels(baseUrl, apiKey)
+    void discoverModels(baseUrl, apiKey, rampCliVersion)
       .then(async (refreshed) => {
         if (refreshed.length > 0) {
           // Pi resolves auth again for inference. If /login or a concurrent
@@ -1299,6 +1323,10 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
     if (context.model?.provider !== PROVIDER_ID) return
 
     for (const name of LINEAGE_HEADERS) replaceHeader(event.headers, name)
+
+    if (rampCliVersion) {
+      replaceHeader(event.headers, RAMP_CLI_VERSION_HEADER, rampCliVersion)
+    }
 
     const sessionID = boundedSessionID(context.sessionManager.getSessionId())
     if (!sessionID) return

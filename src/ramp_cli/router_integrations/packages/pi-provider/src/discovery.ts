@@ -61,6 +61,9 @@ type OpenAIModelList = {
 }
 
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 10_000
+// Telemetry only: Router records the CLI version that wrote this plugin's
+// config and grants nothing for it.
+export const RAMP_CLI_VERSION_HEADER = "X-Gateway-Ramp-Cli-Version"
 
 /** The metadata shape this client understands. */
 const SUPPORTED_SCHEMA_VERSION = 1
@@ -211,6 +214,7 @@ export function parseRouterMetadata(
 export async function discoverRouterModels(input: {
   baseURL: string
   apiKey: string
+  rampCliVersion?: string
   fetch?: typeof globalThis.fetch
   timeoutMs?: number
   signal?: AbortSignal
@@ -227,6 +231,9 @@ export async function discoverRouterModels(input: {
       // can return the catalog. This request is model discovery, not an
       // inference, so use the integration's own stable identifier.
       "user-agent": "ramp-cli-pi-provider",
+      ...(input.rampCliVersion
+        ? { [RAMP_CLI_VERSION_HEADER]: input.rampCliVersion }
+        : {}),
     },
     signal: input.signal
       ? AbortSignal.any([input.signal, timeoutSignal])

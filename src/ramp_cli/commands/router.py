@@ -31,7 +31,7 @@ import questionary
 import zstandard
 from click.core import ParameterSource
 
-from ramp_cli import claude_cowork, hermes_agent
+from ramp_cli import __version__, claude_cowork, hermes_agent
 from ramp_cli.commands import claude_code, conductor
 from ramp_cli.commands import router_sync as router_sync_module
 from ramp_cli.commands.router_sync import (
@@ -449,12 +449,19 @@ def _codex_provider(key_path: Path, base_url: str | None = None) -> str:
     safe alongside the model_instructions_file this same setup writes.
     """
     command, args = _codex_key_command(key_path)
+    http_headers = ", ".join(
+        f"{json.dumps(name)} = {json.dumps(value)}"
+        for name, value in (
+            (GATEWAY_CLIENT_HEADER, CODEX_CLIENT_NAME),
+            (claude_code.RAMP_CLI_VERSION_HEADER, __version__),
+        )
+    )
     return f'''[model_providers.ramp-router]
 name = "Ramp Router"
 base_url = "{(base_url or router_base_url()).rstrip("/")}"
 wire_api = "responses"
 supports_websockets = false
-http_headers = {{ "{GATEWAY_CLIENT_HEADER}" = "{CODEX_CLIENT_NAME}" }}
+http_headers = {{ {http_headers} }}
 
 [model_providers.ramp-router.auth]
 command = {json.dumps(command)}
@@ -1864,7 +1871,7 @@ def _ensure_claude_aliases(
     if not claude_models:
         return {}
     origin = _statusline_origin(base_url)
-    headers = {"Authorization": f"Bearer {api_key}"}
+    headers = {"Authorization": f"Bearer {api_key}", **_router_telemetry_headers()}
     try:
         response = httpx.get(
             f"{origin}/self-service/model-aliases", headers=headers, timeout=10
@@ -3034,7 +3041,7 @@ def _strategy_settings_request(
     line's session-usage reads.
     """
     url = f"{_statusline_origin()}/session-usage/strategies"
-    headers = {"Authorization": f"Bearer {api_key}"}
+    headers = {"Authorization": f"Bearer {api_key}", **_router_telemetry_headers()}
     try:
         if changes is None:
             response = httpx.get(url, headers=headers, timeout=10)
@@ -4377,7 +4384,8 @@ def _conductor_claude_wrapper(key_path: Path, base_url: str | None) -> str:
     """
     claude = conductor.vendored_binary("claude")
     custom_headers = (
-        f"{GATEWAY_CLIENT_HEADER}: {claude_code.GATEWAY_CLIENT_HEADER_VALUE}"
+        f"{GATEWAY_CLIENT_HEADER}: {claude_code.GATEWAY_CLIENT_HEADER_VALUE}\n"
+        f"{claude_code.RAMP_CLI_VERSION_HEADER}: {__version__}"
     )
     return f"""#!/bin/sh
 # Written by `ramp router configure conductor`.
@@ -4998,7 +5006,12 @@ def _fetch_configure_summary(
     )
     try:
         response = httpx.get(
-            url, headers={"Authorization": f"Bearer {api_key}"}, timeout=5
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                **_router_telemetry_headers(),
+            },
+            timeout=5,
         )
         if response.status_code != 200:
             return None
@@ -5102,7 +5115,11 @@ def _install_cost_script(
     if not _cost_script_runtime_available(skip):
         return False
     try:
-        response = httpx.get(url, headers={"Accept": "text/plain"}, timeout=10)
+        response = httpx.get(
+            url,
+            headers={"Accept": "text/plain", **_router_telemetry_headers()},
+            timeout=10,
+        )
         response.raise_for_status()
         script = response.text
     except (httpx.HTTPError, ValueError):
@@ -6209,6 +6226,7 @@ def _configure_plugin_client(
                 # dashboard host from the data-plane URL alone.
                 "usageBaseURL": _statusline_origin(base_url),
                 "apiKey": api_key,
+                "rampCliVersion": __version__,
                 **(
                     {"rampExecutable": str(executable)}
                     if (executable := router_sync_module.ramp_executable()) is not None
@@ -6317,6 +6335,7 @@ def _configure_plugin_client(
                 {
                     "baseUrl": base_url or router_base_url(),
                     "usageBaseUrl": _statusline_origin(base_url),
+                    "rampCliVersion": __version__,
                 },
             ),
         ]
@@ -6607,6 +6626,14 @@ def _read_json_config(client: str, path: Path) -> dict:
         ) from None
 
 
+def _router_telemetry_headers() -> dict[str, str]:
+    """Headers naming this CLI on the requests it makes to Router itself."""
+    return {
+        claude_code.RAMP_CLI_VERSION_HEADER: __version__,
+        "User-Agent": f"ramp-cli/{__version__}",
+    }
+
+
 def _fetch_models(
     api_key: str,
     claude_code_view: bool = False,
@@ -6625,6 +6652,7 @@ def _fetch_models(
                 f"{(base_url or router_base_url()).rstrip('/')}/models",
                 headers={
                     "Authorization": f"Bearer {api_key}",
+                    **_router_telemetry_headers(),
                     # Ask for the projection whose ids the named client accepts.
                     **(
                         {GATEWAY_CLIENT_HEADER: requested_client}
@@ -6702,6 +6730,7 @@ def _fetch_codex_catalog(api_key: str, *, base_url: str | None = None) -> dict:
             headers={
                 "Authorization": f"Bearer {api_key}",
                 GATEWAY_CLIENT_HEADER: CODEX_CLIENT_NAME,
+                **_router_telemetry_headers(),
             },
             timeout=10,
         )
@@ -6758,13 +6787,15 @@ def _render_codex_catalog(catalog: dict, selected_model: str) -> str:
 
 
 def _codex_provider_is_out_of_date(existing: dict) -> bool:
-    """Report an existing Router block written before the client marker.
+    """Report an existing Router block missing a current header.
 
     Router answers with Codex's own catalog shape only for a client that asks
     by name. A block written before that will keep receiving the OpenAI model
     list, which Codex ignores entirely, so its picker simply comes up empty
     with nothing said. Rewriting the block fixes it, and saying so is what
-    tells someone why they had to.
+    tells someone why they had to. A version header from an earlier install
+    is the same kind of staleness: Codex reads the block, not this CLI, so
+    only a rewrite brings the reported version up to date.
     """
     providers = existing.get("model_providers")
     if not isinstance(providers, dict):
@@ -6773,8 +6804,12 @@ def _codex_provider_is_out_of_date(existing: dict) -> bool:
     if not isinstance(router, dict):
         return False
     headers = router.get("http_headers")
-    stated = headers.get(GATEWAY_CLIENT_HEADER) if isinstance(headers, dict) else None
-    return stated != CODEX_CLIENT_NAME
+    if not isinstance(headers, dict):
+        return True
+    return (
+        headers.get(GATEWAY_CLIENT_HEADER) != CODEX_CLIENT_NAME
+        or headers.get(claude_code.RAMP_CLI_VERSION_HEADER) != __version__
+    )
 
 
 def _configure_codex(

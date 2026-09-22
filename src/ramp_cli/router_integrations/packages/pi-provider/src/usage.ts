@@ -3,6 +3,8 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent"
 
+import { RAMP_CLI_VERSION_HEADER } from "./discovery.ts"
+
 const DEFAULT_USAGE_BASE_URL = "https://app.router.com"
 const KNOWN_DEPLOYMENT_USAGE_URLS: Record<string, string> = {
   "https://router-api.ramp.com/v1": DEFAULT_USAGE_BASE_URL,
@@ -55,6 +57,7 @@ export async function fetchSessionUsage(input: {
   usageOrigin: string
   apiKey: string
   sessionID: string
+  rampCliVersion?: string
   fetch?: typeof globalThis.fetch
   timeoutMs?: number
 }): Promise<SessionUsage | undefined> {
@@ -67,7 +70,12 @@ export async function fetchSessionUsage(input: {
     const response = await (input.fetch ?? globalThis.fetch)(
       `${input.usageOrigin.replace(/\/+$/, "")}/session-usage/usage/session?${query}`,
       {
-        headers: { authorization: `Bearer ${input.apiKey}` },
+        headers: {
+          authorization: `Bearer ${input.apiKey}`,
+          ...(input.rampCliVersion
+            ? { [RAMP_CLI_VERSION_HEADER]: input.rampCliVersion }
+            : {}),
+        },
         signal: AbortSignal.timeout(input.timeoutMs ?? USAGE_FETCH_TIMEOUT_MS),
       },
     )
@@ -184,6 +192,7 @@ export function registerUsageWidget(
     baseURL: string
     /** The recorded dashboard origin, which wins over derivation from baseURL. */
     usageOrigin?: string
+    rampCliVersion?: string
     resolveAPIKey: () => Promise<string | undefined>
     fetch?: typeof globalThis.fetch
     schedule?: (callback: () => void, delayMs: number) => unknown
@@ -248,6 +257,7 @@ export function registerUsageWidget(
         usageOrigin: input.usageOrigin ?? usageOriginFromBaseURL(input.baseURL),
         apiKey,
         sessionID,
+        ...(input.rampCliVersion ? { rampCliVersion: input.rampCliVersion } : {}),
         ...(input.fetch ? { fetch: input.fetch } : {}),
       })
       if (

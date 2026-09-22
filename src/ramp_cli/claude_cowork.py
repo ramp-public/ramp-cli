@@ -25,6 +25,9 @@ from urllib.parse import urlsplit
 
 import click
 
+from ramp_cli import __version__
+from ramp_cli.commands.claude_code import RAMP_CLI_VERSION_HEADER
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Cowork setup is macOS-only
@@ -267,9 +270,24 @@ def _profile(api_key: str, router_base_url: str) -> dict:
         "inferenceCredentialKind": "static",
         "inferenceGatewayApiKey": api_key,
         "inferenceGatewayAuthScheme": "bearer",
-        "inferenceCustomHeaders": {GATEWAY_CLIENT_HEADER: GATEWAY_CLIENT},
+        "inferenceCustomHeaders": {
+            GATEWAY_CLIENT_HEADER: GATEWAY_CLIENT,
+            RAMP_CLI_VERSION_HEADER: __version__,
+        },
         "modelDiscoveryEnabled": True,
     }
+
+
+def _owned_custom_headers(headers: object) -> bool:
+    # A profile written by an earlier CLI carries that CLI's version, or none
+    # at all; neither is a user edit that should block unconfigure.
+    if not isinstance(headers, dict):
+        return False
+    return (
+        headers.keys() <= {GATEWAY_CLIENT_HEADER, RAMP_CLI_VERSION_HEADER}
+        and headers.get(GATEWAY_CLIENT_HEADER) == GATEWAY_CLIENT
+        and isinstance(headers.get(RAMP_CLI_VERSION_HEADER, ""), str)
+    )
 
 
 def _ensure_macos() -> None:
@@ -776,8 +794,7 @@ def _owned_profile(state: dict) -> dict | None:
         profile.get("inferenceProvider") != "gateway"
         or profile.get("inferenceCredentialKind") != "static"
         or profile.get("inferenceGatewayAuthScheme") != "bearer"
-        or profile.get("inferenceCustomHeaders")
-        != {GATEWAY_CLIENT_HEADER: GATEWAY_CLIENT}
+        or not _owned_custom_headers(profile.get("inferenceCustomHeaders"))
         or profile.get("modelDiscoveryEnabled") is not True
         or profile.get("inferenceGatewayBaseUrl") != state.get("gateway_base_url")
     ):

@@ -101,6 +101,7 @@ describe("discoverRouterModels", () => {
     const discovered = await discoverRouterModels({
       baseURL: "http://localhost:8002",
       apiKey: "test-secret",
+      rampCliVersion: "0.2.38",
       fetch: fetcher,
     })
     assert.deepEqual(
@@ -122,6 +123,7 @@ describe("discoverRouterModels", () => {
     assert.deepEqual(fetcher.mock.calls[0].arguments[1].headers, {
       authorization: "Bearer test-secret",
       "user-agent": "ramp-cli-pi-provider",
+      "X-Gateway-Ramp-Cli-Version": "0.2.38",
     })
   })
 
@@ -2187,6 +2189,35 @@ describe("Pi session lineage headers", () => {
         "X-Session-Id": "019ff2af-7ce1-7000-8000-000000000001",
       },
     )
+  })
+
+  it("reports the CLI version configure recorded, replacing a caller's copy", async () => {
+    // Pi calls Router directly, so the version can only be the one written
+    // beside the credential; a caller-supplied value is not a CLI observation.
+    writeFileSync(
+      join(process.env.PI_CODING_AGENT_DIR, "ramp-router-config.json"),
+      JSON.stringify({ rampCliVersion: "0.2.38" }),
+    )
+
+    assert.deepEqual(
+      await lineageHeaders({
+        initialHeaders: { "x-gateway-ramp-cli-version": "stale" },
+      }),
+      {
+        "X-Gateway-Ramp-Cli-Version": "0.2.38",
+        "X-Gateway-Client": "pi",
+        "X-Session-Id": "019ff2af-7ce1-7000-8000-000000000001",
+      },
+    )
+    // The version is telemetry, not lineage: it goes out even when the
+    // session id cannot, and never for another provider.
+    assert.deepEqual(await lineageHeaders({ sessionID: "bad id" }), {
+      "Existing-Header": "preserved",
+      "X-Gateway-Ramp-Cli-Version": "0.2.38",
+    })
+    assert.deepEqual(await lineageHeaders({ provider: "openai" }), {
+      "Existing-Header": "preserved",
+    })
   })
 
   it("resolves a fork source from only the parent session header", async () => {

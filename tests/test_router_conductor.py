@@ -20,7 +20,7 @@ import pytest
 from click.testing import CliRunner
 
 import ramp_cli.commands.router as router_module
-from ramp_cli import claude_cowork
+from ramp_cli import __version__, claude_cowork
 from ramp_cli.commands import conductor
 from ramp_cli.commands.router import DEFAULT_ROUTER_BASE_URL as ROUTER_BASE_URL
 from ramp_cli.main import cli
@@ -148,7 +148,12 @@ def test_configure_conductor_writes_wrappers_and_settings(monkeypatch):
     assert f"export ANTHROPIC_BASE_URL={ROUTER_BASE_URL.removesuffix('/v1')}" in (
         claude_wrapper
     )
-    assert "'X-Gateway-Client: claude-code'" in claude_wrapper
+    # Newline-separated like the settings.json value Claude Code parses, and
+    # single-quoted so the shell hands it over verbatim.
+    assert (
+        "export ANTHROPIC_CUSTOM_HEADERS='X-Gateway-Client: claude-code\n"
+        f"X-Gateway-Ramp-Cli-Version: {__version__}'\n"
+    ) in claude_wrapper
     assert str(key_path) in claude_wrapper
     assert "unset ANTHROPIC_API_KEY" in claude_wrapper
     assert str(conductor.vendored_binary("claude")) in claude_wrapper

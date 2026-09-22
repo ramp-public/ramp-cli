@@ -1,6 +1,6 @@
 import type { Config, Plugin, PluginModule } from "@opencode-ai/plugin"
 
-import { discoverRouterModels } from "./discovery.ts"
+import { RAMP_CLI_VERSION_HEADER, discoverRouterModels } from "./discovery.ts"
 import type { RouterModel } from "./discovery.ts"
 import {
   DEFAULT_API_KEY_ENV,
@@ -10,6 +10,7 @@ import {
   resolveBaseURL,
   resolveProviderID,
   resolveProviderName,
+  resolveRampCliVersion,
   routerPluginOptions,
 } from "./options.ts"
 
@@ -131,6 +132,7 @@ const RouterProvider: Plugin = async (_input, rawOptions) => {
   const name = resolveProviderName(options)
   const apiKeyEnv = nonEmpty(options.apiKeyEnv, DEFAULT_API_KEY_ENV)
   const inlineAPIKey = nonEmpty(options.apiKey, "")
+  const rampCliVersion = resolveRampCliVersion(options)
 
   return {
     config: async (config) => {
@@ -142,7 +144,11 @@ const RouterProvider: Plugin = async (_input, rawOptions) => {
         )
       }
 
-      const discovered = await discoverRouterModels({ baseURL, apiKey })
+      const discovered = await discoverRouterModels({
+        baseURL,
+        apiKey,
+        ...(rampCliVersion ? { rampCliVersion } : {}),
+      })
       const existing = providerConfig(config, providerID)
       const existingModels = existing?.models ?? {}
       const models = Object.fromEntries(
@@ -181,6 +187,7 @@ const RouterProvider: Plugin = async (_input, rawOptions) => {
       )
 
       config.provider ??= {}
+      const existingHeaders = existing?.options?.headers
       config.provider[providerID] = {
         ...existing,
         npm: "@ai-sdk/openai",
@@ -198,11 +205,26 @@ const RouterProvider: Plugin = async (_input, rawOptions) => {
           ...existing?.options,
           baseURL,
           ...(inlineAPIKey ? { apiKey: inlineAPIKey } : {}),
+          // OpenCode spreads these options into the @ai-sdk/openai factory,
+          // which sends `headers` on every request; a user's own headers on
+          // the existing entry are kept alongside.
+          ...(rampCliVersion
+            ? {
+                headers: {
+                  ...(isRecord(existingHeaders) ? existingHeaders : {}),
+                  [RAMP_CLI_VERSION_HEADER]: rampCliVersion,
+                },
+              }
+            : {}),
         },
         models,
       }
     },
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 const plugin = {

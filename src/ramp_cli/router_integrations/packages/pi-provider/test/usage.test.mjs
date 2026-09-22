@@ -68,6 +68,7 @@ describe("Pi Router session usage", () => {
         usageOrigin: "https://app.router.com",
         apiKey: "usage-secret",
         sessionID: "pi-session",
+        rampCliVersion: "0.2.38",
         fetch: fetcher,
       }),
       usage(),
@@ -81,6 +82,7 @@ describe("Pi Router session usage", () => {
     )
     assert.deepEqual(fetcher.mock.calls[0].arguments[1].headers, {
       authorization: "Bearer usage-secret",
+      "X-Gateway-Ramp-Cli-Version": "0.2.38",
     })
   })
 

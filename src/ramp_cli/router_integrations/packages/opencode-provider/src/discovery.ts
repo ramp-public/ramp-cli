@@ -63,6 +63,9 @@ type OpenAIModelList = {
 }
 
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 10_000
+// Telemetry only: Router records the CLI version that wrote this plugin's
+// config and grants nothing for it.
+export const RAMP_CLI_VERSION_HEADER = "X-Gateway-Ramp-Cli-Version"
 
 /** The metadata shape this client understands. */
 const SUPPORTED_SCHEMA_VERSION = 1
@@ -215,6 +218,7 @@ export function parseRouterMetadata(
 export async function discoverRouterModels(input: {
   baseURL: string
   apiKey: string
+  rampCliVersion?: string
   fetch?: typeof globalThis.fetch
   timeoutMs?: number
 }): Promise<RouterModel[]> {
@@ -223,6 +227,9 @@ export async function discoverRouterModels(input: {
   const response = await fetcher(`${baseURL}/models`, {
     headers: {
       authorization: `Bearer ${input.apiKey}`,
+      ...(input.rampCliVersion
+        ? { [RAMP_CLI_VERSION_HEADER]: input.rampCliVersion }
+        : {}),
     },
     signal: AbortSignal.timeout(input.timeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS),
   })

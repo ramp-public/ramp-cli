@@ -17,6 +17,7 @@ from pathlib import Path
 
 import click
 
+from ramp_cli import __version__
 from ramp_cli.commands.router_sync import (
     SYNC_HOOK_USER_MANAGED,
     command_runs_session_sync,
@@ -152,6 +153,11 @@ _ROUTER_MODEL_PREFIX = "claude-router-"
 GATEWAY_CLIENT_HEADER = "X-Gateway-Client"
 GATEWAY_CLIENT_HEADER_VALUE = "claude-code"
 MODEL_VIEW_HEADER = "X-Gateway-Model-View"
+# Telemetry only: Router records the installed CLI version and grants nothing
+# for it. The CLI is not in the request path of any agent it configures, so the
+# version is baked into each written config and goes stale until the next
+# configure or sync rewrites it.
+RAMP_CLI_VERSION_HEADER = "X-Gateway-Ramp-Cli-Version"
 
 _STATE_FILENAME = "ramp-router-state.json"
 _ORIGINAL_SETTINGS_FILENAME = "original.settings.json"
@@ -682,6 +688,7 @@ def plan_configuration(
         CUSTOM_HEADERS_STATE_KEY: {
             GATEWAY_CLIENT_HEADER: GATEWAY_CLIENT_HEADER_VALUE,
             MODEL_VIEW_HEADER: "all" if model_view_all else None,
+            RAMP_CLI_VERSION_HEADER: __version__,
         },
     }
     custom_headers = _set_custom_header(
@@ -691,6 +698,9 @@ def plan_configuration(
     )
     custom_headers = _set_custom_header(
         custom_headers, MODEL_VIEW_HEADER, "all" if model_view_all else None
+    )
+    custom_headers = _set_custom_header(
+        custom_headers, RAMP_CLI_VERSION_HEADER, __version__
     )
     updated = dict(settings)
     updated["env"] = {
@@ -1236,7 +1246,8 @@ def _valid_state(state: object) -> bool:
         or not set(automatic_defaults) <= set(SUBAGENT_TIER_ENV_KEYS)
         or not all(isinstance(model, str) for model in automatic_defaults.values())
         or not isinstance(managed_headers, dict)
-        or not set(managed_headers) <= {GATEWAY_CLIENT_HEADER, MODEL_VIEW_HEADER}
+        or not set(managed_headers)
+        <= {GATEWAY_CLIENT_HEADER, MODEL_VIEW_HEADER, RAMP_CLI_VERSION_HEADER}
         or not all(
             value is None or isinstance(value, str)
             for value in managed_headers.values()

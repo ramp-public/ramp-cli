@@ -19,6 +19,7 @@ export type RouterPluginOptions = PluginOptions & {
   apiKey?: string
   apiKeyEnv?: string
   rampExecutable?: string
+  rampCliVersion?: string
 }
 
 export function nonEmpty(value: unknown, fallback: string): string {
@@ -60,6 +61,11 @@ export function resolveAPIKey(options: RouterPluginOptions): string | undefined 
     process.env[LEGACY_API_KEY_ENV] ||
     undefined
   )
+}
+
+/** The CLI version recorded at configure time, absent for a hand-written entry. */
+export function resolveRampCliVersion(options: RouterPluginOptions): string | undefined {
+  return nonEmpty(options.rampCliVersion, "") || undefined
 }
 
 /**

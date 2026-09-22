@@ -10,6 +10,7 @@ from click.testing import CliRunner
 
 import ramp_cli.commands.claude_code as claude_code
 import ramp_cli.commands.router as router_module
+from ramp_cli import __version__
 from ramp_cli.main import cli
 
 
@@ -1261,7 +1262,9 @@ def test_discovery_is_enabled_with_the_projection_marker(monkeypatch, tmp_path):
 
     env = json.loads((tmp_path / "settings.json").read_text())["env"]
     assert env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
-    assert env["ANTHROPIC_CUSTOM_HEADERS"] == "X-Gateway-Client: claude-code"
+    assert env["ANTHROPIC_CUSTOM_HEADERS"] == (
+        f"X-Gateway-Client: claude-code\nX-Gateway-Ramp-Cli-Version: {__version__}"
+    )
     # The default model has to come from the list Claude Code itself will see,
     # or the id written here is one its picker does not recognize.
     assert any(headers.get("X-Gateway-Client") == "claude-code" for headers in seen)
@@ -1280,7 +1283,8 @@ def test_configuration_merges_custom_headers_and_restores_them(tmp_path):
     )
 
     assert configured["env"]["ANTHROPIC_CUSTOM_HEADERS"] == (
-        "X-Unrelated: keep\nX-Gateway-Client: claude-code"
+        "X-Unrelated: keep\nX-Gateway-Client: claude-code\n"
+        f"X-Gateway-Ramp-Cli-Version: {__version__}"
     )
     assert claude_code.plan_restoration(configured, path, state) == original
 
@@ -1328,6 +1332,31 @@ def test_refresh_does_not_claim_a_user_edited_model_view(tmp_path):
     restored = claude_code.plan_restoration(refreshed, path, state)
 
     assert restored["env"]["ANTHROPIC_CUSTOM_HEADERS"] == ("X-Gateway-Model-View: all")
+
+
+def test_a_refresh_after_an_upgrade_rewrites_the_version_it_still_owns(
+    tmp_path, monkeypatch
+):
+    # The header is Router's to keep current and Router's to remove: a refresh
+    # by a newer CLI must replace the older value rather than orphan it, and
+    # unconfigure must then recognize the newer value as its own.
+    path = tmp_path / "settings.json"
+    original = {"env": {"ANTHROPIC_CUSTOM_HEADERS": "X-Unrelated: keep"}}
+    configured, state = claude_code.plan_configuration(
+        original, path, "https://router.example", "secret", "model"
+    )
+    monkeypatch.setattr(claude_code, "__version__", "9.9.9")
+
+    refreshed, fresh = claude_code.plan_configuration(
+        configured, path, "https://router.example", "secret", "model"
+    )
+    state = claude_code.merge_states(state, fresh, preserve_model_view_ownership=True)
+
+    assert refreshed["env"]["ANTHROPIC_CUSTOM_HEADERS"] == (
+        "X-Unrelated: keep\nX-Gateway-Client: claude-code\n"
+        "X-Gateway-Ramp-Cli-Version: 9.9.9"
+    )
+    assert claude_code.plan_restoration(refreshed, path, state) == original
 
 
 def test_capability_overrides_are_not_written(monkeypatch, tmp_path):

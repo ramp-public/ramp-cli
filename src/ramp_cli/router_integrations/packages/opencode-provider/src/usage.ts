@@ -1,4 +1,4 @@
-import { normalizeBaseURL } from "./discovery.ts"
+import { RAMP_CLI_VERSION_HEADER, normalizeBaseURL } from "./discovery.ts"
 
 /** The dashboard origin paired with the production data plane. */
 const DEFAULT_USAGE_BASE_URL = "https://app.router.com"
@@ -64,6 +64,7 @@ export async function fetchSessionUsage(input: {
   usageOrigin: string
   apiKey: string
   sessionID: string
+  rampCliVersion?: string
   fetch?: typeof globalThis.fetch
   timeoutMs?: number
 }): Promise<SessionUsage | undefined> {
@@ -78,7 +79,12 @@ export async function fetchSessionUsage(input: {
     const response = await fetcher(
       `${origin}/session-usage/usage/session?${query}`,
       {
-        headers: { authorization: `Bearer ${input.apiKey}` },
+        headers: {
+          authorization: `Bearer ${input.apiKey}`,
+          ...(input.rampCliVersion
+            ? { [RAMP_CLI_VERSION_HEADER]: input.rampCliVersion }
+            : {}),
+        },
         signal: AbortSignal.timeout(input.timeoutMs ?? DEFAULT_USAGE_TIMEOUT_MS),
       },
     )

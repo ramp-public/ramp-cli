@@ -9,6 +9,7 @@ import type {
 import {
   resolveAPIKey,
   resolveProviderID,
+  resolveRampCliVersion,
   resolveUsageOrigin,
   routerPluginOptions,
 } from "./options.ts"
@@ -50,6 +51,7 @@ function barFill(row: SidebarBarRow): string {
 const RouterTui: TuiPlugin = async (api, rawOptions) => {
   const options = routerPluginOptions(rawOptions)
   const providerID = resolveProviderID(options)
+  const rampCliVersion = resolveRampCliVersion(options)
   const [updateNotice, setUpdateNotice] = createSignal<string>()
 
   // Deliberately not awaited: the bounded, fail-open hook reads cached state
@@ -116,6 +118,7 @@ const RouterTui: TuiPlugin = async (api, rawOptions) => {
         usageOrigin: resolveUsageOrigin(options),
         apiKey,
         sessionID,
+        ...(rampCliVersion ? { rampCliVersion } : {}),
         timeoutMs: USAGE_FETCH_TIMEOUT_MS,
       })
       lastFetched.set(sessionID, Date.now())

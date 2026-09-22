@@ -10,7 +10,7 @@ from pathlib import Path
 import click
 import pytest
 
-from ramp_cli import claude_cowork
+from ramp_cli import __version__, claude_cowork
 
 
 @pytest.fixture
@@ -229,7 +229,10 @@ def test_configure_and_unconfigure_restore_the_previous_claude_setup(cowork_host
         "inferenceCredentialKind": "static",
         "inferenceGatewayApiKey": "router-secret",
         "inferenceGatewayAuthScheme": "bearer",
-        "inferenceCustomHeaders": {"X-Gateway-Client": "claude-cowork"},
+        "inferenceCustomHeaders": {
+            "X-Gateway-Client": "claude-cowork",
+            "X-Gateway-Ramp-Cli-Version": __version__,
+        },
         "modelDiscoveryEnabled": True,
     }
     meta = json.loads(meta_path.read_text())
@@ -459,6 +462,32 @@ def test_unconfigure_refuses_to_delete_a_profile_with_a_changed_gateway(cowork_h
     assert profile_path.exists()
     assert claude_cowork.state_path().exists()
     assert events == ["quit", "launch", "quit", "launch"]
+
+
+@pytest.mark.parametrize("recorded_version", ["0.1.0", None])
+def test_unconfigure_removes_a_profile_written_by_another_cli_version(
+    cowork_host, recorded_version
+):
+    # The version header is telemetry the CLI wrote, not a user edit: a
+    # profile from before the upgrade (or before the header existed) must
+    # still be recognized as ours to remove.
+    _root, _events = cowork_host
+    profile_path, _ = claude_cowork.configure(
+        "router-secret", "https://router.example/v1"
+    )
+    profile = json.loads(profile_path.read_text())
+    if recorded_version is None:
+        del profile["inferenceCustomHeaders"]["X-Gateway-Ramp-Cli-Version"]
+    else:
+        profile["inferenceCustomHeaders"]["X-Gateway-Ramp-Cli-Version"] = (
+            recorded_version
+        )
+    profile_path.write_text(json.dumps(profile))
+
+    claude_cowork.unconfigure()
+
+    assert not profile_path.exists()
+    assert not claude_cowork.state_path().exists()
 
 
 def test_unconfigure_cleans_up_an_interrupted_receipt_without_a_profile(cowork_host):

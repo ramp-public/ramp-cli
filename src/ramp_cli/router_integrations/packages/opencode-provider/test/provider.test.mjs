@@ -74,6 +74,7 @@ describe("discoverRouterModels", () => {
     const discovered = await discoverRouterModels({
       baseURL: "http://localhost:8002",
       apiKey: "test-secret",
+      rampCliVersion: "0.2.38",
       fetch: fetcher,
     })
     assert.deepEqual(
@@ -95,6 +96,7 @@ describe("discoverRouterModels", () => {
     )
     assert.deepEqual(fetcher.mock.calls[0].arguments[1].headers, {
       authorization: "Bearer test-secret",
+      "X-Gateway-Ramp-Cli-Version": "0.2.38",
     })
   })
 
@@ -199,6 +201,32 @@ describe("OpenCode provider plugin", () => {
       config.provider["ramp-router"].options.baseURL,
       "https://router-api.ramp.com/v1",
     )
+  })
+
+  it("sends the recorded CLI version on every request without dropping the user's headers", async () => {
+    // OpenCode spreads provider options into the @ai-sdk/openai factory, so
+    // this is the only place a header can be attached to inference requests.
+    mock.method(globalThis, "fetch", async (_url, init) => {
+      assert.equal(init.headers["X-Gateway-Ramp-Cli-Version"], "0.2.38")
+      return new Response(
+        JSON.stringify({ object: "list", data: [{ id: "model-a", router: routerMetadata("model-a") }] }),
+        { status: 200 },
+      )
+    })
+
+    const hooks = await plugin.server(
+      {},
+      { apiKey: "inline-secret", rampCliVersion: "0.2.38" },
+    )
+    const config = {
+      provider: { "ramp-router": { options: { headers: { "X-Mine": "keep" } } } },
+    }
+    await hooks.config(config)
+
+    assert.deepEqual(config.provider["ramp-router"].options.headers, {
+      "X-Mine": "keep",
+      "X-Gateway-Ramp-Cli-Version": "0.2.38",
+    })
   })
 })
 
