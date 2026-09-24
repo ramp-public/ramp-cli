@@ -176,14 +176,40 @@ describe("toV2Model", () => {
           },
         },
       ],
-      // Withheld, as v1 withholds release_date.
-      time: { released: 0 },
+      time: { released: Date.parse("2026-01-01") },
       // cache_read/cache_write become cache.read/cache.write.
       cost: [{ input: 1.25, output: 10, cache: { read: 0.125, write: 0 } }],
       status: "active",
       enabled: true,
       limit: { context: 400000, output: 128000 },
     })
+  })
+
+  it("uses the schema's zero fallback only for missing or invalid release dates", () => {
+    const metadata = {
+      schemaVersion: 1,
+      displayName: "Model",
+      providerDisplayName: "OpenAI",
+      listingOrder: 0,
+      contextWindow: 128000,
+      maxOutputTokens: 16384,
+      inputModalities: ["text"],
+      outputModalities: ["text"],
+      reasoningEfforts: [],
+      reasoningSummaryValues: [],
+      reasoningSummaryRequestable: false,
+      reasoningInclude: [],
+    }
+    const released = (releaseDate) =>
+      toV2Model("ramp-router", {
+        id: "model",
+        metadata: { ...metadata, ...(releaseDate === undefined ? {} : { releaseDate }) },
+      }).time.released
+
+    assert.equal(released("2024-02-29"), Date.parse("2024-02-29"))
+    for (const date of [undefined, "", "not-a-date", "2026-02-30", "2026-13-01", "2026-01-01T12:00:00Z"]) {
+      assert.equal(released(date), 0, `invalid release date ${date}`)
+    }
   })
 
   it("keeps the include list Router states, empty included, and sends no summary where none is read", () => {
@@ -285,8 +311,8 @@ describe("OpenCode v2 setup", () => {
       assert.equal(init.headers.authorization, "Bearer inline-secret")
       assert.equal(init.headers["X-Gateway-Ramp-Cli-Version"], "0.2.38")
       return modelList(
-        { id: "gpt-5.6-sol", owned_by: "openai", router: routerMetadata("gpt-5.6-sol", { reasoning: openaiReasoning }) },
-        { id: "claude-sonnet-4-6", owned_by: "anthropic", router: routerMetadata("claude-sonnet-4-6", { provider: "Anthropic", reasoning: translatedReasoning }) },
+        { id: "gpt-5.6-sol", created: 1767225600, owned_by: "openai", router: routerMetadata("gpt-5.6-sol", { reasoning: openaiReasoning }) },
+        { id: "claude-sonnet-4-6", created: 1e15, owned_by: "anthropic", router: routerMetadata("claude-sonnet-4-6", { provider: "Anthropic", reasoning: translatedReasoning }) },
         { id: "typesafe", owned_by: "typesafe", router: routerMetadata("typesafe") },
       )
     })
@@ -315,6 +341,8 @@ describe("OpenCode v2 setup", () => {
     )
     assert.deepEqual(models[0].variants.map((variant) => variant.id), ["low", "high"])
     assert.deepEqual(models[1].variants.map((variant) => variant.id), ["high"])
+    assert.equal(models[0].time.released, Date.parse("2026-01-01"))
+    assert.equal(models[1].time.released, 0)
 
     // The transform is replayable: OpenCode re-runs it on every registry
     // rebuild and must get the same models without another discovery call.

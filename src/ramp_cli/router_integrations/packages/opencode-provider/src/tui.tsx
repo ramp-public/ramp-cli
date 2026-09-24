@@ -9,25 +9,15 @@ import type {
 import type { Plugin as TuiPluginV2 } from "@opencode/plugin/tui"
 
 import {
-  resolveAPIKey,
   resolveProviderID,
-  resolveRampCliVersion,
-  resolveUsageOrigin,
   routerPluginOptions,
 } from "./options.ts"
-import type { RouterPluginOptions } from "./options.ts"
-import { fetchSessionUsage } from "./usage.ts"
-import type { SessionUsage } from "./usage.ts"
-import { sidebarUsageView } from "./sidebar-view.ts"
+import { createUsageTracker } from "./usage-tracker.ts"
+import { subscribeV1UsageEvents } from "./v1-usage-events.ts"
 import type { SidebarBarRow, SidebarUsageView } from "./sidebar-view.ts"
 import { showRampCLIUpdateNotice } from "./update-notice.ts"
 
 const PLUGIN_ID = "@ramp/router-opencode-provider"
-const USAGE_FETCH_TIMEOUT_MS = 3_000
-// One idle event ends every turn, but streams of them can land close together
-// while the user reads. A short gap keeps that from re-querying Router
-// without ever showing a stale figure for long.
-const USAGE_REFRESH_MIN_INTERVAL_MS = 5_000
 // Built-in sections use orders 100-400; the repo path lives in the separate
 // sidebar_footer slot, so anything above 400 sits below them all.
 const SIDEBAR_ORDER = 450
@@ -39,80 +29,6 @@ const ANTHROPIC_TERRACOTTA = "#D97757"
 
 function barFill(row: SidebarBarRow): string {
   return row.kind === "ramp" ? RAMP_YELLOW : ANTHROPIC_TERRACOTTA
-}
-
-/** What the two OpenCode generations must supply for the shared tracker. */
-type UsageHost = {
-  options: RouterPluginOptions
-  /** Resolve a Router model name to the display name the picker shows. */
-  modelDisplayName: (modelID: string) => string | undefined
-  /**
-   * Whether the session's latest completed turn routed through this
-   * provider. The idle event names every session, not just ours, and the
-   * usage query carries the session id to Router with the credential, so
-   * only sessions this provider actually served may be looked up.
-   */
-  isRouterSession: (sessionID: string) => boolean
-}
-
-/**
- * The per-session usage state shared by both TUI generations: gated fetches
- * keyed by session, refreshed on idle, rendered from the last-known value.
- */
-function createUsageTracker(host: UsageHost) {
-  const { options } = host
-  const rampCliVersion = resolveRampCliVersion(options)
-  const [usages, setUsages] = createSignal<Record<string, SessionUsage>>({})
-  const inFlight = new Set<string>()
-  const lastFetched = new Map<string, number>()
-
-  const refresh = async (sessionID: string): Promise<void> => {
-    if (!sessionID || inFlight.has(sessionID)) return
-    if (!host.isRouterSession(sessionID)) return
-    // One gate for every trigger, idle events included: usage ingestion lags
-    // a finished turn by a few seconds anyway, so a fetch suppressed here is
-    // caught by the next idle rather than lost.
-    const last = lastFetched.get(sessionID)
-    if (last !== undefined && Date.now() - last < USAGE_REFRESH_MIN_INTERVAL_MS) {
-      return
-    }
-    inFlight.add(sessionID)
-    try {
-      const apiKey = resolveAPIKey(options)
-      if (!apiKey) return
-      const usage = await fetchSessionUsage({
-        usageOrigin: resolveUsageOrigin(options),
-        apiKey,
-        sessionID,
-        ...(rampCliVersion ? { rampCliVersion } : {}),
-        timeoutMs: USAGE_FETCH_TIMEOUT_MS,
-      })
-      lastFetched.set(sessionID, Date.now())
-      setUsages((previous) => {
-        if (usage) return { ...previous, [sessionID]: usage }
-        if (!(sessionID in previous)) return previous
-        const next = { ...previous }
-        delete next[sessionID]
-        return next
-      })
-    } catch {
-      // The usage display is an extra; the sidebar keeps working without it.
-    } finally {
-      inFlight.delete(sessionID)
-    }
-  }
-
-  /** The rendered view for one session, or nothing when Router has no figures. */
-  const view = (sessionID: string): SidebarUsageView | undefined => {
-    const usage = usages()[sessionID]
-    if (!usage) return undefined
-    // The sidebar's content width is fixed, so the bars fit it by
-    // construction rather than tracking the terminal, whose width says
-    // nothing about the slot's.
-    return sidebarUsageView(usage, { modelDisplayName: host.modelDisplayName })
-  }
-
-  return { refresh, view }
 }
 
 type SectionProps = {
@@ -228,17 +144,14 @@ const RouterTuiV1: TuiPlugin = async (api, rawOptions) => {
       } catch {
         // An unreadable session is not ours to query.
       }
-      return false
+      return undefined
     },
   })
 
-  // A turn's usage lands in Router through event ingestion, so the idle event
-  // marks the earliest moment a fresh figure could exist. Show the last-known
-  // value until then; never a spinner.
-  const unsubscribe = api.event.on("session.idle", (event) => {
-    void tracker.refresh(event.properties.sessionID)
-  })
-  api.lifecycle.onDispose(unsubscribe)
+  // V1 may publish a completed assistant or idle status without delivering
+  // session.idle to the TUI. Any completion starts the bounded ingestion retry.
+  subscribeV1UsageEvents(api, providerID, tracker.onIdle)
+  api.lifecycle.onDispose(tracker.dispose)
 
   api.slots.register({
     order: SIDEBAR_ORDER,
@@ -301,12 +214,19 @@ const setupRouterTuiV2: TuiPluginV2.Definition["setup"] = (context) => {
       } catch {
         // An unreadable session is not ours to query.
       }
-      return false
+      return undefined
     },
+    syncSession: (sessionID) => context.data.session.message.sync(sessionID),
   })
 
   const stopIdle = context.data.on("session.idle", (event) => {
-    void tracker.refresh(event.data.sessionID)
+    tracker.onIdle(event.data.sessionID)
+  })
+  // V2 emits execution.succeeded on the normal completion path. Its idle
+  // message can reach the TUI without a session.idle event; either event
+  // starts the same bounded retry sequence for delayed Router ingestion.
+  const stopSucceeded = context.data.on("session.execution.succeeded", (event) => {
+    tracker.onIdle(event.data.sessionID)
   })
   const unslot = context.ui.slot({
     append: "sidebar.content",
@@ -326,7 +246,9 @@ const setupRouterTuiV2: TuiPluginV2.Definition["setup"] = (context) => {
 
   return () => {
     stopIdle()
+    stopSucceeded()
     unslot()
+    tracker.dispose()
   }
 }
 

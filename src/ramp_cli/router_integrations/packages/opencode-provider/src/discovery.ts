@@ -118,7 +118,8 @@ function rate(value: unknown): number | undefined {
 function isoDate(value: unknown): string | undefined {
   // The model object carries a Unix timestamp; clients want a calendar date.
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined
-  return new Date(value * 1000).toISOString().slice(0, 10)
+  const date = new Date(value * 1000)
+  return Number.isFinite(date.getTime()) ? date.toISOString().slice(0, 10) : undefined
 }
 
 function pricing(value: unknown): RouterPricing | undefined {

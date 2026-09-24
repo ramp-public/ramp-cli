@@ -153,7 +153,7 @@ describe("OpenCode provider plugin", () => {
         JSON.stringify({
           object: "list",
           data: [
-            { id: "gpt-4o", owned_by: "openai", router: routerMetadata("gpt-4o") },
+            { id: "gpt-4o", created: 1767225600, owned_by: "openai", router: routerMetadata("gpt-4o") },
             {
               id: "gpt-5.4",
               owned_by: "openai",
@@ -195,6 +195,7 @@ describe("OpenCode provider plugin", () => {
     })
     assert.equal(provider.models["gpt-4o"].limit.output, 2048)
     assert.equal(provider.models["gpt-4o"].reasoning, false)
+    assert.equal(Object.hasOwn(provider.models["gpt-4o"], "release_date"), false)
     assert.equal(provider.models["gpt-5.4"].reasoning, true)
     // Variants come from Router's published efforts now, for OpenAI models
     // too. OpenCode's own generated set was only used when Router said

@@ -61,13 +61,23 @@ export type V2ProviderInfo = {
   body?: Record<string, unknown>
 }
 
+function releaseTimestamp(date: string | undefined): number {
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return 0
+  // v2 compares release times with Date.now() to select recent models and
+  // sorts the catalog by them, so the schema's finite number is UTC millis.
+  const released = Date.parse(date)
+  return Number.isFinite(released) && new Date(released).toISOString().slice(0, 10) === date
+    ? released
+    : 0
+}
+
 /**
  * Map one Router model onto OpenCode v2's native model shape.
  *
  * Every field OpenCode v2 requires is stated from Router's metadata rather
  * than left to OpenCode's defaults, which assume a 200k window and 32k output
  * for anything unspecified. Fields v2 ignores (temperature, attachment,
- * release date, reasoning flag) are not carried over.
+ * reasoning flag) are not carried over.
  */
 export function toV2Model(providerID: string, model: RouterModel): V2ModelInfo {
   const metadata = model.metadata
@@ -103,10 +113,7 @@ export function toV2Model(providerID: string, model: RouterModel): V2ModelInfo {
       id: effort,
       settings,
     })),
-    // Withheld for the same reason v1 withholds release_date: Router
-    // publishes no model family, and a date without one only feeds a
-    // "newest of its family" rule half of what it needs.
-    time: { released: 0 },
+    time: { released: releaseTimestamp(metadata.releaseDate) },
     cost: metadata.pricing
       ? [
           {
