@@ -8,7 +8,7 @@ export const DEFAULT_API_KEY_ENV = "RAMP_ROUTER_API_KEY"
 export const LEGACY_API_KEY_ENV = "LLM_GATEWAY_API_KEY"
 export const DEFAULT_BASE_URL_ENV = "RAMP_ROUTER_BASE_URL"
 export const LEGACY_BASE_URL_ENV = "LLM_GATEWAY_BASE_URL"
-export const DEFAULT_BASE_URL = "https://router-api.ramp.com/v1"
+export const DEFAULT_BASE_URL = "https://api.router.com/v1"
 export const USAGE_BASE_URL_ENV = "RAMP_ROUTER_USAGE_BASE_URL"
 
 export type RouterPluginOptions = PluginOptions & {

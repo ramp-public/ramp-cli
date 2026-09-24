@@ -945,3 +945,84 @@ def test_configured_gateway_base_url_rejects_endpoint_drift(cowork_host):
     with pytest.raises(click.ClickException) as error:
         claude_cowork.configured_gateway_base_url()
     assert "endpoint changed after setup" in error.value.message
+
+
+def test_migrate_gateway_base_url_keeps_the_original_restore_snapshot(cowork_host):
+    _, events = cowork_host
+    profile_path, _ = claude_cowork.configure(
+        "router-secret", "https://router-api.ramp.com/v1"
+    )
+    original_state = json.loads(claude_cowork.state_path().read_text())
+    original_profile = json.loads(profile_path.read_text())
+    events.clear()
+
+    assert claude_cowork.migrate_gateway_base_url(
+        "https://router-api.ramp.com", "https://api.router.com"
+    )
+    assert events == []
+    assert claude_cowork.configured_gateway_base_url() == "https://api.router.com"
+    assert json.loads(profile_path.read_text()) == {
+        **original_profile,
+        "inferenceGatewayBaseUrl": "https://api.router.com",
+    }
+    assert json.loads(claude_cowork.state_path().read_text()) == {
+        **original_state,
+        "gateway_base_url": "https://api.router.com",
+    }
+    assert not claude_cowork.migrate_gateway_base_url(
+        "https://router-api.ramp.com", "https://api.router.com"
+    )
+
+
+def test_migrate_gateway_base_url_skips_running_or_edited_profiles(
+    cowork_host, monkeypatch
+):
+    _, events = cowork_host
+    profile_path, _ = claude_cowork.configure(
+        "router-secret", "https://router-api.ramp.com/v1"
+    )
+    events.clear()
+    before = profile_path.read_text()
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: True)
+    assert not claude_cowork.migrate_gateway_base_url(
+        "https://router-api.ramp.com", "https://api.router.com"
+    )
+    assert profile_path.read_text() == before
+    assert events == []
+
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: False)
+    profile = json.loads(before)
+    profile["inferenceGatewayBaseUrl"] = "https://user.example"
+    profile_path.write_text(json.dumps(profile))
+    with pytest.raises(click.ClickException, match="profile changed after setup"):
+        claude_cowork.migrate_gateway_base_url(
+            "https://router-api.ramp.com", "https://api.router.com"
+        )
+    assert json.loads(profile_path.read_text()) == profile
+
+
+def test_migrate_gateway_base_url_restores_profile_when_receipt_write_fails(
+    cowork_host, monkeypatch
+):
+    profile_path, _ = claude_cowork.configure(
+        "router-secret", "https://router-api.ramp.com/v1"
+    )
+    original_profile = profile_path.read_text()
+    original_state = claude_cowork.state_path().read_text()
+    write = claude_cowork._write_private_json
+    failed = False
+
+    def fail_once(path, value):
+        nonlocal failed
+        if path == claude_cowork.state_path() and not failed:
+            failed = True
+            raise OSError("disk full")
+        write(path, value)
+
+    monkeypatch.setattr(claude_cowork, "_write_private_json", fail_once)
+    with pytest.raises(click.ClickException, match="Could not migrate"):
+        claude_cowork.migrate_gateway_base_url(
+            "https://router-api.ramp.com", "https://api.router.com"
+        )
+    assert profile_path.read_text() == original_profile
+    assert claude_cowork.state_path().read_text() == original_state

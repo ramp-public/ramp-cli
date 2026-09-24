@@ -776,6 +776,52 @@ def configured_gateway_base_url() -> str:
     return base_url
 
 
+def configured_router_connection() -> tuple[str, str]:
+    """Read a coherent CLI-owned credential and endpoint pair.
+
+    A concurrent reconfigure can change both files. Holding the same lock as
+    configure prevents refresh from fetching one generation's endpoint with
+    another generation's key.
+    """
+    with transaction_lock():
+        return configured_api_key(), configured_gateway_base_url()
+
+
+def migrate_gateway_base_url(previous: str, replacement: str) -> bool:
+    """Move an owned profile while Desktop is closed, without opening the app.
+
+    Refresh can be launched by an agent's session-start hook, so it must not
+    quit an active Cowork session just to update the production host. The
+    receipt and profile must agree and still belong to this CLI before either
+    is rewritten; an edited profile is the user's to reconfigure explicitly.
+    """
+    with transaction_lock():
+        if _claude_is_running():
+            return False
+        state = _read_state()
+        if state is None or state.get("gateway_base_url") != previous:
+            return False
+        profile = _owned_profile(state)
+        if profile is None:
+            raise click.ClickException(
+                "The Claude Cowork Router profile is missing. "
+                "Run the configure command again to repair it."
+            )
+        profile_path = _profile_path(state["profile_id"])
+        updated_profile = {**profile, "inferenceGatewayBaseUrl": replacement}
+        updated_state = {**state, "gateway_base_url": replacement}
+        try:
+            _write_private_json(profile_path, updated_profile)
+            _write_private_json(state_path(), updated_state)
+        except OSError as exc:
+            _restore_document(profile_path, profile, True)
+            _restore_document(state_path(), state, True)
+            raise click.ClickException(
+                f"Could not migrate the Claude Cowork Router profile: {exc}"
+            ) from None
+        return True
+
+
 def _owned_profile(state: dict) -> dict | None:
     profile, profile_exists = _read_object(
         _profile_path(state["profile_id"]), "Claude Cowork Router profile"

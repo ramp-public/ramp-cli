@@ -286,7 +286,7 @@ def test_base_url_is_the_host_root():
     # Claude Code appends /v1/messages itself, so a base URL ending in /v1
     # produces /v1/v1/messages and every request 404s.
     assert not router_module._router_host().endswith("/v1")
-    assert router_module._router_host() == "https://router-api.ramp.com"
+    assert router_module._router_host() == "https://api.router.com"
 
 
 def test_setup_state_requires_the_complete_current_schema(tmp_path):

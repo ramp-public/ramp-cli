@@ -396,13 +396,13 @@ describe("OpenCode v2 setup", () => {
 
   it("uses the production Router endpoint by default", async () => {
     mock.method(globalThis, "fetch", async (url) => {
-      assert.equal(url, "https://router-api.ramp.com/v1/models")
+      assert.equal(url, "https://api.router.com/v1/models")
       return modelList({ id: "m", router: routerMetadata("m") })
     })
     const { ctx, added } = fakeContext({ apiKey: "k" })
 
     await plugin.setup(ctx)
 
-    assert.equal(added[0].info.settings.baseURL, "https://router-api.ramp.com/v1")
+    assert.equal(added[0].info.settings.baseURL, "https://api.router.com/v1")
   })
 })

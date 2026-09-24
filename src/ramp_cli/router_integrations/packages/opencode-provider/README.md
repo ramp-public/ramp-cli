@@ -51,7 +51,7 @@ global plugin array. Both forms accept `apiKey`, `baseURL`, `usageBaseURL`,
   "plugin": [
     [
       "file:///absolute/path/to/opencode-provider",
-      { "apiKey": "...", "baseURL": "https://router-api.ramp.com/v1" }
+      { "apiKey": "...", "baseURL": "https://api.router.com/v1" }
     ]
   ]
 }
@@ -61,7 +61,7 @@ global plugin array. Both forms accept `apiKey`, `baseURL`, `usageBaseURL`,
   "plugins": [
     {
       "package": "file:///absolute/path/to/opencode-provider",
-      "options": { "apiKey": "...", "baseURL": "https://router-api.ramp.com/v1" }
+      "options": { "apiKey": "...", "baseURL": "https://api.router.com/v1" }
     }
   ]
 }

@@ -17,6 +17,16 @@ Ramp Router. The picker lists the integrations found on your machine:
 ramp router configure
 ```
 
+New production setups use `https://api.router.com/v1` for Router requests.
+`ramp router refresh` migrates the exact previous production endpoint
+(`https://router-api.ramp.com/v1`) in CLI-managed agent setups to the canonical
+host. For Claude Code, the configured `ANTHROPIC_BASE_URL` is the host without
+`/v1`. Other saved deployments and current `RAMP_ROUTER_BASE_URL` /
+`LLM_GATEWAY_BASE_URL` overrides are preserved. Claude Cowork's Desktop profile
+migrates on refresh when Claude Desktop is closed. Refresh does not interrupt
+a running Desktop session; to migrate immediately, run
+`ramp router configure cowork --base-url https://api.router.com/v1`.
+
 Without a terminal (for example, during an MDM install), omitting client names
 configures all automatic integrations, including Claude Desktop/Cowork when
 installed on macOS. Claude Desktop restarts to apply its Router profile.

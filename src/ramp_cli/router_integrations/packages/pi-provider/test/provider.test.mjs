@@ -2109,7 +2109,7 @@ describe("Pi provider extension", () => {
     await registerRouterProvider({ registerProvider, on: mock.fn() })
 
     const [provider] = registerProvider.mock.calls[0].arguments
-    assert.equal(provider.baseUrl, "https://router-api.ramp.com/v1")
+    assert.equal(provider.baseUrl, "https://api.router.com/v1")
   })
 })
 
@@ -2142,7 +2142,7 @@ describe("which Router the plugin calls", () => {
     process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "pi-home-"))
     delete process.env.RAMP_ROUTER_BASE_URL
 
-    assert.equal(await registeredBaseUrl(), "https://router-api.ramp.com/v1")
+    assert.equal(await registeredBaseUrl(), "https://api.router.com/v1")
   })
 })
 

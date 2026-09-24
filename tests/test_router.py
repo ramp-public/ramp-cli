@@ -1608,6 +1608,75 @@ def test_refresh_migrates_stale_cowork_model_selections(tmp_path, monkeypatch):
     assert selector["cowork"]["model"] == "claude-fable-router-5-6-sol-419255[1m]"
 
 
+def test_refresh_migrates_a_closed_cli_owned_cowork_profile(tmp_path, monkeypatch):
+    monkeypatch.setattr(claude_cowork.sys, "platform", "darwin")
+    monkeypatch.setenv("RAMP_CLAUDE_DESKTOP_APP_SUPPORT", str(tmp_path))
+    monkeypatch.setattr(claude_cowork, "_ensure_claude_installed", lambda: None)
+    monkeypatch.setattr(claude_cowork, "_quit_claude", lambda: None)
+    monkeypatch.setattr(claude_cowork, "_launch_claude", lambda **_kwargs: None)
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: False)
+    profile_path, _ = claude_cowork.configure(
+        "router-secret", router_module.LEGACY_ROUTER_BASE_URL
+    )
+    monkeypatch.setenv("RAMP_ROUTER_BASE_URL", router_module.LEGACY_ROUTER_BASE_URL)
+    _mock_models(monkeypatch, base_url=router_module.LEGACY_ROUTER_BASE_URL)
+    overridden = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+    assert overridden.exit_code == 0, overridden.output
+    assert claude_cowork.configured_gateway_base_url() == (
+        "https://router-api.ramp.com"
+    )
+
+    monkeypatch.delenv("RAMP_ROUTER_BASE_URL")
+    _mock_models(monkeypatch)
+
+    result = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+
+    assert result.exit_code == 0, result.output
+    assert "Moved Claude Cowork's Router profile to api.router.com" in result.output
+    assert claude_cowork.configured_gateway_base_url() == "https://api.router.com"
+    assert json.loads(profile_path.read_text())["inferenceGatewayBaseUrl"] == (
+        "https://api.router.com"
+    )
+
+
+@pytest.mark.parametrize(
+    ("migration_completed", "expected_connection"),
+    [
+        (True, ("legacy-key", "https://api.router.com/v1")),
+        (False, ("custom-key", "https://custom.example/v1")),
+    ],
+)
+def test_cowork_refresh_keeps_key_and_endpoint_paired_across_reconfigure(
+    tmp_path, monkeypatch, migration_completed, expected_connection
+):
+    _stale_cowork_selection(tmp_path, monkeypatch)
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: False)
+    connection = ["legacy-key", "https://router-api.ramp.com"]
+
+    def read_connection():
+        return tuple(connection)
+
+    def migrate(_previous, _replacement):
+        # A configure from another process changes both values immediately
+        # after the migration lock is released.
+        connection[:] = ["custom-key", "https://custom.example"]
+        return migration_completed
+
+    monkeypatch.setattr(claude_cowork, "configured_router_connection", read_connection)
+    monkeypatch.setattr(claude_cowork, "migrate_gateway_base_url", migrate)
+    captured = []
+
+    def fetch_models(key, **kwargs):
+        captured.append((key, kwargs["base_url"]))
+        return [_router_model("claude-router-5-6-sol-419255")]
+
+    monkeypatch.setattr(router_module, "_fetch_models", fetch_models)
+    result = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+
+    assert result.exit_code == 0, result.output
+    assert captured == [expected_connection]
+
+
 def test_refresh_leaves_cowork_selections_alone_while_claude_runs(
     tmp_path, monkeypatch
 ):
@@ -1698,6 +1767,92 @@ def test_refresh_without_the_configure_environment_keeps_stored_endpoints(
         if isinstance(item, list) and len(item) > 1
     ]
     assert entry[1]["baseURL"] == "https://qa-router.example/v1"
+
+
+def test_refresh_migrates_cli_owned_legacy_production_endpoints(tmp_path, monkeypatch):
+    legacy_url = router_module.LEGACY_ROUTER_BASE_URL
+    claude_home = tmp_path / "claude"
+    codex_home = tmp_path / "codex"
+    opencode_config = tmp_path / "opencode" / "opencode.json"
+    pi_home = tmp_path / "pi"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("OPENCODE_CONFIG", str(opencode_config))
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(pi_home))
+    monkeypatch.setenv("RAMP_ROUTER_BASE_URL", legacy_url)
+    _mock_models(monkeypatch, base_url=legacy_url)
+    runner = CliRunner()
+
+    configured = runner.invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure",
+            "claude-code",
+            "codex",
+            "opencode",
+            "pi",
+            "--api-key",
+            "router-secret",
+        ],
+    )
+    assert configured.exit_code == 0, configured.output
+
+    # A current override explicitly selecting the legacy host takes precedence
+    # over automatic migration of previously written configurations.
+    overridden = runner.invoke(cli, ["--human", "router", "refresh"])
+    assert overridden.exit_code == 0, overridden.output
+    settings_path = claude_home / "settings.json"
+    assert json.loads(settings_path.read_text())["env"]["ANTHROPIC_BASE_URL"] == (
+        "https://router-api.ramp.com"
+    )
+
+    monkeypatch.delenv("RAMP_ROUTER_BASE_URL")
+    _mock_models(monkeypatch)
+    refreshed = runner.invoke(cli, ["--human", "router", "refresh"])
+    assert refreshed.exit_code == 0, refreshed.output
+    assert json.loads(settings_path.read_text())["env"]["ANTHROPIC_BASE_URL"] == (
+        "https://api.router.com"
+    )
+    assert (
+        tomllib.loads((codex_home / "config.toml").read_text())["model_providers"][
+            "ramp-router"
+        ]["base_url"]
+        == ROUTER_BASE_URL
+    )
+    plugins = json.loads(opencode_config.read_text())["plugin"]
+    assert (
+        next(entry[1] for entry in plugins if isinstance(entry, list))["baseURL"]
+        == ROUTER_BASE_URL
+    )
+    assert (
+        json.loads((pi_home / "ramp-router-config.json").read_text())["baseUrl"]
+        == ROUTER_BASE_URL
+    )
+
+
+def test_refresh_does_not_migrate_unmanaged_legacy_router_config(tmp_path, monkeypatch):
+    config_path = tmp_path / "opencode.json"
+    original = {
+        "plugin": [
+            [
+                "file:///user/plugin",
+                {
+                    "providerID": "ramp-router",
+                    "baseURL": "https://router-api.ramp.com/v1",
+                },
+            ]
+        ],
+        "theme": "user-choice",
+    }
+    config_path.write_text(json.dumps(original))
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
+
+    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+
+    assert refreshed.exit_code == 0, refreshed.output
+    assert json.loads(config_path.read_text()) == original
 
 
 def test_refresh_does_not_claim_a_user_selected_claude_model_view(
@@ -1820,6 +1975,7 @@ def test_configure_claude_fetches_exhaustive_view_but_writes_compact(
     # The picker preference is Claude Code's, not the fetch's: a compact
     # configure leaves the settings without the expanded-view header.
     environment = json.loads((claude_home / "settings.json").read_text())["env"]
+    assert environment["ANTHROPIC_BASE_URL"] == "https://api.router.com"
     assert "X-Gateway-Model-View" not in environment.get("ANTHROPIC_CUSTOM_HEADERS", "")
 
 
@@ -2744,7 +2900,7 @@ def test_configure_codex_writes_router_provider(tmp_path, monkeypatch):
     provider = config["model_providers"]["ramp-router"]
     assert provider == {
         "name": "Ramp Router",
-        "base_url": "https://router-api.ramp.com/v1",
+        "base_url": "https://api.router.com/v1",
         "wire_api": "responses",
         "supports_websockets": False,
         # Command auth, not experimental_bearer_token: Codex only refreshes its
@@ -4523,20 +4679,30 @@ def test_configure_codex_requires_interactive_input(tmp_path, monkeypatch):
     assert not (tmp_path / "codex" / "config.toml").exists()
 
 
+@pytest.mark.parametrize(
+    ("saved_url", "active_url"),
+    [
+        (ROUTER_BASE_URL, ROUTER_BASE_URL),
+        (router_module.LEGACY_ROUTER_BASE_URL, ROUTER_BASE_URL),
+        (ROUTER_BASE_URL, router_module.LEGACY_ROUTER_BASE_URL),
+    ],
+)
 def test_configure_reuses_one_existing_router_key_without_browser(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, saved_url, active_url
 ):
     codex_home = tmp_path / "codex"
     pi_home = tmp_path / "pi"
     codex_home.mkdir()
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     monkeypatch.setenv("PI_CODING_AGENT_DIR", str(pi_home))
+    if active_url != ROUTER_BASE_URL:
+        monkeypatch.setenv("RAMP_ROUTER_BASE_URL", active_url)
     (codex_home / "ramp-router-state.json").write_text("{}\n")
     (codex_home / "ramp-router-key").write_text("existing-key\n")
     (codex_home / "config.toml").write_text(
-        f'[model_providers.ramp-router]\nbase_url = "{ROUTER_BASE_URL}"\n'
+        f'[model_providers.ramp-router]\nbase_url = "{saved_url}"\n'
     )
-    _mock_models(monkeypatch, key="existing-key")
+    _mock_models(monkeypatch, key="existing-key", base_url=active_url)
 
     def unexpected_browser_setup(*_args, **_kwargs):
         raise AssertionError("browser setup should not run")
@@ -4571,6 +4737,21 @@ def test_configure_reuses_one_existing_router_key_without_browser(
         "existing-key"
     )
     assert "existing-key" not in result.output
+
+
+def test_router_key_reuse_does_not_cross_into_a_distinct_deployment(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    (codex_home / "ramp-router-state.json").write_text("{}\n")
+    (codex_home / "ramp-router-key").write_text("custom-key\n")
+    (codex_home / "config.toml").write_text(
+        '[model_providers.ramp-router]\nbase_url = "https://custom.example/v1"\n'
+    )
+
+    assert router_module._stored_router_api_key_choices() == []
 
 
 @pytest.mark.parametrize(
@@ -4840,7 +5021,7 @@ def test_configure_opencode_installs_plugin_and_preserves_config(tmp_path, monke
         {
             "providerID": "ramp-router",
             "name": "Ramp Router",
-            "baseURL": "https://router-api.ramp.com/v1",
+            "baseURL": "https://api.router.com/v1",
             # The dashboard origin the plugin's session-usage status
             # display queries; the data plane does not serve it.
             "usageBaseURL": "https://app.router.com",
@@ -5179,7 +5360,7 @@ def test_configure_opencode_v2_writes_plugins_objects_and_cli_json(
         "options": {
             "providerID": "ramp-router",
             "name": "Ramp Router",
-            "baseURL": "https://router-api.ramp.com/v1",
+            "baseURL": "https://api.router.com/v1",
             "usageBaseURL": "https://app.router.com",
             "apiKey": "router-secret",
             "rampCliVersion": __version__,
@@ -5210,7 +5391,7 @@ def test_configure_opencode_v2_writes_plugins_objects_and_cli_json(
         "router-secret"
     )
     assert router_module._stored_router_base_url("opencode", config_path) == (
-        "https://router-api.ramp.com/v1"
+        "https://api.router.com/v1"
     )
 
     unconfigure = CliRunner().invoke(
@@ -5327,6 +5508,10 @@ def test_configure_pi_installs_plugin_and_is_idempotent(tmp_path, monkeypatch):
     assert json.loads((pi_home / "auth.json").read_text()) == {
         "ramp-router": {"type": "api_key", "key": "router-secret"}
     }
+    assert (
+        json.loads((pi_home / "ramp-router-config.json").read_text())["baseUrl"]
+        == ROUTER_BASE_URL
+    )
     assert "Connecting Ramp Router to your coding agent" in first.output
     assert "Connected to: Pi" in first.output
     assert "2 models added. Start an agent and pick a model." in first.output

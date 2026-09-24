@@ -213,7 +213,7 @@ describe("OpenCode provider plugin", () => {
 
   it("uses the production Router endpoint by default", async () => {
     mock.method(globalThis, "fetch", async (url) => {
-      assert.equal(url, "https://router-api.ramp.com/v1/models")
+      assert.equal(url, "https://api.router.com/v1/models")
       return new Response(
         JSON.stringify({ object: "list", data: [{ id: "model-a", router: routerMetadata("model-a") }] }),
         { status: 200 },
@@ -226,7 +226,7 @@ describe("OpenCode provider plugin", () => {
 
     assert.equal(
       config.provider["ramp-router"].options.baseURL,
-      "https://router-api.ramp.com/v1",
+      "https://api.router.com/v1",
     )
   })
 

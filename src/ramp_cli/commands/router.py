@@ -57,7 +57,8 @@ from ramp_cli.version_check import (
     sync_update_notice_file,
 )
 
-DEFAULT_ROUTER_BASE_URL = "https://router-api.ramp.com/v1"
+DEFAULT_ROUTER_BASE_URL = "https://api.router.com/v1"
+LEGACY_ROUTER_BASE_URL = "https://router-api.ramp.com/v1"
 
 # The bundled plugins already take these, and reading them here too means a
 # stack other than production can be reached without hand-editing the files
@@ -76,7 +77,7 @@ ROUTER_BASE_URL_ENV = BASE_URL_ENVS[0]
 # Deployments whose dashboard is not the data-plane host minus /v1.
 KNOWN_DEPLOYMENT_UI_URLS = {
     DEFAULT_ROUTER_BASE_URL: ROUTER_UI_URL,
-    "https://api.router.com/v1": ROUTER_UI_URL,
+    LEGACY_ROUTER_BASE_URL: ROUTER_UI_URL,
     "https://qa-api.router.com/v1": "https://qa.router.com",
     "https://internal-api.router.com/v1": "https://internal.router.com",
     "https://qa-internal-api.router.com/v1": "https://qa-internal.router.com",
@@ -1603,9 +1604,9 @@ def _run_configure(
 def _refresh_cowork_model_selections() -> dict | None:
     """Migrate Cowork's persisted model selections during a refresh.
 
-    Cowork joins refresh for exactly one artifact: the model selections its
-    host app persisted. The Router profile itself needs no reapplication —
-    configure writes it once — but a selection that predates a Router model
+    Cowork also moves a CLI-owned profile from the legacy production host
+    while Desktop is closed. It must not quit an active Cowork session merely
+    because a session-start hook ran. A selection that predates a Router model
     rename keeps an id Claude no longer recognizes, which it sizes at its
     200k unknown-model fallback instead of the model's real window. Refresh
     heals those whenever Claude Desktop is closed; configure covers the
@@ -1626,8 +1627,33 @@ def _refresh_cowork_model_selections() -> dict | None:
             "skipped_while_running": True,
         }
     try:
-        api_key = claude_cowork.configured_api_key()
-        base_url = f"{claude_cowork.configured_gateway_base_url()}/v1"
+        api_key, gateway_origin = claude_cowork.configured_router_connection()
+        base_url = f"{gateway_origin}/v1"
+        migrated_gateway = False
+        if base_url == LEGACY_ROUTER_BASE_URL and not any(
+            os.environ.get(name, "").strip() for name in BASE_URL_ENVS
+        ):
+            migrated_gateway = claude_cowork.migrate_gateway_base_url(
+                _router_host(LEGACY_ROUTER_BASE_URL),
+                _router_host(DEFAULT_ROUTER_BASE_URL),
+            )
+            if migrated_gateway:
+                base_url = DEFAULT_ROUTER_BASE_URL
+            elif claude_cowork.claude_is_running():
+                return {
+                    "client": COWORK_CLIENT,
+                    "migrated_model_selections": 0,
+                    "skipped_while_running": True,
+                }
+            else:
+                # Another configure could have changed the profile while
+                # refresh waited for the lock; never fetch against a stale
+                # endpoint paired with this credential. Read both together.
+                api_key, gateway_origin = claude_cowork.configured_router_connection()
+                base_url = f"{gateway_origin}/v1"
+            # On success keep the legacy credential read before migration:
+            # both production hosts accept it, even if another configure
+            # switches this profile to a custom deployment in the meantime.
         # Cowork accepts the ids from its own projection, same as configure.
         models = _fetch_models(
             api_key,
@@ -1648,6 +1674,7 @@ def _refresh_cowork_model_selections() -> dict | None:
         "client": COWORK_CLIENT,
         "migrated_model_selections": len(outcome.migrated),
         "skipped_while_running": outcome.skipped_while_running,
+        **({"migrated_gateway": True} if migrated_gateway else {}),
     }
 
 
@@ -1660,14 +1687,19 @@ def _cowork_refresh_message(result: dict) -> str:
             "Claude Cowork's saved model selections were not checked because "
             "Claude Desktop is running."
         )
+    migrated_gateway = result.get("migrated_gateway") is True
     count = result["migrated_model_selections"]
     if count:
         plural = "" if count == 1 else "s"
-        return (
+        message = (
             f"Updated {count} saved Claude Cowork model selection{plural} to "
             "the ids Router serves today."
         )
-    return "Claude Cowork's saved model selections are current."
+    else:
+        message = "Claude Cowork's saved model selections are current."
+    if migrated_gateway:
+        return "Moved Claude Cowork's Router profile to api.router.com. " + message
+    return message
 
 
 @router_group.command(
@@ -1720,11 +1752,13 @@ def router_refresh(ctx: click.Context) -> None:
                         "Ramp Router is no longer configured in Conductor."
                     )
                 api_key = _stored_router_api_key(client, path)
-                # The endpoint paired with the stored credential wins for
-                # every client, so a refresh run under a different
-                # environment — such as one spawned by session sync — cannot
-                # rewrite a non-production setup to the default Router.
-                base_url = _stored_router_base_url(client, path) or router_base_url()
+                # Keep the endpoint paired with the stored credential for
+                # other deployments, regardless of the environment under
+                # which a session-start sync happens. Both production hosts
+                # accept the same keys, so migrate only the exact CLI-owned
+                # legacy production URL unless this run explicitly selects
+                # a deployment through the environment.
+                base_url = _refresh_router_base_url(client, path)
                 claude_code_view = client == "claude-code"
                 request_key = (api_key, claude_code_view, base_url)
                 models = models_by_request.get(request_key)
@@ -5852,7 +5886,11 @@ def _stored_router_api_key_choices() -> list[tuple[str, tuple[str, ...]]]:
                     path.parent / "ramp-router-state.json"
                 ):
                     continue
-                if _stored_router_base_url(client, path) != active_url:
+                saved_url = _stored_router_base_url(client, path)
+                if saved_url != active_url and {saved_url, active_url} != {
+                    DEFAULT_ROUTER_BASE_URL,
+                    LEGACY_ROUTER_BASE_URL,
+                }:
                     continue
                 api_key = _stored_router_api_key(client, path)
         except click.ClickException:
@@ -5946,6 +5984,22 @@ def _stored_router_base_url(client: str, path: Path) -> str | None:
     if isinstance(base_url, str) and base_url.strip():
         return base_url.strip().rstrip("/")
     return None
+
+
+def _refresh_router_base_url(client: str, path: Path) -> str:
+    """Migrate only a saved CLI-owned production alias, not other deployments.
+
+    Enrollment in ``configured_router_clients`` requires our setup receipt
+    and credential. A current deployment override suppresses this migration;
+    refresh still uses the saved endpoint so it cannot repoint a QA or custom
+    setup when invoked from a different shell.
+    """
+    stored = _stored_router_base_url(client, path)
+    if stored == LEGACY_ROUTER_BASE_URL and not any(
+        os.environ.get(name, "").strip() for name in BASE_URL_ENVS
+    ):
+        return DEFAULT_ROUTER_BASE_URL
+    return stored or router_base_url()
 
 
 def _stored_router_api_key(client: str, path: Path) -> str:

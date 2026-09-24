@@ -45,7 +45,7 @@ import { registerUsageWidget } from "./usage.ts"
 const PROVIDER_ID = "ramp-router"
 const API_KEY_ENVS = ["RAMP_ROUTER_API_KEY", "LLM_GATEWAY_API_KEY"]
 const BASE_URL_ENVS = ["RAMP_ROUTER_BASE_URL", "LLM_GATEWAY_BASE_URL"]
-const DEFAULT_BASE_URL = "https://router-api.ramp.com/v1"
+const DEFAULT_BASE_URL = "https://api.router.com/v1"
 // Only the first uncached launch waits for discovery. A stalled Router must not
 // inherit the general 10-second request deadline and hold every Pi startup.
 const STARTUP_DISCOVERY_TIMEOUT_MS = 2_000
