@@ -17,7 +17,6 @@ from ramp_cli.auth import refresh as refresh_helper
 from ramp_cli.auth import store
 from ramp_cli.auth.constants import INVALID_GRANT
 from ramp_cli.auth.oauth import (
-    OAuthTokenError,
     TokenResponse,
     _classify_token_error,
     _extract_agent_key_uuid,
@@ -126,30 +125,24 @@ def test_agent_key_uuid_roundtrips_through_disk():
 # --- oauth error classification ---
 
 
-@pytest.mark.parametrize(
-    "description",
-    [
-        "Agent-key-authorized session has expired; please re-authenticate.",
-        "Session has expired",
-    ],
-)
-def test_classify_token_error__session_expired_maps_to_invalid_grant(description):
+def test_classify_token_error__refresh_400_maps_to_invalid_grant():
     assert (
-        _classify_token_error(
-            status_code=401, grant_type="refresh_token", description=description
-        )
+        _classify_token_error(status_code=400, grant_type="refresh_token")
         == INVALID_GRANT
     )
 
 
-def test_refresh_failure_on_session_expiry_raises_invalid_grant():
-    err = OAuthTokenError("token_request_failed", "Session has expired")
-    classified = _classify_token_error(
-        status_code=401,
-        grant_type="refresh_token",
-        description=err.description,
+@pytest.mark.parametrize(
+    ("status_code", "grant_type"),
+    [(401, "refresh_token"), (500, "refresh_token"), (400, "authorization_code")],
+)
+def test_classify_token_error__other_failures_are_not_invalid_grant(
+    status_code, grant_type
+):
+    assert (
+        _classify_token_error(status_code=status_code, grant_type=grant_type)
+        == "token_request_failed"
     )
-    assert classified == INVALID_GRANT
 
 
 # --- exchange/refresh wiring (JWT-based) ---

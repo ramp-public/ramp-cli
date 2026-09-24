@@ -538,17 +538,16 @@ def test_try_refresh__clears_tokens_on_invalid_grant(isolated_config, monkeypatc
     assert store.get_tokens("sandbox") == ("", "")
 
 
-def test_refresh_tokens__classifies_ramp_refresh_not_found_as_invalid_grant(
+def test_refresh_tokens__classifies_ramp_error_envelope_400_as_invalid_grant(
     monkeypatch,
 ):
     class FakeResponse:
-        status_code = 401
+        status_code = 400
         is_error = True
         text = (
             '{"error_v2":{"additional_info":{},"notes":"","error_id":"abc123",'
-            '"error_code":"DEVELOPER_7002","message":"Refresh token with given '
-            'refresh_token not found"},"error":{"message":"Refresh token with '
-            'given refresh_token not found","details":{}}}'
+            '"error_code":"EXTERNAL_AGENT_7003","message":"Agent key has expired."},'
+            '"error":{"message":"Agent key has expired.","details":{}}}'
         )
 
         @staticmethod
@@ -558,13 +557,10 @@ def test_refresh_tokens__classifies_ramp_refresh_not_found_as_invalid_grant(
                     "additional_info": {},
                     "notes": "",
                     "error_id": "abc123",
-                    "error_code": "DEVELOPER_7002",
-                    "message": "Refresh token with given refresh_token not found",
+                    "error_code": "EXTERNAL_AGENT_7003",
+                    "message": "Agent key has expired.",
                 },
-                "error": {
-                    "message": "Refresh token with given refresh_token not found",
-                    "details": {},
-                },
+                "error": {"message": "Agent key has expired.", "details": {}},
             }
 
     monkeypatch.setattr(

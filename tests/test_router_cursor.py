@@ -373,33 +373,6 @@ def test_unconfigure_cursor_prints_manual_steps(monkeypatch, tmp_path):
     assert "Removed Ramp Router" not in result.output
 
 
-def test_bare_unconfigure_offers_cursor_when_installed(monkeypatch, tmp_path):
-    monkeypatch.setenv("RAMP_CLAUDE_DESKTOP_APP_SUPPORT", str(tmp_path))
-    monkeypatch.setattr(router_module, "_clients_with_a_receipt", lambda: ())
-    monkeypatch.setattr(router_module, "_cursor_is_installed", lambda: True)
-    monkeypatch.setattr(router_module, "_can_draw_picker", lambda _ctx: True)
-    captured = {}
-
-    class Prompt:
-        def ask(self):
-            return ["cursor"]
-
-    def checkbox(message, **kwargs):
-        captured.update(kwargs)
-        return Prompt()
-
-    monkeypatch.setattr(router_module.questionary, "checkbox", checkbox)
-    result = CliRunner().invoke(cli, ["--human", "router", "unconfigure"])
-    assert result.exit_code == 0, result.output
-    # A Cursor-only setup left no receipt, so an installed Cursor is the
-    # evidence the picker runs on; picking it prints the removal steps
-    # instead of claiming Router is not configured anywhere.
-    assert any(
-        getattr(choice, "value", None) == "cursor" for choice in captured["choices"]
-    )
-    assert 'Toggle off "OpenAI API Key"' in result.output
-
-
 def test_configure_announces_the_clipboard_when_another_client_fails(
     monkeypatch, tmp_path
 ):

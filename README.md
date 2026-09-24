@@ -10,12 +10,18 @@ curl -fsSL https://agents.ramp.com/install.sh | sh
 
 This detects your platform, downloads a pre-built binary, and sets up the `ramp` command.
 
-After installation, choose which coding agents to connect to Ramp Router. The
-picker lists the agents found on your machine, all selected by default:
+After installation, choose which coding agents and desktop apps to connect to
+Ramp Router. The picker lists the integrations found on your machine:
 
 ```bash
 ramp router configure
 ```
+
+Without a terminal (for example, during an MDM install), omitting client names
+configures all automatic integrations, including Claude Desktop/Cowork when
+installed on macOS. Claude Desktop restarts to apply its Router profile.
+All integrations use the same key acquired during that run.
+Pass client names, such as `ramp router configure codex`, to limit setup.
 
 To connect to another Router deployment, pass `--base-url` (the gateway `/v1`
 URL written into agent configs) and, for a deployment the CLI does not already

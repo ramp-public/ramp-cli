@@ -208,12 +208,25 @@ def test_configure_scrubs_the_stale_fable_verdict(monkeypatch, tmp_path):
 
     config = json.loads(user_config.read_text(encoding="utf-8"))
     assert config["modelAccessCache"] == []
+    settings = json.loads((tmp_path / "settings.json").read_text())
+    assert settings["env"]["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+    assert settings["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
     assert (
         "Removed Claude Code's cached not-entitled Fable 5 verdict" not in result.output
     )
 
 
-def test_repeat_configure_scrubs_the_stale_fable_verdict(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["router", "configure", "claude-code", "--claude-models", "compact"],
+        ["router", "refresh"],
+    ],
+)
+@pytest.mark.parametrize("previous", [None, "", "1"])
+def test_repeat_configure_scrubs_the_stale_fable_verdict(
+    monkeypatch, tmp_path, command, previous
+):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
     _mock_models(monkeypatch)
     (tmp_path / "settings.json").write_text("{}", encoding="utf-8")
@@ -223,6 +236,28 @@ def test_repeat_configure_scrubs_the_stale_fable_verdict(monkeypatch, tmp_path):
         ["--human", "router", "configure", "claude-code", "--api-key", "router-key"],
     )
     assert result.exit_code == 0, result.output
+
+    # Upgrade a receipt that predates the bootstrap fix. The preference at
+    # migration time must survive unconfigure, including an explicit empty value.
+    access_key = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+    path = tmp_path / "settings.json"
+    settings = claude_code.read_settings(path)
+    settings["env"].pop(access_key)
+    if previous is not None:
+        settings["env"][access_key] = previous
+    path.write_text(json.dumps(settings))
+    state = claude_code.read_state(path)
+    del state["env"][access_key]
+    del state["written"]["env"][access_key]
+    overlay_path = claude_code.original_settings_path(path)
+    overlay = json.loads(overlay_path.read_text())
+    del overlay["env"][access_key]
+    overlay_body = json.dumps(overlay) + "\n"
+    overlay_path.write_text(overlay_body)
+    state[claude_code.ORIGINAL_SETTINGS_DIGEST_KEY] = router_module._content_digest(
+        overlay_body
+    )
+    claude_code.state_path(path).write_text(json.dumps(state))
 
     # The verdict lands after the first configure — the shape of a machine
     # that used Claude directly before moving to Router.
@@ -234,16 +269,17 @@ def test_repeat_configure_scrubs_the_stale_fable_verdict(monkeypatch, tmp_path):
         encoding="utf-8",
     )
 
-    # A keyless repeat configure takes the existing-setup shortcut and must
-    # still clear it.
-    result = runner.invoke(
-        cli,
-        ["router", "configure", "claude-code", "--claude-models", "compact"],
-        obj=None,
-    )
+    result = runner.invoke(cli, command)
     assert result.exit_code == 0, result.output
     config = json.loads(user_config.read_text(encoding="utf-8"))
     assert config["modelAccessCache"] == []
+    assert claude_code.read_settings(path)["env"][access_key] == "1"
+    assert json.loads(overlay_path.read_text())["env"][access_key] == (previous or "")
+
+    result = runner.invoke(cli, ["router", "unconfigure", "claude-code"])
+    assert result.exit_code == 0, result.output
+    restored_env = claude_code.read_settings(path).get("env", {})
+    assert restored_env.get(access_key) == previous
 
 
 def test_base_url_is_the_host_root():

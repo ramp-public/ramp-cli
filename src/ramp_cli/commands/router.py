@@ -135,11 +135,8 @@ CLIENT_EXECUTABLES = {
 # set up through Claude Desktop's profile library rather than through the
 # config-path machinery the coding agents share.
 COWORK_CLIENT = "cowork"
-# Cursor also joins the pickers without a CLIENT_NAMES entry: it keeps its
-# provider settings in its own account-synced UI, so there is no config file
-# the config-path machinery could write or restore. Configure provisions the
-# credential and prints the two fields to paste; unconfigure prints how to
-# undo them.
+# Cursor requires explicit, guided setup: its account-synced settings cannot
+# be written or restored by the automatic configuration flow.
 CURSOR_CLIENT = "cursor"
 AGENT_NAMES = {
     **CLIENT_NAMES,
@@ -835,8 +832,8 @@ def _can_draw_picker(ctx: click.Context) -> bool:
 
     An installer or CI job supplies the key through the environment without
     passing --no-input, and a full-screen prompt in that shape aborts the
-    command instead of configuring anything. Omitting agent names there means
-    what it always meant: every agent.
+    command instead of configuring anything. Omitting client names there
+    configures all automatic integrations, including available desktop apps.
     """
     if ctx.obj["no_input"]:
         return False
@@ -870,29 +867,16 @@ def _pick_installed_clients() -> tuple[str, ...]:
         # available Cowork earns it a place even where Claude Code itself
         # was not detected.
         candidates = (*candidates, "claude-code")
-    cursor_installed = _cursor_is_installed()
     if not candidates:
-        if cursor_installed:
-            # Cursor's setup is guided rather than written, but it starts
-            # from the same credential, so it earns a line in the same
-            # picker — and an installed Cursor means an agent WAS found.
-            candidates = (CURSOR_CLIENT,)
-        else:
-            # Offering nothing would end the command on a machine where
-            # detection simply missed, and configuring an agent before
-            # installing it is a supported thing to do. Hermes is the
-            # exception: its setup runs through the hermes executable, so a
-            # machine detection just proved has neither the binary nor a
-            # config directory can only fail on it.
-            click.echo("No coding agents found. Showing every agent Router supports.")
-            candidates = tuple(
-                client
-                for client in CLIENT_NAMES
-                if (client != "hermes" or hermes_agent.hermes_executable() is not None)
-                and (client != "conductor" or conductor.is_installed())
-            )
-    elif cursor_installed:
-        candidates = (*candidates, CURSOR_CLIENT)
+        # Detection may miss, and preparing an agent before installing it is
+        # supported. Hermes needs its executable; Conductor needs its app.
+        click.echo("No coding agents found. Showing every agent Router supports.")
+        candidates = tuple(
+            client
+            for client in CLIENT_NAMES
+            if (client != "hermes" or hermes_agent.hermes_executable() is not None)
+            and (client != "conductor" or conductor.is_installed())
+        )
     # The list says which apps an entry covers, so nobody has to think of
     # Claude Code and Claude Desktop as two separate things to configure.
     titles = dict(AGENT_NAMES)
@@ -967,7 +951,7 @@ def _pick_claude_models(
     return selected
 
 
-@click.group("router", help="Configure coding agents to use Ramp Router")
+@click.group("router", help="Connect coding agents and desktop apps to Ramp Router")
 def router_group() -> None:
     pass
 
@@ -1053,7 +1037,10 @@ def _validate_deployment_url(
 
 @router_group.command(
     "configure",
-    help="Configure coding agents and Claude Cowork; omit names to choose interactively",
+    help=(
+        "Configure coding agents and desktop apps. Omit names to choose "
+        "interactively, or configure all automatic integrations without a terminal."
+    ),
 )
 @click.argument(
     "clients",
@@ -1162,9 +1149,15 @@ def _run_configure(
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     requested_clients = tuple(dict.fromkeys(clients))
     picked_from_menu = False
-    if not requested_clients and _can_prompt(ctx, fmt):
-        requested_clients = _pick_installed_clients()
-        picked_from_menu = True
+    if not requested_clients:
+        if _can_prompt(ctx, fmt):
+            requested_clients = _pick_installed_clients()
+            picked_from_menu = True
+        else:
+            # Cowork uses a desktop profile rather than agent config files,
+            # but belongs in unattended setup too.
+            if claude_cowork.is_available():
+                all_clients = (*all_clients, COWORK_CLIENT)
     clients = requested_clients or all_clients
     if (
         claude_models is not None
@@ -1187,10 +1180,8 @@ def _run_configure(
         and api_key is None
         and not deployment_override
     ):
-        # A repeat configure changes only the presentation preference. It does
-        # not need a new key, a model request, or another pass over auth and
-        # discovery settings that are already configured. A new deployment is
-        # a full reconfigure, not a preference change.
+        # A repeat configure repairs the picker locally, without a new key or
+        # model request. A new deployment requires a full reconfigure.
         _stored_router_api_key("claude-code", claude_path)
         current_view = claude_code.model_view(
             claude_code.read_settings(claude_path), claude_path
@@ -1814,11 +1805,6 @@ def router_refresh(ctx: click.Context) -> None:
 
     if failures:
         raise click.ClickException("Could not refresh " + "; ".join(failures))
-
-
-def _cursor_is_installed() -> bool:
-    """Report whether Cursor appears to be present on this machine."""
-    return bool(shutil.which("cursor")) or Path("/Applications/Cursor.app").exists()
 
 
 def _cursor_suggested_model(models: list[RouterModel]) -> str | None:
@@ -2556,7 +2542,7 @@ def _write_subagent_tiers(
 
 
 def _write_claude_model_view(path: Path, view: str) -> None:
-    """Update only Claude's model projection preference and its receipt."""
+    """Update Claude's model projection and prevent stale entitlement refreshes."""
     with claude_code.settings_lock(path):
         state = claude_code.read_state(path)
         original_state = state
@@ -2567,6 +2553,7 @@ def _write_claude_model_view(path: Path, view: str) -> None:
         updated, new_state = claude_code.plan_model_view_update(
             settings, path, state, view
         )
+        overlay = _prepare_claude_original_settings(path, new_state)
         state_path = claude_code.state_path(path)
         try:
             _write_private_file(state_path, json.dumps(new_state, indent=2) + "\n")
@@ -2583,6 +2570,7 @@ def _write_claude_model_view(path: Path, view: str) -> None:
             raise click.ClickException(
                 f"Could not update Claude Code settings {path}: {exc}"
             ) from None
+        _save_claude_original_settings(*overlay)
 
 
 def _subagent_tier_metadata(
@@ -3310,7 +3298,7 @@ def router_strategy_disable(
 
 @router_group.command(
     "unconfigure",
-    help="Restore coding agents and Claude Cowork; omit names to choose interactively",
+    help="Restore coding agents and desktop apps; omit names to choose interactively",
 )
 @click.argument(
     "clients",
@@ -3348,11 +3336,6 @@ def _run_unconfigure(
             # Claude entry is the only interactive road to it, so the entry
             # is offered even where Claude Code itself holds no receipt.
             candidates = ("claude-code", *candidates)
-        if _cursor_is_installed():
-            # Cursor's guided setup leaves no receipt to prove itself, so an
-            # installed Cursor is the best evidence available. The entry
-            # prints the guided removal steps, which is all removal is.
-            candidates = (*candidates, CURSOR_CLIENT)
         if candidates:
             # One Claude entry covers both Claude apps and the Codex entry
             # covers the Codex CLI and app, exactly as the configure picker
@@ -3366,7 +3349,6 @@ def _run_unconfigure(
                 candidates,
                 titles=titles,
             )
-    # A run that names no agents keeps meaning every coding agent.
     clients = requested_clients or tuple(CLIENT_NAMES)
     if cowork_configured and "claude-code" in clients:
         # Unconfiguring Claude Code always unconfigures both Claude apps,
@@ -5470,23 +5452,7 @@ def _configure_claude_code(
         # file from one the user has edited. Planned from the merged state, so
         # it describes what the user had before Router rather than what a
         # previous configure left behind.
-        original_settings = claude_code.original_settings_path(path)
-        overlay_body = (
-            json.dumps(claude_code.plan_original_settings(state), indent=2) + "\n"
-        )
-        overlay_claim = _claim_escape_artifact(
-            original_settings,
-            state,
-            claude_code.ORIGINAL_SETTINGS_STATE_KEY,
-            claude_code.ORIGINAL_SETTINGS_DIGEST_KEY,
-        )
-        if overlay_claim is None:
-            original_settings = None
-        else:
-            state[claude_code.ORIGINAL_SETTINGS_STATE_KEY] = original_settings.name
-            state[claude_code.ORIGINAL_SETTINGS_DIGEST_KEY] = _content_digest(
-                overlay_body
-            )
+        overlay = _prepare_claude_original_settings(path, state)
         # Written first so a successful settings write is always paired with
         # the managed values needed to undo it. A failed settings write puts
         # the prior state back below.
@@ -5508,26 +5474,43 @@ def _configure_claude_code(
             raise click.ClickException(
                 f"Could not update Claude Code settings {path}: {exc}"
             ) from None
-        if overlay_claim in ("create", "replace"):
-            # Written last, and only after the settings landed, because it is
-            # an extra: failing to write it must not fail a setup that is
-            # otherwise complete. New files are created exclusively; existing
-            # files are rewritten only with receipt provenance above.
-            try:
-                if overlay_claim == "create":
-                    _write_new_private_file(original_settings, overlay_body)
-                else:
-                    _write_private_file(original_settings, overlay_body)
-            except OSError as exc:
-                click.echo(
-                    "Could not save your previous Claude Code settings to "
-                    f"{original_settings}: {exc}.",
-                    err=True,
-                )
+        _save_claude_original_settings(*overlay)
     # Outside the settings lock: this touches Claude Code's separate user
     # config, not the settings file the lock guards.
     _scrub_stale_fable_verdict()
     return model
+
+
+def _prepare_claude_original_settings(
+    path: Path, state: dict
+) -> tuple[Path, str, str | None]:
+    original_settings = claude_code.original_settings_path(path)
+    body = json.dumps(claude_code.plan_original_settings(state), indent=2) + "\n"
+    claim = _claim_escape_artifact(
+        original_settings,
+        state,
+        claude_code.ORIGINAL_SETTINGS_STATE_KEY,
+        claude_code.ORIGINAL_SETTINGS_DIGEST_KEY,
+    )
+    if claim is not None:
+        state[claude_code.ORIGINAL_SETTINGS_STATE_KEY] = original_settings.name
+        state[claude_code.ORIGINAL_SETTINGS_DIGEST_KEY] = _content_digest(body)
+    return original_settings, body, claim
+
+
+def _save_claude_original_settings(path: Path, body: str, claim: str | None) -> None:
+    # Written only after the settings land. Preserve user-edited overlays and
+    # don't fail an otherwise complete setup if this optional file cannot save.
+    try:
+        if claim == "create":
+            _write_new_private_file(path, body)
+        elif claim == "replace":
+            _write_private_file(path, body)
+    except OSError as exc:
+        click.echo(
+            f"Could not save your previous Claude Code settings to {path}: {exc}.",
+            err=True,
+        )
 
 
 def _scrub_stale_fable_verdict() -> None:
@@ -5674,7 +5657,7 @@ def _json_config_path(client: str) -> Path:
 
 
 def _opencode_tui_config_path() -> Path:
-    """Locate the TUI plugin config, exactly as OpenCode's TUI resolves it.
+    """Locate the OpenCode v1 TUI plugin config, exactly as its TUI resolves it.
 
     Deliberately not derived from OPENCODE_CONFIG: the TUI does not consult
     that variable either, so following it would write a file the TUI never
@@ -5687,6 +5670,80 @@ def _opencode_tui_config_path() -> Path:
         os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
     ).expanduser()
     return config_home / "opencode" / "tui.json"
+
+
+def _opencode_cli_config_path() -> Path:
+    """Locate OpenCode v2's single global terminal-client config.
+
+    v2 replaced the layered tui.json files with one ``cli.json`` that only
+    the terminal client reads; there is no project-local variant and no
+    environment override for its location.
+    """
+    config_home = Path(
+        os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
+    ).expanduser()
+    return config_home / "opencode" / "cli.json"
+
+
+def _opencode_executable() -> str | None:
+    return shutil.which("opencode")
+
+
+def _opencode_major_version() -> int:
+    """Report which OpenCode generation the plugin config must be written for.
+
+    v1 reads ``plugin`` tuples from opencode.json and tui.json; v2 reads
+    ``plugins`` objects from opencode.json and cli.json and ignores tui.json
+    entirely. The installed binary is the authority when it can be asked. When
+    it cannot (not on PATH, or the version call fails), a cli.json that v2
+    itself created is the next best evidence, and otherwise the v1 layout is
+    kept so an existing setup is never rewritten into a shape its OpenCode
+    cannot read. RAMP_OPENCODE_MAJOR overrides detection for setups where
+    the binary is not reachable from this shell.
+    """
+    override = os.environ.get("RAMP_OPENCODE_MAJOR", "").strip()
+    if override in {"1", "2"}:
+        return int(override)
+    executable = _opencode_executable()
+    if executable:
+        try:
+            result = subprocess.run(
+                [executable, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            result = None
+        if result is not None and result.returncode == 0:
+            match = re.search(r"(\d+)\.\d+\.\d+", result.stdout)
+            if match:
+                return 2 if int(match.group(1)) >= 2 else 1
+    return 2 if _opencode_cli_config_path().is_file() else 1
+
+
+def _opencode_plugin_entries(config: dict) -> list[object]:
+    """Every plugin registration in an OpenCode config, whichever generation.
+
+    v1 wrote ``plugin`` and v2 reads ``plugins``; v2 also still normalizes a
+    leftover v1 ``plugin`` array, so a config can legitimately carry both.
+    """
+    entries: list[object] = []
+    for key in ("plugin", "plugins"):
+        value = config.get(key)
+        if isinstance(value, list):
+            entries.extend(value)
+    return entries
+
+
+def _opencode_plugin_options(entry: object) -> dict | None:
+    """The options object of a v1 tuple or a v2 ``{package, options}`` entry."""
+    if isinstance(entry, list) and len(entry) > 1 and isinstance(entry[1], dict):
+        return entry[1]
+    if isinstance(entry, dict) and isinstance(entry.get("options"), dict):
+        return entry["options"]
+    return None
 
 
 def _client_config_path(client: str) -> Path:
@@ -5850,15 +5907,12 @@ def _stored_router_base_url(client: str, path: Path) -> str | None:
     elif client == "opencode":
         config = _read_json_config(client, path)
         package_path = _bundled_plugin_path(client)
-        plugins = config.get("plugin", [])
-        if isinstance(plugins, list):
-            for entry in plugins:
-                if _is_router_plugin_entry(client, entry, package_path):
-                    if isinstance(entry, list) and len(entry) > 1:
-                        options = entry[1]
-                        if isinstance(options, dict):
-                            base_url = options.get("baseURL")
-                    break
+        for entry in _opencode_plugin_entries(config):
+            if _is_router_plugin_entry(client, entry, package_path):
+                options = _opencode_plugin_options(entry)
+                if options is not None:
+                    base_url = options.get("baseURL")
+                break
     elif client == "pi":
         config = _read_json_config(client, path.parent / PI_PLUGIN_CONFIG_FILE)
         base_url = config.get("baseUrl")
@@ -5908,16 +5962,13 @@ def _stored_router_api_key(client: str, path: Path) -> str:
         elif client == "opencode":
             config = _read_json_config(client, path)
             package_path = _bundled_plugin_path(client)
-            plugins = config.get("plugin", [])
-            if isinstance(plugins, list):
-                for entry in plugins:
-                    if not _is_router_plugin_entry(client, entry, package_path):
-                        continue
-                    if isinstance(entry, list) and len(entry) > 1:
-                        options = entry[1]
-                        if isinstance(options, dict):
-                            api_key = options.get("apiKey")
-                            break
+            for entry in _opencode_plugin_entries(config):
+                if not _is_router_plugin_entry(client, entry, package_path):
+                    continue
+                options = _opencode_plugin_options(entry)
+                if options is not None:
+                    api_key = options.get("apiKey")
+                    break
         elif client == "pi":
             auth = _read_json_config(client, path.parent / "auth.json")
             credential = auth.get(ROUTER_PROVIDER)
@@ -6097,8 +6148,11 @@ def _plugin_source(entry: object) -> str | None:
         return entry
     if isinstance(entry, list) and entry and isinstance(entry[0], str):
         return entry[0]
-    if isinstance(entry, dict) and isinstance(entry.get("source"), str):
-        return entry["source"]
+    if isinstance(entry, dict):
+        # OpenCode v2 registers plugins as {package, options}; Pi as {source}.
+        for key in ("package", "source"):
+            if isinstance(entry.get(key), str):
+                return entry[key]
     return None
 
 
@@ -6125,9 +6179,9 @@ def _is_router_plugin_entry(client: str, entry: object, package_path: Path) -> b
     # because Pi records a native path and Windows separates with backslashes.
     if PurePath(source.rstrip("/\\")).name == package_dir:
         return True
-    if client == "opencode" and isinstance(entry, list) and len(entry) > 1:
-        options = entry[1]
-        if isinstance(options, dict) and options.get("providerID") in {
+    if client == "opencode":
+        options = _opencode_plugin_options(entry)
+        if options is not None and options.get("providerID") in {
             ROUTER_PROVIDER,
             "router",
         }:
@@ -6148,6 +6202,148 @@ def _bundled_plugin_path(client: str) -> Path:
     return path
 
 
+def _opencode_layout(generation: int) -> tuple[str, Path, str]:
+    """The plugin array key, terminal-client config, and its schema URL."""
+    if generation >= 2:
+        return "plugins", _opencode_cli_config_path(), "https://opencode.ai/v2/cli.json"
+    return "plugin", _opencode_tui_config_path(), "https://opencode.ai/tui.json"
+
+
+def _opencode_plugin_array(config: dict, key: str, path: Path) -> list:
+    plugins = config.get(key, [])
+    if not isinstance(plugins, list):
+        raise click.ClickException(
+            f"Could not update OpenCode config {path}: '{key}' must be an array."
+        )
+    return plugins
+
+
+def _configure_opencode(
+    path: Path,
+    package_path: Path,
+    state_path: Path,
+    api_key: str,
+    default_model: str,
+    *,
+    base_url: str | None,
+) -> tuple[str | None, list[tuple[Path, dict]]]:
+    """Register the bundled plugin for whichever OpenCode generation is installed.
+
+    Both generations load the server-side provider from opencode.json but only
+    load the sidebar from their terminal-client config: v1 from tui.json (as a
+    ``plugin`` tuple) and v2 from cli.json (as a ``plugins`` object, which is
+    also the only way the sidebar receives its options, since a plugin v2
+    auto-loads from the server list arrives without any). The same package
+    and options therefore go into both files, in the shape the installed
+    generation reads.
+    """
+    generation = _opencode_major_version()
+    plugin_key, tui_path, tui_schema = _opencode_layout(generation)
+    existing = _read_json_config("opencode", path)
+    for key in ("plugin", "plugins"):
+        _opencode_plugin_array(existing, key, path)
+    for key in ("provider", "providers"):
+        if not isinstance(existing.get(key, {}), dict):
+            raise click.ClickException(
+                f"Could not update OpenCode config {path}: '{key}' must be an object."
+            )
+    providers = existing.get("provider", {})
+    providers_v2 = existing.get("providers", {})
+    tui_existed = tui_path.exists()
+    tui_config = _read_json_config("opencode", tui_path)
+    tui_plugins = _opencode_plugin_array(tui_config, plugin_key, tui_path)
+
+    def router_entries(entries: list) -> list:
+        return [
+            entry
+            for entry in entries
+            if _is_router_plugin_entry("opencode", entry, package_path)
+        ]
+
+    def foreign_entries(entries: list) -> list:
+        return [
+            entry
+            for entry in entries
+            if not _is_router_plugin_entry("opencode", entry, package_path)
+        ]
+
+    state = None
+    if not state_path.exists():
+        # A hand-written static entry for the same provider id is recorded
+        # and removed, whichever key it lives under: v2 layers config
+        # providers over plugin-registered ones, so leaving it would let a
+        # stale static block shadow the discovered catalog.
+        state = (
+            json.dumps(
+                {
+                    "opencode_generation": generation,
+                    "provider_present": ROUTER_PROVIDER in providers,
+                    "provider": providers.get(ROUTER_PROVIDER),
+                    "providers_present": ROUTER_PROVIDER in providers_v2,
+                    "providers": providers_v2.get(ROUTER_PROVIDER),
+                    "model_present": "model" in existing,
+                    "model": existing.get("model"),
+                    "plugin_present": "plugin" in existing,
+                    "plugin_entries": router_entries(existing.get("plugin", [])),
+                    "plugins_present": "plugins" in existing,
+                    "plugins_entries": router_entries(existing.get("plugins", [])),
+                    "tui_file_present": tui_existed,
+                    "tui_plugin_present": plugin_key in tui_config,
+                    "tui_plugin_entries": router_entries(tui_plugins),
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+
+    options = {
+        "providerID": ROUTER_PROVIDER,
+        "name": "Ramp Router",
+        "baseURL": base_url or router_base_url(),
+        # The dashboard origin serving /session-usage, which the data plane
+        # behind baseURL does not. Written explicitly for the same reason
+        # Claude Code gets ROUTER_BASE_URL: the plugin cannot know a
+        # split-origin deployment's dashboard host from the data-plane URL
+        # alone.
+        "usageBaseURL": _statusline_origin(base_url),
+        "apiKey": api_key,
+        "rampCliVersion": __version__,
+        **(
+            {"rampExecutable": str(executable)}
+            if (executable := router_sync_module.ramp_executable()) is not None
+            else {}
+        ),
+    }
+    plugin_entry: object = (
+        {"package": package_path.as_uri(), "options": options}
+        if generation >= 2
+        else [package_path.as_uri(), options]
+    )
+
+    # Strip Router from both plugin keys so an upgrade between generations
+    # never leaves the old shape behind alongside the new one.
+    for key in ("plugin", "plugins"):
+        if key in existing:
+            existing[key] = foreign_entries(existing[key])
+    existing.setdefault(plugin_key, []).append(plugin_entry)
+    other_key = "plugins" if plugin_key == "plugin" else "plugin"
+    if other_key in existing and not existing[other_key]:
+        existing.pop(other_key)
+    for key, mapping in (("provider", providers), ("providers", providers_v2)):
+        mapping.pop(ROUTER_PROVIDER, None)
+        if mapping:
+            existing[key] = mapping
+        else:
+            existing.pop(key, None)
+    existing["model"] = f"{ROUTER_PROVIDER}/{default_model}"
+
+    if not tui_existed:
+        tui_config["$schema"] = tui_schema
+    tui_config[plugin_key] = foreign_entries(tui_plugins)
+    tui_config[plugin_key].append(plugin_entry)
+    return state, [(path, existing), (tui_path, tui_config)]
+
+
 def _configure_plugin_client(
     client: str,
     path: Path,
@@ -6160,101 +6356,14 @@ def _configure_plugin_client(
     state = None
 
     if client == "opencode":
-        existing = _read_json_config(client, path)
-        plugins = existing.get("plugin", [])
-        if not isinstance(plugins, list):
-            raise click.ClickException(
-                f"Could not update OpenCode config {path}: 'plugin' must be an array."
-            )
-        providers = existing.get("provider", {})
-        if not isinstance(providers, dict):
-            raise click.ClickException(
-                f"Could not update OpenCode config {path}: 'provider' must be an object."
-            )
-        # OpenCode's TUI loads plugins only from tui.json; a package listed in
-        # opencode.json alone never gets its sidebar entrypoint loaded. The
-        # same tuple therefore goes into both files: opencode.json for the
-        # server-side provider, tui.json for the usage sidebar.
-        tui_path = _opencode_tui_config_path()
-        tui_existed = tui_path.exists()
-        tui_config = _read_json_config(client, tui_path)
-        tui_plugins = tui_config.get("plugin", [])
-        if not isinstance(tui_plugins, list):
-            raise click.ClickException(
-                f"Could not update OpenCode config {tui_path}: "
-                "'plugin' must be an array."
-            )
-        previous_plugins = [
-            entry
-            for entry in plugins
-            if _is_router_plugin_entry(client, entry, package_path)
-        ]
-        previous_tui_plugins = [
-            entry
-            for entry in tui_plugins
-            if _is_router_plugin_entry(client, entry, package_path)
-        ]
-        if not state_path.exists():
-            state = (
-                json.dumps(
-                    {
-                        "provider_present": ROUTER_PROVIDER in providers,
-                        "provider": providers.get(ROUTER_PROVIDER),
-                        "model_present": "model" in existing,
-                        "model": existing.get("model"),
-                        "plugin_present": "plugin" in existing,
-                        "plugin_entries": previous_plugins,
-                        "tui_file_present": tui_existed,
-                        "tui_plugin_present": "plugin" in tui_config,
-                        "tui_plugin_entries": previous_tui_plugins,
-                    },
-                    indent=2,
-                )
-                + "\n"
-            )
-
-        plugin_entry = [
-            package_path.as_uri(),
-            {
-                "providerID": ROUTER_PROVIDER,
-                "name": "Ramp Router",
-                "baseURL": base_url or router_base_url(),
-                # The dashboard origin serving /session-usage, which the
-                # data plane behind baseURL does not. Written explicitly
-                # for the same reason Claude Code gets ROUTER_BASE_URL:
-                # the plugin cannot know a split-origin deployment's
-                # dashboard host from the data-plane URL alone.
-                "usageBaseURL": _statusline_origin(base_url),
-                "apiKey": api_key,
-                "rampCliVersion": __version__,
-                **(
-                    {"rampExecutable": str(executable)}
-                    if (executable := router_sync_module.ramp_executable()) is not None
-                    else {}
-                ),
-            },
-        ]
-        existing["plugin"] = [
-            entry
-            for entry in plugins
-            if not _is_router_plugin_entry(client, entry, package_path)
-        ]
-        existing["plugin"].append(plugin_entry)
-        providers.pop(ROUTER_PROVIDER, None)
-        if providers:
-            existing["provider"] = providers
-        else:
-            existing.pop("provider", None)
-        existing["model"] = f"{ROUTER_PROVIDER}/{default_model}"
-        if not tui_existed:
-            tui_config["$schema"] = "https://opencode.ai/tui.json"
-        tui_config["plugin"] = [
-            entry
-            for entry in tui_plugins
-            if not _is_router_plugin_entry(client, entry, package_path)
-        ]
-        tui_config["plugin"].append(plugin_entry)
-        writes = [(path, existing), (tui_path, tui_config)]
+        state, writes = _configure_opencode(
+            path,
+            package_path,
+            state_path,
+            api_key,
+            default_model,
+            base_url=base_url,
+        )
     else:
         settings = _read_json_config(client, path)
         packages = settings.get("packages", [])
@@ -6355,6 +6464,140 @@ def _configure_plugin_client(
         ) from None
 
 
+def _unconfigure_opencode(
+    path: Path,
+    state: dict,
+    state_path: Path,
+    package_path: Path,
+) -> list[tuple[Path, dict]]:
+    """Undo the OpenCode registration this CLI wrote, whichever generation.
+
+    Router entries are stripped from both plugin keys and from both terminal
+    configs that exist, because the user may have moved between OpenCode
+    generations since configure ran; the receipt says which file and key the
+    original entries go back into.
+    """
+
+    def entries_from_state(key: str) -> list:
+        previous = state.get(key, [])
+        if not isinstance(previous, list):
+            raise click.ClickException(
+                f"Could not read Ramp Router setup state from {state_path}."
+            )
+        return previous
+
+    def foreign_entries(entries: list) -> list:
+        return [
+            entry
+            for entry in entries
+            if not _is_router_plugin_entry("opencode", entry, package_path)
+        ]
+
+    def restore_array(config: dict, key: str, present_key: str, previous: list) -> None:
+        recorded = present_key in state
+        if key not in config and not previous and not recorded:
+            return
+        plugins = foreign_entries(
+            _opencode_plugin_array(config, key, path) if key in config else []
+        )
+        plugins.extend(previous)
+        if plugins or state.get(present_key) is True:
+            config[key] = plugins
+        elif recorded or key in config:
+            # Either the receipt says the key was absent, or a receipt from
+            # the other generation never recorded this key and it now holds
+            # nothing but the Router entry just stripped.
+            config.pop(key, None)
+
+    existing = _read_json_config("opencode", path)
+    restore_array(
+        existing, "plugin", "plugin_present", entries_from_state("plugin_entries")
+    )
+    restore_array(
+        existing, "plugins", "plugins_present", entries_from_state("plugins_entries")
+    )
+
+    for key, present_key, value_key in (
+        ("provider", "provider_present", "provider"),
+        ("providers", "providers_present", "providers"),
+    ):
+        mapping = existing.get(key, {})
+        if not isinstance(mapping, dict):
+            raise click.ClickException(
+                f"Could not restore OpenCode config {path}: '{key}' must be an object."
+            )
+        if present_key not in state and key == "providers":
+            # A v1-era receipt predates the v2 key; nothing was recorded for it.
+            continue
+        if ROUTER_PROVIDER in mapping:
+            # Configure removed this entry, so one present now was written by
+            # the user afterwards. Their current settings win over the
+            # receipt's snapshot, exactly as a newer model selection does.
+            continue
+        _restore_json_value(
+            mapping, ROUTER_PROVIDER, state.get(present_key), state.get(value_key)
+        )
+        if mapping:
+            existing[key] = mapping
+        else:
+            existing.pop(key, None)
+    if str(existing.get("model", "")).startswith(f"{ROUTER_PROVIDER}/"):
+        _restore_json_value(
+            existing,
+            "model",
+            state.get("model_present"),
+            state.get("model"),
+        )
+    writes = [(path, existing)]
+
+    # Undo the terminal-client registration too. The receipt names the file
+    # configure wrote into; the other generation's file, if present, only
+    # loses the Router entries this CLI recognizes. A receipt from before
+    # configure wrote any terminal config has no record of it, so those
+    # setups likewise only strip Router entries and leave the rest untouched.
+    generation = state.get("opencode_generation", 1)
+    recorded_key, recorded_path, _ = _opencode_layout(
+        generation if isinstance(generation, int) else 1
+    )
+    for plugin_key, tui_path in (
+        ("plugin", _opencode_tui_config_path()),
+        ("plugins", _opencode_cli_config_path()),
+    ):
+        if not tui_path.exists():
+            continue
+        tui_config = _read_json_config("opencode", tui_path)
+        tui_plugins = _opencode_plugin_array(tui_config, plugin_key, tui_path)
+        recorded = tui_path == recorded_path and plugin_key == recorded_key
+        previous = entries_from_state("tui_plugin_entries") if recorded else []
+        if not recorded and not any(
+            _is_router_plugin_entry("opencode", entry, package_path)
+            for entry in tui_plugins
+        ):
+            continue
+        tui_plugins = foreign_entries(tui_plugins)
+        tui_plugins.extend(previous)
+        if tui_plugins or (recorded and state.get("tui_plugin_present") is True):
+            tui_config[plugin_key] = tui_plugins
+        else:
+            tui_config.pop(plugin_key, None)
+        if (
+            recorded
+            and state.get("tui_file_present") is False
+            and set(tui_config) <= {"$schema"}
+        ):
+            # Configure created this file and nothing else moved in, so
+            # removing it restores exactly what the user had: no file.
+            try:
+                tui_path.unlink()
+            except OSError as exc:
+                raise click.ClickException(
+                    f"Could not restore OpenCode config {tui_path}: {exc}"
+                ) from None
+        else:
+            writes.append((tui_path, tui_config))
+    return writes
+
+
 def _unconfigure_json_client(client: str, path: Path) -> None:
     state_path = path.parent / "ramp-router-state.json"
     if not state_path.exists():
@@ -6380,93 +6623,7 @@ def _unconfigure_json_client(client: str, path: Path) -> None:
 
     package_path = integration_package_path(client).resolve()
     if client == "opencode":
-        existing = _read_json_config(client, path)
-        plugins = existing.get("plugin", [])
-        if not isinstance(plugins, list):
-            raise click.ClickException(
-                f"Could not restore OpenCode config {path}: 'plugin' must be an array."
-            )
-        previous_plugins = state.get("plugin_entries", [])
-        if not isinstance(previous_plugins, list):
-            raise click.ClickException(
-                f"Could not read Ramp Router setup state from {state_path}."
-            )
-        plugins = [
-            entry
-            for entry in plugins
-            if not _is_router_plugin_entry(client, entry, package_path)
-        ]
-        plugins.extend(previous_plugins)
-        if plugins or state.get("plugin_present") is True:
-            existing["plugin"] = plugins
-        else:
-            existing.pop("plugin", None)
-
-        providers = existing.get("provider", {})
-        if not isinstance(providers, dict):
-            raise click.ClickException(
-                f"Could not restore OpenCode config {path}: "
-                "'provider' must be an object."
-            )
-        _restore_json_value(
-            providers,
-            ROUTER_PROVIDER,
-            provider_present,
-            state.get("provider"),
-        )
-        if providers:
-            existing["provider"] = providers
-        else:
-            existing.pop("provider", None)
-        if str(existing.get("model", "")).startswith(f"{ROUTER_PROVIDER}/"):
-            _restore_json_value(
-                existing,
-                "model",
-                state.get("model_present"),
-                state.get("model"),
-            )
-        writes = [(path, existing)]
-
-        # Undo the TUI registration too. A receipt from before configure
-        # wrote tui.json has no record of it, so those setups only strip the
-        # Router entries this CLI recognizes and leave the rest untouched.
-        tui_path = _opencode_tui_config_path()
-        if tui_path.exists():
-            tui_config = _read_json_config(client, tui_path)
-            tui_plugins = tui_config.get("plugin", [])
-            if not isinstance(tui_plugins, list):
-                raise click.ClickException(
-                    f"Could not restore OpenCode config {tui_path}: "
-                    "'plugin' must be an array."
-                )
-            previous_tui_plugins = state.get("tui_plugin_entries", [])
-            if not isinstance(previous_tui_plugins, list):
-                raise click.ClickException(
-                    f"Could not read Ramp Router setup state from {state_path}."
-                )
-            tui_plugins = [
-                entry
-                for entry in tui_plugins
-                if not _is_router_plugin_entry(client, entry, package_path)
-            ]
-            tui_plugins.extend(previous_tui_plugins)
-            if tui_plugins or state.get("tui_plugin_present") is True:
-                tui_config["plugin"] = tui_plugins
-            else:
-                tui_config.pop("plugin", None)
-            if state.get("tui_file_present") is False and set(tui_config) <= {
-                "$schema"
-            }:
-                # Configure created this file and nothing else moved in, so
-                # removing it restores exactly what the user had: no file.
-                try:
-                    tui_path.unlink()
-                except OSError as exc:
-                    raise click.ClickException(
-                        f"Could not restore OpenCode config {tui_path}: {exc}"
-                    ) from None
-            else:
-                writes.append((tui_path, tui_config))
+        writes = _unconfigure_opencode(path, state, state_path, package_path)
     else:
         settings = _read_json_config(client, path)
         packages = settings.get("packages", [])

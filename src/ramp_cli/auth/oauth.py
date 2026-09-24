@@ -530,7 +530,7 @@ def _raise_for_token_error(resp: Any, body: dict[str, Any], grant_type: str) -> 
     description = _token_error_description(body, resp)
     error = body.get("error")
     if not isinstance(error, str) or not error:
-        error = _classify_token_error(resp.status_code, grant_type, description)
+        error = _classify_token_error(resp.status_code, grant_type)
     raise OAuthTokenError(str(error), description)
 
 
@@ -550,24 +550,9 @@ def _token_error_description(body: dict[str, Any], resp: Any) -> str:
     return str(body)
 
 
-def _classify_token_error(status_code: int, grant_type: str, description: str) -> str:
-    lower = description.lower()
-    if grant_type == "refresh_token":
-        refresh_invalid_markers = (
-            "refresh token with given refresh_token not found",
-            "invalid refresh token",
-            "expired refresh token",
-            "refresh token expired",
-            "refresh token revoked",
-            "invalid_grant",
-            # Agent-key session lapsed — no refresh path can recover; user must re-auth.
-            "agent-key-authorized session has expired",
-            "session has expired",
-        )
-        if any(marker in lower for marker in refresh_invalid_markers):
-            return INVALID_GRANT
-        if status_code in (400, 401) and "refresh token" in lower:
-            return INVALID_GRANT
+def _classify_token_error(status_code: int, grant_type: str) -> str:
+    if grant_type == "refresh_token" and status_code == 400:
+        return INVALID_GRANT
     return "token_request_failed"
 
 

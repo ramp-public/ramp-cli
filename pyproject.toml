@@ -43,6 +43,9 @@ exclude = [
 
 [tool.hatch.build.targets.sdist.force-include]
 "src/ramp_cli/router_integrations/packages/opencode-provider/src" = "src/ramp_cli/router_integrations/packages/opencode-provider/src"
+# OpenCode v2 resolves a local plugin's entrypoints at the package root.
+"src/ramp_cli/router_integrations/packages/opencode-provider/index.ts" = "src/ramp_cli/router_integrations/packages/opencode-provider/index.ts"
+"src/ramp_cli/router_integrations/packages/opencode-provider/tui.ts" = "src/ramp_cli/router_integrations/packages/opencode-provider/tui.ts"
 "src/ramp_cli/router_integrations/packages/opencode-provider/package.json" = "src/ramp_cli/router_integrations/packages/opencode-provider/package.json"
 "src/ramp_cli/router_integrations/packages/pi-provider/src" = "src/ramp_cli/router_integrations/packages/pi-provider/src"
 "src/ramp_cli/router_integrations/packages/pi-provider/package.json" = "src/ramp_cli/router_integrations/packages/pi-provider/package.json"

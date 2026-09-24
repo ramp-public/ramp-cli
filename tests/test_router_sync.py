@@ -186,8 +186,10 @@ def test_session_sync_hook_command_is_skipped_when_it_cannot_run(monkeypatch):
     monkeypatch.setattr(sync_module, "ramp_executable", lambda: None)
     assert sync_module.session_sync_hook_command("codex") is None
 
-    monkeypatch.setattr(sync_module.os, "name", "nt")
-    assert sync_module.session_sync_hook_command("codex") is None
+    # Restore the process-wide platform before pytest formats its report paths.
+    with monkeypatch.context() as windows:
+        windows.setattr(sync_module.os, "name", "nt")
+        assert sync_module.session_sync_hook_command("codex") is None
 
 
 @pytest.mark.parametrize(

@@ -19,7 +19,12 @@ def test_clients_load_checked_in_typescript_sources():
     opencode = json.loads((packages / "opencode-provider" / "package.json").read_text())
     pi = json.loads((packages / "pi-provider" / "package.json").read_text())
 
-    assert opencode["exports"]["."] == "./src/index.ts"
+    # OpenCode v2 resolves a local plugin's entrypoints at the package root,
+    # so the manifest points there and the root files forward to src/.
+    assert opencode["exports"]["."] == "./index.ts"
+    assert opencode["exports"]["./tui"] == "./tui.ts"
+    for entrypoint in ("index.ts", "tui.ts"):
+        assert (packages / "opencode-provider" / entrypoint).is_file()
     assert pi["pi"]["extensions"] == ["./src/index.ts"]
 
 

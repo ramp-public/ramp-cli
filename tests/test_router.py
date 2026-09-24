@@ -4573,8 +4573,11 @@ def test_configure_reuses_one_existing_router_key_without_browser(
     assert "existing-key" not in result.output
 
 
-def test_configure_does_not_reuse_a_key_from_another_router_endpoint(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    "saved_base_url", [ROUTER_BASE_URL, "https://qa-router.ramp.dev/v1"]
+)
+def test_configure_without_terminal_uses_browser_even_with_a_saved_key(
+    tmp_path, monkeypatch, saved_base_url
 ):
     codex_home = tmp_path / "codex"
     pi_home = tmp_path / "pi"
@@ -4582,9 +4585,9 @@ def test_configure_does_not_reuse_a_key_from_another_router_endpoint(
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     monkeypatch.setenv("PI_CODING_AGENT_DIR", str(pi_home))
     (codex_home / "ramp-router-state.json").write_text("{}\n")
-    (codex_home / "ramp-router-key").write_text("nonproduction-key\n")
+    (codex_home / "ramp-router-key").write_text("existing-key\n")
     (codex_home / "config.toml").write_text(
-        '[model_providers.ramp-router]\nbase_url = "https://qa-router.ramp.dev/v1"\n'
+        f'[model_providers.ramp-router]\nbase_url = "{saved_base_url}"\n'
     )
     _mock_models(monkeypatch, key="browser-key")
     browser_calls = []
@@ -5058,6 +5061,224 @@ def test_unconfigure_opencode_keeps_newer_model_selection(tmp_path, monkeypatch)
     assert json.loads(config_path.read_text())["model"] == "new/provider-model"
 
 
+def test_unconfigure_opencode_keeps_newer_provider_override(tmp_path, monkeypatch):
+    """A providers.ramp-router block written after configure is the user's."""
+    monkeypatch.setenv("RAMP_OPENCODE_MAJOR", "2")
+    config_path = tmp_path / "opencode.json"
+    config_path.write_text(
+        json.dumps({"providers": {"ramp-router": {"name": "Old static block"}}})
+    )
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    configure = runner.invoke(
+        cli,
+        ["--human", "router", "configure", "opencode"],
+        input="router-secret\n",
+    )
+    assert configure.exit_code == 0
+    assert "providers" not in json.loads(config_path.read_text())
+    config = json.loads(config_path.read_text())
+    config["providers"] = {"ramp-router": {"headers": {"X-Team": "platform"}}}
+    config_path.write_text(json.dumps(config))
+
+    unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "opencode"])
+
+    assert unconfigure.exit_code == 0
+    # The receipt's snapshot does not overwrite the newer entry.
+    assert json.loads(config_path.read_text())["providers"] == {
+        "ramp-router": {"headers": {"X-Team": "platform"}}
+    }
+
+
+def _fake_opencode(tmp_path, version: str) -> None:
+    """Stand in for the installed OpenCode binary's --version output."""
+    script = tmp_path / "bin" / "opencode"
+    script.parent.mkdir(exist_ok=True)
+    script.write_text(f"#!/bin/sh\necho '{version}'\n")
+    script.chmod(0o755)
+    return script
+
+
+@pytest.mark.parametrize(
+    ("version_output", "expected"),
+    [
+        ("opencode v2.0.15", 2),
+        ("2.1.0", 2),
+        ("1.18.32", 1),
+        ("opencode 1.18.3", 1),
+    ],
+)
+def test_opencode_major_version_asks_the_binary(
+    tmp_path, monkeypatch, version_output, expected
+):
+    script = _fake_opencode(tmp_path, version_output)
+    monkeypatch.setattr(router_module, "_opencode_executable", lambda: str(script))
+
+    assert router_module._opencode_major_version() == expected
+
+
+def test_opencode_major_version_falls_back_to_cli_json_then_v1(tmp_path, monkeypatch):
+    # No binary reachable and no v2 terminal config: keep the v1 layout, so an
+    # existing setup is never rewritten into a shape its OpenCode cannot read.
+    assert router_module._opencode_major_version() == 1
+    cli_path = router_module._opencode_cli_config_path()
+    cli_path.parent.mkdir(parents=True, exist_ok=True)
+    cli_path.write_text("{}\n")
+    # A cli.json is only ever created by a v2 terminal client.
+    assert router_module._opencode_major_version() == 2
+    # A binary that answers wins over the file.
+    script = _fake_opencode(tmp_path, "1.18.32")
+    monkeypatch.setattr(router_module, "_opencode_executable", lambda: str(script))
+    assert router_module._opencode_major_version() == 1
+    # And an explicit override wins over everything.
+    monkeypatch.setenv("RAMP_OPENCODE_MAJOR", "2")
+    assert router_module._opencode_major_version() == 2
+
+
+def test_configure_opencode_v2_writes_plugins_objects_and_cli_json(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("RAMP_OPENCODE_MAJOR", "2")
+    config_path = tmp_path / "opencode" / "opencode.json"
+    config_path.parent.mkdir()
+    config_path.write_text(
+        json.dumps(
+            {
+                "$schema": "https://opencode.ai/config.json",
+                "model": "existing/model",
+                "plugins": ["some-other-plugin"],
+                # The hand-written static block a design partner keeps today.
+                # v2 layers config providers over plugin-registered ones, so
+                # it is lifted out (and restored on unconfigure) rather than
+                # left to shadow the discovered catalog.
+                "providers": {
+                    "ramp-router": {
+                        "package": "aisdk:@ai-sdk/openai",
+                        "settings": {"baseURL": "https://router-api.ramp.com/v1"},
+                    },
+                    "existing": {"models": {"model": {}}},
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
+    _mock_models(monkeypatch, [{"id": "a"}, {"id": "b"}])
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "opencode"],
+        input="router-secret\n",
+    )
+
+    assert result.exit_code == 0
+    config = json.loads(config_path.read_text())
+    plugin_path = router_module.integration_package_path("opencode").resolve()
+    expected_entry = {
+        "package": plugin_path.as_uri(),
+        "options": {
+            "providerID": "ramp-router",
+            "name": "Ramp Router",
+            "baseURL": "https://router-api.ramp.com/v1",
+            "usageBaseURL": "https://app.router.com",
+            "apiKey": "router-secret",
+            "rampCliVersion": __version__,
+            "rampExecutable": "/opt/ramp-cli/bin/ramp",
+        },
+    }
+    assert config["plugins"] == ["some-other-plugin", expected_entry]
+    assert "plugin" not in config
+    assert config["providers"] == {"existing": {"models": {"model": {}}}}
+    assert config["model"] == "ramp-router/a"
+    # v2 loads the sidebar from cli.json, never tui.json, and the auto-loaded
+    # TUI half of a server plugin gets no options, so the same object goes
+    # there too.
+    cli_path = router_module._opencode_cli_config_path()
+    cli_config = json.loads(cli_path.read_text())
+    assert cli_config["$schema"] == "https://opencode.ai/v2/cli.json"
+    assert cli_config["plugins"] == [expected_entry]
+    assert cli_path.stat().st_mode & 0o777 == 0o600
+    assert not router_module._opencode_tui_config_path().exists()
+    state = json.loads((tmp_path / "opencode" / "ramp-router-state.json").read_text())
+    assert state["opencode_generation"] == 2
+    assert state["providers_present"] is True
+    assert state["providers"]["package"] == "aisdk:@ai-sdk/openai"
+    assert "router-secret" not in result.output
+
+    # The refresh readers understand the v2 object entry.
+    assert router_module._stored_router_api_key("opencode", config_path) == (
+        "router-secret"
+    )
+    assert router_module._stored_router_base_url("opencode", config_path) == (
+        "https://router-api.ramp.com/v1"
+    )
+
+    unconfigure = CliRunner().invoke(
+        cli, ["--human", "router", "unconfigure", "opencode"]
+    )
+
+    assert unconfigure.exit_code == 0
+    restored = json.loads(config_path.read_text())
+    assert restored["plugins"] == ["some-other-plugin"]
+    assert restored["providers"]["ramp-router"] == {
+        "package": "aisdk:@ai-sdk/openai",
+        "settings": {"baseURL": "https://router-api.ramp.com/v1"},
+    }
+    assert restored["model"] == "existing/model"
+    # Configure created cli.json, so unconfigure restores its absence.
+    assert not cli_path.exists()
+
+
+def test_configure_opencode_v2_replaces_v1_tuple_left_by_an_upgrade(
+    tmp_path, monkeypatch
+):
+    """A v1-era setup moved to OpenCode v2 is rewritten into the v2 shape."""
+    config_path = tmp_path / "opencode" / "opencode.json"
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    v1 = runner.invoke(
+        cli,
+        ["--human", "router", "configure", "opencode"],
+        input="router-secret\n",
+    )
+    assert v1.exit_code == 0
+    assert "plugin" in json.loads(config_path.read_text())
+    tui_path = router_module._opencode_tui_config_path()
+    assert tui_path.exists()
+
+    monkeypatch.setenv("RAMP_OPENCODE_MAJOR", "2")
+    v2 = runner.invoke(
+        cli,
+        ["--human", "router", "configure", "opencode"],
+        input="router-secret\n",
+    )
+
+    assert v2.exit_code == 0
+    config = json.loads(config_path.read_text())
+    # The tuple is gone rather than left for v2 to normalize into a second
+    # registration of the same provider.
+    assert "plugin" not in config
+    assert config["plugins"][0]["package"] == (
+        router_module.integration_package_path("opencode").resolve().as_uri()
+    )
+    cli_config = json.loads(router_module._opencode_cli_config_path().read_text())
+    assert cli_config["plugins"][0]["options"]["apiKey"] == "router-secret"
+
+    unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "opencode"])
+
+    assert unconfigure.exit_code == 0
+    assert "plugin" not in json.loads(config_path.read_text())
+    assert "plugins" not in json.loads(config_path.read_text())
+    # Both generations' terminal configs are cleaned. The receipt predates
+    # the move to v2, so it can only vouch for tui.json, which it created and
+    # therefore removes; cli.json loses the Router entry but is otherwise
+    # left as found.
+    cli_config = json.loads(router_module._opencode_cli_config_path().read_text())
+    assert "plugins" not in cli_config
+    assert not tui_path.exists()
+
+
 def test_configure_pi_installs_plugin_and_is_idempotent(tmp_path, monkeypatch):
     pi_home = tmp_path / "pi"
     pi_home.mkdir()
@@ -5308,9 +5529,6 @@ def _capture_picker(monkeypatch, answer):
         return Prompt()
 
     monkeypatch.setattr(router_module.questionary, "checkbox", checkbox)
-    # Pinned so the offered lines depend on the test, not on whether the
-    # machine running the suite happens to have Cursor installed.
-    monkeypatch.setattr(router_module, "_cursor_is_installed", lambda: False)
     return captured
 
 
@@ -6963,20 +7181,6 @@ def test_configure_picker_starts_with_no_installed_agents_selected(monkeypatch):
     assert captured["validate"]([]) == "Select at least one agent."
 
 
-def test_client_picker_offers_cursor_when_installed(monkeypatch):
-    # Cursor's setup is guided rather than written, but it starts from the
-    # same credential, so an installed Cursor earns a line in the picker.
-    captured = _capture_picker(monkeypatch, ["cursor"])
-    monkeypatch.setattr(router_module, "_installed_clients", lambda: ("codex",))
-    monkeypatch.setattr(router_module, "_cursor_is_installed", lambda: True)
-
-    assert router_module._pick_installed_clients() == ("cursor",)
-    assert [(choice.title, choice.value) for choice in captured["choices"]] == [
-        ("Codex (CLI + desktop app)", "codex"),
-        ("Cursor", "cursor"),
-    ]
-
-
 def test_client_picker_never_lists_cowork_as_its_own_line(monkeypatch):
     # Cowork is Claude Desktop's side of the Claude setup, so the main menu
     # stays at the coding agents: one Claude entry covers both Claude apps,
@@ -7216,7 +7420,11 @@ def test_configure_rejects_an_empty_supplied_key_before_the_picker(monkeypatch):
     assert "Invalid value for '--api-key': cannot be empty" in result.output
 
 
-def test_configure_without_a_terminal_targets_every_agent(tmp_path, monkeypatch):
+@pytest.mark.parametrize("desktop_apps_available", [False, True])
+@pytest.mark.parametrize("browser_setup", [False, True])
+def test_configure_without_a_terminal_targets_every_integration(
+    tmp_path, monkeypatch, desktop_apps_available, browser_setup
+):
     # An installer or CI job supplies the key through the environment without
     # passing --no-input. Drawing a full-screen picker there aborts the command
     # instead of configuring anything.
@@ -7232,13 +7440,49 @@ def test_configure_without_a_terminal_targets_every_agent(tmp_path, monkeypatch)
         lambda: pytest.fail("a picker cannot be drawn without a terminal"),
     )
     _mock_models(monkeypatch)
+    monkeypatch.setattr(claude_cowork, "is_available", lambda: desktop_apps_available)
+    browser_calls = []
+    desktop_keys = {}
 
-    configure = CliRunner().invoke(
-        cli, ["--human", "router", "configure", "--api-key", "router-secret"]
+    def acquire(url, *, no_browser):
+        browser_calls.append((url, no_browser))
+        return "router-secret"
+
+    def configure_cowork(api_key, base_url, *, model_ids):
+        desktop_keys["cowork"] = api_key
+        assert base_url == ROUTER_BASE_URL
+        assert model_ids == ("gpt-5.4",)
+        return tmp_path / "profile.json", ()
+
+    monkeypatch.setattr(router_module, "acquire_router_api_key", acquire)
+    monkeypatch.setattr(claude_cowork, "configure", configure_cowork)
+    monkeypatch.setattr(
+        router_module,
+        "_copy_to_clipboard",
+        lambda _key: pytest.fail("automatic setup must not copy credentials"),
     )
+    if not browser_setup:
+        monkeypatch.setenv(router_module.CONFIGURE_KEY_ENV, "router-secret")
+
+    configure = CliRunner().invoke(cli, ["--human", "router", "configure"])
 
     assert configure.exit_code == 0, configure.output
-    assert "Connected to: Claude Code, Codex, OpenCode, and Pi" in configure.output
+    assert browser_calls == (
+        [("https://app.router.com", False)] if browser_setup else []
+    )
+    assert (tmp_path / ".codex" / "ramp-router-key").read_text().strip() == (
+        "router-secret"
+    )
+    assert desktop_keys == (
+        {"cowork": "router-secret"} if desktop_apps_available else {}
+    )
+    if desktop_apps_available:
+        assert "Connected to: Claude Code, Codex, OpenCode, Pi, and Claude Cowork" in (
+            configure.output
+        )
+    else:
+        assert "Connected to: Claude Code, Codex, OpenCode, and Pi" in configure.output
+    assert "router-secret" not in configure.output
 
 
 def test_the_picker_is_offered_only_when_both_streams_are_a_terminal(monkeypatch):
@@ -7410,7 +7654,10 @@ def test_configure_picker_targets_only_selected_clients(tmp_path, monkeypatch):
     assert not (tmp_path / ".config" / "opencode" / "opencode.json").exists()
 
 
-def test_configure_json_output_bypasses_the_picker(tmp_path, monkeypatch):
+@pytest.mark.parametrize("desktop_apps_available", [False, True])
+def test_configure_json_output_bypasses_the_picker(
+    tmp_path, monkeypatch, desktop_apps_available
+):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
@@ -7428,6 +7675,12 @@ def test_configure_json_output_bypasses_the_picker(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(router_module, "_install_codex_cost_hook", lambda *_args: None)
     monkeypatch.setattr(router_module.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(claude_cowork, "is_available", lambda: desktop_apps_available)
+    monkeypatch.setattr(
+        claude_cowork,
+        "configure",
+        lambda *_args, **_kwargs: (tmp_path / "profile.json", ()),
+    )
     _mock_models(monkeypatch)
 
     configured = CliRunner().invoke(
@@ -7441,10 +7694,10 @@ def test_configure_json_output_bypasses_the_picker(tmp_path, monkeypatch):
     # Hermes is set up through its own executable, absent here, so a bare run
     # skips it rather than failing, and Conductor is skipped the same way on
     # a machine that never had the app; every other agent is configured.
-    assert configured_clients == set(router_module.CLIENT_NAMES) - {
-        "hermes",
-        "conductor",
-    }
+    expected = set(router_module.CLIENT_NAMES) - {"hermes", "conductor"}
+    if desktop_apps_available:
+        expected.add("cowork")
+    assert configured_clients == expected
 
 
 def test_unconfigure_picker_starts_with_no_configured_agents_selected(

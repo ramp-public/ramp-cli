@@ -298,9 +298,6 @@ def test_picker_offers_conductor_only_when_installed(monkeypatch):
 
     monkeypatch.setattr(router_module, "_pick_clients", pick)
     monkeypatch.setattr(router_module, "_installed_clients", lambda: ("codex",))
-    # Cursor detection reads the real /Applications; what this developer has
-    # installed must not decide what the test asserts.
-    monkeypatch.setattr(router_module, "_cursor_is_installed", lambda: False)
 
     runner = CliRunner()
     runner.invoke(cli, ["--human", "router", "configure"])

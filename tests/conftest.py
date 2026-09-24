@@ -38,6 +38,11 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     # otherwise have tests drive the real binary against their real setup.
     # Tests that exercise the Hermes client re-point this at a test double.
     monkeypatch.setattr("ramp_cli.hermes_agent.hermes_executable", lambda: None)
+    # OpenCode configure asks the installed binary which generation it is, so
+    # a developer with OpenCode on PATH would otherwise have tests run the real
+    # binary and write whichever layout it reports. Tests that exercise the v2
+    # layout re-point this at a test double or set RAMP_OPENCODE_MAJOR.
+    monkeypatch.setattr("ramp_cli.commands.router._opencode_executable", lambda: None)
     # The CLI reads these, so a developer pointing their own shell at a local
     # stack would otherwise change what the tests assert.
     for leaked in (
@@ -47,6 +52,7 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         "RAMP_ROUTER_CONFIGURE_API_KEY",
         "RAMP_ACCESS_TOKEN",
         "RAMP_AGENT_WALLET_API_URL",
+        "RAMP_OPENCODE_MAJOR",
         # Claude Code configure reads the shell's auto-compact window to decide
         # whether the settings file must override it.
         "CLAUDE_CODE_AUTO_COMPACT_WINDOW",

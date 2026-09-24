@@ -108,6 +108,9 @@ _OWNED_ENV_KEYS = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_CUSTOM_HEADERS",
     "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+    # A saved Anthropic login can otherwise repopulate modelAccessCache with
+    # denials that override Router's discovered models (Claude Code 2.1.281).
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
     # Suppresses Claude's expected "connectors are disabled" warning in Router
     # sessions. Unlike the restrictive top-level setting, this normal env value
     # can be unset by the original settings overlay.
@@ -130,6 +133,7 @@ _OWNED_ENV_KEYS = (
 # alone, and merge_states adopts the fresh snapshot taken before this
 # configure wrote it.
 _ENV_KEYS_OWNED_LATER = (
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
     "ROUTER_BASE_URL",
     _CLAUDE_AI_CONNECTORS_ENV,
     AUTO_COMPACT_WINDOW_ENV,
@@ -232,10 +236,10 @@ def scrub_stale_fable_access(path: Path) -> bool:
     When Claude Code talks to Anthropic directly it caches the account's
     per-model entitlements in its user config, and its /model picker keeps
     trusting a cached ``claude-fable-5: entitled=false`` verdict after the
-    session is pointed at Router: the Fable row this setup provides through
-    ANTHROPIC_DEFAULT_FABLE_MODEL disappears from the picker while the model
-    stays perfectly callable. Router sessions never refresh the entitlement
-    cache, so without this the stale verdict persists indefinitely.
+    session is pointed at Router: the Fable row returned by gateway discovery
+    disappears from the picker while the model stays callable. Router
+    configuration also disables nonessential
+    Anthropic traffic so a saved login cannot repopulate these verdicts.
 
     Only Fable-family records claiming no entitlement are removed. The rest
     of the cache is Anthropic-owned state that direct Anthropic use rebuilds
@@ -708,6 +712,7 @@ def plan_configuration(
         "ANTHROPIC_BASE_URL": base_url,
         "ANTHROPIC_AUTH_TOKEN": api_key,
         "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         _CLAUDE_AI_CONNECTORS_ENV: "false",
     }
     if custom_headers is None:
@@ -950,14 +955,22 @@ def plan_model_view_update(
     else:
         environment["ANTHROPIC_CUSTOM_HEADERS"] = rendered
     managed[MODEL_VIEW_HEADER] = desired
+    access_key = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+    access_snapshot = state["env"].get(
+        access_key,
+        {"present": access_key in environment, "value": environment.get(access_key)},
+    )
+    environment[access_key] = "1"
     updated_state = {
         **state,
+        "env": {**state["env"], access_key: access_snapshot},
         CUSTOM_HEADERS_STATE_KEY: managed,
         "written": {
             **state["written"],
             "env": {
                 **state["written"]["env"],
                 "ANTHROPIC_CUSTOM_HEADERS": rendered,
+                access_key: "1",
             },
         },
     }
