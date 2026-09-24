@@ -68,7 +68,7 @@ const CONFIG_FILE = "ramp-router-config.json"
 const RUNTIME_MODELS_FILE = "ramp-router-runtime-models.json"
 const MODEL_CACHE_FILE = "ramp-router-model-cache.json"
 const MODEL_CACHE_KEY_FILE = "ramp-router-model-cache-key"
-const MODEL_CACHE_VERSION = 2
+const MODEL_CACHE_VERSION = 4
 // Local safety ceilings, not Router catalog limits. Oversized private state is
 // discarded and rebuilt from the bounded startup request instead of read into
 // memory during every Pi launch.
@@ -89,9 +89,18 @@ const PI_THINKING_LEVELS = [
   "max",
 ] as const
 
-type RouterModel = Model<"openai-responses">
+type RouterApi = "openai-responses" | "anthropic-messages"
+type RouterModel = Model<RouterApi>
 
-async function hostOpenAIResponsesApi(): Promise<ProviderStreams> {
+function modelBaseURL(api: RouterApi, routerBaseURL: string): string {
+  // Pi's Anthropic SDK appends /v1/messages itself. Responses appends only
+  // /responses, so it needs the versioned Router URL.
+  return api === "anthropic-messages"
+    ? routerBaseURL.slice(0, -"/v1".length)
+    : routerBaseURL
+}
+
+async function hostApi(providerId: string): Promise<ProviderStreams> {
   // Pi only makes its public package roots available to path-installed
   // extensions. Resolve the built-in adapter through the host runtime instead
   // of importing an SDK subpath that does not exist beside this package.
@@ -100,13 +109,24 @@ async function hostOpenAIResponsesApi(): Promise<ProviderStreams> {
     refreshOnCreate: false,
     allowModelNetwork: false,
   })
-  const provider = runtime.getProvider("openai")
-  if (!provider) throw new Error("Pi's OpenAI Responses provider is unavailable")
+  const provider = runtime.getProvider(providerId)
+  if (!provider) throw new Error(`Pi's ${providerId} provider is unavailable`)
+
+  const withNativeCompat = (model: RouterModel): RouterModel => {
+    if (providerId !== "anthropic") return model
+    // The Anthropic adapter requires model-specific options (for example,
+    // Opus 5.5 only accepts adaptive thinking). Reuse Pi's own compatibility
+    // metadata for the matching model instead of guessing from Router efforts.
+    const native = provider.getModels().find((candidate) => candidate.id === model.id)
+    return native?.compat
+      ? { ...model, compat: { ...native.compat, ...model.compat } }
+      : model
+  }
 
   return {
-    stream: (model, context, options) => provider.stream(model, context, options),
+    stream: (model, context, options) => provider.stream(withNativeCompat(model as RouterModel), context, options),
     streamSimple: (model, context, options) =>
-      provider.streamSimple(model, context, options),
+      provider.streamSimple(withNativeCompat(model as RouterModel), context, options),
   }
 }
 
@@ -286,6 +306,7 @@ function piInputModalities(modalities: readonly string[] | undefined): RouterMod
 function toPiModel(model: DiscoveredModel, baseUrl: string): RouterModel {
   const reasoning = supportsReasoning(model)
   const metadata = model.metadata
+  const api = model.ownedBy === "anthropic" ? "anthropic-messages" : "openai-responses"
   return {
     // Pi's model selector hardcodes Model.id as each row's label. Model.name
     // participates in search but appears only below the selected row, unlike
@@ -301,9 +322,9 @@ function toPiModel(model: DiscoveredModel, baseUrl: string): RouterModel {
     // request_name before policy, routing, logs, and accounting.
     id: model.id,
     name: `${metadata.displayName} via ${metadata.providerDisplayName || model.ownedBy || "Ramp Router"}`,
-    api: "openai-responses",
+    api,
     provider: PROVIDER_ID,
-    baseUrl,
+    baseUrl: modelBaseURL(api, baseUrl),
     reasoning,
     ...(reasoning ? { thinkingLevelMap: thinkingLevelMap(model) } : {}),
     input: piInputModalities(metadata.inputModalities),
@@ -399,11 +420,26 @@ function routerProvider(
     new Error("Ramp Router request model is not in the active catalog")
   const guardedRequestOptions = <T extends ProviderRequestOptions>(
     expectedModelID: string,
+    api: RouterApi,
     options: T | undefined,
   ): T => {
     const transformPayload = options?.onPayload
     return {
       ...options,
+      ...(api === "anthropic-messages"
+        ? {
+            // Pi's Anthropic adapter normally sends x-api-key. Router's
+            // Messages surface expects the same Bearer key as discovery and
+            // Responses; give the adapter header-owned auth instead.
+            apiKey: undefined,
+            headers: {
+              ...options?.headers,
+              Authorization: `Bearer ${options?.apiKey}`,
+              // Keep inference's client identity consistent with discovery.
+              "user-agent": "ramp-cli-pi-provider",
+            },
+          }
+        : {}),
       onPayload: async (payload, model) => {
         const replacement = await transformPayload?.(payload, model)
         // Match the underlying adapter: only `undefined` means "use the
@@ -418,11 +454,7 @@ function routerProvider(
         let store: unknown
         let stream: unknown
         try {
-          if (
-            !Object.hasOwn(finalPayload, "model") ||
-            !Object.hasOwn(finalPayload, "store") ||
-            !Object.hasOwn(finalPayload, "stream")
-          ) throw payloadModelError()
+          if (!Object.hasOwn(finalPayload, "model")) throw payloadModelError()
           finalModel = Reflect.get(finalPayload, "model")
         } catch {
           throw payloadModelError()
@@ -434,18 +466,20 @@ function routerProvider(
         } catch {
           throw new Error("Ramp Router request payload violates provider invariants")
         }
-        if (store !== false || stream !== true) {
+        if (
+          (api === "openai-responses" &&
+            (!Object.hasOwn(finalPayload, "store") || store !== false ||
+              !Object.hasOwn(finalPayload, "stream") || stream !== true)) ||
+          (api === "anthropic-messages" && store !== undefined)
+        ) {
           throw new Error("Ramp Router request payload violates provider invariants")
         }
         // Detach the top-level request from any object retained by an extension
         // hook, then reassert the guarded fields last. A later mutation of the
         // hook's object cannot change the model or storage semantics sent.
-        return {
-          ...finalPayload,
-          model: expectedModelID,
-          store: false,
-          stream: true,
-        }
+        return api === "openai-responses"
+          ? { ...finalPayload, model: expectedModelID, store: false, stream: true }
+          : { ...finalPayload, model: expectedModelID, stream: true }
       },
     } as T
   }
@@ -482,7 +516,7 @@ function routerProvider(
     try {
       // Pi composes models.json tuning into the Model passed to the provider.
       // Snapshot it before validation so a retained reference cannot change
-      // what is checked versus what the Responses adapter later consumes.
+      // what is checked versus what the selected adapter later consumes.
       composed = copyModel(model)
     } catch {
       throw new Error("Ramp Router model does not match this provider")
@@ -498,6 +532,7 @@ function routerProvider(
       const normalized = name.toLowerCase()
       if (
         normalized === "authorization" ||
+        normalized === "x-api-key" ||
         normalized === "cf-aig-authorization"
       ) {
         throw new Error("Ramp Router request authorization is ambiguous")
@@ -505,8 +540,8 @@ function routerProvider(
     }
     if (
       composed.provider !== PROVIDER_ID ||
-      composed.api !== "openai-responses" ||
-      composed.baseUrl !== baseUrl
+      (composed.api !== "openai-responses" && composed.api !== "anthropic-messages") ||
+      composed.baseUrl !== modelBaseURL(composed.api, baseUrl)
     ) {
       // baseUrl is the destination for the credential checked above, not a
       // presentation/tuning override. Router endpoint changes must use the
@@ -517,6 +552,9 @@ function routerProvider(
     const canonical = currentModels.find((candidate) => candidate.id === modelID)
     if (!canonical) {
       throw new Error("Ramp Router model is not in the active catalog")
+    }
+    if (composed.api !== canonical.api) {
+      throw new Error("Ramp Router model does not match this provider")
     }
     // Preserve Pi's validated models.json tuning while pinning the four
     // identity-bearing fields to the private active catalog. The adapter and
@@ -538,19 +576,20 @@ function routerProvider(
       ...(composed.compat === undefined ? {} : { compat: composed.compat }),
     }
   }
-  let responsesApi: Promise<ProviderStreams> | undefined
-  const getResponsesApi = () =>
-    (responsesApi ??= hostOpenAIResponsesApi())
-  const guardedApi: ProviderStreams = {
+  const apis: Partial<Record<RouterApi, Promise<ProviderStreams>>> = {}
+  const getApi = (api: RouterApi) =>
+    (apis[api] ??= hostApi(api === "anthropic-messages" ? "anthropic" : "openai"))
+  const guardedApi = (api: RouterApi): ProviderStreams => ({
     stream: (model, context, options) =>
       lazyStream(model, async () => {
         const requestOptions = snapshotRequestOptions(options)
         const canonical = requestModel(model as RouterModel, requestOptions)
         const expectedModelID = canonical.id
-        return (await getResponsesApi()).stream(
+        if (canonical.api !== api) throw new Error("Ramp Router model does not match this provider")
+        return (await getApi(api)).stream(
           canonical,
           context,
-          guardedRequestOptions(expectedModelID, requestOptions),
+          guardedRequestOptions(expectedModelID, api, requestOptions),
         )
       }),
     streamSimple: (model, context, options) =>
@@ -558,13 +597,14 @@ function routerProvider(
         const requestOptions = snapshotRequestOptions(options)
         const canonical = requestModel(model as RouterModel, requestOptions)
         const expectedModelID = canonical.id
-        return (await getResponsesApi()).streamSimple(
+        if (canonical.api !== api) throw new Error("Ramp Router model does not match this provider")
+        return (await getApi(api)).streamSimple(
           canonical,
           context,
-          guardedRequestOptions(expectedModelID, requestOptions),
+          guardedRequestOptions(expectedModelID, api, requestOptions),
         )
       }),
-  }
+  })
   const provider = createProvider({
     id: PROVIDER_ID,
     name: "Ramp Router",
@@ -573,7 +613,10 @@ function routerProvider(
       apiKey: envApiKeyAuth("Ramp Router API key", API_KEY_ENVS),
     },
     models,
-    api: guardedApi,
+    api: {
+      "openai-responses": guardedApi("openai-responses"),
+      "anthropic-messages": guardedApi("anthropic-messages"),
+    },
   })
   const registeredProvider = {
     ...provider,
@@ -1020,8 +1063,8 @@ function cachedRouterModel(value: unknown, baseUrl: string): RouterModel | undef
     !model.id ||
     typeof model.name !== "string" ||
     model.provider !== PROVIDER_ID ||
-    model.api !== "openai-responses" ||
-    model.baseUrl !== baseUrl ||
+    (model.api !== "openai-responses" && model.api !== "anthropic-messages") ||
+    model.baseUrl !== modelBaseURL(model.api as RouterApi, baseUrl) ||
     typeof model.reasoning !== "boolean" ||
     typeof model.contextWindow !== "number" ||
     !Number.isSafeInteger(model.contextWindow) ||
@@ -1081,9 +1124,9 @@ function cachedRouterModel(value: unknown, baseUrl: string): RouterModel | undef
   return {
     id: model.id,
     name: model.name,
-    api: "openai-responses",
+    api: model.api as RouterApi,
     provider: PROVIDER_ID,
-    baseUrl,
+    baseUrl: modelBaseURL(model.api as RouterApi, baseUrl),
     reasoning: model.reasoning,
     ...(restoredThinkingLevelMap
       ? { thinkingLevelMap: restoredThinkingLevelMap }

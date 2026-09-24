@@ -145,12 +145,27 @@ describe("discoverRouterModels", () => {
     )
   })
 
-  it("leaves out models that cannot serve Responses traffic", async () => {
+  it("keeps only models supporting their selected Pi API", async () => {
     const fetcher = mock.fn(async () =>
       new Response(
         JSON.stringify({
           data: [
             { id: "gpt-5.4", owned_by: "openai", router: routerMetadata("gpt-5.4") },
+            {
+              id: "claude-messages-only",
+              owned_by: "anthropic",
+              router: { ...routerMetadata("claude-messages-only"), surfaces: ["messages"] },
+            },
+            {
+              id: "claude-responses-only",
+              owned_by: "anthropic",
+              router: { ...routerMetadata("claude-responses-only"), surfaces: ["responses"] },
+            },
+            {
+              id: "gpt-messages-only",
+              owned_by: "openai",
+              router: { ...routerMetadata("gpt-messages-only"), surfaces: ["messages"] },
+            },
             {
               id: "jev-by-surface",
               owned_by: "router",
@@ -168,7 +183,7 @@ describe("discoverRouterModels", () => {
       apiKey: "test-secret",
       fetch: fetcher,
     })
-    assert.deepEqual(discovered.map(({ id }) => id), ["gpt-5.4"])
+    assert.deepEqual(discovered.map(({ id }) => id), ["gpt-5.4", "claude-messages-only"])
   })
 })
 
@@ -890,7 +905,7 @@ describe("Pi provider extension", () => {
     ])
     for (const candidate of [
       { ...model, provider: "openai" },
-      { ...model, api: "openai-completions" },
+      { ...model, id: "current-model", api: "anthropic-messages" },
       { ...model, baseUrl: "https://other.example/v1" },
     ]) {
       await fixedFailure(
@@ -903,6 +918,7 @@ describe("Pi provider extension", () => {
       { Authorization: "Bearer current-secret" },
       { authorization: null },
       { AUTHORIZATION: "" },
+      { "X-Api-Key": "other-secret" },
       { "CF-AIG-Authorization": "Bearer current-secret" },
       { "cf-aig-authorization": null },
     ]) {
@@ -914,6 +930,85 @@ describe("Pi provider extension", () => {
     }
     assert.equal(provider.fetchDeferred, undefined)
     assert.equal(provider.cancelDeferred, undefined)
+  })
+
+  it("routes Anthropic models through Messages and restores their API from cache", async () => {
+    const home = process.env.PI_CODING_AGENT_DIR
+    writeFileSync(join(home, "auth.json"), JSON.stringify({
+      "ramp-router": { type: "api_key", key: "current-secret" },
+    }))
+    const discovery = mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({
+      data: [
+        {
+          id: "claude-sonnet-4-6", owned_by: "anthropic",
+          router: {
+            ...routerMetadata("claude-sonnet-4-6"), surfaces: ["messages"],
+            capabilities: {
+              ...routerMetadata("claude-sonnet-4-6").capabilities,
+              reasoning: { efforts: [{ value: "medium", description: "" }] },
+            },
+          },
+        },
+        { id: "gpt-5.4", owned_by: "openai", router: routerMetadata("gpt-5.4") },
+      ],
+    }), { status: 200 }))
+    const registerProvider = mock.fn()
+    await registerRouterProvider({ registerProvider })
+    const [provider] = registerProvider.mock.calls[0].arguments
+    const [claude, gpt] = provider.getModels()
+    assert.equal(claude.api, "anthropic-messages")
+    assert.equal(gpt.api, "openai-responses")
+    assert.equal(claude.baseUrl, "https://api.router.com")
+    assert.equal(gpt.baseUrl, "https://api.router.com/v1")
+
+    const requests = []
+    const capture = async (url, init) => {
+      requests.push({ url: String(url), headers: new Headers(init.headers), body: JSON.parse(init.body) })
+      return new Response(JSON.stringify({ error: { message: "fixture stop" } }), {
+        status: 400, headers: { "content-type": "application/json" },
+      })
+    }
+    const context = { messages: [{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() }] }
+    for (const model of [claude, gpt]) {
+      await provider.streamSimple(model, context, {
+        apiKey: "current-secret", fetch: capture, maxRetries: 0,
+        ...(model === claude ? { reasoning: "medium" } : {}),
+      }).result()
+    }
+    assert.equal(new URL(requests[0].url).pathname, "/v1/messages")
+    assert.equal(requests[0].headers.get("authorization"), "Bearer current-secret")
+    assert.equal(requests[0].headers.has("x-api-key"), false)
+    assert.equal(requests[0].headers.get("user-agent"), "ramp-cli-pi-provider")
+    assert.equal(requests[0].body.model, claude.id)
+    assert.equal(requests[0].body.messages[0].content[0].text, "hello")
+    assert.equal(requests[0].body.stream, true)
+    assert.equal(requests[0].body.thinking.type, "adaptive")
+    assert.equal(requests[0].body.output_config.effort, "medium")
+    assert.equal("store" in requests[0].body, false)
+    assert.equal(new URL(requests[1].url).pathname, "/v1/responses")
+    assert.equal(requests[1].body.store, false)
+
+    process.env.PI_OFFLINE = "1"
+    discovery.mock.mockImplementation(async () => { throw new Error("offline discovery") })
+    const restored = mock.fn()
+    await registerRouterProvider({ registerProvider: restored })
+    assert.deepEqual(restored.mock.calls[0].arguments[0].getModels().map(({ api }) => api), [
+      "anthropic-messages", "openai-responses",
+    ])
+    assert.equal(restored.mock.calls[0].arguments[0].getModels()[0].baseUrl, claude.baseUrl)
+
+    const blocked = async (model, options, pattern) => {
+      const result = await provider.streamSimple(model, context, {
+        apiKey: "current-secret", fetch: capture, maxRetries: 0, ...options,
+      }).result()
+      assert.equal(result.stopReason, "error")
+      assert.match(result.errorMessage, pattern)
+    }
+    await blocked({ ...claude, api: "openai-responses" }, {}, /model does not match this provider/)
+    await blocked(claude, { onPayload: (payload) => ({ ...payload, model: gpt.id }) }, /request model is not in the active catalog/)
+    await blocked(claude, { onPayload: (payload) => ({ ...payload, store: true }) }, /payload violates provider invariants/)
+    await blocked(claude, { headers: { "x-api-key": "other-secret" } }, /request authorization is ambiguous/)
+    assert.equal(requests.length, 2)
   })
 
   it("guards the final Responses payload after sampling and extension transforms", async () => {

@@ -212,14 +212,17 @@ export function parseRouterMetadata(
 }
 
 /**
- * Router also lists non-LLM tools (TypeSafe answers only on /v1/systemone).
- * A Router without the surfaces field predates the distinction, so its rows
- * pass unless the owner identifies them.
+ * Include only models supporting the API Pi will use: Messages for Anthropic,
+ * Responses for everyone else. Router also lists non-LLM tools (TypeSafe
+ * answers only on /v1/systemone). Older Routers without a surfaces field
+ * predate the distinction, so their rows pass unless the owner identifies them.
  */
-function servesResponses(raw: OpenAIModel): boolean {
+function servesPiApi(raw: OpenAIModel): boolean {
   if (raw.owned_by === "typesafe") return false
   const surfaces = record(raw.router).surfaces
-  return !Array.isArray(surfaces) || surfaces.includes("responses")
+  return !Array.isArray(surfaces) || surfaces.includes(
+    raw.owned_by === "anthropic" ? "messages" : "responses",
+  )
 }
 
 export async function discoverRouterModels(input: {
@@ -271,7 +274,7 @@ export async function discoverRouterModels(input: {
     if (identifier.length === 0) {
       throw new Error("Ramp Router model discovery returned a model without an id")
     }
-    if (models.has(identifier) || !servesResponses(raw)) {
+    if (models.has(identifier) || !servesPiApi(raw)) {
       // Keep the first, matching the CLI, so both agree on which entry won.
       continue
     }
