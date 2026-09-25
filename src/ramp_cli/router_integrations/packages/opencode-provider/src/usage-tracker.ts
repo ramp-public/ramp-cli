@@ -56,8 +56,15 @@ export function createUsageTracker(host: UsageHost, deps: TrackerDeps = {}) {
     })
   }
 
-  const refresh = async (sessionID: string, afterIdle = false): Promise<"found" | "retry" | "non-router"> => {
-    if (disposed || !sessionID || inFlight.has(sessionID)) return "retry"
+  const refresh = async (
+    sessionID: string,
+    afterIdle = false,
+    previousRequestCount?: number,
+    publish = true,
+  ): Promise<"found" | "retry" | "stale" | "settling" | "non-router"> => {
+    if (disposed || !sessionID || inFlight.has(sessionID) || (!afterIdle && activeRetries.has(sessionID))) {
+      return "retry"
+    }
     inFlight.add(sessionID)
     try {
       // An idle event may beat the assistant in TUI state. Sync once if the
@@ -98,6 +105,13 @@ export function createUsageTracker(host: UsageHost, deps: TrackerDeps = {}) {
       lastFetched.set(sessionID, now())
       // Keep last-known usage only while the bounded post-idle retry is active.
       if (usage) {
+        // A valid response can still be the previous turn's totals. A single
+        // new request can also be only part of a multi-request turn: wait for
+        // the bounded post-idle settling window before showing its aggregate.
+        if (previousRequestCount !== undefined && usage.requestCount <= previousRequestCount) {
+          return "stale"
+        }
+        if (!publish) return "settling"
         setUsages((previous) => ({ ...previous, [sessionID]: usage }))
         return "found"
       }
@@ -112,17 +126,30 @@ export function createUsageTracker(host: UsageHost, deps: TrackerDeps = {}) {
     }
   }
 
-  const retryAfterIdle = async (sessionID: string, attempt: number, generation: number): Promise<void> => {
-    const result = await refresh(sessionID, true)
+  const retryAfterIdle = async (
+    sessionID: string,
+    attempt: number,
+    generation: number,
+    previousRequestCount?: number,
+  ): Promise<void> => {
+    // Router does not expose a turn-ingestion completion marker. Sample
+    // through the entire bounded window even on the first turn, rather than
+    // treating the first observed request as the complete turn.
+    const result = await refresh(
+      sessionID,
+      true,
+      previousRequestCount,
+      attempt >= IDLE_RETRY_DELAYS_MS.length,
+    )
     if (disposed || generations.get(sessionID) !== generation) return
-    if (result !== "retry" || attempt >= IDLE_RETRY_DELAYS_MS.length) {
+    if ((result !== "retry" && result !== "stale" && result !== "settling") || attempt >= IDLE_RETRY_DELAYS_MS.length) {
       activeRetries.delete(sessionID)
       if (result === "retry") clearUsage(sessionID)
       return
     }
     const timer = setTimer(() => {
       timers.delete(sessionID)
-      void retryAfterIdle(sessionID, attempt + 1, generation)
+      void retryAfterIdle(sessionID, attempt + 1, generation, previousRequestCount)
     }, IDLE_RETRY_DELAYS_MS[attempt]!)
     timers.set(sessionID, timer)
   }
@@ -135,7 +162,7 @@ export function createUsageTracker(host: UsageHost, deps: TrackerDeps = {}) {
     const generation = (generations.get(sessionID) ?? 0) + 1
     generations.set(sessionID, generation)
     activeRetries.add(sessionID)
-    void retryAfterIdle(sessionID, 0, generation)
+    void retryAfterIdle(sessionID, 0, generation, usages()[sessionID]?.requestCount)
   }
 
   const view = (sessionID: string): SidebarUsageView | undefined => {
