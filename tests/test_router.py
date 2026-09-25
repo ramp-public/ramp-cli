@@ -131,7 +131,9 @@ def _mock_models(
                 json={
                     "models": [
                         {
-                            "slug": model["id"],
+                            # Router names most Codex rows by display name,
+                            # not by the request id the generic view uses.
+                            "slug": model.get("codex_slug", model["id"]),
                             "display_name": model["router"]["display_name"],
                             "base_instructions": "",
                         }
@@ -1473,7 +1475,10 @@ def test_refresh_reapplies_codex_config_and_preserves_selected_model(
 ):
     codex_home = tmp_path / "codex"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
-    _mock_models(monkeypatch, [{"id": "a"}, {"id": "b"}])
+    _mock_models(
+        monkeypatch,
+        [{"id": "a"}, {"id": "claude-fable-5-1", "codex_slug": "Claude Fable 5.1"}],
+    )
     configured = CliRunner().invoke(
         cli,
         ["--human", "router", "configure", "codex"],
@@ -1482,7 +1487,10 @@ def test_refresh_reapplies_codex_config_and_preserves_selected_model(
     assert configured.exit_code == 0
 
     config_path = codex_home / "config.toml"
-    outdated = config_path.read_text().replace('model = "a"', 'model = "b"')
+    # Codex writes the picker slug, which is not the generic request id.
+    outdated = config_path.read_text().replace(
+        'model = "a"', 'model = "Claude Fable 5.1"'
+    )
     outdated = outdated.replace('wire_api = "responses"', 'wire_api = "chat"')
     config_path.write_text(outdated)
     catalog_path = codex_home / router_module.CODEX_ROUTER_CATALOG
@@ -1493,11 +1501,11 @@ def test_refresh_reapplies_codex_config_and_preserves_selected_model(
     assert refreshed.exit_code == 0
     assert "Refreshed the Ramp Router configuration for Codex." in refreshed.output
     config = tomllib.loads(config_path.read_text())
-    assert config["model"] == "b"
+    assert config["model"] == "Claude Fable 5.1"
     assert config["model_providers"]["ramp-router"]["wire_api"] == "responses"
     assert [
         model["slug"] for model in json.loads(catalog_path.read_text())["models"]
-    ] == ["a", "b"]
+    ] == ["a", "Claude Fable 5.1"]
 
 
 def test_refresh_reapplies_claude_config_and_preserves_selected_model(

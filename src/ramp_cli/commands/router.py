@@ -7037,6 +7037,22 @@ def _codex_provider_is_out_of_date(existing: dict) -> bool:
     )
 
 
+def _preferred_codex_model(
+    models: list[RouterModel], router_catalog: dict, selected_model: str | None
+) -> str:
+    """Keep a selection Codex itself made before falling back to the shared choice.
+
+    Codex writes the slug from its picker back to config.toml, and Router's
+    Codex projection names most models by display name ("Claude Fable 5.1")
+    rather than by request id ("claude-fable-5-1"). Checking that slug against
+    the generic id list alone reset such selections to DEFAULT_MODEL on every
+    refresh.
+    """
+    if selected_model in {model["slug"] for model in router_catalog["models"]}:
+        return selected_model
+    return _preferred_model(models, selected_model)
+
+
 def _configure_codex(
     path: Path,
     api_key: str,
@@ -7080,13 +7096,13 @@ def _configure_codex_in_lock(
     cost_hook_command: str | None,
     sync_hook_command: str | None,
 ) -> tuple[str, bool]:
-    default_model = _preferred_model(models, selected_model)
     existing, existing_data = _read_codex_config(path)
     if selected_model is not None:
         # Refresh captures a selection before discovery starts. Read it again
         # from the post-discovery snapshot so a model change made while the
         # request was in flight is preserved.
-        default_model = _preferred_model(models, existing_data.get("model"))
+        selected_model = existing_data.get("model")
+    default_model = _preferred_codex_model(models, router_catalog, selected_model)
     router_catalog_body = _render_codex_catalog(router_catalog, default_model)
     chunks = _config_chunks(existing)
     repaired = _codex_provider_is_out_of_date(existing_data)
