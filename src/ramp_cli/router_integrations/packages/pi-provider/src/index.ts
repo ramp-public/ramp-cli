@@ -90,7 +90,9 @@ const PI_THINKING_LEVELS = [
 ] as const
 
 type RouterApi = "openai-responses" | "anthropic-messages"
-type RouterModel = Model<RouterApi>
+// Discovery owns this classification; Pi's Responses adapter also serves
+// non-OpenAI Router models, so API alone is not enough to enable native tools.
+type RouterModel = Model<RouterApi> & { openaiModel?: true }
 
 function modelBaseURL(api: RouterApi, routerBaseURL: string): string {
   // Pi's Anthropic SDK appends /v1/messages itself. Responses appends only
@@ -113,14 +115,30 @@ async function hostApi(providerId: string): Promise<ProviderStreams> {
   if (!provider) throw new Error(`Pi's ${providerId} provider is unavailable`)
 
   const withNativeCompat = (model: RouterModel): RouterModel => {
-    if (providerId !== "anthropic") return model
-    // The Anthropic adapter requires model-specific options (for example,
-    // Opus 5.5 only accepts adaptive thinking). Reuse Pi's own compatibility
-    // metadata for the matching model instead of guessing from Router efforts.
-    const native = provider.getModels().find((candidate) => candidate.id === model.id)
-    return native?.compat
-      ? { ...model, compat: { ...native.compat, ...model.compat } }
-      : model
+    if (providerId === "anthropic") {
+      // Anthropic models need Pi's model-specific thinking compatibility.
+      const native = provider.getModels().find(
+        (candidate) => candidate.id === model.id && candidate.api === model.api,
+      )
+      return native?.compat
+        ? { ...model, compat: { ...native.compat, ...model.compat } }
+        : model
+    }
+    // Only Router models discovered as OpenAI inherit native tool behavior.
+    // Old caches without ownership remain usable with cache-only compat.
+    // Router can serve GPT models before Pi lists them (e.g. gpt-6-sol).
+    const native = provider.getModels().find(
+      (candidate): candidate is Model<"openai-responses"> =>
+        candidate.id === model.id && candidate.api === "openai-responses",
+    )
+    const explicitCache = native?.compat?.supportsExplicitPromptCacheMode ??
+      (!native && supportsExplicitPromptCacheMode(model.id) ? true : undefined)
+    const compat = {
+      ...(model.openaiModel ? native?.compat : {}),
+      ...(explicitCache !== undefined ? { supportsExplicitPromptCacheMode: explicitCache } : {}),
+      ...model.compat,
+    }
+    return Object.keys(compat).length > 0 ? { ...model, compat } : model
   }
 
   return {
@@ -303,6 +321,18 @@ function piInputModalities(modalities: readonly string[] | undefined): RouterMod
   return supported.length > 0 ? supported : ["text"]
 }
 
+// Fallback only for Router GPT models missing from Pi's native catalog. Pi
+// needs this capability to turn cacheRetention: "none" into explicit mode.
+function supportsExplicitPromptCacheMode(id: string): boolean {
+  const match = /^gpt-(\d+)(?:\.(\d+))?(?:-|$)/.exec(id)
+  if (!match) return false
+  const major = Number(match[1])
+  const minor = Number(match[2])
+  return Number.isSafeInteger(major) &&
+    (major > 5 ||
+      (major === 5 && match[2] !== undefined && Number.isSafeInteger(minor) && minor >= 6))
+}
+
 function toPiModel(model: DiscoveredModel, baseUrl: string): RouterModel {
   const reasoning = supportsReasoning(model)
   const metadata = model.metadata
@@ -325,6 +355,9 @@ function toPiModel(model: DiscoveredModel, baseUrl: string): RouterModel {
     api,
     provider: PROVIDER_ID,
     baseUrl: modelBaseURL(api, baseUrl),
+    ...(api === "openai-responses" && model.ownedBy === "openai"
+      ? { openaiModel: true as const }
+      : {}),
     reasoning,
     ...(reasoning ? { thinkingLevelMap: thinkingLevelMap(model) } : {}),
     input: piInputModalities(metadata.inputModalities),
@@ -1159,6 +1192,7 @@ function readModelCache(baseUrl: string, apiKey: string): RouterModel[] {
       baseUrl?: unknown
       credentialIdentity?: unknown
       models?: unknown
+      openaiModelIds?: unknown
     }
     if (
       cache.version !== MODEL_CACHE_VERSION ||
@@ -1173,7 +1207,20 @@ function readModelCache(baseUrl: string, apiKey: string): RouterModel[] {
       return []
     }
     if (new Set(models.map((model) => model.id)).size !== models.length) return []
-    return models
+    const openaiModelIds = cache.openaiModelIds ?? []
+    const responseModelIds = new Set(
+      models.filter((model) => model.api === "openai-responses").map((model) => model.id),
+    )
+    if (
+      !Array.isArray(openaiModelIds) ||
+      new Set(openaiModelIds).size !== openaiModelIds.length ||
+      !openaiModelIds.every((id) =>
+        typeof id === "string" && responseModelIds.has(id))
+    ) return []
+    const openaiModels = new Set<string>(openaiModelIds)
+    return models.map((model) => openaiModels.has(model.id)
+      ? { ...model, openaiModel: true }
+      : model)
   } catch {
     return []
   }
@@ -1195,7 +1242,10 @@ function writeModelCache(
       version: MODEL_CACHE_VERSION,
       baseUrl,
       credentialIdentity: persistentCredentialIdentity,
-      models,
+      // Older CLI releases ignore unknown top-level keys, but reject unknown
+      // model fields. Keep v4 model entries intact across upgrades/downgrades.
+      openaiModelIds: models.filter((model) => model.openaiModel).map((model) => model.id),
+      models: models.map(({ openaiModel: _openaiModel, ...model }) => model),
     }),
   )
 }

@@ -188,6 +188,132 @@ describe("discoverRouterModels", () => {
 })
 
 describe("Pi provider extension", () => {
+  it("uses full native compat only for OpenAI-owned models and keeps old caches usable", async () => {
+    const home = process.env.PI_CODING_AGENT_DIR
+    writeFileSync(join(home, "auth.json"), JSON.stringify({
+      "ramp-router": { type: "api_key", key: "current-secret" },
+    }))
+    const discovery = mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({
+      data: [
+        { id: "gpt-5.6-sol", owned_by: "openai", router: routerMetadata("gpt-5.6-sol") },
+        { id: "gpt-6-sol", owned_by: "openai", router: routerMetadata("gpt-6-sol") },
+        { id: "gpt-5.10", owned_by: "openai", router: routerMetadata("gpt-5.10") },
+        { id: "gpt-10-sol", owned_by: "openai", router: routerMetadata("gpt-10-sol") },
+        { id: "gpt-6-router", owned_by: "router", router: { ...routerMetadata("gpt-6-router"), surfaces: ["responses"] } },
+        { id: "gpt-5.5", owned_by: "openai", router: routerMetadata("gpt-5.5") },
+        { id: "gpt-5.6sol", owned_by: "openai", router: routerMetadata("gpt-5.6sol") },
+        { id: "gpt-5.6-terra", owned_by: "router", router: { ...routerMetadata("gpt-5.6-terra"), surfaces: ["responses"] } },
+        { id: "gpt-4o", owned_by: "router", router: { ...routerMetadata("gpt-4o"), surfaces: ["responses"] } },
+        { id: "gpt-6-other", owned_by: "anthropic", router: { ...routerMetadata("gpt-6-other"), surfaces: ["messages"] } },
+      ],
+    }), { status: 200 }))
+    const registered = mock.fn()
+    await registerRouterProvider({ registerProvider: registered })
+    const provider = registered.mock.calls[0].arguments[0]
+    const models = provider.getModels()
+    assert.equal(models.every(({ compat }) => compat === undefined), true)
+    assert.equal(models[0].openaiModel, true)
+    assert.equal(models[7].openaiModel, undefined)
+
+    const cache = JSON.parse(readFileSync(join(home, "ramp-router-model-cache.json"), "utf8"))
+    assert.equal(cache.version, 4)
+    assert.equal(cache.models.every(({ compat }) => compat === undefined), true)
+    assert.equal(cache.models.every(({ openaiModel }) => openaiModel === undefined), true)
+    assert.equal(cache.openaiModelIds.includes("gpt-5.5"), true)
+    assert.equal(cache.openaiModelIds.includes("gpt-5.6-terra"), false)
+    process.env.PI_OFFLINE = "1"
+    discovery.mock.mockImplementation(async () => { throw new Error("offline discovery") })
+    const restored = mock.fn()
+    await registerRouterProvider({ registerProvider: restored })
+    assert.equal(discovery.mock.callCount(), 1)
+    const offlineProvider = restored.mock.calls[0].arguments[0]
+    assert.equal(offlineProvider.getModels().every(({ compat }) => compat === undefined), true)
+
+    const requests = []
+    const effectiveCompat = []
+    const capture = async (_url, init) => {
+      requests.push(JSON.parse(init.body))
+      return new Response(JSON.stringify({ error: { message: "fixture stop" } }), {
+        status: 400, headers: { "content-type": "application/json" },
+      })
+    }
+    const context = {
+      messages: [{ role: "user", content: [{ type: "text", text: "summarize" }], timestamp: Date.now() }],
+      tools: [{ name: "lookup", description: "Look up a value", parameters: { type: "object", properties: {} } }],
+    }
+    for (const model of offlineProvider.getModels().slice(0, 9)) {
+      await offlineProvider.streamSimple(model, context, {
+        apiKey: "current-secret", fetch: capture, maxRetries: 0,
+        cacheRetention: "none", sessionId: "session-key",
+        onPayload: (payload, requestModel) => {
+          effectiveCompat.push(requestModel.compat)
+          return payload
+        },
+      }).result()
+    }
+    const nativeOpenAI = (await ModelRuntime.create({
+      modelsPath: null, refreshOnCreate: false, allowModelNetwork: false,
+    })).getProvider("openai").getModels()
+    assert.deepEqual(effectiveCompat[0], nativeOpenAI.find(({ id }) => id === "gpt-5.6-sol").compat)
+    assert.equal(nativeOpenAI.some(({ id }) => id === "gpt-6-sol"), false)
+    assert.deepEqual(effectiveCompat[1], { supportsExplicitPromptCacheMode: true })
+    assert.deepEqual(effectiveCompat[5], nativeOpenAI.find(({ id }) => id === "gpt-5.5").compat)
+    assert.equal(nativeOpenAI.some(({ id }) => id === "gpt-5.6-terra"), true)
+    assert.deepEqual(effectiveCompat[7], { supportsExplicitPromptCacheMode: true })
+    assert.equal(nativeOpenAI.some(({ id }) => id === "gpt-4o"), true)
+    assert.equal(effectiveCompat[8], undefined)
+    assert.deepEqual(requests.map(({ prompt_cache_options }) => prompt_cache_options), [
+      { mode: "explicit" }, { mode: "explicit" }, { mode: "explicit" },
+      { mode: "explicit" }, { mode: "explicit" },
+      undefined, undefined, { mode: "explicit" }, undefined,
+    ])
+    for (const [index, request] of requests.entries()) {
+      assert.equal(request.prompt_cache_key, undefined)
+      assert.equal(request.store, false)
+      assert.equal(request.tools[0].type, "function")
+      assert.equal("strict" in request.tools[0], index === 0 || index === 5)
+    }
+    await offlineProvider.streamSimple(offlineProvider.getModels()[0], context, {
+      apiKey: "current-secret", fetch: capture, maxRetries: 0,
+      cacheRetention: "short", sessionId: "session-key",
+    }).result()
+    assert.equal(requests[9].prompt_cache_options, undefined)
+    assert.equal(requests[9].prompt_cache_key, "session-key")
+
+    // A v4 cache written by the previous CLI had no ownership field. Keep
+    // those models usable offline, but do not infer full OpenAI compatibility.
+    delete cache.openaiModelIds
+    writeFileSync(join(home, "ramp-router-model-cache.json"), JSON.stringify(cache))
+    const legacy = mock.fn()
+    await registerRouterProvider({ registerProvider: legacy })
+    const legacyProvider = legacy.mock.calls[0].arguments[0]
+    assert.equal(legacyProvider.getModels().length, models.length)
+    let legacyCompat
+    await legacyProvider.streamSimple(legacyProvider.getModels()[0], context, {
+      apiKey: "current-secret", fetch: capture, maxRetries: 0,
+      cacheRetention: "none",
+      onPayload: (payload, requestModel) => {
+        legacyCompat = requestModel.compat
+        return payload
+      },
+    }).result()
+    assert.deepEqual(legacyCompat, { supportsExplicitPromptCacheMode: true })
+    assert.deepEqual(requests[10].prompt_cache_options, { mode: "explicit" })
+
+    cache.openaiModelIds = ["gpt-6-other"]
+    writeFileSync(join(home, "ramp-router-model-cache.json"), JSON.stringify(cache))
+    const invalidOwner = mock.fn()
+    await registerRouterProvider({ registerProvider: invalidOwner })
+    assert.deepEqual(invalidOwner.mock.calls[0].arguments[0].getModels(), [])
+
+    delete cache.openaiModelIds
+    cache.models[5].compat = { supportsExplicitPromptCacheMode: true }
+    writeFileSync(join(home, "ramp-router-model-cache.json"), JSON.stringify(cache))
+    const malformed = mock.fn()
+    await registerRouterProvider({ registerProvider: malformed })
+    assert.deepEqual(malformed.mock.calls[0].arguments[0].getModels(), [])
+  })
+
   it("discovers models from Pi's stored credential during ordinary startup", async () => {
     const home = mkdtempSync(join(tmpdir(), "pi-home-"))
     writeFileSync(
