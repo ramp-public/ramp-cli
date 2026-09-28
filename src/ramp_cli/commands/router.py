@@ -131,6 +131,15 @@ CLIENT_EXECUTABLES = {
     "pi": "pi",
     "hermes": "hermes",
 }
+# The Codex desktop app is now part of OpenAI's ChatGPT app. It carries its
+# own Codex CLI inside the bundle and puts no `codex` on PATH, so the bundled
+# CLI is the evidence that Codex is present. Legacy chat-only ChatGPT installs
+# have no such CLI and are ignored.
+_CODEX_APP_LOCATIONS = (
+    Path("/Applications/ChatGPT.app"),
+    Path.home() / "Applications" / "ChatGPT.app",
+)
+_CODEX_APP_BUNDLED_CLI = Path("Contents/Resources/codex-cli/bin/codex")
 # Claude Cowork joins the configure and unconfigure pickers but stays out of
 # CLIENT_NAMES: it has no config file of its own, exists only on macOS, and is
 # set up through Claude Desktop's profile library rather than through the
@@ -281,7 +290,20 @@ def _human_join(values: list[str]) -> str:
 
 
 def _codex_harness_prompt(default_model: str) -> str | None:
-    return _codex_harness_prompt_from(shutil.which("codex"), default_model)
+    executable = shutil.which("codex")
+    if executable:
+        # Once the config points at Router, the ordinary read reports Router's
+        # catalog, which carries no instructions; the bundled read recovers the
+        # prompt, so a CLI installed after an earlier configure still gets it.
+        return _codex_harness_prompt_from(
+            executable, default_model
+        ) or _codex_harness_prompt_from(executable, default_model, bundled=True)
+    # Without a Codex on PATH, the desktop app's bundled CLI is the binary the
+    # app actually runs, so its prompt matches the app. Only the bundled read
+    # works there, since the app shares a config that may already select Router.
+    return _codex_harness_prompt_from(
+        _codex_app_bundled_cli(), default_model, bundled=True
+    )
 
 
 def _codex_harness_prompt_from(
@@ -828,6 +850,26 @@ def _installed_clients() -> tuple[str, ...]:
     )
 
 
+def _codex_app_bundled_cli() -> Path | None:
+    """Locate the Codex CLI bundled inside the ChatGPT app on this Mac."""
+    if sys.platform != "darwin":
+        return None
+    for location in _CODEX_APP_LOCATIONS:
+        bundled_cli = location / _CODEX_APP_BUNDLED_CLI
+        if bundled_cli.is_file():
+            return bundled_cli
+    return None
+
+
+def _codex_app_installed() -> bool:
+    """Report whether the ChatGPT app with Codex is installed on this Mac.
+
+    The app reads the same Codex config the Codex entry writes, so it earns
+    that entry a place in the picker even where no `codex` is on PATH.
+    """
+    return _codex_app_bundled_cli() is not None
+
+
 def _can_draw_picker(ctx: click.Context) -> bool:
     """Report whether there is a terminal to draw the picker on.
 
@@ -858,6 +900,16 @@ def _pick_installed_clients() -> tuple[str, ...]:
     Codex CLI and the Codex app.
     """
     candidates = _installed_clients()
+    codex_cli_installed = "codex" in candidates
+    codex_app_installed = _codex_app_installed()
+    if not codex_cli_installed and codex_app_installed:
+        # The desktop app carries its CLI inside the bundle rather than on
+        # PATH, so command detection alone misses app-only machines.
+        candidates = tuple(
+            client
+            for client in CLIENT_EXECUTABLES
+            if client in candidates or client == "codex"
+        )
     if conductor.is_installed():
         # Conductor ships no PATH executable, so app-level detection is what
         # earns it a line beside the agents found by command name.
@@ -881,7 +933,12 @@ def _pick_installed_clients() -> tuple[str, ...]:
     # The list says which apps an entry covers, so nobody has to think of
     # Claude Code and Claude Desktop as two separate things to configure.
     titles = dict(AGENT_NAMES)
-    titles["codex"] = "Codex (CLI + desktop app)"
+    # Like the Claude entry, the Codex title names only the apps found here,
+    # so a Mac without the Codex CLI is never told it has one.
+    if codex_cli_installed and codex_app_installed:
+        titles["codex"] = "Codex (CLI + desktop app)"
+    elif codex_app_installed:
+        titles["codex"] = "Codex (desktop app)"
     if cowork_available:
         titles["claude-code"] = "Claude (CLI + desktop app)"
     selected = _pick_clients(

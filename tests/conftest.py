@@ -33,6 +33,12 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv(
         "RAMP_CONDUCTOR_APP_SUPPORT", str(tmp_path / "conductor-app-support")
     )
+    # Codex desktop app detection looks for the ChatGPT app's bundled Codex
+    # CLI; a sandbox location keeps a developer's real app out of the picker.
+    monkeypatch.setattr(
+        "ramp_cli.commands.router._CODEX_APP_LOCATIONS",
+        (tmp_path / "ChatGPT.app",),
+    )
     # Hermes is configured through its own `hermes config` executable rather
     # than direct file writes, so a developer with Hermes installed would
     # otherwise have tests drive the real binary against their real setup.

@@ -7367,7 +7367,7 @@ def test_configure_picker_starts_with_no_installed_agents_selected(monkeypatch):
         (choice.title, choice.value, choice.checked) for choice in captured["choices"]
     ] == [
         ("Claude Code", "claude-code", False),
-        ("Codex (CLI + desktop app)", "codex", False),
+        ("Codex", "codex", False),
         ("Pi", "pi", False),
     ]
     assert captured["validate"](["codex"]) is True
@@ -7384,6 +7384,7 @@ def test_client_picker_never_lists_cowork_as_its_own_line(monkeypatch):
         router_module, "_installed_clients", lambda: ("claude-code", "codex")
     )
     monkeypatch.setattr(claude_cowork, "is_available", lambda: True)
+    monkeypatch.setattr(router_module, "_codex_app_installed", lambda: True)
 
     # The selection leaves the picker already covering both Claude apps, so
     # the label's promise and the configured set can never drift apart.
@@ -7773,6 +7774,55 @@ def test_installed_clients_requires_each_agent_executable(tmp_path, monkeypatch)
     # detection joins the picker separately, so command detection covers
     # exactly the executable-backed agents.
     assert router_module._installed_clients() == tuple(router_module.CLIENT_EXECUTABLES)
+
+
+def _write_chatgpt_app(directory, *, with_codex):
+    bundle = directory / "ChatGPT.app"
+    (bundle / "Contents").mkdir(parents=True)
+    if with_codex:
+        cli = bundle / router_module._CODEX_APP_BUNDLED_CLI
+        cli.parent.mkdir(parents=True)
+        cli.write_text("")
+    return bundle
+
+
+def test_codex_app_is_found_by_its_bundled_cli(tmp_path, monkeypatch):
+    monkeypatch.setattr(router_module.sys, "platform", "darwin")
+    # A legacy chat-only ChatGPT install carries no Codex CLI.
+    legacy = _write_chatgpt_app(tmp_path / "system", with_codex=False)
+    monkeypatch.setattr(router_module, "_CODEX_APP_LOCATIONS", (legacy,))
+
+    assert router_module._codex_app_installed() is False
+
+    merged = _write_chatgpt_app(tmp_path / "user", with_codex=True)
+    monkeypatch.setattr(router_module, "_CODEX_APP_LOCATIONS", (legacy, merged))
+
+    assert router_module._codex_app_installed() is True
+
+
+def test_codex_app_detection_is_macos_only(tmp_path, monkeypatch):
+    bundle = _write_chatgpt_app(tmp_path, with_codex=True)
+    monkeypatch.setattr(router_module, "_CODEX_APP_LOCATIONS", (bundle,))
+    monkeypatch.setattr(router_module.sys, "platform", "linux")
+
+    assert router_module._codex_app_installed() is False
+
+
+def test_client_picker_offers_codex_for_the_desktop_app_alone(monkeypatch):
+    # The desktop app keeps its CLI inside the bundle, off PATH, yet reads the
+    # Codex config this entry writes.
+    captured = _capture_picker(monkeypatch, ["codex"])
+    monkeypatch.setattr(
+        router_module, "_installed_clients", lambda: ("claude-code", "pi")
+    )
+    monkeypatch.setattr(router_module, "_codex_app_installed", lambda: True)
+
+    assert router_module._pick_installed_clients() == ("codex",)
+    assert [(choice.title, choice.value) for choice in captured["choices"]] == [
+        ("Claude Code", "claude-code"),
+        ("Codex (desktop app)", "codex"),
+        ("Pi", "pi"),
+    ]
 
 
 def test_client_picker_ignores_stale_pi_config_beside_installed_agent(
@@ -8441,6 +8491,83 @@ def test_codex_is_configured_without_a_prompt_when_it_is_not_installed(
     assert not (codex_home / "ramp-router-instructions.md").exists()
     config = tomllib.loads((codex_home / "config.toml").read_text())
     assert "model_instructions_file" not in config
+
+
+def test_codex_app_alone_supplies_the_harness_prompt(tmp_path, monkeypatch):
+    # The ChatGPT desktop app keeps its Codex CLI inside the bundle, off PATH.
+    # Without falling back to it, app-only machines sent Router models no
+    # Codex prompt at all.
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch, [{"id": "gpt-5.4"}])
+    monkeypatch.setattr(router_module.shutil, "which", lambda _: None)
+    monkeypatch.setattr(router_module.sys, "platform", "darwin")
+    app = _write_chatgpt_app(tmp_path / "Applications", with_codex=True)
+    monkeypatch.setattr(router_module, "_CODEX_APP_LOCATIONS", (app,))
+    catalog = {"models": [{"slug": "gpt-5.4", "base_instructions": "APP CODEX PROMPT"}]}
+    commands = []
+
+    def run(command, *_args, **_kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, json.dumps(catalog), "")
+
+    monkeypatch.setattr(router_module.subprocess, "run", run)
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+
+    assert result.exit_code == 0, result.output
+    instructions = codex_home / "ramp-router-instructions.md"
+    assert instructions.read_text() == "APP CODEX PROMPT"
+    config = tomllib.loads((codex_home / "config.toml").read_text())
+    assert config["model_instructions_file"] == str(instructions.resolve())
+    # The app's own binary, reading its shipped catalog rather than whatever
+    # provider the shared config already selects.
+    assert commands[0][0] == str(app / router_module._CODEX_APP_BUNDLED_CLI)
+    assert "--bundled" in commands[0]
+
+
+def test_a_codex_on_path_is_preferred_over_the_app_for_the_prompt(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(router_module.shutil, "which", lambda _: "/usr/bin/codex")
+    monkeypatch.setattr(router_module.sys, "platform", "darwin")
+    app = _write_chatgpt_app(tmp_path, with_codex=True)
+    monkeypatch.setattr(router_module, "_CODEX_APP_LOCATIONS", (app,))
+    calls = []
+
+    def read(executable, _model, **kwargs):
+        calls.append((executable, kwargs))
+        return "PATH CODEX PROMPT"
+
+    monkeypatch.setattr(router_module, "_codex_harness_prompt_from", read)
+
+    assert router_module._codex_harness_prompt("gpt-5.4") == "PATH CODEX PROMPT"
+    assert calls == [("/usr/bin/codex", {})]
+
+
+def test_a_codex_on_path_already_pointed_at_router_reads_its_bundled_prompt(
+    tmp_path, monkeypatch
+):
+    # A CLI installed after configuring the desktop app finds the shared config
+    # already on Router, whose catalog has no instructions.
+    monkeypatch.setattr(router_module.shutil, "which", lambda _: "/usr/bin/codex")
+    router_catalog = {"models": [{"slug": "gpt-5.4", "base_instructions": ""}]}
+    bundled_catalog = {
+        "models": [{"slug": "gpt-5.4", "base_instructions": "BUNDLED PROMPT"}]
+    }
+    commands = []
+
+    def run(command, *_args, **_kwargs):
+        commands.append(command)
+        catalog = bundled_catalog if "--bundled" in command else router_catalog
+        return subprocess.CompletedProcess(command, 0, json.dumps(catalog), "")
+
+    monkeypatch.setattr(router_module.subprocess, "run", run)
+
+    assert router_module._codex_harness_prompt("gpt-5.4") == "BUNDLED PROMPT"
+    assert [command[0] for command in commands] == ["/usr/bin/codex"] * 2
 
 
 def test_a_failed_codex_configure_leaves_no_wreckage(tmp_path, monkeypatch):
