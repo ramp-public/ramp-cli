@@ -188,130 +188,31 @@ describe("discoverRouterModels", () => {
 })
 
 describe("Pi provider extension", () => {
-  it("uses full native compat only for OpenAI-owned models and keeps old caches usable", async () => {
-    const home = process.env.PI_CODING_AGENT_DIR
-    writeFileSync(join(home, "auth.json"), JSON.stringify({
-      "ramp-router": { type: "api_key", key: "current-secret" },
-    }))
-    const discovery = mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({
-      data: [
-        { id: "gpt-5.6-sol", owned_by: "openai", router: routerMetadata("gpt-5.6-sol") },
-        { id: "gpt-6-sol", owned_by: "openai", router: routerMetadata("gpt-6-sol") },
-        { id: "gpt-5.10", owned_by: "openai", router: routerMetadata("gpt-5.10") },
-        { id: "gpt-10-sol", owned_by: "openai", router: routerMetadata("gpt-10-sol") },
-        { id: "gpt-6-router", owned_by: "router", router: { ...routerMetadata("gpt-6-router"), surfaces: ["responses"] } },
-        { id: "gpt-5.5", owned_by: "openai", router: routerMetadata("gpt-5.5") },
-        { id: "gpt-5.6sol", owned_by: "openai", router: routerMetadata("gpt-5.6sol") },
-        { id: "gpt-5.6-terra", owned_by: "router", router: { ...routerMetadata("gpt-5.6-terra"), surfaces: ["responses"] } },
-        { id: "gpt-4o", owned_by: "router", router: { ...routerMetadata("gpt-4o"), surfaces: ["responses"] } },
-        { id: "gpt-6-other", owned_by: "anthropic", router: { ...routerMetadata("gpt-6-other"), surfaces: ["messages"] } },
-      ],
-    }), { status: 200 }))
-    const registered = mock.fn()
-    await registerRouterProvider({ registerProvider: registered })
-    const provider = registered.mock.calls[0].arguments[0]
-    const models = provider.getModels()
-    assert.equal(models.every(({ compat }) => compat === undefined), true)
-    assert.equal(models[0].openaiModel, true)
-    assert.equal(models[7].openaiModel, undefined)
+  beforeEach(() => {
+    // Most tests use synthetic Router IDs to exercise cache and credential
+    // behavior. Make those IDs known to the mocked Pi host without weakening
+    // the production catalog check or the explicit unknown-model tests below.
+    const fixtureIDs = [
+      "concurrent-model", "live-model", "current-model", "environment-model",
+      "escaped-model", "first-model", "stale-model", "superseded-model",
+      "audio-only", "second-model", "refreshed-model", "new-host-model",
+    ]
+    const createRuntime = ModelRuntime.create.bind(ModelRuntime)
+    mock.method(ModelRuntime, "create", async (...args) => {
+      const runtime = await createRuntime(...args)
+      const getProvider = runtime.getProvider.bind(runtime)
+      runtime.getProvider = (id) => {
+        const native = getProvider(id)
+        return id === "openai" && native
+          ? { ...native, getModels: () => [
+              ...native.getModels(),
+              ...fixtureIDs.map((id) => ({ id, compat: {} })),
+            ] }
+          : native
+      }
+      return runtime
+    })
 
-    const cache = JSON.parse(readFileSync(join(home, "ramp-router-model-cache.json"), "utf8"))
-    assert.equal(cache.version, 4)
-    assert.equal(cache.models.every(({ compat }) => compat === undefined), true)
-    assert.equal(cache.models.every(({ openaiModel }) => openaiModel === undefined), true)
-    assert.equal(cache.openaiModelIds.includes("gpt-5.5"), true)
-    assert.equal(cache.openaiModelIds.includes("gpt-5.6-terra"), false)
-    process.env.PI_OFFLINE = "1"
-    discovery.mock.mockImplementation(async () => { throw new Error("offline discovery") })
-    const restored = mock.fn()
-    await registerRouterProvider({ registerProvider: restored })
-    assert.equal(discovery.mock.callCount(), 1)
-    const offlineProvider = restored.mock.calls[0].arguments[0]
-    assert.equal(offlineProvider.getModels().every(({ compat }) => compat === undefined), true)
-
-    const requests = []
-    const effectiveCompat = []
-    const capture = async (_url, init) => {
-      requests.push(JSON.parse(init.body))
-      return new Response(JSON.stringify({ error: { message: "fixture stop" } }), {
-        status: 400, headers: { "content-type": "application/json" },
-      })
-    }
-    const context = {
-      messages: [{ role: "user", content: [{ type: "text", text: "summarize" }], timestamp: Date.now() }],
-      tools: [{ name: "lookup", description: "Look up a value", parameters: { type: "object", properties: {} } }],
-    }
-    for (const model of offlineProvider.getModels().slice(0, 9)) {
-      await offlineProvider.streamSimple(model, context, {
-        apiKey: "current-secret", fetch: capture, maxRetries: 0,
-        cacheRetention: "none", sessionId: "session-key",
-        onPayload: (payload, requestModel) => {
-          effectiveCompat.push(requestModel.compat)
-          return payload
-        },
-      }).result()
-    }
-    const nativeOpenAI = (await ModelRuntime.create({
-      modelsPath: null, refreshOnCreate: false, allowModelNetwork: false,
-    })).getProvider("openai").getModels()
-    assert.deepEqual(effectiveCompat[0], nativeOpenAI.find(({ id }) => id === "gpt-5.6-sol").compat)
-    assert.equal(nativeOpenAI.some(({ id }) => id === "gpt-6-sol"), false)
-    assert.deepEqual(effectiveCompat[1], { supportsExplicitPromptCacheMode: true })
-    assert.deepEqual(effectiveCompat[5], nativeOpenAI.find(({ id }) => id === "gpt-5.5").compat)
-    assert.equal(nativeOpenAI.some(({ id }) => id === "gpt-5.6-terra"), true)
-    assert.deepEqual(effectiveCompat[7], { supportsExplicitPromptCacheMode: true })
-    assert.equal(nativeOpenAI.some(({ id }) => id === "gpt-4o"), true)
-    assert.equal(effectiveCompat[8], undefined)
-    assert.deepEqual(requests.map(({ prompt_cache_options }) => prompt_cache_options), [
-      { mode: "explicit" }, { mode: "explicit" }, { mode: "explicit" },
-      { mode: "explicit" }, { mode: "explicit" },
-      undefined, undefined, { mode: "explicit" }, undefined,
-    ])
-    for (const [index, request] of requests.entries()) {
-      assert.equal(request.prompt_cache_key, undefined)
-      assert.equal(request.store, false)
-      assert.equal(request.tools[0].type, "function")
-      assert.equal("strict" in request.tools[0], index === 0 || index === 5)
-    }
-    await offlineProvider.streamSimple(offlineProvider.getModels()[0], context, {
-      apiKey: "current-secret", fetch: capture, maxRetries: 0,
-      cacheRetention: "short", sessionId: "session-key",
-    }).result()
-    assert.equal(requests[9].prompt_cache_options, undefined)
-    assert.equal(requests[9].prompt_cache_key, "session-key")
-
-    // A v4 cache written by the previous CLI had no ownership field. Keep
-    // those models usable offline, but do not infer full OpenAI compatibility.
-    delete cache.openaiModelIds
-    writeFileSync(join(home, "ramp-router-model-cache.json"), JSON.stringify(cache))
-    const legacy = mock.fn()
-    await registerRouterProvider({ registerProvider: legacy })
-    const legacyProvider = legacy.mock.calls[0].arguments[0]
-    assert.equal(legacyProvider.getModels().length, models.length)
-    let legacyCompat
-    await legacyProvider.streamSimple(legacyProvider.getModels()[0], context, {
-      apiKey: "current-secret", fetch: capture, maxRetries: 0,
-      cacheRetention: "none",
-      onPayload: (payload, requestModel) => {
-        legacyCompat = requestModel.compat
-        return payload
-      },
-    }).result()
-    assert.deepEqual(legacyCompat, { supportsExplicitPromptCacheMode: true })
-    assert.deepEqual(requests[10].prompt_cache_options, { mode: "explicit" })
-
-    cache.openaiModelIds = ["gpt-6-other"]
-    writeFileSync(join(home, "ramp-router-model-cache.json"), JSON.stringify(cache))
-    const invalidOwner = mock.fn()
-    await registerRouterProvider({ registerProvider: invalidOwner })
-    assert.deepEqual(invalidOwner.mock.calls[0].arguments[0].getModels(), [])
-
-    delete cache.openaiModelIds
-    cache.models[5].compat = { supportsExplicitPromptCacheMode: true }
-    writeFileSync(join(home, "ramp-router-model-cache.json"), JSON.stringify(cache))
-    const malformed = mock.fn()
-    await registerRouterProvider({ registerProvider: malformed })
-    assert.deepEqual(malformed.mock.calls[0].arguments[0].getModels(), [])
   })
 
   it("discovers models from Pi's stored credential during ordinary startup", async () => {
@@ -751,7 +652,7 @@ describe("Pi provider extension", () => {
       syncBuiltinESMExports();
       globalThis.fetch = async () => new Response(JSON.stringify({
         data: [{
-          id: "concurrent-model",
+          id: "gpt-5.4",
           owned_by: "openai",
           router: {
             schema_version: 1,
@@ -819,8 +720,8 @@ describe("Pi provider extension", () => {
 
     const winnerResult = JSON.parse(readFileSync(winner.resultPath, "utf8"))
     const loserResult = JSON.parse(readFileSync(loser.resultPath, "utf8"))
-    assert.deepEqual(winnerResult.models, ["concurrent-model"])
-    assert.deepEqual(loserResult.models, ["concurrent-model"])
+    assert.deepEqual(winnerResult.models, ["gpt-5.4"])
+    assert.deepEqual(loserResult.models, ["gpt-5.4"])
     assert.equal(
       winnerResult.credentialIdentity,
       loserResult.credentialIdentity,
@@ -835,7 +736,7 @@ describe("Pi provider extension", () => {
     )
     assert.deepEqual(
       JSON.parse(readFileSync(cachePath, "utf8")).models.map(({ id }) => id),
-      ["concurrent-model"],
+      ["gpt-5.4"],
     )
     assert.equal(
       fs.readdirSync(home).some(
@@ -1135,6 +1036,157 @@ describe("Pi provider extension", () => {
     await blocked(claude, { onPayload: (payload) => ({ ...payload, store: true }) }, /payload violates provider invariants/)
     await blocked(claude, { headers: { "x-api-key": "other-secret" } }, /request authorization is ambiguous/)
     assert.equal(requests.length, 2)
+  })
+
+  it("hides unsupported Anthropic models until Pi's native catalog includes them", async () => {
+    const home = process.env.PI_CODING_AGENT_DIR
+    writeFileSync(join(home, "auth.json"), JSON.stringify({
+      "ramp-router": { type: "api_key", key: "current-secret" },
+    }))
+    mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({
+      data: [{
+        id: "claude-opus-5-5", owned_by: "anthropic",
+        router: {
+          ...routerMetadata("claude-opus-5-5"), surfaces: ["messages"],
+          capabilities: {
+            ...routerMetadata("claude-opus-5-5").capabilities,
+            reasoning: { efforts: [
+              { value: "none", description: "" },
+              { value: "high", description: "" },
+            ] },
+          },
+        },
+      }],
+    }), { status: 200 }))
+    const registerProvider = mock.fn()
+    await registerRouterProvider({ registerProvider })
+    const [provider] = registerProvider.mock.calls[0].arguments
+    assert.deepEqual(provider.getModels(), [])
+    const [cached] = JSON.parse(readFileSync(join(home, "ramp-router-model-cache.json"), "utf8")).models
+    assert.equal(cached.id, "claude-opus-5-5")
+    assert.deepEqual(provider.filterModels([cached], { type: "api_key", key: "current-secret" }), [])
+
+    const requests = []
+    const capture = async (_url, init) => {
+      requests.push(JSON.parse(init.body))
+      return new Response(JSON.stringify({ error: { message: "fixture stop" } }), {
+        status: 400, headers: { "content-type": "application/json" },
+      })
+    }
+    const context = { messages: [{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() }] }
+    const blocked = await provider.streamSimple(cached, context, {
+      apiKey: "current-secret", fetch: capture, maxRetries: 0, reasoning: "high",
+    }).result()
+    assert.equal(blocked.stopReason, "error")
+    assert.match(blocked.errorMessage, /Update Pi to use this model/)
+    assert.equal(requests.length, 0)
+
+    // A host upgrade makes the same cached Router catalog selectable, even
+    // offline. Its native model metadata is then used for Messages requests.
+    const createRuntime = ModelRuntime.create.bind(ModelRuntime)
+    mock.method(ModelRuntime, "create", async (options) => {
+      const runtime = await createRuntime(options)
+      const getProvider = runtime.getProvider.bind(runtime)
+      runtime.getProvider = (id) => {
+        const native = getProvider(id)
+        return id === "anthropic" && native
+          ? { ...native, getModels: () => [...native.getModels(), {
+              id: "claude-opus-5-5", compat: { forceAdaptiveThinking: true },
+            }] }
+          : native
+      }
+      return runtime
+    })
+    process.env.PI_OFFLINE = "1"
+    const updated = mock.fn()
+    await registerRouterProvider({ registerProvider: updated })
+    const [updatedProvider] = updated.mock.calls[0].arguments
+    const [model] = updatedProvider.getModels()
+    assert.equal(model.id, "claude-opus-5-5")
+    assert.deepEqual(updatedProvider.filterModels([model], { type: "api_key", key: "current-secret" }), [model])
+    await updatedProvider.streamSimple(model, context, {
+      apiKey: "current-secret", fetch: capture, maxRetries: 0, reasoning: "high",
+    }).result()
+    assert.equal(requests[0].thinking.type, "adaptive")
+    assert.equal(requests[0].output_config.effort, "high")
+  })
+
+  it("hides unknown OpenAI models while retaining Router-only Responses models", async () => {
+    const home = process.env.PI_CODING_AGENT_DIR
+    writeFileSync(join(home, "auth.json"), JSON.stringify({
+      "ramp-router": { type: "api_key", key: "current-secret" },
+    }))
+    mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ data: [
+      { id: "unlisted-openai-model", owned_by: "openai", router: routerMetadata("unlisted-openai-model") },
+      { id: "router-only-model", owned_by: "xai", router: routerMetadata("router-only-model") },
+      // Pi 0.84.1 lacks this ID even though the Responses adapter has a
+      // request-format fallback for it. An OpenAI-owned entry is still hidden.
+      { id: "gpt-6-sol", owned_by: "openai", router: routerMetadata("gpt-6-sol") },
+    ] }), { status: 200 }))
+    const registered = mock.fn()
+    await registerRouterProvider({ registerProvider: registered })
+    const [provider] = registered.mock.calls[0].arguments
+    assert.deepEqual(provider.getModels().map(({ id }) => id), ["router-only-model"])
+    const cached = JSON.parse(readFileSync(join(home, "ramp-router-model-cache.json"), "utf8")).models
+    assert.deepEqual(cached.map(({ routerOwner }) => routerOwner), ["openai", "other", "openai"])
+    assert.deepEqual(provider.filterModels(cached, { type: "api_key", key: "current-secret" }).map(({ id }) => id), ["router-only-model"])
+    // Pi's models.json composer rebuilds definitions from a fixed field list;
+    // it does not preserve the private owner marker on either candidate.
+    const [composedOpenAI, composedRouterOnly] = cached.map(({ routerOwner, ...model }) => model)
+    assert.deepEqual(provider.filterModels([composedOpenAI, composedRouterOnly], {
+      type: "api_key", key: "current-secret",
+    }), [composedRouterOnly])
+    assert.deepEqual(provider.filterModels([
+      { ...composedRouterOnly, api: "anthropic-messages" },
+      { ...composedRouterOnly, id: "unknown-model" },
+    ], { type: "api_key", key: "current-secret" }), [])
+    const capture = mock.fn(async () => new Response(JSON.stringify({ error: { message: "fixture stop" } }), {
+      status: 400, headers: { "content-type": "application/json" },
+    }))
+    const blocked = await provider.streamSimple(cached[0], { messages: [] }, {
+      apiKey: "current-secret", fetch: capture, maxRetries: 0,
+    }).result()
+    assert.equal(blocked.stopReason, "error")
+    assert.match(blocked.errorMessage, /Update Pi to use this model/)
+    assert.equal(capture.mock.callCount(), 0)
+    const gatedGPT = await provider.streamSimple(cached[2], { messages: [] }, {
+      apiKey: "current-secret", fetch: capture, maxRetries: 0,
+    }).result()
+    assert.equal(gatedGPT.stopReason, "error")
+    assert.match(gatedGPT.errorMessage, /Update Pi to use this model/)
+    assert.equal(capture.mock.callCount(), 0)
+    await provider.streamSimple(composedRouterOnly, { messages: [] }, {
+      apiKey: "current-secret", fetch: capture, maxRetries: 0,
+    }).result()
+    assert.equal(capture.mock.callCount(), 1)
+
+    const createRuntime = ModelRuntime.create.bind(ModelRuntime)
+    mock.method(ModelRuntime, "create", async (...args) => {
+      const runtime = await createRuntime(...args)
+      const getProvider = runtime.getProvider.bind(runtime)
+      runtime.getProvider = (id) => {
+        const native = getProvider(id)
+        return id === "openai" && native
+          ? { ...native, getModels: () => [...native.getModels(), {
+              id: "unlisted-openai-model", api: "openai-responses", compat: { supportsStrictMode: true },
+            }] }
+          : native
+      }
+      return runtime
+    })
+    process.env.PI_OFFLINE = "1"
+    const updated = mock.fn()
+    await registerRouterProvider({ registerProvider: updated })
+    const [updatedProvider] = updated.mock.calls[0].arguments
+    assert.deepEqual(updatedProvider.getModels().map(({ id }) => id), ["unlisted-openai-model", "router-only-model"])
+    await updatedProvider.streamSimple(updatedProvider.getModels()[0], { messages: [] }, {
+      apiKey: "current-secret", fetch: capture, maxRetries: 0,
+      onPayload: (payload, requestModel) => {
+        assert.equal(requestModel.compat.supportsStrictMode, true)
+        return payload
+      },
+    }).result()
+    assert.equal(capture.mock.callCount(), 2)
   })
 
   it("guards the final Responses payload after sampling and extension transforms", async () => {

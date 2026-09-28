@@ -7,6 +7,11 @@ Router API key. Anthropic-owned models use Router's Anthropic Messages
 compatibility endpoint; other models use the OpenAI Responses API. Rows Router
 marks as unable to serve their selected API (for example TypeSafe, which
 answers only on `/v1/systemone`) are left out.
+Anthropic and OpenAI models are shown only when their IDs also appear in the
+installed Pi version's built-in catalog for the corresponding provider. Pi
+supplies model-specific Messages and Responses compatibility settings, so
+update Pi to see newly released models. Other Router-owned models still use
+the Responses adapter without requiring a native Pi catalog entry.
 
 Router sessions also show a native widget above Pi's editor after settled
 turns. It reports Switchyard routing, Router's last routed model and provider,

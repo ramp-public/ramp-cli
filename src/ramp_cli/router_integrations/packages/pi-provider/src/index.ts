@@ -68,7 +68,7 @@ const CONFIG_FILE = "ramp-router-config.json"
 const RUNTIME_MODELS_FILE = "ramp-router-runtime-models.json"
 const MODEL_CACHE_FILE = "ramp-router-model-cache.json"
 const MODEL_CACHE_KEY_FILE = "ramp-router-model-cache-key"
-const MODEL_CACHE_VERSION = 4
+const MODEL_CACHE_VERSION = 5
 // Local safety ceilings, not Router catalog limits. Oversized private state is
 // discarded and rebuilt from the bounded startup request instead of read into
 // memory during every Pi launch.
@@ -90,9 +90,10 @@ const PI_THINKING_LEVELS = [
 ] as const
 
 type RouterApi = "openai-responses" | "anthropic-messages"
+type RouterOwner = "anthropic" | "openai" | "other"
 // Discovery owns this classification; Pi's Responses adapter also serves
 // non-OpenAI Router models, so API alone is not enough to enable native tools.
-type RouterModel = Model<RouterApi> & { openaiModel?: true }
+type RouterModel = Model<RouterApi> & { routerOwner: RouterOwner }
 
 function modelBaseURL(api: RouterApi, routerBaseURL: string): string {
   // Pi's Anthropic SDK appends /v1/messages itself. Responses appends only
@@ -120,9 +121,19 @@ async function hostApi(providerId: string): Promise<ProviderStreams> {
       const native = provider.getModels().find(
         (candidate) => candidate.id === model.id && candidate.api === model.api,
       )
-      return native?.compat
-        ? { ...model, compat: { ...native.compat, ...model.compat } }
-        : model
+      const compat = { ...native?.compat, ...model.compat }
+      if (model.id === "claude-opus-5-5") {
+        // Older Pi hosts don't know Opus 5.5 yet. Its Messages API rejects
+        // both budget-based and disabled thinking, even when a local override
+        // tries to turn reasoning off. Keep Pi's adapter on adaptive.
+        return {
+          ...model,
+          reasoning: true,
+          thinkingLevelMap: { ...model.thinkingLevelMap, off: null },
+          compat: { ...compat, forceAdaptiveThinking: true },
+        }
+      }
+      return native?.compat ? { ...model, compat } : model
     }
     // Only Router models discovered as OpenAI inherit native tool behavior.
     // Old caches without ownership remain usable with cache-only compat.
@@ -134,7 +145,7 @@ async function hostApi(providerId: string): Promise<ProviderStreams> {
     const explicitCache = native?.compat?.supportsExplicitPromptCacheMode ??
       (!native && supportsExplicitPromptCacheMode(model.id) ? true : undefined)
     const compat = {
-      ...(model.openaiModel ? native?.compat : {}),
+      ...(model.routerOwner === "openai" ? native?.compat : {}),
       ...(explicitCache !== undefined ? { supportsExplicitPromptCacheMode: explicitCache } : {}),
       ...model.compat,
     }
@@ -146,6 +157,30 @@ async function hostApi(providerId: string): Promise<ProviderStreams> {
     streamSimple: (model, context, options) =>
       provider.streamSimple(withNativeCompat(model as RouterModel), context, options),
   }
+}
+
+async function nativeModelIDs(): Promise<ReadonlyMap<RouterApi, ReadonlySet<string>>> {
+  const ids = new Map<RouterApi, ReadonlySet<string>>()
+  try {
+    // Router models are dynamic, but both Pi adapters have native per-model
+    // compatibility settings. Upgrading Pi unlocks models without changing
+    // Router's credential-scoped catalog or cache.
+    const runtime = await ModelRuntime.create({
+      modelsPath: null,
+      refreshOnCreate: false,
+      allowModelNetwork: false,
+    })
+    for (const [api, provider] of [
+      ["anthropic-messages", "anthropic"],
+      ["openai-responses", "openai"],
+    ] as const) {
+      ids.set(api, new Set(runtime.getProvider(provider)?.getModels().map((model) => model.id)))
+    }
+  } catch {
+    // No native compatibility catalog means neither adapter can safely
+    // advertise Router models until Pi loads on the next launch.
+  }
+  return ids
 }
 
 /**
@@ -354,10 +389,9 @@ function toPiModel(model: DiscoveredModel, baseUrl: string): RouterModel {
     name: `${metadata.displayName} via ${metadata.providerDisplayName || model.ownedBy || "Ramp Router"}`,
     api,
     provider: PROVIDER_ID,
+    routerOwner: model.ownedBy === "anthropic" || model.ownedBy === "openai"
+      ? model.ownedBy : "other",
     baseUrl: modelBaseURL(api, baseUrl),
-    ...(api === "openai-responses" && model.ownedBy === "openai"
-      ? { openaiModel: true as const }
-      : {}),
     reasoning,
     ...(reasoning ? { thinkingLevelMap: thinkingLevelMap(model) } : {}),
     input: piInputModalities(metadata.inputModalities),
@@ -434,6 +468,7 @@ function routerProvider(
   baseUrl: string,
   models: readonly RouterModel[],
   catalogGeneration: CatalogGeneration,
+  supportedModelIDs: ReadonlyMap<RouterApi, ReadonlySet<string>>,
   initialCredentialIdentity?: string,
   rampCliVersion?: string,
 ) {
@@ -448,6 +483,12 @@ function routerProvider(
   // Never expose the model objects used as request authority. Pi and other
   // extensions retain Model references and can mutate them after selection.
   let currentModels = copyModels(models)
+  // An adapter fallback for a new GPT's request shape does not make that
+  // OpenAI-owned model available on an older Pi: require Pi's native catalog
+  // entry. Router-owned models still use the Responses adapter without one.
+  const isSupportedByPi = (model: RouterModel) =>
+    model.routerOwner === "other" ||
+    supportedModelIDs.get(model.api)?.has(model.id) === true
   let catalogCredentialIdentity = initialCredentialIdentity
   const payloadModelError = () =>
     new Error("Ramp Router request model is not in the active catalog")
@@ -589,6 +630,9 @@ function routerProvider(
     if (composed.api !== canonical.api) {
       throw new Error("Ramp Router model does not match this provider")
     }
+    if (!isSupportedByPi(canonical)) {
+      throw new Error("Update Pi to use this model through Ramp Router")
+    }
     // Preserve Pi's validated models.json tuning while pinning the four
     // identity-bearing fields to the private active catalog. The adapter and
     // onPayload hooks receive a disposable copy, never that private authority.
@@ -653,14 +697,22 @@ function routerProvider(
   })
   const registeredProvider = {
     ...provider,
-    getModels: () => copyModels(currentModels),
+    getModels: () => copyModels(currentModels.filter(isSupportedByPi)),
     // Pi owns the effective credential, including runtime --api-key
     // overrides. Filter against that exact resolved value instead of trying
     // to infer whether a refresh credential came from disk or runtime state.
     filterModels: (candidateModels: readonly RouterModel[], credential?: Credential) => {
       const apiKey = resolvedCredentialApiKey(credential)
       return apiKey && credentialIdentity(apiKey) === catalogCredentialIdentity
-        ? candidateModels
+        ? candidateModels.filter((candidate) => {
+            // Pi's models.json composer rebuilds models from a fixed field list,
+            // dropping routerOwner. Use only the private Router catalog for the
+            // owner decision; an unknown or API-swapped model stays hidden.
+            const canonical = currentModels.find(
+              (model) => model.id === candidate.id && model.api === candidate.api,
+            )
+            return canonical !== undefined && isSupportedByPi(canonical)
+          })
         : []
     },
     refreshModels: async ({
@@ -1082,6 +1134,7 @@ function cachedRouterModel(value: unknown, baseUrl: string): RouterModel | undef
     "name",
     "api",
     "provider",
+    "routerOwner",
     "baseUrl",
     "reasoning",
     "thinkingLevelMap",
@@ -1096,7 +1149,10 @@ function cachedRouterModel(value: unknown, baseUrl: string): RouterModel | undef
     !model.id ||
     typeof model.name !== "string" ||
     model.provider !== PROVIDER_ID ||
+    (model.routerOwner !== "anthropic" && model.routerOwner !== "openai" && model.routerOwner !== "other") ||
     (model.api !== "openai-responses" && model.api !== "anthropic-messages") ||
+    (model.routerOwner === "anthropic" && model.api !== "anthropic-messages") ||
+    (model.routerOwner !== "anthropic" && model.api !== "openai-responses") ||
     model.baseUrl !== modelBaseURL(model.api as RouterApi, baseUrl) ||
     typeof model.reasoning !== "boolean" ||
     typeof model.contextWindow !== "number" ||
@@ -1159,6 +1215,7 @@ function cachedRouterModel(value: unknown, baseUrl: string): RouterModel | undef
     name: model.name,
     api: model.api as RouterApi,
     provider: PROVIDER_ID,
+    routerOwner: model.routerOwner as RouterOwner,
     baseUrl: modelBaseURL(model.api as RouterApi, baseUrl),
     reasoning: model.reasoning,
     ...(restoredThinkingLevelMap
@@ -1192,7 +1249,6 @@ function readModelCache(baseUrl: string, apiKey: string): RouterModel[] {
       baseUrl?: unknown
       credentialIdentity?: unknown
       models?: unknown
-      openaiModelIds?: unknown
     }
     if (
       cache.version !== MODEL_CACHE_VERSION ||
@@ -1207,20 +1263,7 @@ function readModelCache(baseUrl: string, apiKey: string): RouterModel[] {
       return []
     }
     if (new Set(models.map((model) => model.id)).size !== models.length) return []
-    const openaiModelIds = cache.openaiModelIds ?? []
-    const responseModelIds = new Set(
-      models.filter((model) => model.api === "openai-responses").map((model) => model.id),
-    )
-    if (
-      !Array.isArray(openaiModelIds) ||
-      new Set(openaiModelIds).size !== openaiModelIds.length ||
-      !openaiModelIds.every((id) =>
-        typeof id === "string" && responseModelIds.has(id))
-    ) return []
-    const openaiModels = new Set<string>(openaiModelIds)
-    return models.map((model) => openaiModels.has(model.id)
-      ? { ...model, openaiModel: true }
-      : model)
+    return models
   } catch {
     return []
   }
@@ -1242,10 +1285,7 @@ function writeModelCache(
       version: MODEL_CACHE_VERSION,
       baseUrl,
       credentialIdentity: persistentCredentialIdentity,
-      // Older CLI releases ignore unknown top-level keys, but reject unknown
-      // model fields. Keep v4 model entries intact across upgrades/downgrades.
-      openaiModelIds: models.filter((model) => model.openaiModel).map((model) => model.id),
-      models: models.map(({ openaiModel: _openaiModel, ...model }) => model),
+      models,
     }),
   )
 }
@@ -1287,6 +1327,7 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
   let startupModels: RouterModel[] = []
   let restoredCatalog = false
   const catalogGeneration: CatalogGeneration = { current: 0 }
+  const supportedModelIDs = await nativeModelIDs()
   try {
     if (!supportsRuntimeModelBootstrap(PI_VERSION)) {
       throw new Error("Pi host does not support isolated model bootstrap")
@@ -1336,6 +1377,7 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
     baseUrl,
     startupModels,
     catalogGeneration,
+    supportedModelIDs,
     startupCredentialIdentity,
     rampCliVersion,
   )
