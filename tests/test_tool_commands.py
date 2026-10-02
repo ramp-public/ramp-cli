@@ -1134,8 +1134,9 @@ class TestPositionalIdParams:
         arg_names = [a.name for a in args]
         assert "bill_id" in arg_names
 
-    def test_real_tool_lock_card_id_positional(self):
+    def test_real_tool_lock_card_id_positional(self, monkeypatch):
         """lock-or-unlock-card should have id as positional."""
+        _use_bundled_spec(monkeypatch)
         tool = get_tool("lock-or-unlock-card")
         assert tool is not None
         cmd = build_tool_command(tool)
@@ -1276,8 +1277,9 @@ class TestDisplayName:
 
 
 class TestErrorExampleFormat:
-    def test_error_shows_positional_before_options(self):
+    def test_error_shows_positional_before_options(self, monkeypatch):
         """Error example should show positional args before options."""
+        _use_bundled_spec(monkeypatch)
         runner = CliRunner()
         # Provide the ID so Click doesn't intercept the missing arg error.
         # The missing --action triggers our custom error with the example.
