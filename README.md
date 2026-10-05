@@ -32,6 +32,12 @@ configures all automatic integrations, including Claude Desktop/Cowork when
 installed on macOS. Claude Desktop restarts to apply its Router profile.
 All integrations use the same key acquired during that run.
 Pass client names, such as `ramp router configure codex`, to limit setup.
+For unattended redeployments, add `--reuse-existing-key` to reuse a saved key
+for the selected Router deployment without opening the browser. If no compatible
+key is saved, setup still requests browser approval. If multiple saved keys
+disagree, setup stops so the user can choose a key interactively rather than
+silently replacing their credentials. An invalid saved key also fails setup;
+run `ramp router configure` without this option to create or select a replacement.
 
 To connect to another Router deployment, pass `--base-url` (the gateway `/v1`
 URL written into agent configs) and, for a deployment the CLI does not already

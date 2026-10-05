@@ -1014,6 +1014,23 @@ def router_group() -> None:
     pass
 
 
+@router_group.command("codex-connection-fingerprint", hidden=True)
+def router_codex_connection_fingerprint() -> None:
+    path = _client_config_path("codex")
+    _, config = _read_codex_config(path)
+    if config.get("model_provider") != ROUTER_PROVIDER:
+        click.echo("unconfigured")
+        return
+    base_url = _stored_router_base_url("codex", path)
+    try:
+        api_key = _stored_router_api_key("codex", path)
+    except click.ClickException:
+        api_key = None
+    # MDM compares connections without copying credentials into shell variables
+    # or treating refreshed models and version headers as a connection change.
+    click.echo(_content_digest(json.dumps([base_url, api_key])))
+
+
 @router_group.command(
     "configure-cowork",
     hidden=True,
@@ -1125,6 +1142,14 @@ def _validate_deployment_url(
     help="Print the Router setup URL instead of opening a browser.",
 )
 @click.option(
+    "--reuse-existing-key",
+    is_flag=True,
+    help=(
+        "Reuse a saved key for this Router deployment without a key picker. "
+        "Opens browser setup if none is saved; fails if saved keys disagree."
+    ),
+)
+@click.option(
     "--claude-models",
     type=click.Choice(("compact", "all"), case_sensitive=False),
     help="Models shown by Claude Code: recommended compact list or all models.",
@@ -1150,6 +1175,7 @@ def router_configure(
     setup_file: Path | None,
     api_key: str | None,
     no_browser: bool,
+    reuse_existing_key: bool,
     claude_models: str | None,
     base_url: str | None,
     ui_url: str | None,
@@ -1168,6 +1194,7 @@ def router_configure(
         claude_models=claude_models,
         api_key_source=ctx.get_parameter_source("api_key"),
         deployment_override=bool(base_url or ui_url),
+        reuse_existing_key=reuse_existing_key,
     )
 
 
@@ -1182,6 +1209,7 @@ def _run_configure(
     api_key_source: ParameterSource | None,
     legacy_cowork_alias: bool = False,
     deployment_override: bool = False,
+    reuse_existing_key: bool = False,
 ) -> None:
     if (
         setup_file is not None
@@ -1276,6 +1304,16 @@ def _run_configure(
             click.echo(f"Claude Code model list: {view}")
         return
 
+    if reuse_existing_key and setup_file is None and api_key is None:
+        credentials = _stored_router_api_key_choices()
+        if len(credentials) > 1:
+            raise click.UsageError(
+                "Saved Ramp Router keys disagree. Run 'ramp router configure' "
+                "interactively to choose a key, or supply --api-key."
+            )
+        if credentials:
+            api_key = credentials[0][0]
+
     if ctx.obj["no_input"] and setup_file is None and api_key is None:
         raise click.UsageError(
             "Pass --setup-file or --api-key when using non-interactive mode, or set "
@@ -1326,7 +1364,12 @@ def _run_configure(
         # Named on a host that cannot run Conductor: fail before a browser
         # opens or a key is created for a setup that cannot be written.
         raise click.ClickException("Conductor is only available on macOS.")
-    if setup_file is None and api_key is None and _can_prompt(ctx, fmt):
+    if (
+        setup_file is None
+        and api_key is None
+        and not reuse_existing_key
+        and _can_prompt(ctx, fmt)
+    ):
         api_key = _pick_stored_router_api_key()
     if setup_file is None and api_key is None:
         if clients == (CURSOR_CLIENT,) and not _clipboard_available():

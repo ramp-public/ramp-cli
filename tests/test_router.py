@@ -4688,15 +4688,74 @@ def test_configure_codex_requires_interactive_input(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("change", "connection_changed"),
+    [
+        ("key", True),
+        ("base-url", True),
+        ("first-setup", True),
+        ("disable-router", True),
+        ("model", False),
+        ("headers", False),
+    ],
+)
+def test_codex_connection_fingerprint_tracks_only_the_router_connection(
+    tmp_path, monkeypatch, change, connection_changed
+):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    config_path = tmp_path / "config.toml"
+    key_path = tmp_path / "ramp-router-key"
+    config = (
+        'model_provider = "ramp-router"\n'
+        'model = "gpt-5.4"\n'
+        "[model_providers.ramp-router]\n"
+        f'base_url = "{ROUTER_BASE_URL}"\n'
+        'http_headers = { "X-Gateway-Ramp-Cli-Version" = "old-version" }\n'
+    )
+    if change != "first-setup":
+        config_path.write_text(config)
+        key_path.write_text("saved-router-secret\n")
+    args = ["--quiet", "--no-input", "router", "codex-connection-fingerprint"]
+    before = CliRunner().invoke(cli, args)
+    assert before.exit_code == 0, before.output
+
+    replacements = {
+        "base-url": (ROUTER_BASE_URL, "https://internal-api.router.com/v1"),
+        "disable-router": (
+            'model_provider = "ramp-router"',
+            'model_provider = "openai"',
+        ),
+        "model": ("gpt-5.4", "gpt-5.5"),
+        "headers": ("old-version", "new-version"),
+    }
+    if change in replacements:
+        config = config.replace(*replacements[change])
+    config_path.write_text(config)
+    key_path.write_text(
+        "replacement-router-secret\n" if change == "key" else "saved-router-secret\n"
+    )
+    after = CliRunner().invoke(cli, args)
+    assert after.exit_code == 0, after.output
+    assert (before.output != after.output) == connection_changed
+    assert "saved-router-secret" not in before.output + after.output
+    assert "replacement-router-secret" not in before.output + after.output
+
+
+@pytest.mark.parametrize("unattended", [False, True])
+@pytest.mark.parametrize(
     ("saved_url", "active_url"),
     [
         (ROUTER_BASE_URL, ROUTER_BASE_URL),
         (router_module.LEGACY_ROUTER_BASE_URL, ROUTER_BASE_URL),
         (ROUTER_BASE_URL, router_module.LEGACY_ROUTER_BASE_URL),
+        ("https://internal-api.router.com/v1", "https://internal-api.router.com/v1"),
+        (
+            "https://qa-internal-api.router.com/v1",
+            "https://qa-internal-api.router.com/v1",
+        ),
     ],
 )
 def test_configure_reuses_one_existing_router_key_without_browser(
-    tmp_path, monkeypatch, saved_url, active_url
+    tmp_path, monkeypatch, saved_url, active_url, unattended
 ):
     codex_home = tmp_path / "codex"
     pi_home = tmp_path / "pi"
@@ -4718,7 +4777,7 @@ def test_configure_reuses_one_existing_router_key_without_browser(
     monkeypatch.setattr(
         router_module, "acquire_router_api_key", unexpected_browser_setup
     )
-    monkeypatch.setattr(router_module, "_can_prompt", lambda _ctx, _fmt: True)
+    monkeypatch.setattr(router_module, "_can_prompt", lambda _ctx, _fmt: not unattended)
 
     class Prompt:
         def ask(self):
@@ -4733,14 +4792,23 @@ def test_configure_reuses_one_existing_router_key_without_browser(
 
     monkeypatch.setattr(router_module.questionary, "select", select)
 
-    result = CliRunner().invoke(cli, ["--human", "router", "configure", "pi"])
+    args = ["--human"]
+    if unattended:
+        args.append("--no-input")
+    args.extend(["router", "configure", "pi"])
+    if unattended:
+        args.append("--reuse-existing-key")
+    result = CliRunner().invoke(cli, args)
 
     assert result.exit_code == 0, result.output
-    assert captured["message"] == "Choose a Ramp Router API key"
-    assert [choice.title for choice in captured["choices"]] == [
-        "Reuse existing key used by Codex",
-        "Create a new key",
-    ]
+    if unattended:
+        assert not captured
+    else:
+        assert captured["message"] == "Choose a Ramp Router API key"
+        assert [choice.title for choice in captured["choices"]] == [
+            "Reuse existing key used by Codex",
+            "Create a new key",
+        ]
     assert json.loads((pi_home / "auth.json").read_text())["ramp-router"]["key"] == (
         "existing-key"
     )
@@ -4762,11 +4830,18 @@ def test_router_key_reuse_does_not_cross_into_a_distinct_deployment(
     assert router_module._stored_router_api_key_choices() == []
 
 
+@pytest.mark.parametrize("reuse_existing_key", [False, True])
 @pytest.mark.parametrize(
-    "saved_base_url", [ROUTER_BASE_URL, "https://qa-router.ramp.dev/v1"]
+    ("saved_base_url", "saved_key"),
+    [
+        (ROUTER_BASE_URL, "existing-key"),
+        ("https://qa-router.ramp.dev/v1", "existing-key"),
+        (ROUTER_BASE_URL, None),
+        (ROUTER_BASE_URL, ""),
+    ],
 )
-def test_configure_without_terminal_uses_browser_even_with_a_saved_key(
-    tmp_path, monkeypatch, saved_base_url
+def test_configure_without_terminal_reuses_only_readable_compatible_keys_when_requested(
+    tmp_path, monkeypatch, saved_base_url, saved_key, reuse_existing_key
 ):
     codex_home = tmp_path / "codex"
     pi_home = tmp_path / "pi"
@@ -4774,11 +4849,17 @@ def test_configure_without_terminal_uses_browser_even_with_a_saved_key(
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     monkeypatch.setenv("PI_CODING_AGENT_DIR", str(pi_home))
     (codex_home / "ramp-router-state.json").write_text("{}\n")
-    (codex_home / "ramp-router-key").write_text("existing-key\n")
+    if saved_key is not None:
+        (codex_home / "ramp-router-key").write_text(saved_key)
     (codex_home / "config.toml").write_text(
         f'[model_providers.ramp-router]\nbase_url = "{saved_base_url}"\n'
     )
-    _mock_models(monkeypatch, key="browser-key")
+    expected_key = (
+        "existing-key"
+        if reuse_existing_key and saved_key and saved_base_url == ROUTER_BASE_URL
+        else "browser-key"
+    )
+    _mock_models(monkeypatch, key=expected_key)
     browser_calls = []
 
     def acquire(url, *, no_browser):
@@ -4787,17 +4868,23 @@ def test_configure_without_terminal_uses_browser_even_with_a_saved_key(
 
     monkeypatch.setattr(router_module, "acquire_router_api_key", acquire)
 
-    result = CliRunner().invoke(cli, ["--human", "router", "configure", "pi"])
+    args = ["--human", "router", "configure", "pi"]
+    if reuse_existing_key:
+        args.append("--reuse-existing-key")
+    result = CliRunner().invoke(cli, args)
 
     assert result.exit_code == 0, result.output
-    assert browser_calls == [("https://app.router.com", False)]
+    assert browser_calls == (
+        [] if expected_key == "existing-key" else [("https://app.router.com", False)]
+    )
     assert json.loads((pi_home / "auth.json").read_text())["ramp-router"]["key"] == (
-        "browser-key"
+        expected_key
     )
 
 
-def test_configure_uses_browser_when_existing_router_keys_disagree(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("unattended", [False, True])
+def test_configure_handles_conflicting_existing_router_keys(
+    tmp_path, monkeypatch, unattended
 ):
     codex_home = tmp_path / "codex"
     pi_home = tmp_path / "pi"
@@ -4811,7 +4898,8 @@ def test_configure_uses_browser_when_existing_router_keys_disagree(
         f'[model_providers.ramp-router]\nbase_url = "{ROUTER_BASE_URL}"\n'
     )
     (pi_home / "auth.json").write_text(
-        json.dumps({"ramp-router": {"type": "api_key", "key": "pi-key"}}) + "\n"
+        json.dumps({"ramp-router": {"type": "api_key", "key": "stored-pi-secret"}})
+        + "\n"
     )
     (pi_home / "ramp-router-config.json").write_text(
         json.dumps({"baseUrl": ROUTER_BASE_URL}) + "\n"
@@ -4824,7 +4912,7 @@ def test_configure_uses_browser_when_existing_router_keys_disagree(
         return "browser-key"
 
     monkeypatch.setattr(router_module, "acquire_router_api_key", acquire)
-    monkeypatch.setattr(router_module, "_can_prompt", lambda _ctx, _fmt: True)
+    monkeypatch.setattr(router_module, "_can_prompt", lambda _ctx, _fmt: not unattended)
 
     class Prompt:
         def ask(self):
@@ -4838,7 +4926,19 @@ def test_configure_uses_browser_when_existing_router_keys_disagree(
 
     monkeypatch.setattr(router_module.questionary, "select", select)
 
-    result = CliRunner().invoke(cli, ["--human", "router", "configure", "codex"])
+    args = ["--human", "router", "configure", "codex"]
+    if unattended:
+        args.append("--reuse-existing-key")
+    result = CliRunner().invoke(cli, args)
+
+    if unattended:
+        assert result.exit_code == 2, result.output
+        assert not browser_calls
+        assert not captured
+        assert (codex_home / "ramp-router-key").read_text() == "codex-key\n"
+        assert "codex-key" not in result.output
+        assert "stored-pi-secret" not in result.output
+        return
 
     assert result.exit_code == 0, result.output
     assert [choice.title for choice in captured["choices"]] == [
