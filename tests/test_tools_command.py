@@ -12,6 +12,7 @@ from ramp_cli.main import cli
 from ramp_cli.specs import AGENT_TOOL_SPEC
 from ramp_cli.tools.availability import AvailabilitySnapshot, ToolAvailability
 from ramp_cli.tools.parser import ToolDef, parse_spec
+from ramp_cli.tools.registry import _registry
 
 
 @pytest.fixture()
@@ -214,6 +215,11 @@ class TestToolsList:
     ):
         tools = parse_spec(AGENT_TOOL_SPEC)
         monkeypatch.setattr("ramp_cli.commands.tools.list_tool_defs", lambda env: tools)
+        # Commands resolve through the process-wide registry, which an earlier
+        # test in this worker may have loaded from another spec.
+        monkeypatch.setattr(_registry, "_tools", tools)
+        monkeypatch.setattr(_registry, "_index", {tool.name: tool for tool in tools})
+        monkeypatch.setattr(_registry, "_loaded_env", "production")
 
         list_result = runner.invoke(cli, ["--agent", "tools", "list"])
 

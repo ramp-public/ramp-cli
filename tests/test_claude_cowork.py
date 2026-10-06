@@ -1,4 +1,4 @@
-"""Tests for host-side Claude Cowork Router setup."""
+"""Tests for host-side Claude Desktop Router setup."""
 
 from __future__ import annotations
 
@@ -1026,3 +1026,126 @@ def test_migrate_gateway_base_url_restores_profile_when_receipt_write_fails(
         )
     assert profile_path.read_text() == original_profile
     assert claude_cowork.state_path().read_text() == original_state
+
+
+def _write_code_session(
+    root: Path,
+    data_dir: str,
+    scope: str,
+    session_id: str,
+    cli_session_id: str,
+    *,
+    title: str,
+    last_activity_at: int,
+) -> Path:
+    path = root / data_dir / "claude-code-sessions" / scope / f"local_{session_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "sessionId": f"local_{session_id}",
+                "cliSessionId": cli_session_id,
+                "title": title,
+                "lastActivityAt": last_activity_at,
+            }
+        )
+    )
+    return path
+
+
+def _code_session_titles(root: Path, data_dir: str) -> dict[str, str]:
+    return {
+        entry["cliSessionId"]: entry["title"]
+        for entry in (
+            json.loads(path.read_text())
+            for path in (root / data_dir / "claude-code-sessions").glob(
+                "*/*/local_*.json"
+            )
+        )
+    }
+
+
+def test_configure_and_unconfigure_carry_code_sessions_across_modes(cowork_host):
+    root, _events = cowork_host
+    _write_code_session(
+        root, "Claude", "acct/org", "a", "cli-a", title="Before", last_activity_at=1
+    )
+    _write_code_session(
+        root,
+        "Claude-3p",
+        "acct/org",
+        "z",
+        "cli-z",
+        title="Old 3p",
+        last_activity_at=1,
+    )
+
+    claude_cowork.configure("router-secret", "https://router.example/v1")
+
+    assert _code_session_titles(root, "Claude-3p") == {
+        "cli-a": "Before",
+        "cli-z": "Old 3p",
+    }
+    copied = root / "Claude-3p/claude-code-sessions/acct/org/local_a.json"
+    assert stat.S_IMODE(copied.stat().st_mode) == 0o600
+
+    # Work continues in third-party mode, then Router is removed.
+    _write_code_session(
+        root,
+        "Claude-3p",
+        "acct/org",
+        "b",
+        "cli-b",
+        title="During",
+        last_activity_at=2,
+    )
+    _write_code_session(
+        root,
+        "Claude-3p",
+        "acct/org",
+        "a",
+        "cli-a",
+        title="Renamed",
+        last_activity_at=3,
+    )
+
+    claude_cowork.unconfigure()
+
+    assert _code_session_titles(root, "Claude") == {
+        "cli-a": "Renamed",
+        "cli-b": "During",
+        "cli-z": "Old 3p",
+    }
+    # Entries already present are updated in place rather than duplicated.
+    assert (
+        len(list((root / "Claude/claude-code-sessions").glob("*/*/local_a.json"))) == 1
+    )
+
+
+def test_code_session_sync_keeps_the_most_recently_active_entry(cowork_host):
+    root, _events = cowork_host
+    newer = _write_code_session(
+        root, "Claude", "acct/org", "a", "cli-a", title="Newer", last_activity_at=5
+    )
+    _write_code_session(
+        root, "Claude-3p", "acct/org", "a", "cli-a", title="Older", last_activity_at=4
+    )
+
+    assert claude_cowork._sync_code_sessions_stopped() == 1
+    assert json.loads(newer.read_text())["title"] == "Newer"
+    assert _code_session_titles(root, "Claude-3p") == {"cli-a": "Newer"}
+    assert claude_cowork._sync_code_sessions_stopped() == 0
+
+
+def test_code_session_sync_needs_a_signed_in_target(cowork_host):
+    root, _events = cowork_host
+    _write_code_session(
+        root, "Claude-3p", "acct/org", "z", "cli-z", title="3p", last_activity_at=1
+    )
+
+    assert claude_cowork._sync_code_sessions_stopped() == 0
+    assert not (root / "Claude" / "claude-code-sessions").exists()
+
+    (root / "Claude/claude-code-sessions/acct/org").mkdir(parents=True)
+    assert claude_cowork._sync_code_sessions_stopped() == 1
+    assert _code_session_titles(root, "Claude") == {"cli-z": "3p"}

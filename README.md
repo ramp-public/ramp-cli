@@ -10,8 +10,30 @@ curl -fsSL https://agents.ramp.com/install.sh | sh
 
 This detects your platform, downloads a pre-built binary, and sets up the `ramp` command.
 
-After installation, choose which coding agents and desktop apps to connect to
-Ramp Router. The picker lists the integrations found on your machine:
+After installation, open the Router workspace to connect coding agents and
+desktop apps, manage API keys, edit routing strategies, and choose subagent
+models:
+
+```bash
+ramp router                          # or: ramp router ui
+ramp router ui --inline --height 18  # beneath your prompt (macOS/Linux)
+ramp router ui --theme light         # dark, light, terminal, or auto (default)
+```
+
+`RAMP_ROUTER_THEME` sets a default theme and `RAMP_ROUTER_REDUCED_MOTION=1`
+turns off animation. Interactive `router configure`, `keys`, `strategies`,
+`account`, and `subagents` open their workspace screens.
+
+Scripts never get the UI: agent mode, `--no-input`, JSON output, `--quiet`,
+redirected stdin/stdout, and `TERM=dumb` keep every command's existing
+noninteractive behavior, and `router ui` in those modes is a usage error:
+
+```bash
+ramp --agent router keys list
+ramp --agent --no-input router configure codex  # key from RAMP_ROUTER_CONFIGURE_API_KEY or --setup-file
+```
+
+To start directly at harness setup:
 
 ```bash
 ramp router configure
@@ -22,10 +44,10 @@ New production setups use `https://api.router.com/v1` for Router requests.
 (`https://router-api.ramp.com/v1`) in CLI-managed agent setups to the canonical
 host. For Claude Code, the configured `ANTHROPIC_BASE_URL` is the host without
 `/v1`. Other saved deployments and current `RAMP_ROUTER_BASE_URL` /
-`LLM_GATEWAY_BASE_URL` overrides are preserved. Claude Cowork's Desktop profile
+`LLM_GATEWAY_BASE_URL` overrides are preserved. Claude Desktop's Router profile
 migrates on refresh when Claude Desktop is closed. Refresh does not interrupt
 a running Desktop session; to migrate immediately, run
-`ramp router configure cowork --base-url https://api.router.com/v1`.
+`ramp router configure desktop --base-url https://api.router.com/v1`.
 
 Without a terminal (for example, during an MDM install), omitting client names
 configures all automatic integrations, including Claude Desktop/Cowork when
@@ -60,6 +82,41 @@ brew install ramp-public/ramp/ramp-cli
 ```bash
 uv tool install git+https://github.com/ramp-public/ramp-cli.git
 ```
+
+## Manage Router API keys
+
+Run `ramp router login`, then `ramp router keys` to select a key and inspect
+its usage. The selected-key menu lets you rename it, choose an existing routing
+strategy, or lock/unlock it. Locking stops requests without deleting the key;
+unlocking remains subject to account and administrator restrictions.
+Changing strategy moves only that key, without editing the shared strategy.
+Strategy selection requires routing profiles to be available for your account.
+
+For scripts and AI agents:
+
+```bash
+ramp router keys rename KEY_ID --name "Coding"
+ramp router keys set-strategy KEY_ID --routing-profile "Cheap"
+ramp router keys lock KEY_ID
+ramp router keys unlock KEY_ID
+```
+
+All four commands support `--dry-run` and the standard `--agent` JSON output.
+These changes do not rotate the key's secret or rewrite agent configurations.
+
+For routing strategies, `ramp router strategies` opens the account editor in
+human-readable mode. Machine-readable listings preserve the configured API key's
+strategy-settings response, even after `ramp router login`. Select account profiles
+explicitly with `ramp --agent router strategies list --account` (or
+`ramp --agent router strategies --account`). `--account` and `--api-key` cannot be
+combined. Account profiles are changed with `strategies create/edit/delete`;
+`strategies enable/disable` continues to change key-owner settings.
+
+Strategy saves apply settings and key assignments in separate requests. If a save
+partially fails, some changes may already be live. The editor reloads the saved
+state and preserves your remaining edits for review; if it cannot reload, editing
+stops until you reopen the strategy. Browser reauthorization that changes the
+user or business stops a pending write so you can review the account and rerun it.
 
 ## Quick Start
 

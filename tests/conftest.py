@@ -21,7 +21,7 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
     monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "pi"))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
-    # Claude Cowork state lives under ~/Library/Application Support and is
+    # Claude Desktop state lives under ~/Library/Application Support and is
     # reached through Path.home(), so without this a test that configures or
     # tears down every agent edits the developer's real Cowork setup.
     monkeypatch.setenv("RAMP_CLAUDE_DESKTOP_APP_SUPPORT", str(tmp_path / "app-support"))
@@ -33,6 +33,16 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv(
         "RAMP_CONDUCTOR_APP_SUPPORT", str(tmp_path / "conductor-app-support")
     )
+    # Cursor detection reads its user-data directory and state database.
+    monkeypatch.setenv("RAMP_CURSOR_USER_DIR", str(tmp_path / "cursor-user"))
+    # A RouterService pins the process to its Router origin; reset it so one
+    # test's origin never decides where the next one's requests go.
+    monkeypatch.setattr("ramp_cli.commands.router._session_origin", None)
+    # Cloudflare Access tokens come from the developer's own cloudflared and
+    # ~/.cloudflared, and detected edges are remembered per process.
+    monkeypatch.setattr("ramp_cli.client.router_user._edge_token", lambda _o: None)
+    monkeypatch.setattr("ramp_cli.client.router_user._edge_origins", set())
+    monkeypatch.setattr("ramp_cli.client.router_user._edge_rejected", {})
     # Codex desktop app detection looks for the ChatGPT app's bundled Codex
     # CLI; a sandbox location keeps a developer's real app out of the picker.
     monkeypatch.setattr(
@@ -54,6 +64,8 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     for leaked in (
         "RAMP_ROUTER_BASE_URL",
         "RAMP_ROUTER_UI_URL",
+        "RAMP_ROUTER_ACCESS_ORIGIN",
+        "RAMP_ROUTER_ACCESS_TOKEN",
         "LLM_GATEWAY_BASE_URL",
         "RAMP_ROUTER_CONFIGURE_API_KEY",
         "RAMP_ACCESS_TOKEN",

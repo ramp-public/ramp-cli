@@ -18,13 +18,17 @@ import httpx
 import pytest
 import zstandard
 from click.testing import CliRunner
+from prompt_toolkit.application import create_app_session
+from prompt_toolkit.input import create_pipe_input
+from prompt_toolkit.output import DummyOutput
 
 import ramp_cli.commands.router as router_module
 from ramp_cli import __version__, claude_cowork
-from ramp_cli.commands import claude_code
+from ramp_cli.commands import claude_code, cursor
 from ramp_cli.commands.router import DEFAULT_ROUTER_BASE_URL as ROUTER_BASE_URL
 from ramp_cli.config.settings import config_dir
 from ramp_cli.main import cli
+from ramp_cli.router_ui import harness as router_harness
 
 
 @pytest.fixture(autouse=True)
@@ -246,7 +250,7 @@ def test_configure_cowork_consumes_the_setup_file_and_deletes_it_after_success(
     assert not setup_file.exists()
     assert "router-secret" not in result.output
     assert "ambient-secret" not in result.output
-    assert "Connected to: Claude Cowork" in result.output
+    assert "Connected to: Claude Desktop" in result.output
     assert "1 model discovered" in result.output
     assert "5.6 Sol" in result.output
 
@@ -515,7 +519,7 @@ def test_configure_cowork_names_the_model_that_was_actually_discovered(
     )
 
     assert result.exit_code == 0, result.output
-    assert "Pick Other Model in Cowork" in result.output
+    assert "Pick Other Model in Claude Desktop" in result.output
 
 
 def test_configure_cowork_agent_output_recommends_without_claiming_a_default(
@@ -773,11 +777,11 @@ def test_configure_cowork_through_the_consolidated_command(tmp_path, monkeypatch
     )
 
     assert result.exit_code == 0, result.output
-    assert "Connected to: Claude Cowork" in result.output
+    assert "Connected to: Claude Desktop" in result.output
     assert "1 model discovered" in result.output
     assert "Claude Desktop was restarted" in result.output
-    assert "Pick 5.6 Sol in Cowork" in result.output
-    assert "ramp router unconfigure cowork" in result.output
+    assert "Pick 5.6 Sol in Claude Desktop" in result.output
+    assert "ramp router unconfigure desktop" in result.output
 
 
 def test_configure_cowork_classifies_bad_input_before_the_host_check(
@@ -1050,7 +1054,7 @@ def test_unconfigure_cowork_through_the_consolidated_command(monkeypatch):
     assert result.exit_code == 0, result.output
     assert events == ["undone"]
     assert (
-        "Removed Ramp Router and restored your previous settings for: Claude Cowork."
+        "Removed Ramp Router and restored your previous settings for: Claude Desktop."
         in result.output
     )
     assert "Claude Desktop was restarted." in result.output
@@ -1082,7 +1086,7 @@ def test_unconfigure_without_arguments_removes_a_configured_cowork(
     assert removed.exit_code == 0, removed.output
     assert not (tmp_path / "codex" / "ramp-router-state.json").exists()
     assert events == ["undone"]
-    assert "Claude Cowork" in removed.output
+    assert "Claude Desktop" in removed.output
     assert "Claude Desktop was restarted." in removed.output
 
 
@@ -1137,7 +1141,7 @@ def test_unconfigure_picker_offers_a_configured_cowork(monkeypatch):
     # the Claude setup that exists instead of failing on the one that
     # does not.
     assert events == ["undone"]
-    assert "Claude Cowork" in result.output
+    assert "Claude Desktop" in result.output
 
 
 def test_unconfigure_picker_merges_cowork_into_the_claude_entry(monkeypatch):
@@ -1226,7 +1230,7 @@ def test_unconfigure_named_claude_removes_both_claude_setups(monkeypatch):
     assert result.exit_code == 0, result.output
     assert removed == ["claude-code", "cowork"]
     assert "Claude Code" in result.output
-    assert "Claude Cowork" in result.output
+    assert "Claude Desktop" in result.output
     assert "Claude Desktop was restarted." in result.output
 
 
@@ -1284,7 +1288,7 @@ def test_unconfigure_named_claude_resolves_to_the_claude_setup_that_exists(
 
     assert result.exit_code == 0, result.output
     assert events == ["undone"]
-    assert "Claude Cowork" in result.output
+    assert "Claude Desktop" in result.output
 
 
 def test_cowork_commands_are_hidden_deprecated_aliases():
@@ -1609,7 +1613,7 @@ def test_refresh_migrates_stale_cowork_model_selections(tmp_path, monkeypatch):
         },
     )
     assert (
-        "Updated 1 saved Claude Cowork model selection to the ids Router "
+        "Updated 1 saved Claude Desktop model selection to the ids Router "
         "serves today." in result.output
     )
     selector = json.loads(settings_path.read_text())["__model_selector_state"]
@@ -1640,7 +1644,7 @@ def test_refresh_migrates_a_closed_cli_owned_cowork_profile(tmp_path, monkeypatc
     result = CliRunner().invoke(cli, ["--human", "router", "refresh"])
 
     assert result.exit_code == 0, result.output
-    assert "Moved Claude Cowork's Router profile to api.router.com" in result.output
+    assert "Moved Claude Desktop's Router profile to api.router.com" in result.output
     assert claude_cowork.configured_gateway_base_url() == "https://api.router.com"
     assert json.loads(profile_path.read_text())["inferenceGatewayBaseUrl"] == (
         "https://api.router.com"
@@ -1722,7 +1726,7 @@ def test_refresh_reports_an_unusable_cowork_setup_without_failing(
 
     def raise_credential_changed():
         raise click.ClickException(
-            "The Claude Cowork Router credential changed after setup."
+            "The Claude Desktop Router credential changed after setup."
         )
 
     monkeypatch.setattr(claude_cowork, "configured_api_key", raise_credential_changed)
@@ -1731,8 +1735,8 @@ def test_refresh_reports_an_unusable_cowork_setup_without_failing(
 
     assert result.exit_code == 0, result.output
     assert (
-        "Claude Cowork's saved model selections were not checked: "
-        "The Claude Cowork Router credential changed after setup."
+        "Claude Desktop's saved model selections were not checked: "
+        "The Claude Desktop Router credential changed after setup."
     ) in result.output
     assert settings_path.read_text() == before
 
@@ -5863,6 +5867,72 @@ def test_unconfigure_pi_restores_original_auth_after_reconfigure(tmp_path, monke
     assert json.loads(auth_path.read_text()) == original_auth
 
 
+@pytest.mark.parametrize(
+    ("keys", "expected"),
+    [
+        ("\r\x1b[B\r\x1b[B\x1b[B\r", ("claude-code", "codex")),
+        ("\r\r\x1b[B \x1b[B\x1b[B\r", ("codex",)),
+        ("a\x1b[B\x1b[B\x1b[B\r", ("claude-code", "codex", "cursor")),
+        ("\x1b[B\x1b[B\x1b[B\r\x1b[A\r\x1b[B\r", ("cursor",)),
+        ("aa\x1b[B\r\x1b[B\x1b[B\r", ("codex",)),
+    ],
+)
+def test_agent_picker_toggles_until_submit(keys, expected):
+    with create_pipe_input() as pipe:
+        with create_app_session(input=pipe, output=DummyOutput()):
+            pipe.send_text(keys)
+            assert (
+                router_module._pick_clients(
+                    "Choose agents", ("claude-code", "codex", "cursor")
+                )
+                == expected
+            )
+
+
+def test_agent_picker_cancel_aborts():
+    with create_pipe_input() as pipe:
+        with create_app_session(input=pipe, output=DummyOutput()):
+            pipe.send_text("\x03")
+            with pytest.raises(click.Abort):
+                router_module._pick_clients("Choose agents", ("codex",))
+
+
+@pytest.mark.parametrize("command", ["configure", "unconfigure"])
+def test_agent_picker_escape_returns_to_router_menu(command, monkeypatch, tmp_path):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setattr(router_module, "_can_draw_picker", lambda _ctx: True)
+    monkeypatch.setattr(router_module, "_installed_clients", lambda: ("codex",))
+    monkeypatch.setattr(router_module, "_codex_app_installed", lambda: False)
+    monkeypatch.setattr(router_module.conductor, "is_installed", lambda: False)
+    monkeypatch.setattr(router_module, "_clients_with_a_receipt", lambda: ("codex",))
+    with create_pipe_input() as pipe:
+        with create_app_session(input=pipe, output=DummyOutput()):
+            pipe.send_text("\x1b")
+            result = CliRunner().invoke(
+                cli,
+                [
+                    "--human",
+                    "router",
+                    *(
+                        ["configure", "connect"]
+                        if command == "configure"
+                        else [command]
+                    ),
+                ],
+                prog_name="ramp",
+            )
+
+    assert result.exit_code == 0, result.output
+    if command == "configure":
+        assert "ramp router configure [OPTIONS]" in result.output
+        assert "disconnect" in result.output
+    else:
+        assert "ramp router [OPTIONS] COMMAND [ARGS]" in result.output
+    assert "Commands" in result.output
+    assert "Aborted!" not in result.output
+    assert not (tmp_path / "codex" / "ramp-router-state.json").exists()
+
+
 def _capture_picker(monkeypatch, answer):
     """Record the choices the picker is built with instead of drawing it."""
     captured = {}
@@ -5876,6 +5946,7 @@ def _capture_picker(monkeypatch, answer):
         captured.update(kwargs)
         return Prompt()
 
+    monkeypatch.setattr(router_module, "_agent_checkbox", checkbox)
     monkeypatch.setattr(router_module.questionary, "checkbox", checkbox)
     return captured
 
@@ -7602,7 +7673,7 @@ def test_claude_models_option_survives_the_merged_claude_entry(tmp_path, monkeyp
     )
 
     assert result.exit_code == 0, result.output
-    assert "Connected to: Claude Code and Claude Cowork" in result.output
+    assert "Connected to: Claude Code and Claude Desktop" in result.output
 
 
 def test_picking_claude_in_the_menu_sets_up_cowork_without_a_question(
@@ -7626,10 +7697,10 @@ def test_picking_claude_in_the_menu_sets_up_cowork_without_a_question(
         lambda *_args, **_kwargs: (tmp_path / "profile.json", ()),
     )
 
-    result = CliRunner().invoke(cli, ["--human", "router", "configure"])
+    result = CliRunner().invoke(cli, ["--human", "router", "configure", "connect"])
 
     assert result.exit_code == 0, result.output
-    assert "Connected to: Claude Code and Claude Cowork" in result.output
+    assert "Connected to: Claude Code and Claude Desktop" in result.output
     assert (claude_home / "settings.json").exists()
 
 
@@ -7654,7 +7725,7 @@ def test_the_claude_entry_covers_only_claude_code_where_cowork_cannot_run(
     )
     monkeypatch.setattr(router_module, "_pick_stored_router_api_key", lambda: None)
 
-    result = CliRunner().invoke(cli, ["--human", "router", "configure"])
+    result = CliRunner().invoke(cli, ["--human", "router", "configure", "connect"])
 
     assert result.exit_code == 0, result.output
     assert "Connected to: Claude Code" in result.output
@@ -7696,7 +7767,7 @@ def test_a_setup_file_run_covers_the_picked_claude_entry(tmp_path, monkeypatch):
     )
 
     assert result.exit_code == 0, result.output
-    assert "Connected to: Claude Code and Claude Cowork" in result.output
+    assert "Connected to: Claude Code and Claude Desktop" in result.output
     assert (claude_home / "settings.json").exists()
     assert not setup_file.exists()
 
@@ -7704,10 +7775,11 @@ def test_a_setup_file_run_covers_the_picked_claude_entry(tmp_path, monkeypatch):
 def test_an_explicit_claude_code_argument_stays_exactly_claude_code(
     tmp_path, monkeypatch
 ):
-    # Naming agents on the command line means exactly those agents; the
-    # silent Cowork expansion belongs to the picker's merged Claude entry.
+    # Naming claude-code adds Claude Desktop only while Desktop isn't on
+    # Router; an already connected Desktop is never restarted.
     claude_home = tmp_path / "claude"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    monkeypatch.setattr(claude_cowork, "desktop_status", lambda: "connected")
     _mock_models(monkeypatch)
     monkeypatch.setattr(router_module, "_can_draw_picker", lambda _ctx: True)
     monkeypatch.setattr(claude_cowork, "is_available", lambda: True)
@@ -7813,7 +7885,10 @@ def test_configure_without_a_terminal_targets_every_integration(
     if not browser_setup:
         monkeypatch.setenv(router_module.CONFIGURE_KEY_ENV, "router-secret")
 
-    configure = CliRunner().invoke(cli, ["--human", "router", "configure"])
+    # Human-facing configure now opens its action menu. Explicit connect runs
+    # setup; the env-key installer shortcut remains compatible without it.
+    path = ["--human", "router", "configure"] + (["connect"] if browser_setup else [])
+    configure = CliRunner().invoke(cli, path)
 
     assert configure.exit_code == 0, configure.output
     assert browser_calls == (
@@ -7826,7 +7901,7 @@ def test_configure_without_a_terminal_targets_every_integration(
         {"cowork": "router-secret"} if desktop_apps_available else {}
     )
     if desktop_apps_available:
-        assert "Connected to: Claude Code, Codex, OpenCode, Pi, and Claude Cowork" in (
+        assert "Connected to: Claude Code, Codex, OpenCode, Pi, and Claude Desktop" in (
             configure.output
         )
     else:
@@ -9520,6 +9595,91 @@ def test_strategy_disable_patches_false(monkeypatch):
     assert "Disabled Cost-efficient routing." in result.output
 
 
+def _connected_harness(monkeypatch, base_url="https://router.example/v1"):
+    @contextlib.contextmanager
+    def connection(client):
+        yield router_harness.Connection(client, None, f"{client}-secret", base_url)
+
+    monkeypatch.setattr(router_harness, "connection", connection)
+
+
+def test_strategy_harness_flag_uses_that_harness_key_and_endpoint(monkeypatch):
+    _connected_harness(monkeypatch)
+    monkeypatch.setenv(router_module.CONFIGURE_KEY_ENV, "env-secret")
+    captured = {}
+
+    def patch(url, *, headers, json, timeout):
+        captured["request"] = (url, headers["Authorization"], json)
+        return httpx.Response(
+            200,
+            json={**_STRATEGY_SETTINGS_PAYLOAD, "allow_flex_tier_default": False},
+            request=httpx.Request("PATCH", url),
+        )
+
+    monkeypatch.setattr("ramp_cli.commands.router.httpx.patch", patch)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--no-input",
+            "--human",
+            "router",
+            "strategies",
+            "--harness",
+            "codex",
+            "disable",
+            "cost-efficient-routing",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["request"] == (
+        "https://router.example/session-usage/strategies",
+        "Bearer codex-secret",
+        {"allow_flex_tier_default": False},
+    )
+
+
+def test_strategy_harness_flag_reads_settings_noninteractively(monkeypatch):
+    _connected_harness(monkeypatch)
+    urls = []
+
+    def get(url, *, headers, timeout):
+        urls.append((url, headers["Authorization"]))
+        return httpx.Response(
+            200, json=_STRATEGY_SETTINGS_PAYLOAD, request=httpx.Request("GET", url)
+        )
+
+    monkeypatch.setattr("ramp_cli.commands.router.httpx.get", get)
+    result = CliRunner().invoke(
+        cli, ["-o", "json", "router", "strategies", "--harness", "claude-code"]
+    )
+    assert result.exit_code == 0, result.output
+    assert urls == [
+        (
+            "https://router.example/session-usage/strategies",
+            "Bearer claude-code-secret",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--harness", "codex", "--api-key", "other"],
+        ["--harness", "codex", "--account"],
+        ["--harness", "codex", "enable", "switchyard-routing", "--api-key", "other"],
+    ],
+)
+def test_strategy_harness_flag_rejects_a_second_key_source(monkeypatch, arguments):
+    _connected_harness(monkeypatch)
+    monkeypatch.setattr(
+        "ramp_cli.commands.router.httpx.patch",
+        lambda *a, **kw: pytest.fail("Changed settings for the wrong key"),
+    )
+    result = CliRunner().invoke(cli, ["router", "strategies", *arguments])
+    assert result.exit_code == 2, result.output
+    assert "--harness cannot be combined" in result.output
+
+
 def test_strategy_enable_reports_a_change_router_declined(monkeypatch):
     # Router answers with the effective state, which can decline a change.
     monkeypatch.setattr(
@@ -10210,3 +10370,31 @@ def test_strategy_enable_surfaces_router_config_validation_errors(monkeypatch):
 
     assert result.exit_code != 0
     assert "Unknown Switchyard efficient model `oops`." in result.output
+
+
+def _cursor_override(base_url):
+    """Write Cursor's OpenAI base-URL override where Cursor keeps it."""
+    path = cursor.user_dir() / "globalStorage" / "state.vscdb"
+    path.parent.mkdir(parents=True)
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB)")
+        db.execute(
+            "INSERT INTO ItemTable VALUES (?, ?)",
+            (cursor._SETTINGS_KEY, json.dumps({"openAIBaseUrl": base_url})),
+        )
+
+
+def test_cursor_counts_as_routed_only_when_its_override_points_at_router():
+    assert not cursor.is_installed()
+    assert not router_module._cursor_routes_to_router()
+    _cursor_override(" https://api.router.com/v1/ ")
+    assert cursor.is_installed()
+    assert cursor.override_base_url() == "https://api.router.com/v1"
+    assert router_module._cursor_routes_to_router()
+
+
+def test_cursor_pointed_elsewhere_or_unreadable_is_not_routed():
+    _cursor_override("https://api.openai.com/v1")
+    assert not router_module._cursor_routes_to_router()
+    (cursor.user_dir() / "globalStorage" / "state.vscdb").write_text("not sqlite")
+    assert cursor.override_base_url() is None

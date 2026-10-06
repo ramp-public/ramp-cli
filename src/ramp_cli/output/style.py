@@ -1181,10 +1181,12 @@ def show_detail_card(
     title: str,
     fields: dict[str, Any],
     file: TextIO | None = None,
+    *,
+    plain: bool = False,
 ) -> None:
-    """Print a framed detail card with gradient values and status coloring."""
+    """Print a detail card; plain mode omits gradients, fills, and shadows."""
     file = file or sys.stdout
-    use_color = _color_supported(file)
+    use_color = _color_supported(file) and not plain
     available = _term_width() - _MARGIN - _SHADOW_W
     width = min(max(_WIDTH_MIN, available), _WIDTH_MAX)
     inner = width - 4
@@ -1192,7 +1194,9 @@ def show_detail_card(
     if not use_color:
         # Plain key:value output
         click.echo(_frame_top(title, width, use_color=False), file=file)
-        label_w_plain = 25
+        # Explicit plain cards size labels to their content; the legacy
+        # no-color fallback keeps its fixed column.
+        label_w_plain = max((len(k) for k in fields), default=10) + 2 if plain else 25
         # value column width inside the frame: inner minus label, minus the
         # single space separator between label and value
         max_val_w_plain = max(1, inner - label_w_plain - 1)

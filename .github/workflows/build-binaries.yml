@@ -102,6 +102,8 @@ jobs:
             --output-filename="ramp-${{ matrix.os }}-${{ matrix.arch }}" \
             --output-dir=build \
             --include-package=ramp_cli \
+            --include-package=textual \
+            --include-package-data=textual \
             --include-data-files=src/ramp_cli/specs/*.json=ramp_cli/specs/ \
             --include-data-dir=src/ramp_cli/router_integrations/packages=ramp_cli/router_integrations/packages \
             --python-flag=no_site \
@@ -177,6 +179,8 @@ jobs:
             --output-filename="ramp-windows-amd64" \
             --output-dir=build \
             --include-package=ramp_cli \
+            --include-package=textual \
+            --include-package-data=textual \
             --include-data-files=src/ramp_cli/specs/*.json=ramp_cli/specs/ \
             --include-data-dir=src/ramp_cli/router_integrations/packages=ramp_cli/router_integrations/packages \
             --python-flag=no_site \

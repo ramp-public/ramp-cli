@@ -300,12 +300,12 @@ def test_picker_offers_conductor_only_when_installed(monkeypatch):
     monkeypatch.setattr(router_module, "_installed_clients", lambda: ("codex",))
 
     runner = CliRunner()
-    runner.invoke(cli, ["--human", "router", "configure"])
+    runner.invoke(cli, ["--human", "router", "configure", "connect"])
     assert "conductor" not in offered["candidates"]
 
     conductor.conductor_home().mkdir(parents=True)
     (conductor.conductor_home() / "settings.toml").write_text("")
-    runner.invoke(cli, ["--human", "router", "configure"])
+    runner.invoke(cli, ["--human", "router", "configure", "connect"])
     assert offered["candidates"] == ("codex", "conductor")
 
 

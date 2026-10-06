@@ -1,6 +1,6 @@
 """Host-side Claude Desktop configuration for Ramp Router.
 
-Claude Cowork's shell runs in an isolated VM, so it cannot configure the
+Claude Desktop's shell runs in an isolated VM, so it cannot configure the
 Desktop application that hosts it.  The Ramp CLI runs on the host and can use
 the same local configuration library as Claude's own third-party inference UI.
 """
@@ -45,6 +45,7 @@ _STATE_FILE = "ramp-router-cowork-state.json"
 _DESKTOP_CONFIG_FILE = "claude_desktop_config.json"
 _LOCAL_AGENT_SESSIONS_DIR = "local-agent-mode-sessions"
 _ACCOUNT_SETTINGS_FILE = "cowork_account_settings.json"
+_CODE_SESSIONS_DIR = "claude-code-sessions"
 _MODEL_SELECTOR_KEY = "__model_selector_state"
 _ONE_MILLION_SUFFIX = "[1m]"
 _MODEL_HASH_ALPHABET = frozenset("0123456789abcdef")
@@ -61,6 +62,10 @@ def _app_support_root() -> Path:
 
 def state_path() -> Path:
     return _app_support_root() / "Claude" / _STATE_FILE
+
+
+def _first_party_root() -> Path:
+    return _app_support_root() / "Claude"
 
 
 def _third_party_root() -> Path:
@@ -88,7 +93,7 @@ def transaction_lock():
     """Serialize all Cowork configuration read-modify-write transactions."""
     if fcntl is None:  # pragma: no cover - rejected by the macOS preflight
         raise click.ClickException(
-            "Automatic Claude Cowork setup requires macOS file locking."
+            "Automatic Claude Desktop setup requires macOS file locking."
         )
     lock_path = state_path().parent / ".ramp-router-cowork.lock"
     lock_file = None
@@ -104,7 +109,7 @@ def transaction_lock():
             except OSError:
                 pass
         raise click.ClickException(
-            f"Could not lock Claude Cowork configuration {lock_path}: {exc}"
+            f"Could not lock Claude Desktop configuration {lock_path}: {exc}"
         ) from None
     try:
         yield
@@ -154,7 +159,7 @@ def _snapshot_key(value: dict, key: str) -> dict:
 
 def _restore_key(value: dict, key: str, snapshot: object) -> None:
     if not isinstance(snapshot, dict) or not isinstance(snapshot.get("present"), bool):
-        raise click.ClickException("Could not read the Claude Cowork restore state.")
+        raise click.ClickException("Could not read the Claude Desktop restore state.")
     if snapshot["present"]:
         value[key] = snapshot.get("value")
     else:
@@ -214,7 +219,7 @@ def gateway_base_url(router_base_url: str) -> str:
         parsed.port
     except ValueError:
         raise click.ClickException(
-            "Claude Cowork requires a valid HTTPS Router base URL."
+            "Claude Desktop requires a valid HTTPS Router base URL."
         ) from None
     if (
         parsed.scheme != "https"
@@ -224,7 +229,7 @@ def gateway_base_url(router_base_url: str) -> str:
         or parsed.query
         or parsed.fragment
     ):
-        raise click.ClickException("Claude Cowork requires an HTTPS Router base URL.")
+        raise click.ClickException("Claude Desktop requires an HTTPS Router base URL.")
     return value
 
 
@@ -293,7 +298,7 @@ def _owned_custom_headers(headers: object) -> bool:
 def _ensure_macos() -> None:
     if sys.platform != "darwin":
         raise click.ClickException(
-            "Automatic Claude Cowork setup currently supports macOS only."
+            "Automatic Claude Desktop setup currently supports macOS only."
         )
 
 
@@ -375,10 +380,10 @@ def _read_state() -> dict | None:
     path = state_path()
     if not path.exists():
         return None
-    state, _ = _read_object(path, "Claude Cowork restore state")
+    state, _ = _read_object(path, "Claude Desktop restore state")
     if state.get("version") != STATE_VERSION:
         raise click.ClickException(
-            f"Could not read the Claude Cowork restore state {path}: "
+            f"Could not read the Claude Desktop restore state {path}: "
             "unsupported version."
         )
     profile_id = state.get("profile_id")
@@ -386,7 +391,7 @@ def _read_state() -> dict | None:
         uuid.UUID(profile_id)
     except (AttributeError, TypeError, ValueError):
         raise click.ClickException(
-            f"Could not read the Claude Cowork restore state {path}."
+            f"Could not read the Claude Desktop restore state {path}."
         ) from None
     return state
 
@@ -404,6 +409,16 @@ def _new_state(api_key: str, router_base_url: str) -> dict:
             f"Could not read Claude Desktop configuration library "
             f"{_config_meta_path()}: 'entries' must be an array."
         )
+    if desktop_config.get("deploymentMode") == "3p" and not _applied_profile_usable(
+        meta
+    ):
+        # A stranded 3P mode isn't a setting to restore later; restoring it
+        # would leave Desktop pointed at nothing again.
+        desktop_config = {
+            key: value
+            for key, value in desktop_config.items()
+            if key != "deploymentMode"
+        }
     return {
         "version": STATE_VERSION,
         "profile_id": str(uuid.uuid4()),
@@ -446,7 +461,7 @@ def _configure_stopped(api_key: str, router_base_url: str, profile: dict) -> Pat
     profile_id = state["profile_id"]
     profile_path = _profile_path(profile_id)
     previous_profile, profile_existed = _read_object(
-        profile_path, "Claude Cowork Router profile"
+        profile_path, "Claude Desktop Router profile"
     )
     desktop_config, desktop_existed = _read_object(
         _desktop_config_path(), "Claude Desktop configuration"
@@ -490,7 +505,7 @@ def _configure_stopped(api_key: str, router_base_url: str, profile: dict) -> Pat
         )
         if isinstance(exc, OSError):
             raise click.ClickException(
-                f"Could not configure Claude Cowork: {exc}"
+                f"Could not configure Claude Desktop: {exc}"
             ) from None
         raise
 
@@ -646,7 +661,7 @@ def _migrate_model_selections_stopped(
     migrated: list[dict] = []
     for path in _account_settings_paths():
         try:
-            settings, existed = _read_object(path, "Claude Cowork account settings")
+            settings, existed = _read_object(path, "Claude Desktop account settings")
         except click.ClickException:
             continue
         if not existed:
@@ -665,6 +680,89 @@ def _migrate_model_selections_stopped(
             continue
         migrated.extend({"path": str(path), **change} for change in changes)
     return tuple(migrated), False
+
+
+def _code_session_activity(entry: dict) -> float:
+    value = entry.get("lastActivityAt")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return value
+
+
+def _code_session_entries(
+    data_root: Path,
+) -> dict[tuple[str, str], tuple[Path, dict]]:
+    """Index one Desktop data root's Code session entries.
+
+    Entries live under ``<account>/<org>/``; the key keeps that scope, so an
+    entry is only ever matched with, or copied to, the same account and org.
+    """
+    entries: dict[tuple[str, str], tuple[Path, dict]] = {}
+    sessions = data_root / _CODE_SESSIONS_DIR
+    for path in sessions.glob("*/*/local_*.json"):
+        try:
+            entry = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError):
+            continue
+        if not isinstance(entry, dict):
+            continue
+        session = entry.get("cliSessionId") or entry.get("sessionId")
+        if not isinstance(session, str) or not session:
+            continue
+        key = (path.parent.relative_to(sessions).as_posix(), session)
+        current = entries.get(key)
+        if current is None or _code_session_activity(entry) > _code_session_activity(
+            current[1]
+        ):
+            entries[key] = (path, entry)
+    return entries
+
+
+def _mirror_code_sessions(source_root: Path, target_root: Path) -> int:
+    """Copy Code session entries the target data root lacks or has stale.
+
+    Each entry stays within its own account/org directory, and only goes to a
+    target that already lists sessions for that same account and org: one
+    account's or organization's sessions never appear under another's.
+    """
+    target_sessions = target_root / _CODE_SESSIONS_DIR
+    target = _code_session_entries(target_root)
+    copied = 0
+    for key, (path, entry) in _code_session_entries(source_root).items():
+        scope = target_sessions / key[0]
+        if not scope.is_dir():
+            # Desktop hasn't signed in to this account and org in that mode.
+            continue
+        existing = target.get(key)
+        if existing is not None and _code_session_activity(
+            existing[1]
+        ) >= _code_session_activity(entry):
+            continue
+        destination = existing[0] if existing is not None else scope / path.name
+        try:
+            _write_private_json(destination, entry)
+        except OSError:
+            continue
+        copied += 1
+    return copied
+
+
+def _sync_code_sessions_stopped() -> int:
+    """Keep the Code sidebar continuous across Desktop deployment modes.
+
+    Claude Desktop keeps a separate data root per deployment mode (``Claude``
+    for first-party, ``Claude-3p`` for third-party inference), and each root
+    lists only its own Code sessions. The transcripts themselves live in
+    ``~/.claude/projects`` and are shared, so switching modes would otherwise
+    hide every session started in the other mode. Mirroring the index entries
+    both ways while the app is stopped makes the switch invisible; the most
+    recently active copy of an entry wins. Best effort: never blocks setup.
+    """
+    try:
+        first, third = _first_party_root(), _third_party_root()
+        return _mirror_code_sessions(third, first) + _mirror_code_sessions(first, third)
+    except OSError:
+        return 0
 
 
 def claude_is_running() -> bool:
@@ -729,21 +827,67 @@ def configure(
         migrated, _aborted = _migrate_model_selections_stopped(
             model_ids, still_safe=lambda: not _claude_is_running()
         )
+        _sync_code_sessions_stopped()
         _launch_claude(fresh_cowork=True)
         return profile_path, migrated
+
+
+def _applied_profile_usable(meta: dict) -> bool:
+    """Whether the library applies one of its listed profiles.
+
+    Profiles the user lists are theirs to manage; this only catches a 3P mode
+    left with nothing applied at all.
+    """
+    applied = meta.get("appliedId")
+    entries = meta.get("entries")
+    if not isinstance(applied, str) or not applied or not isinstance(entries, list):
+        return False
+    return any(
+        isinstance(entry, dict) and entry.get("id") == applied for entry in entries
+    )
+
+
+def desktop_status() -> str:
+    """How Claude Desktop stands with Router, read without side effects.
+
+    "connected": the CLI-owned profile is applied and Desktop is in 3P mode.
+    "inactive": the receipt exists but Desktop isn't using its profile.
+    "stranded": no receipt, yet Desktop is in 3P mode with no usable profile,
+    so it silently falls back to first-party sign-in.
+    "disconnected": none of the above.
+    """
+    try:
+        desktop, _ = _read_object(
+            _desktop_config_path(), "Claude Desktop configuration"
+        )
+        meta, _ = _read_object(
+            _config_meta_path(), "Claude Desktop configuration library"
+        )
+        state = _read_state() if state_path().exists() else None
+    except click.ClickException:
+        return "disconnected"
+    third_party = desktop.get("deploymentMode") == "3p"
+    if state is not None:
+        ours = meta.get("appliedId") == state.get("profile_id")
+        if third_party and ours and _applied_profile_usable(meta):
+            return "connected"
+        return "inactive"
+    if third_party and not _applied_profile_usable(meta):
+        return "stranded"
+    return "disconnected"
 
 
 def configured_api_key() -> str:
     state = _read_state()
     if state is None:
-        raise click.ClickException("Ramp Router is not configured in Claude Cowork.")
+        raise click.ClickException("Ramp Router is not configured in Claude Desktop.")
     profile, _ = _read_object(
-        _profile_path(state["profile_id"]), "Claude Cowork Router profile"
+        _profile_path(state["profile_id"]), "Claude Desktop Router profile"
     )
     api_key = profile.get("inferenceGatewayApiKey")
     if not _credential_matches(api_key, state.get("credential_marker")):
         raise click.ClickException(
-            "The Claude Cowork Router credential changed after setup. "
+            "The Claude Desktop Router credential changed after setup. "
             "Run the configure command again to adopt it."
         )
     return str(api_key)
@@ -759,18 +903,18 @@ def configured_gateway_base_url() -> str:
     """
     state = _read_state()
     if state is None:
-        raise click.ClickException("Ramp Router is not configured in Claude Cowork.")
+        raise click.ClickException("Ramp Router is not configured in Claude Desktop.")
     base_url = state.get("gateway_base_url")
     if not isinstance(base_url, str) or not base_url:
         raise click.ClickException(
-            f"Could not read the Claude Cowork restore state {state_path()}."
+            f"Could not read the Claude Desktop restore state {state_path()}."
         )
     profile, _ = _read_object(
-        _profile_path(state["profile_id"]), "Claude Cowork Router profile"
+        _profile_path(state["profile_id"]), "Claude Desktop Router profile"
     )
     if profile.get("inferenceGatewayBaseUrl") != base_url:
         raise click.ClickException(
-            "The Claude Cowork Router endpoint changed after setup. "
+            "The Claude Desktop Router endpoint changed after setup. "
             "Run the configure command again to adopt it."
         )
     return base_url
@@ -804,7 +948,7 @@ def migrate_gateway_base_url(previous: str, replacement: str) -> bool:
         profile = _owned_profile(state)
         if profile is None:
             raise click.ClickException(
-                "The Claude Cowork Router profile is missing. "
+                "The Claude Desktop Router profile is missing. "
                 "Run the configure command again to repair it."
             )
         profile_path = _profile_path(state["profile_id"])
@@ -817,14 +961,14 @@ def migrate_gateway_base_url(previous: str, replacement: str) -> bool:
             _restore_document(profile_path, profile, True)
             _restore_document(state_path(), state, True)
             raise click.ClickException(
-                f"Could not migrate the Claude Cowork Router profile: {exc}"
+                f"Could not migrate the Claude Desktop Router profile: {exc}"
             ) from None
         return True
 
 
 def _owned_profile(state: dict) -> dict | None:
     profile, profile_exists = _read_object(
-        _profile_path(state["profile_id"]), "Claude Cowork Router profile"
+        _profile_path(state["profile_id"]), "Claude Desktop Router profile"
     )
     if not profile_exists:
         return None
@@ -833,7 +977,7 @@ def _owned_profile(state: dict) -> dict | None:
         profile.get("inferenceGatewayApiKey"), state.get("credential_marker")
     ):
         raise click.ClickException(
-            "The Claude Cowork Router profile changed after setup, so the CLI "
+            "The Claude Desktop Router profile changed after setup, so the CLI "
             "will not remove it automatically."
         )
     if (
@@ -845,7 +989,7 @@ def _owned_profile(state: dict) -> dict | None:
         or profile.get("inferenceGatewayBaseUrl") != state.get("gateway_base_url")
     ):
         raise click.ClickException(
-            "The Claude Cowork Router profile changed after setup, so the CLI "
+            "The Claude Desktop Router profile changed after setup, so the CLI "
             "will not remove it automatically."
         )
     return profile
@@ -876,14 +1020,14 @@ def _unconfigure_stopped(state: dict) -> None:
     meta["entries"] = entries
     library_snapshot = state.get("config_library")
     if not isinstance(library_snapshot, dict):
-        raise click.ClickException("Could not read the Claude Cowork restore state.")
+        raise click.ClickException("Could not read the Claude Desktop restore state.")
     if profile_is_active:
         applied_snapshot = library_snapshot.get("appliedId")
         if not isinstance(applied_snapshot, dict) or not isinstance(
             applied_snapshot.get("present"), bool
         ):
             raise click.ClickException(
-                "Could not read the Claude Cowork restore state."
+                "Could not read the Claude Desktop restore state."
             )
         prior = applied_snapshot.get("value")
         ids = [
@@ -904,7 +1048,7 @@ def _unconfigure_stopped(state: dict) -> None:
     previous_desktop = json.loads(json.dumps(desktop_config))
     desktop_snapshot = state.get("desktop_config")
     if not isinstance(desktop_snapshot, dict):
-        raise click.ClickException("Could not read the Claude Cowork restore state.")
+        raise click.ClickException("Could not read the Claude Desktop restore state.")
     if profile_is_active:
         _restore_owned_key(
             desktop_config,
@@ -919,6 +1063,13 @@ def _unconfigure_stopped(state: dict) -> None:
             desktop_snapshot.get("awaitingSignIn"),
             written_present=False,
         )
+    # Never leave 3P mode with nothing to apply: Desktop then drops to
+    # first-party sign-in while looking configured. This happens when the
+    # profile wasn't the applied one, or when setup snapshotted a stale "3p".
+    if desktop_config.get("deploymentMode") == "3p" and not (
+        _applied_profile_usable(meta) and meta.get("appliedId") != profile_id
+    ):
+        desktop_config.pop("deploymentMode")
 
     try:
         if desktop_snapshot.get("existed") is False and not desktop_config:
@@ -947,7 +1098,7 @@ def _unconfigure_stopped(state: dict) -> None:
         _restore_document(state_path(), state, True)
         if isinstance(exc, OSError):
             raise click.ClickException(
-                f"Could not restore Claude Cowork: {exc}"
+                f"Could not restore Claude Desktop: {exc}"
             ) from None
         raise
 
@@ -958,7 +1109,7 @@ def unconfigure() -> None:
     with transaction_lock():
         if not state_path().exists():
             raise click.ClickException(
-                "Ramp Router is not configured in Claude Cowork."
+                "Ramp Router is not configured in Claude Desktop."
             )
 
         _quit_claude()
@@ -966,7 +1117,7 @@ def unconfigure() -> None:
             state = _read_state()
             if state is None:
                 raise click.ClickException(
-                    "Ramp Router is not configured in Claude Cowork."
+                    "Ramp Router is not configured in Claude Desktop."
                 )
             _unconfigure_stopped(state)
         except BaseException:
@@ -976,6 +1127,7 @@ def unconfigure() -> None:
                 pass
             raise
 
+        _sync_code_sessions_stopped()
         _launch_claude(
             failure_message=(
                 "Ramp Router was removed and the previous Cowork settings were "

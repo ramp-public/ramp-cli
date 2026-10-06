@@ -557,7 +557,7 @@ def test_fallback_picker_offers_hermes_when_its_binary_exists(monkeypatch):
         captured.update(kwargs)
         return Prompt()
 
-    monkeypatch.setattr(router_module.questionary, "checkbox", checkbox)
+    monkeypatch.setattr(router_module, "_agent_checkbox", checkbox)
     monkeypatch.setattr(router_module, "_installed_clients", lambda: ())
     monkeypatch.setattr(hermes_agent, "hermes_executable", lambda: "/fake/hermes")
 

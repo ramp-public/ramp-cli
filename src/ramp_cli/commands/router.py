@@ -1,5 +1,7 @@
 """Configure coding agents to use Ramp Router."""
 
+from __future__ import annotations
+
 import hashlib
 import hmac
 import io
@@ -17,6 +19,7 @@ import time
 import tomllib
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
+from copy import copy
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
@@ -32,7 +35,7 @@ import zstandard
 from click.core import ParameterSource
 
 from ramp_cli import __version__, claude_cowork, hermes_agent
-from ramp_cli.commands import claude_code, conductor
+from ramp_cli.commands import claude_code, conductor, cursor
 from ramp_cli.commands import router_sync as router_sync_module
 from ramp_cli.commands.router_sync import (
     SYNC_HOOK_USER_MANAGED,
@@ -45,7 +48,14 @@ from ramp_cli.commands.router_sync import (
     sync_is_due,
     update_notice,
 )
-from ramp_cli.output.formatter import print_agent_json, resolve_format
+from ramp_cli.commands.router_user import RouterMenuGroup, register_router_user_commands
+from ramp_cli.commands.router_user_strategies import (
+    output_user_strategies,
+    register_user_strategy_commands,
+    run_user_strategies,
+    use_account_strategies,
+)
+from ramp_cli.output.formatter import print_agent_json, print_json, resolve_format
 from ramp_cli.output.style import show_notice, start_spinner
 from ramp_cli.router_integrations import integration_package_path
 from ramp_cli.router_setup import (
@@ -53,6 +63,7 @@ from ramp_cli.router_setup import (
     acquire_router_api_key,
     confirm_router_browser_setup,
 )
+from ramp_cli.router_ui import launch as router_ui
 from ramp_cli.version_check import (
     installed_version_path,
     refresh_version_cache,
@@ -144,7 +155,7 @@ _CODEX_APP_LOCATIONS = (
     Path.home() / "Applications" / "ChatGPT.app",
 )
 _CODEX_APP_BUNDLED_CLI = Path("Contents/Resources/codex-cli/bin/codex")
-# Claude Cowork joins the configure and unconfigure pickers but stays out of
+# Claude Desktop joins the configure and unconfigure pickers but stays out of
 # CLIENT_NAMES: it has no config file of its own, exists only on macOS, and is
 # set up through Claude Desktop's profile library rather than through the
 # config-path machinery the coding agents share.
@@ -154,9 +165,38 @@ COWORK_CLIENT = "cowork"
 CURSOR_CLIENT = "cursor"
 AGENT_NAMES = {
     **CLIENT_NAMES,
-    COWORK_CLIENT: "Claude Cowork",
+    COWORK_CLIENT: "Claude Desktop",
     CURSOR_CLIENT: "Cursor",
 }
+# Claude Desktop is the user-facing name: Router switches the whole app, its
+# Code tab included, not just Cowork. "cowork" stays accepted, and stays the
+# internal id, so existing scripts, receipts, and JSON output keep working.
+DESKTOP_COMMAND_NAME = "desktop"
+
+
+def _command_name(client: str) -> str:
+    """The name to type for a client on the command line."""
+    return DESKTOP_COMMAND_NAME if client == COWORK_CLIENT else client
+
+
+class _AgentChoice(click.Choice):
+    """Agent names, listing "desktop" where the internal id is "cowork"."""
+
+    def __init__(self, case_sensitive: bool = True):
+        super().__init__(
+            tuple(_command_name(name) for name in AGENT_NAMES),
+            case_sensitive=case_sensitive,
+        )
+
+    def convert(self, value, param, ctx):
+        if isinstance(value, str) and value.lower() in (
+            DESKTOP_COMMAND_NAME,
+            COWORK_CLIENT,
+        ):
+            return COWORK_CLIENT
+        return super().convert(value, param, ctx)
+
+
 ArtifactClaim = Literal["create", "replace"]
 
 
@@ -172,6 +212,11 @@ class RouterModel:
 
     id: str
     metadata: "RouterModelMetadata"
+    # Router's release timestamp, in Unix seconds; 0 when it states none.
+    created: int = 0
+    # Input, output, and cached-input prices as Router states them: USD per
+    # million tokens, as decimal strings; None where it states none.
+    pricing: tuple[str | None, str | None, str | None] = (None, None, None)
 
 
 @dataclass(frozen=True)
@@ -559,19 +604,30 @@ CODEX_SESSION_DIRECTORIES = ("sessions", "archived_sessions")
 _RAMP_YELLOW = (228, 242, 33)
 _PICKER_YELLOW = "#e4f221"
 _PICKER_POINTER = "\u25b6"
-_PICKER_STYLE = questionary.Style(
-    [
-        ("qmark", f"fg:{_PICKER_YELLOW} bold"),
-        ("question", "bold"),
-        ("instruction", "fg:#8a8a8a"),
-        ("pointer", f"fg:{_PICKER_YELLOW} bold"),
-        ("highlighted", "fg:#ffffff bold noreverse"),
-        ("selected", f"fg:{_PICKER_YELLOW} noreverse"),
-        ("answer", f"fg:{_PICKER_YELLOW} bold"),
-        ("text", "fg:#a8a8a8"),
-        ("disabled", "fg:#585858 italic"),
-    ]
-)
+
+
+@lru_cache(maxsize=1)
+def _picker_style() -> questionary.Style:
+    return questionary.Style(
+        [
+            ("qmark", f"fg:{_PICKER_YELLOW} bold"),
+            ("question", "bold"),
+            ("instruction", "fg:#8a8a8a"),
+            ("pointer", f"fg:{_PICKER_YELLOW} bold"),
+            ("highlighted", "fg:#ffffff bold noreverse"),
+            ("selected", f"fg:{_PICKER_YELLOW} noreverse"),
+            ("answer", f"fg:{_PICKER_YELLOW} bold"),
+            ("text", "fg:#a8a8a8"),
+            ("disabled", "fg:#585858 italic"),
+        ]
+    )
+
+
+def __getattr__(name: str):
+    # The style is built once, on first use.
+    if name == "_PICKER_STYLE":
+        return _picker_style()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _codex_original_profile_path(home: Path) -> Path:
@@ -874,6 +930,34 @@ def _codex_app_installed() -> bool:
     return _codex_app_bundled_cli() is not None
 
 
+def _detected_clients() -> tuple[str, ...]:
+    """Return every harness present on this machine, apps included.
+
+    PATH detection alone misses Conductor, which ships no executable, and
+    Codex on machines that only have the ChatGPT app's bundled CLI.
+    """
+    detected = set(_installed_clients())
+    if _codex_app_installed():
+        detected.add("codex")
+    if conductor.is_installed():
+        detected.add("conductor")
+    if claude_cowork.is_available():
+        detected.add(COWORK_CLIENT)
+    return tuple(client for client in AGENT_NAMES if client in detected)
+
+
+def _cursor_routes_to_router() -> bool:
+    """Report whether Cursor's OpenAI base-URL override points at Router.
+
+    Any known Router deployment counts, as does the one this command targets,
+    so a key pasted against QA or a custom gateway still reads as connected.
+    """
+    override = cursor.override_base_url()
+    if override is None:
+        return False
+    return override in {router_base_url(), *KNOWN_DEPLOYMENT_UI_URLS}
+
+
 def _can_draw_picker(ctx: click.Context) -> bool:
     """Report whether there is a terminal to draw the picker on.
 
@@ -969,6 +1053,79 @@ def _pick_installed_clients() -> tuple[str, ...]:
     return selected
 
 
+_BACK_TO_ROUTER_MENU = object()
+
+
+def _agent_checkbox(message, *, choices, validate, **kwargs):
+    from prompt_toolkit.keys import Keys  # noqa: PLC0415
+    from questionary.prompts.common import InquirerControl  # noqa: PLC0415
+
+    submit = object()
+    prompt = questionary.select(
+        message,
+        choices=[*choices, questionary.Choice("Submit", value=submit)],
+        **kwargs,
+    )
+    control = next(
+        control
+        for control in prompt.application.layout.find_all_controls()
+        if isinstance(control, InquirerControl)
+    )
+    labels = {choice.value: choice.title for choice in choices}
+    selected = set()
+
+    def redraw():
+        for choice in choices:
+            choice.title = (
+                f"{'●' if choice.value in selected else '○'} {labels[choice.value]}"
+            )
+
+    def toggle(event):
+        value = control.get_pointed_at().value
+        if value is submit:
+            return
+        if value in selected:
+            selected.remove(value)
+        else:
+            selected.add(value)
+        control.error_message = None
+        redraw()
+
+    bindings = prompt.application.key_bindings
+    bindings.remove(Keys.ControlM)
+
+    @bindings.add(Keys.ControlM, eager=True)
+    def accept(event):
+        if control.get_pointed_at().value is not submit:
+            toggle(event)
+            return
+        answer = [choice.value for choice in choices if choice.value in selected]
+        verdict = validate(answer)
+        if verdict is not True:
+            control.error_message = str(verdict)
+            return
+        control.is_answered = True
+        event.app.exit(result=answer)
+
+    bindings.add(" ", eager=True)(toggle)
+
+    @bindings.add("a", eager=True)
+    def toggle_all(event):
+        if len(selected) == len(choices):
+            selected.clear()
+        else:
+            selected.update(labels)
+        control.error_message = None
+        redraw()
+
+    @bindings.add(Keys.Escape, eager=True)
+    def go_back(event):
+        event.app.exit(result=_BACK_TO_ROUTER_MENU)
+
+    redraw()
+    return prompt
+
+
 def _pick_clients(
     message: str,
     candidates: tuple[str, ...],
@@ -976,17 +1133,21 @@ def _pick_clients(
 ) -> tuple[str, ...]:
     """Ask which of ``candidates`` to act on, starting with none selected."""
     labels = titles or AGENT_NAMES
-    selected = questionary.checkbox(
+    selected = _agent_checkbox(
         message,
         choices=[
             questionary.Choice(title=labels[client], value=client, checked=False)
             for client in candidates
         ],
         validate=lambda answer: bool(answer) or "Select at least one agent.",
-        style=_PICKER_STYLE,
+        style=_picker_style(),
         pointer=_PICKER_POINTER,
-        instruction="(enter to confirm, space to toggle, a to toggle all)",
+        instruction="(↑/↓ move, enter/space toggle, a toggle all; Submit confirm, Esc back)",
     ).ask()
+    if selected is _BACK_TO_ROUTER_MENU:
+        ctx = click.get_current_context()
+        click.echo(ctx.parent.get_help())
+        ctx.exit()
     if selected is None:
         raise click.Abort()
     return tuple(selected)
@@ -1004,7 +1165,7 @@ def _pick_claude_models(
             questionary.Choice(title="All available models", value="all"),
         ],
         default=current,
-        style=_PICKER_STYLE,
+        style=_picker_style(),
         pointer=_PICKER_POINTER,
         instruction="(enter to confirm)",
     ).ask()
@@ -1013,9 +1174,103 @@ def _pick_claude_models(
     return selected
 
 
-@click.group("router", help="Connect coding agents and desktop apps to Ramp Router")
-def router_group() -> None:
-    pass
+def _workspace_options(command):
+    """Display flags shared by `ramp router` and `ramp router ui`."""
+    command = click.option(
+        "--theme",
+        "theme_mode",
+        type=click.Choice(("auto", "dark", "light", "terminal"), case_sensitive=False),
+        envvar="RAMP_ROUTER_THEME",
+        default=None,
+        show_default="auto",
+        help="Adapt to the terminal, use a fixed palette, or inherit its ANSI colors.",
+    )(command)
+    command = click.option(
+        "--height",
+        "inline_height",
+        type=click.IntRange(12, 60),
+        default=38,
+        show_default=True,
+        help="Inline workspace height in terminal rows; requires --inline.",
+    )(command)
+    return click.option(
+        "--inline",
+        is_flag=True,
+        help="Run beneath the shell prompt instead of full-screen (macOS/Linux).",
+    )(command)
+
+
+def _workspace_display(
+    ctx: click.Context, inline: bool, inline_height: int, theme_mode: str | None
+) -> dict:
+    """Only flags typed on this command, so `router --inline ui` keeps --inline."""
+    height_given = (
+        ctx.get_parameter_source("inline_height") == ParameterSource.COMMANDLINE
+    )
+    if (
+        height_given
+        and not inline
+        and not ctx.meta.get(router_ui.DISPLAY_KEY, {}).get("inline")
+    ):
+        raise click.UsageError("--height requires --inline.")
+    display = {"theme_mode": theme_mode} if theme_mode else {}
+    if inline:
+        display["inline"] = True
+    if height_given:
+        display["inline_height"] = inline_height
+    return display
+
+
+@click.group(
+    "router",
+    cls=RouterMenuGroup,
+    invoke_without_command=True,
+    no_args_is_help=False,
+    help="Connect coding agents and desktop apps to Ramp Router",
+)
+@_workspace_options
+@click.pass_context
+def router_group(
+    ctx: click.Context, inline: bool, inline_height: int, theme_mode: str | None
+) -> None:
+    # Subcommands that open the workspace (e.g. `router --inline account`)
+    # inherit these display flags through ctx.meta.
+    ctx.meta[router_ui.DISPLAY_KEY] = _workspace_display(
+        ctx, inline, inline_height, theme_mode
+    )
+    if ctx.invoked_subcommand is None and not router_ui.launch(ctx):
+        click.echo(ctx.get_help())
+        ctx.exit(2)
+
+
+@router_group.command(
+    "ui",
+    help="Open the Router workspace, full-screen or inline beneath your prompt.",
+    short_help="Open the Router workspace.",
+)
+@_workspace_options
+@click.pass_context
+def router_workspace(
+    ctx: click.Context, inline: bool, inline_height: int, theme_mode: str | None
+) -> None:
+    ctx.meta[router_ui.DISPLAY_KEY] = {
+        **ctx.meta.get(router_ui.DISPLAY_KEY, {}),
+        **_workspace_display(ctx, inline, inline_height, theme_mode),
+    }
+    if not router_ui.launch(ctx, explicit=True):
+        raise click.UsageError(
+            "Router UI needs an interactive human terminal. Remove --agent, "
+            "--no-input, --quiet, and JSON output; use router subcommands for scripts."
+        )
+
+
+register_router_user_commands(
+    router_group,
+    picker_style=_picker_style,
+    picker_pointer=_PICKER_POINTER,
+    # Late-bound: the clipboard helper is defined further down this module.
+    copy_to_clipboard=lambda text: _copy_to_clipboard(text),
+)
 
 
 @router_group.command("codex-connection-fingerprint", hidden=True)
@@ -1038,7 +1293,7 @@ def router_codex_connection_fingerprint() -> None:
 @router_group.command(
     "configure-cowork",
     hidden=True,
-    help="Deprecated alias for 'ramp router configure cowork'.",
+    help="Deprecated alias for 'ramp router configure desktop'.",
 )
 @click.option(
     "--setup-file",
@@ -1082,7 +1337,7 @@ def router_configure_cowork(
 @router_group.command(
     "unconfigure-cowork",
     hidden=True,
-    help="Deprecated alias for 'ramp router unconfigure cowork'.",
+    help="Deprecated alias for 'ramp router unconfigure desktop'.",
 )
 @click.pass_context
 def router_unconfigure_cowork(ctx: click.Context) -> None:
@@ -1123,7 +1378,7 @@ def _validate_deployment_url(
 )
 @click.argument(
     "clients",
-    type=click.Choice(tuple(AGENT_NAMES), case_sensitive=False),
+    type=_AgentChoice(case_sensitive=False),
     nargs=-1,
 )
 @click.option(
@@ -1197,6 +1452,30 @@ def router_configure(
         raise click.UsageError(
             "--confirm-browser cannot be combined with --no-browser."
         )
+    # Click has already copied any configured key into api_key. Drop it from
+    # the environment before the workspace starts, whose detection probes
+    # (Claude Desktop's among them) run as child processes.
+    os.environ.pop(CONFIGURE_KEY_ENV, None)
+    # --no-browser keeps this command's own path, which honors it; the
+    # workspace's sign-in and key creation may open a browser. Scripted
+    # --reuse-existing-key and --confirm-browser (MDM) runs never open it.
+    if (
+        not no_browser
+        and not reuse_existing_key
+        and not confirm_browser
+        and (not clients or (api_key is None and setup_file is None))
+        and router_ui.launch(
+            ctx,
+            "connect",
+            clients=clients,
+            api_key=api_key,
+            setup_file=setup_file,
+            claude_models=claude_models,
+            base_url=base_url,
+            ui_url=ui_url,
+        )
+    ):
+        return
     # The rest of this module resolves the deployment from these variables.
     if base_url:
         os.environ[ROUTER_BASE_URL_ENV] = base_url
@@ -1216,6 +1495,57 @@ def router_configure(
     )
 
 
+def _with_claude_desktop(
+    ctx: click.Context,
+    fmt: str,
+    clients: tuple[str, ...],
+    requested_clients: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Offer Claude Desktop when Claude Code is named and Desktop isn't on Router.
+
+    The menu's Claude entry already covers both apps. Naming claude-code, as
+    the TUI's Connect does, set up only the CLI, so Desktop's Code tab and
+    Cowork kept signing in first-party while Claude showed as connected.
+    """
+    if (
+        "claude-code" not in requested_clients
+        or COWORK_CLIENT in clients
+        or not claude_cowork.is_available()
+        or claude_cowork.desktop_status() == "connected"
+    ):
+        return clients
+    # Setting up Desktop quits and reopens it, which would end a session
+    # running inside it, and it needs a key this run may not be able to get.
+    # Desktop marks its sessions "claude-desktop", or "claude-desktop-3p" on
+    # a 3P profile such as Router's own.
+    inside_desktop = os.environ.get("CLAUDE_CODE_ENTRYPOINT", "").startswith(
+        "claude-desktop"
+    )
+    # Changing Desktop's profile and restarting it needs the user's consent,
+    # so only an interactive run asks; scripts get the command to run instead.
+    if not inside_desktop and _can_prompt(ctx, fmt):
+        connect = questionary.confirm(
+            "Claude Desktop isn't connected to Ramp Router. Connect it too? "
+            "This restarts Claude Desktop.",
+            default=False,
+            style=_picker_style(),
+        ).ask()
+        if connect:
+            return (*clients, COWORK_CLIENT)
+    if fmt != "json":
+        reason = (
+            " from a terminal outside Claude Desktop, since setup restarts it"
+            if inside_desktop
+            else ""
+        )
+        click.echo(
+            "Claude Desktop isn't connected to Ramp Router, so its Code tab "
+            "and Cowork still sign in first-party. To connect it, run "
+            f"'ramp router configure desktop'{reason}."
+        )
+    return clients
+
+
 def _run_configure(
     ctx: click.Context,
     *,
@@ -1230,17 +1560,35 @@ def _run_configure(
     reuse_existing_key: bool = False,
     confirm_browser: bool = False,
 ) -> None:
+    # Click has already copied any configured value into api_key. Drop the
+    # secret from the environment before anything here spawns a child: the
+    # workspace's detection probes, the Cowork availability probe behind the
+    # picker, the host preflight, and Codex itself all inherit what this
+    # process still carries.
+    os.environ.pop(CONFIGURE_KEY_ENV, None)
+    if (
+        not no_browser
+        and not reuse_existing_key
+        and (
+            not clients
+            or api_key is None
+            or ("claude-code" in clients and claude_models is None)
+        )
+    ) and router_ui.launch(
+        ctx,
+        "connect",
+        clients=clients,
+        api_key=api_key,
+        setup_file=setup_file,
+        claude_models=claude_models,
+    ):
+        return
     if (
         setup_file is not None
         and api_key is not None
         and api_key_source is ParameterSource.COMMANDLINE
     ):
         raise click.UsageError("--setup-file cannot be combined with --api-key.")
-    # Click has already copied any configured value into api_key. Drop the
-    # secret from the environment before anything here spawns a child: the
-    # Cowork availability probe behind the picker, the host preflight, and
-    # Codex itself all inherit what this process still carries.
-    os.environ.pop(CONFIGURE_KEY_ENV, None)
     if setup_file is None and api_key is not None:
         # A flag- or environment-supplied key is known now, so an empty one
         # is named as the invalid input before the picker draws, any host
@@ -1275,6 +1623,7 @@ def _run_configure(
             "--claude-models requires exactly one agent: "
             "'ramp router configure claude-code --claude-models compact|all'."
         )
+    clients = _with_claude_desktop(ctx, fmt, clients, requested_clients)
 
     claude_path = _client_config_path("claude-code")
     existing_claude = claude_code.state_path(claude_path).is_file()
@@ -1284,6 +1633,9 @@ def _run_configure(
         and setup_file is None
         and api_key is None
         and not deployment_override
+        and _same_router(
+            _configured_claude_code_router_url(claude_path), router_base_url()
+        )
     ):
         # A repeat configure repairs the picker locally, without a new key or
         # model request. A new deployment requires a full reconfigure.
@@ -1354,10 +1706,12 @@ def _run_configure(
             else current_view
         )
     restore_clients = (
-        "" if clients == all_clients else "".join(f" {client}" for client in clients)
+        ""
+        if clients == all_clients
+        else "".join(f" {_command_name(client)}" for client in clients)
     )
     target_phrase = (
-        "Claude Cowork"
+        "Claude Desktop"
         if clients == (COWORK_CLIENT,)
         else "your coding agent"
         if len(clients) == 1
@@ -1514,7 +1868,7 @@ def _run_configure(
                 )
                 cowork_note = (
                     "Claude Desktop was restarted. "
-                    f"Pick {preferred_label} in Cowork and send a message to "
+                    f"Pick {preferred_label} in Claude Desktop and send a message to "
                     "verify the connection."
                 )
                 if migrated_selections:
@@ -1810,10 +2164,10 @@ def _refresh_cowork_model_selections() -> dict | None:
 def _cowork_refresh_message(result: dict) -> str:
     error = result.get("error")
     if error is not None:
-        return f"Claude Cowork's saved model selections were not checked: {error}"
+        return f"Claude Desktop's saved model selections were not checked: {error}"
     if result["skipped_while_running"]:
         return (
-            "Claude Cowork's saved model selections were not checked because "
+            "Claude Desktop's saved model selections were not checked because "
             "Claude Desktop is running."
         )
     migrated_gateway = result.get("migrated_gateway") is True
@@ -1821,13 +2175,13 @@ def _cowork_refresh_message(result: dict) -> str:
     if count:
         plural = "" if count == 1 else "s"
         message = (
-            f"Updated {count} saved Claude Cowork model selection{plural} to "
+            f"Updated {count} saved Claude Desktop model selection{plural} to "
             "the ids Router serves today."
         )
     else:
-        message = "Claude Cowork's saved model selections are current."
+        message = "Claude Desktop's saved model selections are current."
     if migrated_gateway:
-        return "Moved Claude Cowork's Router profile to api.router.com. " + message
+        return "Moved Claude Desktop's Router profile to api.router.com. " + message
     return message
 
 
@@ -2235,11 +2589,22 @@ def router_cursor(
     between. What remains automatable is the credential and the exact values
     to paste, which is precisely what this does.
     """
-    fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     # Click has already copied any configured value into api_key. Drop the
     # secret from the environment before anything here spawns a child: the
-    # clipboard helper below inherits what this process still carries.
+    # workspace's probes and the clipboard helper below inherit what this
+    # process still carries.
     os.environ.pop(CONFIGURE_KEY_ENV, None)
+    # --show-key asks for the key in this terminal, which the workspace's
+    # clipboard handoff doesn't offer, and --no-browser is honored only here,
+    # so either keeps this command's own path.
+    if (
+        api_key is None
+        and not show_key
+        and not no_browser
+        and router_ui.launch(ctx, "connect", clients=("cursor",))
+    ):
+        return
+    fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     if api_key is not None:
         # A flag- or environment-supplied key is known now, so an empty one
         # is named as the invalid input before any browser or network work.
@@ -2569,6 +2934,11 @@ def router_subagents(
     MODEL may be an exact id from Claude Code's model list, or any unique
     fragment of an id, request name, or display name.
     """
+    # Subagent tiers are edited under Claude Code in the Harnesses tab.
+    if not any((sonnet, opus, haiku, fable, reset)) and router_ui.launch(
+        ctx, "harnesses"
+    ):
+        return
     picks = {
         tier: value
         for tier, value in (
@@ -2824,8 +3194,10 @@ _NO_SWITCHYARD_CONFIG_CHANGE = object()
     "strategies",
     invoke_without_command=True,
     help=(
-        "Show and toggle Ramp Router routing strategies; run without a "
-        "subcommand to toggle interactively"
+        "Create, edit, and assign Ramp Router routing strategies; run without a "
+        "subcommand to edit interactively. Human-readable output uses your "
+        "'ramp router login' account. Machine-readable listings keep stored-key "
+        "settings unless --account is selected. --api-key selects key settings."
     ),
 )
 @click.option(
@@ -2837,29 +3209,85 @@ _NO_SWITCHYARD_CONFIG_CHANGE = object()
         "key stored by 'ramp router configure'."
     ),
 )
+@click.option(
+    "--account",
+    is_flag=True,
+    help="Use the Router login account's strategies instead of an API key's.",
+)
+@click.option(
+    "--harness",
+    "harness_client",
+    type=_AgentChoice(),
+    help=(
+        "Act for the API key and Router endpoint a connected harness uses, "
+        "like the workspace's harness routing page."
+    ),
+)
 @click.pass_context
-def router_strategy_group(ctx: click.Context, api_key: str | None) -> None:
+def router_strategy_group(
+    ctx: click.Context, api_key: str | None, account: bool, harness_client: str | None
+) -> None:
     # Subcommands resolve their own --api-key; keep a group-level value so
     # 'ramp router strategies --api-key KEY enable ...' acts on KEY's account
     # instead of silently falling back to a stored key.
+    if harness_client is not None:
+        # The group option also binds the env var; only a typed key conflicts.
+        typed_key = ctx.get_parameter_source("api_key") == ParameterSource.COMMANDLINE
+        if typed_key or account:
+            raise click.UsageError(
+                "--harness cannot be combined with --api-key or --account."
+            )
+        from ramp_cli.router_ui import harness  # noqa: PLC0415
+
+        with harness.connection(harness_client) as current:
+            api_key = current.key
+            ctx.obj["strategies_base_url"] = current.base_url
+        # A harness's key outranks the environment variable, as --api-key does.
+        ctx.obj["strategies_api_key_from_flag"] = True
     ctx.obj["strategies_api_key"] = api_key
+    ctx.obj["strategies_account"] = account
+    if account and api_key is not None:
+        raise click.UsageError("--account cannot be combined with --api-key.")
+    if account and ctx.invoked_subcommand in ("enable", "disable"):
+        raise click.UsageError(
+            "--account is not supported by enable/disable; use strategies edit."
+        )
     ctx.obj["strategies_api_key_from_flag"] = (
-        ctx.get_parameter_source("api_key") == ParameterSource.COMMANDLINE
+        harness_client is not None
+        or ctx.get_parameter_source("api_key") == ParameterSource.COMMANDLINE
     )
     if ctx.invoked_subcommand is not None:
         return
+    if harness_client is not None and router_ui.launch(
+        ctx, "harness-routing", client=harness_client
+    ):
+        return
+    if harness_client is None and router_ui.launch(
+        ctx, "legacy" if api_key else "strategies", api_key=api_key
+    ):
+        return
+    if api_key is None and use_account_strategies(ctx):
+        run_user_strategies(ctx, style=_picker_style(), pointer=_PICKER_POINTER)
+        return
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     key = _resolve_strategy_api_key(ctx, api_key, fmt)
-    payload = _strategy_settings_request(key)
+    payload = _strategy_settings_request(key, base_url=_strategy_base_url(ctx))
     if not _can_prompt(ctx, fmt):
         # Without a terminal to toggle on, the bare command still answers the
         # question it was asked: what is the current configuration?
         _print_strategy_settings(fmt, payload)
         return
-    _toggle_strategies_interactively(key, payload)
+    _toggle_strategies_interactively(key, payload, base_url=_strategy_base_url(ctx))
 
 
-def _toggle_strategies_interactively(key: str, payload: dict) -> None:
+register_user_strategy_commands(
+    router_strategy_group, picker_style=_picker_style, picker_pointer=_PICKER_POINTER
+)
+
+
+def _toggle_strategies_interactively(
+    key: str, payload: dict, *, base_url: str | None = None
+) -> None:
     """Offer every strategy with its current state and apply what changed."""
     settings = _strategy_states(payload)
     selected = questionary.checkbox(
@@ -2872,7 +3300,7 @@ def _toggle_strategies_interactively(key: str, payload: dict) -> None:
             )
             for name, enabled in settings.items()
         ],
-        style=_PICKER_STYLE,
+        style=_picker_style(),
         pointer=_PICKER_POINTER,
         instruction="(space to toggle, enter to apply)",
     ).ask()
@@ -2895,7 +3323,7 @@ def _toggle_strategies_interactively(key: str, payload: dict) -> None:
     )
     if configure_switchyard:
         changes["switchyard_config"] = _pick_switchyard_config(switchyard)
-    updated_payload = _strategy_settings_request(key, changes)
+    updated_payload = _strategy_settings_request(key, changes, base_url=base_url)
     updated = _strategy_states(updated_payload)
     withheld = []
     for name, enabled in desired.items():
@@ -2982,7 +3410,7 @@ def _pick_switchyard_config(switchyard: dict) -> dict | None:
                 value="custom",
             ),
         ],
-        style=_PICKER_STYLE,
+        style=_picker_style(),
         pointer=_PICKER_POINTER,
         instruction="(enter to confirm)",
     ).ask()
@@ -3026,7 +3454,7 @@ def _pick_switchyard_model(switchyard: dict, config: dict, defaults: dict) -> st
         "Which efficient model should Switchyard route to?",
         choices=choices,
         default=current if any(option["id"] == current for option in options) else None,
-        style=_PICKER_STYLE,
+        style=_picker_style(),
         pointer=_PICKER_POINTER,
         instruction="(enter to confirm)",
     ).ask()
@@ -3066,7 +3494,7 @@ def _pick_switchyard_thinking(
         "How much should the efficient model think?",
         choices=choices,
         default=current if current in efforts else "",
-        style=_PICKER_STYLE,
+        style=_picker_style(),
         pointer=_PICKER_POINTER,
         instruction="(enter to confirm)",
     ).ask()
@@ -3109,7 +3537,7 @@ def _pick_switchyard_sensitivity(switchyard: dict, config: dict) -> str:
         "How sensitive should escalation between the tiers be?",
         choices=choices,
         default=default,
-        style=_PICKER_STYLE,
+        style=_picker_style(),
         pointer=_PICKER_POINTER,
         instruction="(enter to confirm)",
     ).ask()
@@ -3127,6 +3555,10 @@ def _resolve_strategy_api_key(ctx: click.Context, api_key: str | None, fmt: str)
     """
     if api_key is None:
         api_key = ctx.obj.get("strategies_api_key")
+    elif _strategy_base_url(ctx) is not None:
+        if ctx.get_parameter_source("api_key") == ParameterSource.COMMANDLINE:
+            raise click.UsageError("--harness cannot be combined with --api-key.")
+        api_key = ctx.obj["strategies_api_key"]
     elif (
         ctx.obj.get("strategies_api_key_from_flag")
         and ctx.obj.get("strategies_api_key") is not None
@@ -3169,7 +3601,7 @@ def _resolve_strategy_api_key(ctx: click.Context, api_key: str | None, fmt: str)
         selected = questionary.select(
             "Which Ramp Router API key's account should this change?",
             choices=choices,
-            style=_PICKER_STYLE,
+            style=_picker_style(),
             pointer=_PICKER_POINTER,
             instruction="(enter to confirm)",
         ).ask()
@@ -3182,44 +3614,65 @@ def _resolve_strategy_api_key(ctx: click.Context, api_key: str | None, fmt: str)
     )
 
 
-def _strategy_settings_request(
-    api_key: str, changes: dict[str, object] | None = None
-) -> dict:
-    """Read or update the key owner's strategy settings on Router.
+def _strategy_base_url(ctx: click.Context) -> str | None:
+    """The harness endpoint chosen with 'strategies --harness', if any."""
+    return (ctx.obj or {}).get("strategies_base_url")
 
-    Returns the full strategies payload with the toggle fields validated.
-    The endpoint lives on the same origin and API-key surface as the status
-    line's session-usage reads.
+
+def _router_key_request(
+    api_key: str,
+    path: str,
+    *,
+    method: str = "GET",
+    body: dict[str, object] | None = None,
+    base_url: str | None = None,
+    errors: dict[int, str] | None = None,
+) -> object:
+    """Call a Router endpoint authenticated by the API key itself.
+
+    These live on the same origin and API-key surface as the status line's
+    session-usage reads. ``errors`` overrides the message for a status code.
     """
-    url = f"{_statusline_origin()}/session-usage/strategies"
+    origin = (
+        _statusline_origin()
+        if base_url is None
+        else KNOWN_DEPLOYMENT_UI_URLS.get(
+            base_url.rstrip("/"), base_url.rstrip("/").removesuffix("/v1")
+        )
+    )
+    url = f"{origin}/session-usage/{path}"
     headers = {"Authorization": f"Bearer {api_key}", **_router_telemetry_headers()}
     try:
-        if changes is None:
+        if method == "GET":
             response = httpx.get(url, headers=headers, timeout=10)
         else:
-            response = httpx.patch(url, headers=headers, json=changes, timeout=10)
+            send = {"PATCH": httpx.patch, "PUT": httpx.put}[method]
+            response = send(url, headers=headers, json=body, timeout=10)
         response.raise_for_status()
-        payload = response.json()
+        return response.json()
     except httpx.HTTPStatusError as exc:
-        if exc.response.status_code in (401, 403):
+        status = exc.response.status_code
+        if errors and status in errors:
+            raise click.ClickException(errors[status]) from None
+        if status in (401, 403):
             raise click.ClickException(
                 "That API key wasn't accepted by Ramp Router. "
                 f"Create or copy a key at {router_ui_url()} and try again."
             ) from None
-        if exc.response.status_code == 404:
+        if status == 404:
             raise click.ClickException(
                 "This Ramp Router doesn't support strategy management yet. "
                 f"Manage strategies at {router_ui_url()}/strategies instead."
             ) from None
-        if exc.response.status_code == 422:
+        if status == 422:
             # Config validation errors name the exact problem (unknown model,
             # effort the model does not advertise); surface that instead of a
             # generic retry hint.
             detail = None
             try:
-                body = exc.response.json()
-                if isinstance(body, dict) and isinstance(body.get("error"), dict):
-                    detail = body["error"].get("message")
+                payload = exc.response.json()
+                if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+                    detail = payload["error"].get("message")
             except ValueError:
                 detail = None
             raise click.ClickException(
@@ -3229,16 +3682,83 @@ def _strategy_settings_request(
             ) from None
         raise click.ClickException(
             "Ramp Router couldn't process the strategy request "
-            f"(HTTP {exc.response.status_code}). Please try again."
+            f"(HTTP {status}). Please try again."
         ) from None
     except (httpx.HTTPError, ValueError):
         raise click.ClickException(
             "We couldn't reach Ramp Router. Check your connection and try again."
         ) from None
 
+
+def _strategy_settings_request(
+    api_key: str,
+    changes: dict[str, object] | None = None,
+    *,
+    base_url: str | None = None,
+) -> dict:
+    """Read or update the key owner's strategy settings on Router.
+
+    Returns the full strategies payload with the toggle fields validated.
+    """
+    payload = _router_key_request(
+        api_key,
+        "strategies",
+        method="GET" if changes is None else "PATCH",
+        body=changes,
+        base_url=base_url,
+    )
     if not isinstance(payload, dict) or any(
         not isinstance(payload.get(field), bool) for field in STRATEGY_SETTINGS.values()
     ):
+        raise click.ClickException(
+            "Ramp Router returned an unexpected strategies response. Please try again."
+        )
+    return payload
+
+
+_KEY_PROFILES_UNAVAILABLE = (
+    "Named routing strategies aren't available for this key's account yet."
+)
+
+
+def _key_routing_profiles(api_key: str, *, base_url: str | None = None) -> list[dict]:
+    """The key owner's named strategies, default first, marking the key's own."""
+    payload = _router_key_request(
+        api_key,
+        "routing-profiles",
+        base_url=base_url,
+        errors={403: _KEY_PROFILES_UNAVAILABLE, 404: _KEY_PROFILES_UNAVAILABLE},
+    )
+    profiles = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(profiles, list) or any(
+        not isinstance(profile, dict)
+        or not isinstance(profile.get("name"), str)
+        or not isinstance(profile.get("is_current"), bool)
+        for profile in profiles
+    ):
+        raise click.ClickException(
+            "Ramp Router returned an unexpected strategies response. Please try again."
+        )
+    return profiles
+
+
+def _select_key_routing_profile(
+    api_key: str, name: str, *, base_url: str | None = None
+) -> dict:
+    """Route the calling key by the owner's strategy of that name."""
+    payload = _router_key_request(
+        api_key,
+        "routing-profile",
+        method="PUT",
+        body={"name": name},
+        base_url=base_url,
+        errors={
+            403: _KEY_PROFILES_UNAVAILABLE,
+            404: f"No routing strategy named {name!r} exists anymore. Reload and choose again.",
+            409: "A workspace admin manages this key's routing strategy.",
+        },
+    )
+    if not isinstance(payload, dict):
         raise click.ClickException(
             "Ramp Router returned an unexpected strategies response. Please try again."
         )
@@ -3289,11 +3809,32 @@ def _print_strategy_settings(fmt: str, payload: dict) -> None:
         "stored by 'ramp router configure'."
     ),
 )
+@click.option(
+    "--account",
+    is_flag=True,
+    help="List profiles from the Router login account instead of stored-key settings.",
+)
 @click.pass_context
-def router_strategy_list(ctx: click.Context, api_key: str | None) -> None:
+def router_strategy_list(
+    ctx: click.Context, api_key: str | None, account: bool
+) -> None:
+    account = account or ctx.obj.get("strategies_account", False)
+    if account and (
+        api_key is not None or ctx.obj.get("strategies_api_key") is not None
+    ):
+        raise click.UsageError("--account cannot be combined with --api-key.")
+    if (
+        api_key is None
+        and ctx.obj.get("strategies_api_key") is None
+        and (account or use_account_strategies(ctx))
+    ):
+        output_user_strategies(ctx)
+        return
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     key = _resolve_strategy_api_key(ctx, api_key, fmt)
-    _print_strategy_settings(fmt, _strategy_settings_request(key))
+    _print_strategy_settings(
+        fmt, _strategy_settings_request(key, base_url=_strategy_base_url(ctx))
+    )
 
 
 def _run_strategy_update(
@@ -3314,7 +3855,7 @@ def _run_strategy_update(
     changes: dict[str, object] = {STRATEGY_SETTINGS[name]: enabled for name in names}
     if switchyard_config is not _NO_SWITCHYARD_CONFIG_CHANGE:
         changes["switchyard_config"] = switchyard_config
-    payload = _strategy_settings_request(key, changes)
+    payload = _strategy_settings_request(key, changes, base_url=_strategy_base_url(ctx))
     settings = _strategy_states(payload)
     # Router answers with the effective state, which can decline a change:
     # Shadow models stay off for accounts whose content recording is off.
@@ -3465,7 +4006,7 @@ def router_strategy_disable(
 )
 @click.argument(
     "clients",
-    type=click.Choice(tuple(AGENT_NAMES), case_sensitive=False),
+    type=_AgentChoice(case_sensitive=False),
     nargs=-1,
 )
 @click.pass_context
@@ -3479,6 +4020,8 @@ def _run_unconfigure(
     clients: tuple[str, ...],
     legacy_cowork_alias: bool = False,
 ) -> None:
+    if not clients and router_ui.launch(ctx, "disconnect"):
+        return
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     requested_clients = tuple(dict.fromkeys(clients))
     # The machine-readable output contract follows what the caller named, not
@@ -3536,7 +4079,7 @@ def _run_unconfigure(
             )
         )
     target_phrase = (
-        "Claude Cowork"
+        "Claude Desktop"
         if clients == (COWORK_CLIENT,)
         else "your coding agent"
         if len(clients) == 1
@@ -5555,8 +6098,12 @@ def _configure_claude_code(
     selected_model: str | None = None,
     model_view: str = "compact",
     preserve_model_view_ownership: bool = False,
+    expected_connection: tuple[str, str] | None = None,
 ) -> str:
     """Write Claude Code's gateway settings and record how to undo them.
+
+    ``expected_connection`` (key, base URL) makes a model-only edit fail
+    instead of writing when the saved connection changed since it was read.
 
     The default model is read from Router's Claude Code view of /v1/models
     rather than derived locally, because that view is what Claude Code's picker
@@ -5572,6 +6119,18 @@ def _configure_claude_code(
     # writer landing between this read and the writes below would be discarded,
     # or left paired with a state receipt describing a different setup.
     with claude_code.settings_lock(path):
+        if (
+            expected_connection is not None
+            and (
+                _stored_router_api_key("claude-code", path),
+                _stored_router_base_url("claude-code", path),
+            )
+            != expected_connection
+        ):
+            raise click.ClickException(
+                "The Claude Code connection changed during the update. "
+                "Reload before saving."
+            )
         settings = claude_code.read_settings(path)
         state_path = claude_code.state_path(path)
         previous_state = claude_code.read_state(path) if state_path.exists() else None
@@ -5989,6 +6548,15 @@ def _hermes_receipt_enrolls(state_path: Path) -> bool:
     return state.get("written_provider_entry") is not None
 
 
+def _same_router(first: str | None, second: str | None) -> bool:
+    """Whether two base URLs reach one deployment, so share its keys."""
+    first, second = (first or "").rstrip("/"), (second or "").rstrip("/")
+    return first == second or {first, second} == {
+        DEFAULT_ROUTER_BASE_URL,
+        LEGACY_ROUTER_BASE_URL,
+    }
+
+
 def _stored_router_api_key_choices() -> list[tuple[str, tuple[str, ...]]]:
     """Group compatible receipt-backed credentials by the clients using them."""
     active_url = router_base_url().rstrip("/")
@@ -6016,10 +6584,7 @@ def _stored_router_api_key_choices() -> list[tuple[str, tuple[str, ...]]]:
                 ):
                     continue
                 saved_url = _stored_router_base_url(client, path)
-                if saved_url != active_url and {saved_url, active_url} != {
-                    DEFAULT_ROUTER_BASE_URL,
-                    LEGACY_ROUTER_BASE_URL,
-                }:
+                if not _same_router(saved_url, active_url):
                     continue
                 api_key = _stored_router_api_key(client, path)
         except click.ClickException:
@@ -6044,7 +6609,7 @@ def _pick_stored_router_api_key() -> str | None:
     selected = questionary.select(
         "Choose a Ramp Router API key",
         choices=choices,
-        style=_PICKER_STYLE,
+        style=_picker_style(),
         pointer=_PICKER_POINTER,
         instruction="(enter to confirm)",
     ).ask()
@@ -6129,6 +6694,46 @@ def _refresh_router_base_url(client: str, path: Path) -> str:
     ):
         return DEFAULT_ROUTER_BASE_URL
     return stored or router_base_url()
+
+
+def _stored_usage_origin(client: str, path: Path | None) -> str | None:
+    """The dashboard origin a saved setup sends session-usage calls to.
+
+    A model-only edit rewrites the whole setup, so it must keep this origin
+    rather than derive a new one from the environment: the saved key would
+    otherwise be sent as a bearer token to a different host.
+    """
+    if path is None:
+        return None
+    try:
+        if client == "claude-code":
+            environment = claude_code.read_settings(path).get("env")
+            value = (
+                environment.get("ROUTER_BASE_URL")
+                if isinstance(environment, dict)
+                else None
+            )
+        elif client == "opencode":
+            config = _read_json_config(client, path)
+            package_path = _bundled_plugin_path(client)
+            value = next(
+                (
+                    (_opencode_plugin_options(entry) or {}).get("usageBaseURL")
+                    for entry in _opencode_plugin_entries(config)
+                    if _is_router_plugin_entry(client, entry, package_path)
+                ),
+                None,
+            )
+        elif client == "pi":
+            plugin = json.loads(
+                (path.parent / PI_PLUGIN_CONFIG_FILE).read_text(encoding="utf-8")
+            )
+            value = plugin.get("usageBaseUrl") if isinstance(plugin, dict) else None
+        else:
+            return None
+    except (click.ClickException, OSError, UnicodeError, ValueError):
+        return None
+    return value.rstrip("/") if isinstance(value, str) and value.strip() else None
 
 
 def _stored_router_api_key(client: str, path: Path) -> str:
@@ -6220,12 +6825,42 @@ def _configured_model(client: str, path: Path) -> str | None:
 
 
 def router_base_url() -> str:
-    """Return the Router this command should point clients at."""
+    """Return the Router this command should point clients at.
+
+    The environment wins, then the workspace's Router while it runs.
+    Otherwise production, as before Router logins existed: a saved login
+    never retargets API-key commands or the scripts that run them.
+    """
     for name in BASE_URL_ENVS:
         configured = os.environ.get(name, "").strip()
         if configured:
             return configured.rstrip("/")
-    return DEFAULT_ROUTER_BASE_URL
+    # A UI URL alone keeps naming only the dashboard, as it always has.
+    if os.environ.get(ROUTER_UI_URL_ENV, "").strip():
+        return DEFAULT_ROUTER_BASE_URL
+    origin = _session_origin
+    return router_base_url_for(origin) if origin else DEFAULT_ROUTER_BASE_URL
+
+
+def router_base_url_for(origin: str) -> str:
+    """The data plane serving the Router whose dashboard is ``origin``."""
+    origin = origin.rstrip("/")
+    for base, ui in KNOWN_DEPLOYMENT_UI_URLS.items():
+        if ui == origin:
+            return base
+    # Any other origin is a single-origin deployment serving both.
+    return f"{origin}/v1"
+
+
+# Set by the TUI, whose worker threads have no click context to read the
+# profile from, and which may run against a Router it hasn't saved yet.
+_session_origin: str | None = None
+
+
+def use_router_origin(origin: str | None) -> None:
+    """Point this process's Router resolution at ``origin`` (the TUI's)."""
+    global _session_origin
+    _session_origin = origin.rstrip("/") if origin else None
 
 
 # The model a fresh setup starts on. Router publishes no recommendation, and
@@ -6259,6 +6894,8 @@ def _configure_client(
     hermes_lock_held: bool = False,
     conductor_require_receipt: bool = False,
     conductor_lock_held: bool = False,
+    strict_model: bool = False,
+    expected_connection: tuple[str, str] | None = None,
 ) -> tuple[Path, str, bool]:
     """Configure one client, reporting whether it replaced an outdated setup."""
     if client == "claude-code":
@@ -6273,6 +6910,7 @@ def _configure_client(
                 selected_model=selected_model,
                 model_view=claude_model_view or "compact",
                 preserve_model_view_ownership=preserve_model_view_ownership,
+                expected_connection=expected_connection,
             ),
             False,
         )
@@ -6285,6 +6923,7 @@ def _configure_client(
             models,
             base_url=base_url,
             selected_model=selected_model,
+            **({"strict_model": True} if strict_model else {}),
         )
         return path, default_model, repaired
 
@@ -7048,11 +7687,28 @@ def _fetch_models(
         if identifier in discovered or not _serves_responses(model):
             continue
         discovered[identifier] = RouterModel(
-            id=identifier, metadata=_model_metadata(model.get("router"), identifier)
+            id=identifier,
+            metadata=_model_metadata(model.get("router"), identifier),
+            created=_created(model.get("created")),
+            pricing=_pricing(model.get("router")),
         )
     if not discovered:
         raise click.ClickException("No models are available for this Ramp Router key.")
     return list(discovered.values())
+
+
+def _pricing(metadata: object) -> tuple[str | None, str | None, str | None]:
+    pricing = metadata.get("pricing") if isinstance(metadata, dict) else None
+    if not isinstance(pricing, dict):
+        return (None, None, None)
+    rates = [pricing.get(key) for key in ("input", "output", "cache_read_input")]
+    return tuple(rate if isinstance(rate, str) else None for rate in rates)
+
+
+def _created(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return int(value)
 
 
 def _serves_responses(model: dict) -> bool:
@@ -7189,6 +7845,7 @@ def _configure_codex(
     *,
     base_url: str | None = None,
     selected_model: str | None = None,
+    strict_model: bool = False,
 ) -> tuple[str, bool]:
     """Point the Codex CLI and Desktop app at Ramp Router."""
     # Finish remote discovery before taking the lock and the local config
@@ -7197,11 +7854,28 @@ def _configure_codex(
     # made while this request is in flight can be replaced by the stale
     # pre-request copy.
     router_catalog = _fetch_codex_catalog(api_key, base_url=base_url)
+    if strict_model and selected_model not in {
+        *(model.id for model in models),
+        *(model["slug"] for model in router_catalog["models"]),
+    }:
+        raise click.BadParameter(
+            "This model is no longer available. Reload before saving.",
+            param_hint="--model",
+        )
     # None means nothing to (re)register; existing registrations stay as-is.
-    cost_hook_command = _install_codex_cost_hook(path, base_url)
+    cost_hook_command = (
+        None if strict_model else _install_codex_cost_hook(path, base_url)
+    )
     # None (Windows or no resolvable ramp entrypoint) registers nothing.
-    sync_hook_command = session_sync_hook_command("codex")
+    sync_hook_command = None if strict_model else session_sync_hook_command("codex")
     with codex_config_lock(path):
+        if strict_model and (
+            _stored_router_api_key("codex", path) != api_key
+            or _stored_router_base_url("codex", path) != base_url
+        ):
+            raise click.ClickException(
+                "The Codex connection changed during model discovery. Reload before saving."
+            )
         return _configure_codex_in_lock(
             path,
             api_key,
@@ -7211,6 +7885,7 @@ def _configure_codex(
             selected_model=selected_model,
             cost_hook_command=cost_hook_command,
             sync_hook_command=sync_hook_command,
+            explicit_model=strict_model,
         )
 
 
@@ -7224,12 +7899,14 @@ def _configure_codex_in_lock(
     selected_model: str | None,
     cost_hook_command: str | None,
     sync_hook_command: str | None,
+    explicit_model: bool = False,
 ) -> tuple[str, bool]:
     existing, existing_data = _read_codex_config(path)
-    if selected_model is not None:
+    if selected_model is not None and not explicit_model:
         # Refresh captures a selection before discovery starts. Read it again
         # from the post-discovery snapshot so a model change made while the
-        # request was in flight is preserved.
+        # request was in flight is preserved. A model the user just chose is
+        # the change itself, so it is kept as given.
         selected_model = existing_data.get("model")
     default_model = _preferred_codex_model(models, router_catalog, selected_model)
     router_catalog_body = _render_codex_catalog(router_catalog, default_model)
@@ -8295,3 +8972,140 @@ def _copy_codex_session(
                 rendered = json.dumps(item, separators=(",", ":")) + newline
                 replaced = True
         write(rendered.encode("utf-8") if encode else rendered)
+
+
+@click.command("model", help="Change a connected harness's default Router model.")
+@click.argument("client", type=click.Choice(tuple(CLIENT_NAMES), case_sensitive=False))
+@click.option(
+    "--model",
+    required=True,
+    help="An available model ID (Codex also accepts its catalog slug).",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Validate and show the change without writing local settings.",
+)
+@click.option("--expected-connection", hidden=True)
+@click.pass_context
+def router_set_model(
+    ctx: click.Context,
+    client: str,
+    model: str,
+    dry_run: bool,
+    expected_connection: str | None,
+):
+    from ramp_cli.router_ui.harness import set_model  # noqa: PLC0415
+
+    result = set_model(client, model, expected=expected_connection, dry_run=dry_run)
+    fmt = resolve_format(ctx.obj.get("format"), ctx.obj.get("config_format"))
+    if ctx.obj.get("agent_mode"):
+        print_agent_json(result)
+    elif fmt == "json":
+        print_json(result)
+    else:
+        click.echo(
+            f"{'Would set' if dry_run else 'Set'} {CLIENT_NAMES[client]} default model to {model}."
+        )
+
+
+class ConfigureMenuGroup(click.Group):
+    """Expose setup actions while preserving legacy configure arguments."""
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        if args and args[0] not in (*self.commands, "--help", "-h"):
+            # configure CLIENTS/--OPTIONS is the existing connect command.
+            args = ["connect", *args]
+        elif not args and (
+            CONFIGURE_KEY_ENV in os.environ or not router_ui.can_launch(ctx)
+        ):
+            # Without the workspace, bare configure starts configuration as it
+            # always has rather than printing a menu. The connect callback
+            # removes an environment key before any child-app probes run.
+            args = ["connect"]
+        return super().parse_args(ctx, args)
+
+
+def _organize_router_menu() -> None:
+    """Group setup/account actions; keep refresh and subagents at the root."""
+    legacy: dict[str, click.Command] = {}
+    router_group._legacy_commands = legacy
+
+    def move(name: str, destination: click.Group, nested_name: str | None = None):
+        command = router_group.commands.pop(name)
+        alias = copy(command)
+        alias.hidden = True
+        legacy[name] = alias
+        destination.add_command(command, nested_name or name)
+        return command
+
+    @click.group(
+        "configure",
+        cls=ConfigureMenuGroup,
+        invoke_without_command=True,
+        no_args_is_help=False,
+        help="Connect or disconnect coding harnesses.",
+        epilog="Existing shortcuts still work: configure CLIENTS [OPTIONS]. "
+        "For connection options, use 'configure connect --help'. "
+        "For guided Cursor setup, use 'ramp router cursor'.",
+    )
+    @click.pass_context
+    def configure(ctx: click.Context):
+        if ctx.invoked_subcommand is None:
+            if not router_ui.launch(ctx, "harnesses"):
+                click.echo(ctx.get_help())
+
+    connect = router_group.commands.pop("configure")
+    connect.short_help = "Connect coding harnesses."
+    configure.add_command(connect, "connect")
+    configure.add_command(router_set_model)
+    # 'configure cursor [CLIENTS] [OPTIONS]' stays the connect command it has
+    # always been; guided Cursor setup stays 'ramp router cursor', which the
+    # epilog names rather than the root menu.
+    router_group.commands["cursor"].hidden = True
+    move(
+        "unconfigure", configure, "disconnect"
+    ).short_help = "Disconnect coding harnesses."
+    router_group.add_command(configure)
+
+    @click.group(
+        "account",
+        invoke_without_command=True,
+        no_args_is_help=False,
+        help="Sign in, sign out, or check your Router account.",
+    )
+    @click.pass_context
+    def account(ctx: click.Context):
+        if ctx.invoked_subcommand is None:
+            if router_ui.launch(ctx, "account"):
+                return
+            if (
+                ctx.obj.get("agent_mode")
+                or resolve_format(ctx.obj.get("format"), ctx.obj.get("config_format"))
+                == "json"
+            ):
+                ctx.invoke(account.commands["status"])
+            else:
+                click.echo(ctx.get_help())
+
+    for name, description in (
+        ("login", "Sign in to Router."),
+        ("logout", "Sign out of this CLI."),
+        ("status", "Show your account and login."),
+        ("usage", "Show spend, savings, tokens, and credits."),
+    ):
+        move(name, account).short_help = description
+    router_group.add_command(account)
+
+    for name, description in {
+        "account": "Manage your Router login.",
+        "configure": "Connect or disconnect harnesses.",
+        "keys": "View and manage API keys.",
+        "refresh": "Update connected harnesses.",
+        "strategies": "Manage routing strategies.",
+        "subagents": "Choose subagent models.",
+    }.items():
+        router_group.commands[name].short_help = description
+
+
+_organize_router_menu()

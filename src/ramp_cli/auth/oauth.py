@@ -86,6 +86,34 @@ class PkceCallback:
             raise click.ClickException(self._result["error"])
         return str(self._result["code"])
 
+    def submit_url(self, url: str) -> None:
+        """Finish from the address the browser was sent to.
+
+        For a browser that can't reach this machine's callback, as when the
+        CLI runs in a container or over SSH: the page fails to load, but its
+        address holds the same code and state the listener would have read.
+        """
+        parsed = urlparse(url.strip())
+        query = parse_qs(parsed.query)
+        if parsed.path != "/callback" or not ("code" in query or "error" in query):
+            raise click.ClickException(
+                "That isn't the sign-in callback. Paste the full "
+                "http://localhost address your browser was sent to."
+            )
+        if query.get("state", [None])[0] != self.state:
+            raise click.ClickException(
+                "That callback is from a different sign-in. Paste the address "
+                "from the browser tab this sign-in opened."
+            )
+        if self._event.is_set():
+            return
+        if "error" in query:
+            description = query.get("error_description", [""])[0]
+            self._result["error"] = f"OAuth error: {query['error'][0]} — {description}"
+        else:
+            self._result["code"] = query["code"][0]
+        self._event.set()
+
     def shutdown(self) -> None:
         self._server.shutdown()
         self._thread.join(timeout=1)

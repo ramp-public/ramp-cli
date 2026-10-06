@@ -1137,7 +1137,7 @@ class TestPositionalIdParams:
     def test_real_tool_lock_card_id_positional(self, monkeypatch):
         """lock-or-unlock-card should have id as positional."""
         _use_bundled_spec(monkeypatch)
-        tool = get_tool("lock-or-unlock-card")
+        tool = get_tool("lock-or-unlock-card", env="production")
         assert tool is not None
         cmd = build_tool_command(tool)
         args = [p for p in cmd.params if isinstance(p, click.Argument)]
@@ -1285,7 +1285,7 @@ class TestErrorExampleFormat:
         # The missing --action triggers our custom error with the example.
         result = runner.invoke(
             cli,
-            ["lock-or-unlock-card", "abc-123"],
+            ["--env", "production", "lock-or-unlock-card", "abc-123"],
         )
         assert result.exit_code != 0
         # Extract the Example line and verify ordering within it
