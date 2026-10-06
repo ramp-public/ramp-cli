@@ -48,7 +48,11 @@ from ramp_cli.commands.router_sync import (
 from ramp_cli.output.formatter import print_agent_json, resolve_format
 from ramp_cli.output.style import show_notice, start_spinner
 from ramp_cli.router_integrations import integration_package_path
-from ramp_cli.router_setup import acquire_router_api_key
+from ramp_cli.router_setup import (
+    ROUTER_SETUP_DEFERRED_EXIT_CODE,
+    acquire_router_api_key,
+    confirm_router_browser_setup,
+)
 from ramp_cli.version_check import (
     installed_version_path,
     refresh_version_cache,
@@ -1150,6 +1154,14 @@ def _validate_deployment_url(
     ),
 )
 @click.option(
+    "--confirm-browser",
+    is_flag=True,
+    help=(
+        "Show a macOS Connect/Later dialog before browser setup. "
+        "Later or a five-minute timeout defers setup with exit code 3."
+    ),
+)
+@click.option(
     "--claude-models",
     type=click.Choice(("compact", "all"), case_sensitive=False),
     help="Models shown by Claude Code: recommended compact list or all models.",
@@ -1176,10 +1188,15 @@ def router_configure(
     api_key: str | None,
     no_browser: bool,
     reuse_existing_key: bool,
+    confirm_browser: bool,
     claude_models: str | None,
     base_url: str | None,
     ui_url: str | None,
 ) -> None:
+    if confirm_browser and no_browser:
+        raise click.UsageError(
+            "--confirm-browser cannot be combined with --no-browser."
+        )
     # The rest of this module resolves the deployment from these variables.
     if base_url:
         os.environ[ROUTER_BASE_URL_ENV] = base_url
@@ -1195,6 +1212,7 @@ def router_configure(
         api_key_source=ctx.get_parameter_source("api_key"),
         deployment_override=bool(base_url or ui_url),
         reuse_existing_key=reuse_existing_key,
+        confirm_browser=confirm_browser,
     )
 
 
@@ -1210,6 +1228,7 @@ def _run_configure(
     legacy_cowork_alias: bool = False,
     deployment_override: bool = False,
     reuse_existing_key: bool = False,
+    confirm_browser: bool = False,
 ) -> None:
     if (
         setup_file is not None
@@ -1382,6 +1401,16 @@ def _run_configure(
                 "have nowhere to go. Run 'ramp router cursor --show-key' to "
                 "print a key, or pass --api-key with an existing key."
             )
+        if confirm_browser:
+            if fmt == "json":
+                raise click.UsageError(
+                    "--confirm-browser requires --human when browser setup is needed."
+                )
+            if not confirm_router_browser_setup(router_ui_url()):
+                click.echo("Ramp Router installed; browser setup deferred.")
+                # main() uses Click's non-standalone mode, which returns ctx.exit
+                # codes instead of propagating them to the invoking MDM policy.
+                raise SystemExit(ROUTER_SETUP_DEFERRED_EXIT_CODE)
         api_key = acquire_router_api_key(router_ui_url(), no_browser=no_browser)
         browser_acquired_key = True
     api_key = api_key.strip()

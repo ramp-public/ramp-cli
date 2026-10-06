@@ -185,6 +185,52 @@ describe("discoverRouterModels", () => {
     })
     assert.deepEqual(discovered.map(({ id }) => id), ["gpt-5.4", "claude-messages-only"])
   })
+
+  it("prices cache writes from the 5m rate when Router publishes writes per TTL", async () => {
+    const priced = (id, pricing) => ({
+      id,
+      owned_by: id.startsWith("claude") ? "anthropic" : "openai",
+      router: { ...routerMetadata(id), pricing },
+    })
+    const fetcher = mock.fn(async () =>
+      new Response(
+        JSON.stringify({
+          data: [
+            priced("claude-ttl", {
+              input: "5",
+              output: "25",
+              cache_read_input: "0.5",
+              cache_write_input: "0",
+              cache_write_input_5m: "6.25",
+              cache_write_input_1h: "10",
+            }),
+            priced("gpt-flat", {
+              input: "1",
+              output: "2",
+              cache_write_input: "1.5",
+              cache_write_input_5m: "9",
+            }),
+            priced("gpt-no-writes", { input: "1", output: "2" }),
+          ],
+        }),
+        { status: 200 },
+      ),
+    )
+
+    const discovered = await discoverRouterModels({
+      baseURL: "http://localhost:8002",
+      apiKey: "test-secret",
+      fetch: fetcher,
+    })
+    const writes = Object.fromEntries(
+      discovered.map(({ id, metadata }) => [id, metadata.pricing?.cacheWrite]),
+    )
+    assert.deepEqual(writes, {
+      "claude-ttl": 6.25,
+      "gpt-flat": 1.5,
+      "gpt-no-writes": 0,
+    })
+  })
 })
 
 describe("Pi provider extension", () => {

@@ -1,4 +1,5 @@
 import socket
+import subprocess
 import threading
 import urllib.error
 import urllib.parse
@@ -11,6 +12,49 @@ import ramp_cli.router_setup as router_setup
 from ramp_cli.router_setup import start_router_key_callback
 
 ROUTER_UI_URL = "https://app.router.com"
+
+
+@pytest.mark.parametrize(
+    ("output", "returncode", "expected"),
+    [
+        ("Connect\n", 0, True),
+        ("Later\n", 0, False),
+        ("", 1, None),
+        ("unexpected", 0, None),
+    ],
+)
+def test_macos_dialog_requires_an_explicit_connect_result(
+    monkeypatch, output, returncode, expected
+):
+    monkeypatch.setattr(router_setup.sys, "platform", "darwin")
+
+    def run(args, **kwargs):
+        assert args[0] == "osascript"
+        assert args[-1] == ROUTER_UI_URL
+        return subprocess.CompletedProcess(args, returncode, output, "")
+
+    monkeypatch.setattr(router_setup.subprocess, "run", run)
+    if expected is None:
+        with pytest.raises(click.ClickException, match="Browser setup was not started"):
+            router_setup.confirm_router_browser_setup(ROUTER_UI_URL)
+    else:
+        assert router_setup.confirm_router_browser_setup(ROUTER_UI_URL) is expected
+
+
+@pytest.mark.parametrize(
+    "failure", [FileNotFoundError(), subprocess.TimeoutExpired("osascript", 310)]
+)
+def test_macos_dialog_execution_failure_does_not_authorize_browser_setup(
+    monkeypatch, failure
+):
+    monkeypatch.setattr(router_setup.sys, "platform", "darwin")
+
+    def run(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(router_setup.subprocess, "run", run)
+    with pytest.raises(click.ClickException, match="Browser setup was not started"):
+        router_setup.confirm_router_browser_setup(ROUTER_UI_URL)
 
 
 def _post(callback, fields, *, content_type="application/x-www-form-urlencoded"):

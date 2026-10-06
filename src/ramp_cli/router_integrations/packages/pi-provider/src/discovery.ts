@@ -128,7 +128,9 @@ function pricing(value: unknown): RouterPricing | undefined {
     input,
     output,
     cacheRead: rate(rates.cache_read_input) ?? 0,
-    cacheWrite: rate(rates.cache_write_input) ?? 0,
+    // Anthropic rows publish writes per TTL and leave cache_write_input at 0.
+    // Pi prices 1h writes itself (2x input), so the 5m rate is its base rate.
+    cacheWrite: rate(rates.cache_write_input) || rate(rates.cache_write_input_5m) || 0,
   }
 }
 

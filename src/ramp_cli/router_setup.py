@@ -7,6 +7,8 @@ import hashlib
 import json
 import secrets
 import socket
+import subprocess
+import sys
 import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -18,6 +20,7 @@ import click
 from ramp_cli.auth.oauth import _callback_html, _open_browser
 
 ROUTER_SETUP_TIMEOUT_SECONDS = 900
+ROUTER_SETUP_DEFERRED_EXIT_CODE = 3
 ROUTER_SETUP_PATH = "/cli/setup"
 ROUTER_CALLBACK_PATH = "/callback"
 MAX_CALLBACK_BODY_BYTES = 16 * 1024
@@ -29,6 +32,42 @@ CALLBACK_POPUP_HEIGHT = 360
 # Long enough for the confirmation to register and for the acceptance message
 # to reach Router, short enough that the window does not feel abandoned.
 CALLBACK_CLOSE_DELAY_MS = 1200
+
+
+def confirm_router_browser_setup(router_ui_url: str) -> bool:
+    if sys.platform != "darwin":
+        raise click.ClickException("The Connect/Later dialog requires macOS.")
+
+    script = """on run argv
+    try
+        set setupMessage to "Your IT team installed Ramp Router to give your coding tools access to company-approved AI models." & return & return
+        set setupMessage to setupMessage & "Connect with your work account. Your browser will open to finish setup at " & (item 1 of argv) & "."
+        set setupDialog to display dialog setupMessage with title "Connect Ramp Router" buttons {"Later", "Connect"} default button "Connect" cancel button "Later" with icon note giving up after 300
+        if gave up of setupDialog then return "Later"
+        return button returned of setupDialog
+    on error number -128
+        return "Later"
+    end try
+end run"""
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script, router_ui_url],
+            capture_output=True,
+            text=True,
+            timeout=310,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise click.ClickException(
+            "Could not show the Connect/Later dialog. Browser setup was not started; "
+            "rerun the setup policy or run 'ramp router configure' manually."
+        ) from exc
+    if result.returncode != 0 or result.stdout.strip() not in {"Connect", "Later"}:
+        raise click.ClickException(
+            "The Connect/Later dialog did not complete. Browser setup was not started; "
+            "rerun the setup policy or run 'ramp router configure' manually."
+        )
+    return result.stdout.strip() == "Connect"
 
 
 @dataclass

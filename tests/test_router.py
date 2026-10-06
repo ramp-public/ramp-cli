@@ -4777,6 +4777,9 @@ def test_configure_reuses_one_existing_router_key_without_browser(
     monkeypatch.setattr(
         router_module, "acquire_router_api_key", unexpected_browser_setup
     )
+    monkeypatch.setattr(
+        router_module, "confirm_router_browser_setup", unexpected_browser_setup
+    )
     monkeypatch.setattr(router_module, "_can_prompt", lambda _ctx, _fmt: not unattended)
 
     class Prompt:
@@ -4797,7 +4800,7 @@ def test_configure_reuses_one_existing_router_key_without_browser(
         args.append("--no-input")
     args.extend(["router", "configure", "pi"])
     if unattended:
-        args.append("--reuse-existing-key")
+        args.extend(["--reuse-existing-key", "--confirm-browser"])
     result = CliRunner().invoke(cli, args)
 
     assert result.exit_code == 0, result.output
@@ -4813,6 +4816,58 @@ def test_configure_reuses_one_existing_router_key_without_browser(
         "existing-key"
     )
     assert "existing-key" not in result.output
+
+
+@pytest.mark.parametrize("connect", [False, True])
+def test_configure_waits_for_macos_confirmation_before_browser_or_config_changes(
+    tmp_path, monkeypatch, connect
+):
+    pi_home = tmp_path / "pi"
+    pi_home.mkdir()
+    auth_path = pi_home / "auth.json"
+    original_auth = (
+        '{"original-provider": {"type": "api_key", "key": "original-key"}}\n'
+    )
+    auth_path.write_text(original_auth)
+    calls = []
+
+    def confirm(url):
+        calls.append(("dialog", url))
+        return connect
+
+    def acquire(url, *, no_browser):
+        assert calls == [("dialog", "https://app.router.com")]
+        calls.append(("browser", url))
+        return "browser-key"
+
+    monkeypatch.setattr(router_module, "confirm_router_browser_setup", confirm)
+    monkeypatch.setattr(router_module, "acquire_router_api_key", acquire)
+    _mock_models(monkeypatch, key="browser-key")
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure",
+            "pi",
+            "--reuse-existing-key",
+            "--confirm-browser",
+        ],
+    )
+
+    if connect:
+        assert result.exit_code == 0, result.output
+        assert calls == [
+            ("dialog", "https://app.router.com"),
+            ("browser", "https://app.router.com"),
+        ]
+        assert json.loads(auth_path.read_text())["ramp-router"]["key"] == "browser-key"
+    else:
+        assert result.exit_code == 3, result.output
+        assert calls == [("dialog", "https://app.router.com")]
+        assert auth_path.read_text() == original_auth
+        assert list(pi_home.iterdir()) == [auth_path]
 
 
 def test_router_key_reuse_does_not_cross_into_a_distinct_deployment(
