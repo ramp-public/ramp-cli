@@ -105,14 +105,15 @@ describe("discoverRouterModels", () => {
       fetch: fetcher,
     })
     assert.deepEqual(
-      discovered.map(({ id, ownedBy }) => ({ id, ownedBy })),
+      discovered.models.map(({ id, ownedBy }) => ({ id, ownedBy })),
       [
         { id: "model-a", ownedBy: "openai" },
         { id: "model-b", ownedBy: "anthropic" },
       ],
     )
+    assert.deepEqual(discovered.classifiers, [])
     // Router describes every model, so every discovered one carries limits.
-    for (const model of discovered) {
+    for (const model of discovered.models) {
       assert.equal(model.metadata.contextWindow, 128000)
       assert.equal(model.metadata.maxOutputTokens, 16384)
     }
@@ -145,7 +146,7 @@ describe("discoverRouterModels", () => {
     )
   })
 
-  it("keeps only models supporting their selected Pi API", async () => {
+  it("keeps chat models supporting their Pi API and System One classifiers", async () => {
     const fetcher = mock.fn(async () =>
       new Response(
         JSON.stringify({
@@ -183,7 +184,75 @@ describe("discoverRouterModels", () => {
       apiKey: "test-secret",
       fetch: fetcher,
     })
-    assert.deepEqual(discovered.map(({ id }) => id), ["gpt-5.4", "claude-messages-only"])
+    assert.deepEqual(discovered.models.map(({ id }) => id), ["gpt-5.4", "claude-messages-only"])
+    assert.deepEqual(discovered.classifiers, [
+      {
+        id: "jev-by-surface",
+        ownedBy: "router",
+        metadata: { displayName: "jev-by-surface", providerDisplayName: "", contextWindow: 128000 },
+      },
+      {
+        id: "jev-by-owner",
+        ownedBy: "typesafe",
+        metadata: { displayName: "jev-by-owner", providerDisplayName: "", contextWindow: 128000 },
+      },
+    ])
+  })
+
+  it("drops only the malformed classifier rows", async () => {
+    const jev = (id, overrides) => ({
+      id, owned_by: "typesafe",
+      router: { ...routerMetadata(id, ["text"]), surfaces: ["systemone"], ...overrides },
+    })
+    const fetcher = mock.fn(async () => new Response(JSON.stringify({ data: [
+      { id: "gpt-5.4", owned_by: "openai", router: routerMetadata("gpt-5.4") },
+      jev("jev-latest", {
+        display_name: "Jev 1.13",
+        provider_display_name: "TypeSafe",
+        limits: { context_window: 65536, max_input_tokens: 32768, max_output_tokens: 65536 },
+        pricing: { input: "0.042", output: "0", cache_read_input: "0", cache_write_input: "0" },
+      }),
+      jev("jev-unknown-schema", { schema_version: 2 }),
+      jev("jev-no-window", { limits: {} }),
+      jev("jev-no-text", { capabilities: { modalities: { input: ["image"] } } }),
+      // A malformed row must not hide a later valid row with the same id.
+      jev("jev-preview", { limits: {} }),
+      jev("jev-preview"),
+    ] }), { status: 200 }))
+
+    const discovered = await discoverRouterModels({
+      baseURL: "http://localhost:8002",
+      apiKey: "test-secret",
+      fetch: fetcher,
+    })
+    assert.deepEqual(discovered.models.map(({ id }) => id), ["gpt-5.4"])
+    assert.deepEqual(discovered.classifiers, [
+      {
+        id: "jev-latest",
+        ownedBy: "typesafe",
+        metadata: {
+          displayName: "Jev 1.13",
+          providerDisplayName: "TypeSafe",
+          contextWindow: 65536,
+          pricing: { input: 0.042, output: 0, cacheRead: 0, cacheWrite: 0 },
+        },
+      },
+      {
+        id: "jev-preview",
+        ownedBy: "typesafe",
+        metadata: { displayName: "jev-preview", providerDisplayName: "", contextWindow: 128000 },
+      },
+    ])
+  })
+
+  it("rejects a catalog with classifiers but no chat models", async () => {
+    const fetcher = mock.fn(async () => new Response(JSON.stringify({ data: [
+      { id: "jev-latest", owned_by: "typesafe", router: { ...routerMetadata("jev-latest"), surfaces: ["systemone"] } },
+    ] }), { status: 200 }))
+    await assert.rejects(
+      discoverRouterModels({ baseURL: "http://localhost:8002", apiKey: "test-secret", fetch: fetcher }),
+      /returned no models for this API key/,
+    )
   })
 
   it("prices cache writes from the 5m rate when Router publishes writes per TTL", async () => {
@@ -1091,11 +1160,11 @@ describe("Pi provider extension", () => {
     }))
     mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({
       data: [{
-        id: "claude-opus-5-5", owned_by: "anthropic",
+        id: "claude-unreleased-fixture", owned_by: "anthropic",
         router: {
-          ...routerMetadata("claude-opus-5-5"), surfaces: ["messages"],
+          ...routerMetadata("claude-unreleased-fixture"), surfaces: ["messages"],
           capabilities: {
-            ...routerMetadata("claude-opus-5-5").capabilities,
+            ...routerMetadata("claude-unreleased-fixture").capabilities,
             reasoning: { efforts: [
               { value: "none", description: "" },
               { value: "high", description: "" },
@@ -1109,7 +1178,7 @@ describe("Pi provider extension", () => {
     const [provider] = registerProvider.mock.calls[0].arguments
     assert.deepEqual(provider.getModels(), [])
     const [cached] = JSON.parse(readFileSync(join(home, "ramp-router-model-cache.json"), "utf8")).models
-    assert.equal(cached.id, "claude-opus-5-5")
+    assert.equal(cached.id, "claude-unreleased-fixture")
     assert.deepEqual(provider.filterModels([cached], { type: "api_key", key: "current-secret" }), [])
 
     const requests = []
@@ -1137,7 +1206,8 @@ describe("Pi provider extension", () => {
         const native = getProvider(id)
         return id === "anthropic" && native
           ? { ...native, getModels: () => [...native.getModels(), {
-              id: "claude-opus-5-5", compat: { forceAdaptiveThinking: true },
+              id: "claude-unreleased-fixture", api: "anthropic-messages",
+              compat: { forceAdaptiveThinking: true },
             }] }
           : native
       }
@@ -1148,9 +1218,67 @@ describe("Pi provider extension", () => {
     await registerRouterProvider({ registerProvider: updated })
     const [updatedProvider] = updated.mock.calls[0].arguments
     const [model] = updatedProvider.getModels()
-    assert.equal(model.id, "claude-opus-5-5")
+    assert.equal(model.id, "claude-unreleased-fixture")
     assert.deepEqual(updatedProvider.filterModels([model], { type: "api_key", key: "current-secret" }), [model])
     await updatedProvider.streamSimple(model, context, {
+      apiKey: "current-secret", fetch: capture, maxRetries: 0, reasoning: "high",
+    }).result()
+    assert.equal(requests[0].thinking.type, "adaptive")
+    assert.equal(requests[0].output_config.effort, "high")
+  })
+
+  it("keeps Claude Opus 5.5 on adaptive thinking whatever the host's compat says", async () => {
+    const home = process.env.PI_CODING_AGENT_DIR
+    writeFileSync(join(home, "auth.json"), JSON.stringify({
+      "ramp-router": { type: "api_key", key: "current-secret" },
+    }))
+    mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({
+      data: [{
+        id: "claude-opus-5-5", owned_by: "anthropic",
+        router: {
+          ...routerMetadata("claude-opus-5-5"), surfaces: ["messages"],
+          capabilities: {
+            ...routerMetadata("claude-opus-5-5").capabilities,
+            reasoning: { efforts: [
+              { value: "none", description: "" },
+              { value: "high", description: "" },
+            ] },
+          },
+        },
+      }],
+    }), { status: 200 }))
+    // List the model natively but without compat, so only the provider's
+    // own override can select adaptive thinking.
+    const createRuntime = ModelRuntime.create.bind(ModelRuntime)
+    mock.method(ModelRuntime, "create", async (options) => {
+      const runtime = await createRuntime(options)
+      const getProvider = runtime.getProvider.bind(runtime)
+      runtime.getProvider = (id) => {
+        const native = getProvider(id)
+        return id === "anthropic" && native
+          ? { ...native, getModels: () => [
+              ...native.getModels().filter((model) => model.id !== "claude-opus-5-5"),
+              { id: "claude-opus-5-5", api: "anthropic-messages" },
+            ] }
+          : native
+      }
+      return runtime
+    })
+    const registered = mock.fn()
+    await registerRouterProvider({ registerProvider: registered })
+    const [provider] = registered.mock.calls[0].arguments
+    const [model] = provider.getModels()
+    assert.equal(model.id, "claude-opus-5-5")
+
+    const requests = []
+    const capture = async (_url, init) => {
+      requests.push(JSON.parse(init.body))
+      return new Response(JSON.stringify({ error: { message: "fixture stop" } }), {
+        status: 400, headers: { "content-type": "application/json" },
+      })
+    }
+    const context = { messages: [{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() }] }
+    await provider.streamSimple(model, context, {
       apiKey: "current-secret", fetch: capture, maxRetries: 0, reasoning: "high",
     }).result()
     assert.equal(requests[0].thinking.type, "adaptive")
@@ -1165,9 +1293,9 @@ describe("Pi provider extension", () => {
     mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ data: [
       { id: "unlisted-openai-model", owned_by: "openai", router: routerMetadata("unlisted-openai-model") },
       { id: "router-only-model", owned_by: "xai", router: routerMetadata("router-only-model") },
-      // Pi 0.84.1 lacks this ID even though the Responses adapter has a
-      // request-format fallback for it. An OpenAI-owned entry is still hidden.
-      { id: "gpt-6-sol", owned_by: "openai", router: routerMetadata("gpt-6-sol") },
+      // No Pi release lists this ID, though the Responses adapter has a
+      // request-format fallback for its family. An OpenAI-owned entry is still hidden.
+      { id: "gpt-99-fixture", owned_by: "openai", router: routerMetadata("gpt-99-fixture") },
     ] }), { status: 200 }))
     const registered = mock.fn()
     await registerRouterProvider({ registerProvider: registered })
@@ -2429,6 +2557,228 @@ describe("Pi provider extension", () => {
 
     const [provider] = registerProvider.mock.calls[0].arguments
     assert.equal(provider.baseUrl, "https://api.router.com/v1")
+  })
+})
+
+// Classifier models arrived in Pi 0.99. CI also runs this file against an
+// older host, where Router's classifiers must stay invisible.
+async function hostClassifies() {
+  const runtime = await ModelRuntime.create({
+    modelsPath: null,
+    refreshOnCreate: false,
+    allowModelNetwork: false,
+  })
+  return typeof runtime.getProvider("typesafe")?.classify === "function"
+}
+
+const JEV_ROW = {
+  id: "jev-latest",
+  owned_by: "typesafe",
+  router: {
+    ...routerMetadata("jev-latest", ["text"]),
+    display_name: "Jev 1.13",
+    provider_display_name: "TypeSafe",
+    surfaces: ["systemone"],
+    limits: { context_window: 65536, max_input_tokens: 32768, max_output_tokens: 65536 },
+    pricing: { input: "0.042", output: "0", cache_read_input: "0", cache_write_input: "0" },
+  },
+}
+
+const JEV_MODEL = {
+  type: "classifier",
+  id: "jev-latest",
+  name: "Jev 1.13 via TypeSafe",
+  api: "typesafe-system-one",
+  provider: "ramp-router",
+  baseUrl: "https://api.router.com/v1",
+  input: ["text"],
+  cost: { input: 0.042, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: 65536,
+}
+
+const QUESTION = {
+  state: { message: "The change works, thanks." },
+  questions: {
+    approved: {
+      type: "bool",
+      instructions: "Does the user approve?",
+      criteria: { true: "Approval", false: "No approval" },
+    },
+  },
+}
+
+describe("Router classifiers", () => {
+  // Serves discovery and records System One calls; anything else fails.
+  let systemOneRequests
+  beforeEach(() => {
+    systemOneRequests = []
+    writeFileSync(join(process.env.PI_CODING_AGENT_DIR, "auth.json"), JSON.stringify({
+      "ramp-router": { type: "api_key", key: "current-secret" },
+    }))
+    mock.method(globalThis, "fetch", async (url, init) => {
+      if (String(url).endsWith("/v1/models")) {
+        return new Response(JSON.stringify({ data: [
+          { id: "gpt-5.4", owned_by: "openai", router: routerMetadata("gpt-5.4") },
+          JEV_ROW,
+        ] }), { status: 200 })
+      }
+      systemOneRequests.push({
+        url: String(url),
+        headers: Object.fromEntries(
+          Object.entries(init.headers).map(([name, value]) => [name.toLowerCase(), value]),
+        ),
+        body: JSON.parse(init.body),
+      })
+      return new Response(JSON.stringify({
+        model: "jev-1.13.0",
+        answers: { approved: { type: "noul", noul: 0.92 } },
+        usage: { input_tokens: 1_000_000, output_tokens: 10 },
+      }), { status: 200, headers: { "content-type": "application/json" } })
+    })
+  })
+
+  async function register() {
+    const handlers = {}
+    const registerProvider = mock.fn()
+    await registerRouterProvider({
+      registerProvider,
+      on: (event, handler) => { handlers[event] = handler },
+    })
+    return { provider: registerProvider.mock.calls[0].arguments[0], handlers }
+  }
+
+  it("exposes System One models as classifiers only on hosts that can run them", async () => {
+    const { provider } = await register()
+
+    assert.deepEqual(provider.getModels().map(({ id }) => id), ["gpt-5.4"])
+    // The cache mirrors Router whatever the host, so a Pi upgrade restores
+    // classifiers without waiting for discovery.
+    const cache = JSON.parse(readFileSync(join(process.env.PI_CODING_AGENT_DIR, "ramp-router-model-cache.json"), "utf8"))
+    assert.deepEqual(cache.classifiers, [JEV_MODEL])
+
+    if (await hostClassifies()) {
+      assert.deepEqual(provider.getAllModels().filter(({ type }) => type === "classifier"), [JEV_MODEL])
+      assert.deepEqual(provider.getAllModels().filter(({ type }) => type !== "classifier").map(({ id }) => id), ["gpt-5.4"])
+    } else {
+      assert.equal(provider.getAllModels, undefined)
+      assert.equal(provider.filterAllModels, undefined)
+      assert.equal(provider.classify, undefined)
+    }
+  })
+
+  it("filters classifiers with the catalog credential", async () => {
+    const { provider } = await register()
+    if (!(await hostClassifies())) return assert.equal(provider.filterAllModels, undefined)
+
+    const [chat, classifier] = provider.getAllModels()
+    const current = { type: "api_key", key: "current-secret" }
+    assert.deepEqual(provider.filterAllModels([chat, classifier], current), [chat, classifier])
+    assert.deepEqual(provider.filterAllModels([chat, classifier], { type: "api_key", key: "other-secret" }), [])
+    assert.deepEqual(provider.filterAllModels([
+      { ...classifier, id: "jev-unknown" },
+      { ...classifier, api: "cloudflare-workers-ai-system-one" },
+    ], current), [])
+  })
+
+  it("drops classifiers when the credential changes", async () => {
+    const { provider } = await register()
+    if (!(await hostClassifies())) return assert.equal(provider.getAllModels, undefined)
+
+    await provider.refreshModels({
+      credential: { type: "api_key", key: "other-secret" },
+      allowNetwork: false,
+      signal: new AbortController().signal,
+      publish: async ({ update }) => {
+        update?.()
+        return true
+      },
+    })
+    assert.deepEqual(provider.getAllModels(), [])
+  })
+
+  it("classifies through Router's System One surface with Pi session attribution", async () => {
+    const { provider, handlers } = await register()
+    if (!(await hostClassifies())) return assert.equal(provider.classify, undefined)
+
+    const sessionID = "019ff2af-7ce1-7000-8000-000000000001"
+    handlers.session_start(
+      { type: "session_start", reason: "startup" },
+      {
+        sessionManager: { getSessionId: () => sessionID, getHeader: () => ({ type: "session", id: sessionID }) },
+        modelRegistry: { refresh: async () => {} },
+      },
+    )
+    const [jev] = provider.getAllModels().filter(({ type }) => type === "classifier")
+    const result = await provider.classify(jev, QUESTION, { apiKey: "current-secret", maxRetries: 0 })
+
+    assert.equal(result.stopReason, "stop", result.errorMessage)
+    assert.deepEqual(result.answers, { approved: { type: "bool", probability: 0.92 } })
+    // Priced from Router's published rate: $0.042 per million input tokens.
+    assert.equal(result.usage.cost.input, 0.042)
+    const [request] = systemOneRequests
+    assert.equal(request.url, "https://api.router.com/v1/systemone")
+    assert.equal(request.headers.authorization, "Bearer current-secret")
+    assert.equal(request.headers["user-agent"], "ramp-cli-pi-provider")
+    assert.equal(request.headers["x-gateway-client"], "pi")
+    assert.equal(request.headers["x-session-id"], sessionID)
+    assert.deepEqual(request.body, {
+      model: "jev-latest",
+      state: QUESTION.state,
+      questions: { approved: { ...QUESTION.questions.approved, type: "noul" } },
+    })
+
+    // Without an active session the call still goes out, unattributed.
+    handlers.session_shutdown({ type: "session_shutdown" }, {})
+    await provider.classify(jev, QUESTION, { apiKey: "current-secret", maxRetries: 0 })
+    assert.equal(systemOneRequests[1].headers["x-gateway-client"], undefined)
+    assert.equal(systemOneRequests[1].headers["x-session-id"], undefined)
+    assert.equal(systemOneRequests[1].headers["user-agent"], "ramp-cli-pi-provider")
+  })
+
+  it("refuses classifier calls that do not match the active catalog", async () => {
+    const { provider } = await register()
+    if (!(await hostClassifies())) return assert.equal(provider.classify, undefined)
+
+    const [jev] = provider.getAllModels().filter(({ type }) => type === "classifier")
+    const refused = async (model, options, pattern) => {
+      const result = await provider.classify(model, QUESTION, { apiKey: "current-secret", maxRetries: 0, ...options })
+      assert.equal(result.stopReason, "error")
+      assert.match(result.errorMessage, pattern)
+    }
+    await refused(jev, { apiKey: "other-secret" }, /does not match the active credential/)
+    await refused(jev, { headers: { Authorization: "Bearer other-secret" } }, /authorization is ambiguous/)
+    await refused({ ...jev, id: "jev-unknown" }, {}, /not in the active catalog/)
+    await refused({ ...jev, baseUrl: "https://elsewhere.example/v1" }, {}, /does not match this provider/)
+    await refused(jev, { onPayload: (payload) => ({ ...payload, model: "jev-preview" }) }, /not in the active catalog/)
+    await refused(jev, { onPayload: (payload) => ({ ...payload, stream: true }) }, /violates provider invariants/)
+    assert.equal(systemOneRequests.length, 0)
+  })
+
+  it("restores classifiers from the private cache and discards older cache versions", async () => {
+    await register()
+    const home = process.env.PI_CODING_AGENT_DIR
+    const cachePath = join(home, "ramp-router-model-cache.json")
+    process.env.PI_OFFLINE = "1"
+    globalThis.fetch.mock.mockImplementation(async () => {
+      throw new Error("offline launch attempted a network request")
+    })
+
+    const { provider } = await register()
+    assert.deepEqual(provider.getModels().map(({ id }) => id), ["gpt-5.4"])
+    if (await hostClassifies()) {
+      assert.deepEqual(provider.getAllModels().filter(({ type }) => type === "classifier"), [JEV_MODEL])
+    }
+
+    const cache = JSON.parse(readFileSync(cachePath, "utf8"))
+    for (const stale of [
+      { ...cache, version: 5 },
+      { ...cache, classifiers: [{ ...JEV_MODEL, headers: { authorization: "Bearer injected" } }] },
+      { ...cache, classifiers: [{ ...JEV_MODEL, baseUrl: "https://elsewhere.example/v1" }] },
+    ]) {
+      writeFileSync(cachePath, JSON.stringify(stale))
+      const { provider: restored } = await register()
+      assert.deepEqual(restored.getModels(), [])
+    }
   })
 })
 

@@ -3,13 +3,19 @@ import {
   VERSION as PI_VERSION,
   readStoredCredential,
   type ExtensionAPI,
+  type ExtensionContext,
 } from "@earendil-works/pi-coding-agent"
 import {
   createProvider,
   envApiKeyAuth,
   lazyStream,
+  type ClassifierContext,
+  type ClassifierModel,
+  type ClassifierOptions,
+  type ClassifierResult,
   type Credential,
   type Model,
+  type ProviderClassifier,
   type ProviderRequestOptions,
   type ProviderStreams,
   type RefreshModelsContext,
@@ -39,7 +45,11 @@ import {
   discoverRouterModels,
   normalizeBaseURL,
 } from "./discovery.ts"
-import type { RouterModel as DiscoveredModel } from "./discovery.ts"
+import type {
+  RouterCatalog as DiscoveredCatalog,
+  RouterClassifier as DiscoveredClassifier,
+  RouterModel as DiscoveredModel,
+} from "./discovery.ts"
 import { registerUsageWidget } from "./usage.ts"
 
 const PROVIDER_ID = "ramp-router"
@@ -68,7 +78,7 @@ const CONFIG_FILE = "ramp-router-config.json"
 const RUNTIME_MODELS_FILE = "ramp-router-runtime-models.json"
 const MODEL_CACHE_FILE = "ramp-router-model-cache.json"
 const MODEL_CACHE_KEY_FILE = "ramp-router-model-cache-key"
-const MODEL_CACHE_VERSION = 5
+const MODEL_CACHE_VERSION = 6
 // Local safety ceilings, not Router catalog limits. Oversized private state is
 // discarded and rebuilt from the bounded startup request instead of read into
 // memory during every Pi launch.
@@ -94,6 +104,11 @@ type RouterOwner = "anthropic" | "openai" | "other"
 // Discovery owns this classification; Pi's Responses adapter also serves
 // non-OpenAI Router models, so API alone is not enough to enable native tools.
 type RouterModel = Model<RouterApi> & { routerOwner: RouterOwner }
+// Pi's TypeSafe adapter speaks System One, which Router serves on /v1/systemone.
+const CLASSIFIER_API = "typesafe-system-one"
+type RouterClassifier = ClassifierModel<typeof CLASSIFIER_API>
+type RouterCatalog = { models: RouterModel[]; classifiers: RouterClassifier[] }
+type SessionManager = ExtensionContext["sessionManager"]
 
 function modelBaseURL(api: RouterApi, routerBaseURL: string): string {
   // Pi's Anthropic SDK appends /v1/messages itself. Responses appends only
@@ -159,8 +174,15 @@ async function hostApi(providerId: string): Promise<ProviderStreams> {
   }
 }
 
-async function nativeModelIDs(): Promise<ReadonlyMap<RouterApi, ReadonlySet<string>>> {
+type HostSupport = {
+  modelIDs: ReadonlyMap<RouterApi, ReadonlySet<string>>
+  /** Pi's built-in TypeSafe classifier; absent on hosts before classifier support. */
+  classifier?: ProviderClassifier
+}
+
+async function hostSupport(): Promise<HostSupport> {
   const ids = new Map<RouterApi, ReadonlySet<string>>()
+  let classifier: ProviderClassifier | undefined
   try {
     // Router models are dynamic, but both Pi adapters have native per-model
     // compatibility settings. Upgrading Pi unlocks models without changing
@@ -176,11 +198,20 @@ async function nativeModelIDs(): Promise<ReadonlyMap<RouterApi, ReadonlySet<stri
     ] as const) {
       ids.set(api, new Set(runtime.getProvider(provider)?.getModels().map((model) => model.id)))
     }
+    // Classifier models arrived with Pi 0.99. Only a host whose TypeSafe
+    // provider lists them can run Router's System One models.
+    const typesafe = runtime.getProvider("typesafe")
+    if (
+      typeof typesafe?.classify === "function" &&
+      (typesafe.getAllModels?.() ?? []).some((model) => model.type === "classifier")
+    ) {
+      classifier = { classify: typesafe.classify.bind(typesafe) }
+    }
   } catch {
     // No native compatibility catalog means neither adapter can safely
     // advertise Router models until Pi loads on the next launch.
   }
-  return ids
+  return { modelIDs: ids, ...(classifier ? { classifier } : {}) }
 }
 
 /**
@@ -319,6 +350,40 @@ function replaceHeader(
 }
 
 
+/**
+ * Router's client attribution for one Pi session. The CLI version is
+ * telemetry and goes out alone when the session ID is unusable.
+ */
+function sessionAttributionHeaders(
+  sessionManager: SessionManager | undefined,
+  rampCliVersion: string | undefined,
+): Record<string, string> {
+  const headers: Record<string, string> = {}
+  if (rampCliVersion) headers[RAMP_CLI_VERSION_HEADER] = rampCliVersion
+  const sessionID = boundedSessionID(sessionManager?.getSessionId())
+  if (!sessionID) return headers
+  headers["X-Gateway-Client"] = "pi"
+  headers["X-Session-Id"] = sessionID
+  const forkedFromSessionID = parentSessionID(sessionManager?.getHeader()?.parentSession)
+  if (forkedFromSessionID && forkedFromSessionID !== sessionID) {
+    // Keep the compatibility parent field during rollout while giving Router
+    // an unambiguous conversation-fork source that is not overloaded with
+    // control-plane/subagent parentage.
+    headers["X-Parent-Session-Id"] = forkedFromSessionID
+    headers["X-Forked-From-Session-Id"] = forkedFromSessionID
+  }
+  return headers
+}
+
+/** Replace any caller-supplied lineage headers with this session's. */
+function applyAttribution(
+  headers: Record<string, string | null>,
+  attribution: Record<string, string>,
+): void {
+  for (const name of LINEAGE_HEADERS) replaceHeader(headers, name)
+  for (const [name, value] of Object.entries(attribution)) replaceHeader(headers, name, value)
+}
+
 function supportsReasoning(model: DiscoveredModel): boolean {
   return model.metadata.reasoningEfforts.length > 0
 }
@@ -410,6 +475,29 @@ function toPiModel(model: DiscoveredModel, baseUrl: string): RouterModel {
   }
 }
 
+function toPiClassifier(classifier: DiscoveredClassifier, baseUrl: string): RouterClassifier {
+  const metadata = classifier.metadata
+  return {
+    type: "classifier",
+    id: classifier.id,
+    name: `${metadata.displayName} via ${metadata.providerDisplayName || classifier.ownedBy || "Ramp Router"}`,
+    api: CLASSIFIER_API,
+    provider: PROVIDER_ID,
+    // Pi's System One adapter appends /systemone to this.
+    baseUrl,
+    input: ["text"],
+    cost: metadata.pricing ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: metadata.contextWindow,
+  }
+}
+
+function toPiCatalog(discovered: DiscoveredCatalog, baseUrl: string): RouterCatalog {
+  return {
+    models: discovered.models.map((model) => toPiModel(model, baseUrl)),
+    classifiers: discovered.classifiers.map((classifier) => toPiClassifier(classifier, baseUrl)),
+  }
+}
+
 function piHome(): string {
   return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent")
 }
@@ -466,9 +554,10 @@ function resolvedCredentialApiKey(credential?: Credential): string | undefined {
 
 function routerProvider(
   baseUrl: string,
-  models: readonly RouterModel[],
+  catalog: RouterCatalog,
   catalogGeneration: CatalogGeneration,
-  supportedModelIDs: ReadonlyMap<RouterApi, ReadonlySet<string>>,
+  host: HostSupport,
+  activeSession: () => SessionManager | undefined,
   initialCredentialIdentity?: string,
   rampCliVersion?: string,
 ) {
@@ -482,16 +571,76 @@ function routerProvider(
     values.map(copyModel)
   // Never expose the model objects used as request authority. Pi and other
   // extensions retain Model references and can mutate them after selection.
-  let currentModels = copyModels(models)
+  let currentModels = copyModels(catalog.models)
+  let currentClassifiers = structuredClone(catalog.classifiers)
+  let catalogCredentialIdentity = initialCredentialIdentity
+  const adoptCatalog = (next: RouterCatalog | undefined, identity: string | undefined) => {
+    currentModels = copyModels(next?.models ?? [])
+    currentClassifiers = structuredClone(next?.classifiers ?? [])
+    catalogCredentialIdentity = identity
+  }
   // An adapter fallback for a new GPT's request shape does not make that
   // OpenAI-owned model available on an older Pi: require Pi's native catalog
   // entry. Router-owned models still use the Responses adapter without one.
   const isSupportedByPi = (model: RouterModel) =>
     model.routerOwner === "other" ||
-    supportedModelIDs.get(model.api)?.has(model.id) === true
-  let catalogCredentialIdentity = initialCredentialIdentity
+    host.modelIDs.get(model.api)?.has(model.id) === true
+  // Pi owns the effective credential, including runtime --api-key
+  // overrides. Filter against that exact resolved value instead of trying
+  // to infer whether a refresh credential came from disk or runtime state.
+  const credentialMatchesCatalog = (credential?: Credential) => {
+    const apiKey = resolvedCredentialApiKey(credential)
+    return apiKey !== undefined && credentialIdentity(apiKey) === catalogCredentialIdentity
+  }
+  // Pi's models.json composer rebuilds models from a fixed field list,
+  // dropping routerOwner. Use only the private Router catalog for the owner
+  // decision; an unknown or API-swapped model stays hidden.
+  const isAvailableChatModel = (candidate: Model<RouterApi>) => {
+    const canonical = currentModels.find(
+      (model) => model.id === candidate.id && model.api === candidate.api,
+    )
+    return canonical !== undefined && isSupportedByPi(canonical)
+  }
   const payloadModelError = () =>
     new Error("Ramp Router request model is not in the active catalog")
+  /** The final payload, checked to be an object naming the expected model. */
+  const checkedPayload = (payload: unknown, expectedModelID: string): object => {
+    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+      throw payloadModelError()
+    }
+    let model: unknown
+    try {
+      if (!Object.hasOwn(payload, "model")) throw payloadModelError()
+      model = Reflect.get(payload, "model")
+    } catch {
+      throw payloadModelError()
+    }
+    if (model !== expectedModelID) throw payloadModelError()
+    return payload
+  }
+  /** Reject a request whose key or headers do not match the active catalog. */
+  const assertRequestCredential = (options?: {
+    apiKey?: string
+    headers?: Record<string, string | null>
+  }) => {
+    const apiKey = options?.apiKey
+    if (
+      !apiKey ||
+      credentialIdentity(apiKey) !== catalogCredentialIdentity
+    ) {
+      throw new Error("Ramp Router catalog does not match the active credential")
+    }
+    for (const name of Object.keys(options?.headers ?? {})) {
+      const normalized = name.toLowerCase()
+      if (
+        normalized === "authorization" ||
+        normalized === "x-api-key" ||
+        normalized === "cf-aig-authorization"
+      ) {
+        throw new Error("Ramp Router request authorization is ambiguous")
+      }
+    }
+  }
   const guardedRequestOptions = <T extends ProviderRequestOptions>(
     expectedModelID: string,
     api: RouterApi,
@@ -518,22 +667,12 @@ function routerProvider(
         const replacement = await transformPayload?.(payload, model)
         // Match the underlying adapter: only `undefined` means "use the
         // original". A hook that explicitly returns null must fail closed.
-        const finalPayload = replacement === undefined ? payload : replacement
-        if (
-          finalPayload === null ||
-          typeof finalPayload !== "object" ||
-          Array.isArray(finalPayload)
-        ) throw payloadModelError()
-        let finalModel: unknown
+        const finalPayload = checkedPayload(
+          replacement === undefined ? payload : replacement,
+          expectedModelID,
+        )
         let store: unknown
         let stream: unknown
-        try {
-          if (!Object.hasOwn(finalPayload, "model")) throw payloadModelError()
-          finalModel = Reflect.get(finalPayload, "model")
-        } catch {
-          throw payloadModelError()
-        }
-        if (finalModel !== expectedModelID) throw payloadModelError()
         try {
           store = Reflect.get(finalPayload, "store")
           stream = Reflect.get(finalPayload, "stream")
@@ -557,7 +696,7 @@ function routerProvider(
       },
     } as T
   }
-  const snapshotRequestOptions = <T extends ProviderRequestOptions>(
+  const snapshotRequestOptions = <T extends Pick<ProviderRequestOptions, "headers">>(
     options: T | undefined,
   ): T | undefined => {
     if (options === undefined) return undefined
@@ -595,23 +734,7 @@ function routerProvider(
     } catch {
       throw new Error("Ramp Router model does not match this provider")
     }
-    const apiKey = options?.apiKey
-    if (
-      !apiKey ||
-      credentialIdentity(apiKey) !== catalogCredentialIdentity
-    ) {
-      throw new Error("Ramp Router catalog does not match the active credential")
-    }
-    for (const name of Object.keys(options?.headers ?? {})) {
-      const normalized = name.toLowerCase()
-      if (
-        normalized === "authorization" ||
-        normalized === "x-api-key" ||
-        normalized === "cf-aig-authorization"
-      ) {
-        throw new Error("Ramp Router request authorization is ambiguous")
-      }
-    }
+    assertRequestCredential(options)
     if (
       composed.provider !== PROVIDER_ID ||
       (composed.api !== "openai-responses" && composed.api !== "anthropic-messages") ||
@@ -689,32 +812,131 @@ function routerProvider(
     auth: {
       apiKey: envApiKeyAuth("Ramp Router API key", API_KEY_ENVS),
     },
-    models,
+    models: catalog.models,
     api: {
       "openai-responses": guardedApi("openai-responses"),
       "anthropic-messages": guardedApi("anthropic-messages"),
     },
   })
+  const requestClassifier = (
+    model: RouterClassifier,
+    options?: { apiKey?: string; headers?: Record<string, string | null> },
+  ): RouterClassifier => {
+    let composed: RouterClassifier
+    try {
+      composed = structuredClone(model)
+    } catch {
+      throw new Error("Ramp Router model does not match this provider")
+    }
+    assertRequestCredential(options)
+    if (
+      composed.type !== "classifier" ||
+      composed.provider !== PROVIDER_ID ||
+      composed.api !== CLASSIFIER_API ||
+      composed.baseUrl !== baseUrl
+    ) {
+      throw new Error("Ramp Router model does not match this provider")
+    }
+    const canonical = currentClassifiers.find((candidate) => candidate.id === composed.id)
+    if (!canonical) throw new Error("Ramp Router model is not in the active catalog")
+    // As for chat, keep models.json presentation and pricing tuning but pin
+    // identity and destination to the private catalog.
+    return {
+      ...structuredClone(canonical),
+      name: composed.name,
+      cost: composed.cost,
+      contextWindow: composed.contextWindow,
+    }
+  }
+  const guardedClassifierOptions = (
+    expectedModelID: string,
+    options: ClassifierOptions | undefined,
+  ): ClassifierOptions => {
+    const transformPayload = options?.onPayload
+    // Pi sends classifier calls outside its header hook, so attribute them here.
+    const headers: Record<string, string | null> = { ...options?.headers }
+    applyAttribution(headers, sessionAttributionHeaders(activeSession(), rampCliVersion))
+    replaceHeader(headers, "user-agent", "ramp-cli-pi-provider")
+    return {
+      ...options,
+      headers,
+      onPayload: async (payload, model) => {
+        const replacement = await transformPayload?.(payload, model)
+        const finalPayload = checkedPayload(
+          replacement === undefined ? payload : replacement,
+          expectedModelID,
+        )
+        let stream: unknown
+        try {
+          stream = Reflect.get(finalPayload, "stream")
+        } catch {
+          throw new Error("Ramp Router request payload violates provider invariants")
+        }
+        // System One answers in one JSON response.
+        if (stream !== undefined && stream !== false) {
+          throw new Error("Ramp Router request payload violates provider invariants")
+        }
+        return { ...finalPayload, model: expectedModelID }
+      },
+    }
+  }
+  const classify = async (
+    model: RouterClassifier,
+    context: ClassifierContext,
+    options?: ClassifierOptions,
+  ): Promise<ClassifierResult> => {
+    try {
+      if (!host.classifier) {
+        throw new Error("Update Pi to use classifier models through Ramp Router")
+      }
+      const requestOptions = snapshotRequestOptions(options)
+      const canonical = requestClassifier(model, requestOptions)
+      return await host.classifier.classify(
+        canonical,
+        context,
+        guardedClassifierOptions(canonical.id, requestOptions),
+      )
+    } catch (error) {
+      // Pi's contract: classify reports failures in its result, never rejects.
+      return {
+        api: CLASSIFIER_API,
+        provider: PROVIDER_ID,
+        model: typeof model?.id === "string" ? model.id : "",
+        answers: {},
+        stopReason: options?.signal?.aborted ? "aborted" : "error",
+        errorMessage: error instanceof Error ? error.message : "Ramp Router classification failed",
+        timestamp: Date.now(),
+      }
+    }
+  }
+  const getModels = () => copyModels(currentModels.filter(isSupportedByPi))
   const registeredProvider = {
     ...provider,
-    getModels: () => copyModels(currentModels.filter(isSupportedByPi)),
-    // Pi owns the effective credential, including runtime --api-key
-    // overrides. Filter against that exact resolved value instead of trying
-    // to infer whether a refresh credential came from disk or runtime state.
-    filterModels: (candidateModels: readonly RouterModel[], credential?: Credential) => {
-      const apiKey = resolvedCredentialApiKey(credential)
-      return apiKey && credentialIdentity(apiKey) === catalogCredentialIdentity
-        ? candidateModels.filter((candidate) => {
-            // Pi's models.json composer rebuilds models from a fixed field list,
-            // dropping routerOwner. Use only the private Router catalog for the
-            // owner decision; an unknown or API-swapped model stays hidden.
-            const canonical = currentModels.find(
-              (model) => model.id === candidate.id && model.api === candidate.api,
-            )
-            return canonical !== undefined && isSupportedByPi(canonical)
-          })
-        : []
-    },
+    getModels,
+    filterModels: (candidateModels: readonly RouterModel[], credential?: Credential) =>
+      credentialMatchesCatalog(credential) ? candidateModels.filter(isAvailableChatModel) : [],
+    // Classifier members exist only on hosts that can run them; older Pi
+    // reads getModels and never sees a classifier.
+    ...(host.classifier
+      ? {
+          getAllModels: () => [...getModels(), ...structuredClone(currentClassifiers)],
+          filterAllModels: (
+            candidates: readonly (Model<RouterApi> | RouterClassifier)[],
+            credential?: Credential,
+          ) =>
+            credentialMatchesCatalog(credential)
+              ? candidates.filter((candidate) =>
+                  candidate.type === "classifier"
+                    ? currentClassifiers.some(
+                        (classifier) =>
+                          classifier.id === candidate.id && classifier.api === candidate.api,
+                      )
+                    : isAvailableChatModel(candidate),
+                )
+              : [],
+          classify,
+        }
+      : {}),
     refreshModels: async ({
       credential,
       allowNetwork,
@@ -754,8 +976,7 @@ function routerProvider(
           ...(!matchesCatalog
             ? {
                 update: () => {
-                  currentModels = []
-                  catalogCredentialIdentity = undefined
+                  adoptCatalog(undefined, undefined)
                 },
               }
             : {}),
@@ -775,7 +996,7 @@ function routerProvider(
         ...(signal ? { signal } : {}),
       })
       if (signal.aborted) return
-      const refreshed = discovered.map((model) => toPiModel(model, baseUrl))
+      const refreshed = toPiCatalog(discovered, baseUrl)
       if (refreshGeneration !== catalogGeneration.current) return
       if (signal.aborted || refreshGeneration !== catalogGeneration.current) return
       // Cross Pi's refresh-generation gate before mutating either catalog.
@@ -799,8 +1020,7 @@ function routerProvider(
             // The live provider refresh remains useful when its optional
             // startup cache cannot be updated.
           }
-          currentModels = copyModels(refreshed)
-          catalogCredentialIdentity = requestCredentialIdentity
+          adoptCatalog(refreshed, requestCredentialIdentity)
         },
       })
     },
@@ -811,7 +1031,7 @@ function routerProvider(
     publishBackground: (
       generation: number,
       apiKey: string,
-      refreshed: readonly RouterModel[],
+      refreshed: RouterCatalog,
     ): "published" | "opaque" | "rejected" => {
       if (generation !== catalogGeneration.current) return "rejected"
       const requestCredentialIdentity = credentialIdentity(apiKey)
@@ -831,8 +1051,7 @@ function routerProvider(
       if (configuredIdentity !== requestCredentialIdentity) {
         return "rejected"
       }
-      currentModels = copyModels(refreshed)
-      catalogCredentialIdentity = requestCredentialIdentity
+      adoptCatalog(refreshed, requestCredentialIdentity)
       try {
         writeModelCache(baseUrl, apiKey, refreshed)
       } catch {
@@ -1126,6 +1345,29 @@ function cacheCredentialIdentity(apiKey: string): string | undefined {
     : createHmac("sha256", key).update(apiKey).digest("hex")
 }
 
+function cachedCost(value: unknown): RouterModel["cost"] | undefined {
+  if (!value || typeof value !== "object") return undefined
+  const cost = value as Record<string, unknown>
+  const costKeys = ["input", "output", "cacheRead", "cacheWrite"] as const
+  if (
+    Object.keys(cost).length !== costKeys.length ||
+    !costKeys.every(
+      (key) =>
+        typeof cost[key] === "number" &&
+        Number.isFinite(cost[key]) &&
+        cost[key] >= 0,
+    )
+  ) {
+    return undefined
+  }
+  return {
+    input: cost.input as number,
+    output: cost.output as number,
+    cacheRead: cost.cacheRead as number,
+    cacheWrite: cost.cacheWrite as number,
+  }
+}
+
 function cachedRouterModel(value: unknown, baseUrl: string): RouterModel | undefined {
   if (!value || typeof value !== "object") return undefined
   const model = value as Record<string, unknown>
@@ -1168,20 +1410,8 @@ function cachedRouterModel(value: unknown, baseUrl: string): RouterModel | undef
     return undefined
   }
 
-  if (!model.cost || typeof model.cost !== "object") return undefined
-  const cost = model.cost as Record<string, unknown>
-  const costKeys = ["input", "output", "cacheRead", "cacheWrite"] as const
-  if (
-    Object.keys(cost).length !== costKeys.length ||
-    !costKeys.every(
-      (key) =>
-        typeof cost[key] === "number" &&
-        Number.isFinite(cost[key]) &&
-        cost[key] >= 0,
-    )
-  ) {
-    return undefined
-  }
+  const cost = cachedCost(model.cost)
+  if (!cost) return undefined
 
   let restoredThinkingLevelMap: ThinkingLevelMap | undefined
   if (model.reasoning) {
@@ -1222,57 +1452,106 @@ function cachedRouterModel(value: unknown, baseUrl: string): RouterModel | undef
       ? { thinkingLevelMap: restoredThinkingLevelMap }
       : {}),
     input: [...model.input] as RouterModel["input"],
-    cost: {
-      input: cost.input as number,
-      output: cost.output as number,
-      cacheRead: cost.cacheRead as number,
-      cacheWrite: cost.cacheWrite as number,
-    },
+    cost,
     contextWindow: model.contextWindow,
     maxTokens: model.maxTokens,
   }
 }
 
-function readModelCache(baseUrl: string, apiKey: string): RouterModel[] {
+function cachedRouterClassifier(value: unknown, baseUrl: string): RouterClassifier | undefined {
+  if (!value || typeof value !== "object") return undefined
+  const classifier = value as Record<string, unknown>
+  const allowedKeys = new Set([
+    "type", "id", "name", "api", "provider", "baseUrl", "input", "cost", "contextWindow",
+  ])
+  if (
+    Object.keys(classifier).some((key) => !allowedKeys.has(key)) ||
+    classifier.type !== "classifier" ||
+    typeof classifier.id !== "string" ||
+    !classifier.id ||
+    typeof classifier.name !== "string" ||
+    classifier.api !== CLASSIFIER_API ||
+    classifier.provider !== PROVIDER_ID ||
+    classifier.baseUrl !== baseUrl ||
+    !Array.isArray(classifier.input) ||
+    classifier.input.length !== 1 ||
+    classifier.input[0] !== "text" ||
+    typeof classifier.contextWindow !== "number" ||
+    !Number.isSafeInteger(classifier.contextWindow) ||
+    classifier.contextWindow <= 0
+  ) {
+    return undefined
+  }
+  const cost = cachedCost(classifier.cost)
+  if (!cost) return undefined
+  return {
+    type: "classifier",
+    id: classifier.id,
+    name: classifier.name,
+    api: CLASSIFIER_API,
+    provider: PROVIDER_ID,
+    baseUrl,
+    input: ["text"],
+    cost,
+    contextWindow: classifier.contextWindow,
+  }
+}
+
+const EMPTY_CATALOG: RouterCatalog = { models: [], classifiers: [] }
+
+function readModelCache(baseUrl: string, apiKey: string): RouterCatalog {
   try {
     const expectedCredentialIdentity = cacheCredentialIdentity(apiKey)
-    if (expectedCredentialIdentity === undefined) return []
+    if (expectedCredentialIdentity === undefined) return EMPTY_CATALOG
     const serialized = readPrivateFile(
       join(piHome(), MODEL_CACHE_FILE),
       MAX_MODEL_CACHE_BYTES,
     )
-    if (serialized === undefined) return []
+    if (serialized === undefined) return EMPTY_CATALOG
     const parsed: unknown = JSON.parse(serialized)
-    if (!parsed || typeof parsed !== "object") return []
+    if (!parsed || typeof parsed !== "object") return EMPTY_CATALOG
     const cache = parsed as {
       version?: unknown
       baseUrl?: unknown
       credentialIdentity?: unknown
       models?: unknown
+      classifiers?: unknown
     }
     if (
       cache.version !== MODEL_CACHE_VERSION ||
       cache.baseUrl !== baseUrl ||
       cache.credentialIdentity !== expectedCredentialIdentity ||
-      !Array.isArray(cache.models)
+      !Array.isArray(cache.models) ||
+      !Array.isArray(cache.classifiers)
     ) {
-      return []
+      return EMPTY_CATALOG
     }
     const models = cache.models.map((model) => cachedRouterModel(model, baseUrl))
-    if (!models.every((model): model is RouterModel => model !== undefined)) {
-      return []
+    const classifiers = cache.classifiers.map((classifier) =>
+      cachedRouterClassifier(classifier, baseUrl),
+    )
+    if (
+      !models.every((model): model is RouterModel => model !== undefined) ||
+      !classifiers.every((classifier): classifier is RouterClassifier => classifier !== undefined)
+    ) {
+      return EMPTY_CATALOG
     }
-    if (new Set(models.map((model) => model.id)).size !== models.length) return []
-    return models
+    if (
+      new Set(models.map((model) => model.id)).size !== models.length ||
+      new Set(classifiers.map((classifier) => classifier.id)).size !== classifiers.length
+    ) {
+      return EMPTY_CATALOG
+    }
+    return { models, classifiers }
   } catch {
-    return []
+    return EMPTY_CATALOG
   }
 }
 
 function writeModelCache(
   baseUrl: string,
   apiKey: string,
-  models: readonly RouterModel[],
+  catalog: RouterCatalog,
 ): void {
   const persistentCredentialIdentity = cacheCredentialIdentity(apiKey)
   if (persistentCredentialIdentity === undefined) return
@@ -1285,7 +1564,8 @@ function writeModelCache(
       version: MODEL_CACHE_VERSION,
       baseUrl,
       credentialIdentity: persistentCredentialIdentity,
-      models,
+      models: catalog.models,
+      classifiers: catalog.classifiers,
     }),
   )
 }
@@ -1295,14 +1575,14 @@ async function discoverModels(
   apiKey: string,
   rampCliVersion: string | undefined,
   signal?: AbortSignal,
-): Promise<RouterModel[]> {
+): Promise<RouterCatalog> {
   const discovered = await discoverRouterModels({
     baseURL: baseUrl,
     apiKey,
     ...(rampCliVersion ? { rampCliVersion } : {}),
     ...(signal ? { signal } : {}),
   })
-  return discovered.map((model) => toPiModel(model, baseUrl))
+  return toPiCatalog(discovered, baseUrl)
 }
 
 export default async function registerRouterProvider(pi: ExtensionAPI): Promise<void> {
@@ -1324,10 +1604,10 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
   // from the previous caller while the fresh catalog is still loading.
   let apiKey: string | undefined
   let startupCredentialIdentity: string | undefined
-  let startupModels: RouterModel[] = []
+  let startupCatalog = EMPTY_CATALOG
   let restoredCatalog = false
   const catalogGeneration: CatalogGeneration = { current: 0 }
-  const supportedModelIDs = await nativeModelIDs()
+  const host = await hostSupport()
   try {
     if (!supportsRuntimeModelBootstrap(PI_VERSION)) {
       throw new Error("Pi host does not support isolated model bootstrap")
@@ -1335,26 +1615,26 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
     apiKey = await routerApiKey()
     if (!apiKey) throw new Error("Ramp Router credential is unavailable")
     startupCredentialIdentity = credentialIdentity(apiKey)
-    startupModels = readModelCache(baseUrl, apiKey)
-    restoredCatalog = startupModels.length > 0
+    startupCatalog = readModelCache(baseUrl, apiKey)
+    restoredCatalog = startupCatalog.models.length > 0
 
     // Match Pi's own network policy exactly: the CLI implements --offline by
     // defining PI_OFFLINE, and its ModelRuntime treats any defined value as
     // disabled. Only an uncached online launch waits, under a startup-specific
     // deadline; cached launches refresh after registration below.
-    if (startupModels.length === 0 && process.env.PI_OFFLINE === undefined) {
-      startupModels = await discoverModels(
+    if (!restoredCatalog && process.env.PI_OFFLINE === undefined) {
+      startupCatalog = await discoverModels(
         baseUrl,
         apiKey,
         rampCliVersion,
         AbortSignal.timeout(STARTUP_DISCOVERY_TIMEOUT_MS),
       )
       if (!(await routerCredentialIsCurrent(apiKey))) {
-        startupModels = []
+        startupCatalog = EMPTY_CATALOG
         apiKey = undefined
         throw new Error("Ramp Router credential changed during discovery")
       }
-      if (startupModels.length > 0) writeModelCache(baseUrl, apiKey, startupModels)
+      if (startupCatalog.models.length > 0) writeModelCache(baseUrl, apiKey, startupCatalog)
     }
   } catch {
     // A malformed local store or unavailable Router must not prevent Pi from
@@ -1373,11 +1653,14 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
     ? ++catalogGeneration.current
     : undefined
 
+  // Pi classifier calls carry no session, so remember the active one.
+  let activeSession: SessionManager | undefined
   const { registeredProvider, publishBackground } = routerProvider(
     baseUrl,
-    startupModels,
+    startupCatalog,
     catalogGeneration,
-    supportedModelIDs,
+    host,
+    () => activeSession,
     startupCredentialIdentity,
     rampCliVersion,
   )
@@ -1423,8 +1706,12 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
     flushSnapshotRefresh()
   }
   pi.on?.("session_start", (_event, context) => {
+    activeSession = context.sessionManager
     snapshotRegistry = context.modelRegistry
     flushSnapshotRefresh()
+  })
+  pi.on?.("session_shutdown", () => {
+    activeSession = undefined
   })
 
   // A cached launch never waits on the network. Refresh only Router directly,
@@ -1434,7 +1721,7 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
   if (apiKey && backgroundGeneration !== undefined) {
     void discoverModels(baseUrl, apiKey, rampCliVersion)
       .then(async (refreshed) => {
-        if (refreshed.length > 0) {
+        if (refreshed.models.length > 0) {
           // Pi resolves auth again for inference. If /login or a concurrent
           // configure switched credentials while discovery was in flight,
           // publishing the old caller's catalog would make selectable models
@@ -1456,29 +1743,10 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
 
   pi.on?.("before_provider_headers", (event, context) => {
     if (context.model?.provider !== PROVIDER_ID) return
-
-    for (const name of LINEAGE_HEADERS) replaceHeader(event.headers, name)
-
-    if (rampCliVersion) {
-      replaceHeader(event.headers, RAMP_CLI_VERSION_HEADER, rampCliVersion)
-    }
-
-    const sessionID = boundedSessionID(context.sessionManager.getSessionId())
-    if (!sessionID) return
-
-    replaceHeader(event.headers, "X-Gateway-Client", "pi")
-    replaceHeader(event.headers, "X-Session-Id", sessionID)
-
-    const forkedFromSessionID = parentSessionID(
-      context.sessionManager.getHeader()?.parentSession,
+    applyAttribution(
+      event.headers,
+      sessionAttributionHeaders(context.sessionManager, rampCliVersion),
     )
-    if (!forkedFromSessionID || forkedFromSessionID === sessionID) return
-
-    // Keep the compatibility parent field during rollout while giving Router
-    // an unambiguous conversation-fork source that is not overloaded with
-    // control-plane/subagent parentage.
-    replaceHeader(event.headers, "X-Parent-Session-Id", forkedFromSessionID)
-    replaceHeader(event.headers, "X-Forked-From-Session-Id", forkedFromSessionID)
   })
 }
 

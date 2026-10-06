@@ -14,6 +14,13 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # "locked" runs the full verification against the lockfile's Pi. The
+        # pinned leg runs the Pi provider tests against the oldest Pi release
+        # we support (about one month back); advance or drop it around 2026-11-05.
+        pi-host: [locked, "0.85.0"]
     defaults:
       run:
         working-directory: src/ramp_cli/router_integrations
@@ -28,6 +35,26 @@ jobs:
 
       - run: npm ci
 
-      - run: npm run verify
+      - name: Install Pi ${{ matrix.pi-host }}
+        if: matrix.pi-host != 'locked'
+        env:
+          PI_HOST: ${{ matrix.pi-host }}
+        # pi-server is imported by pi-coding-agent 0.85.x but not declared as a
+        # dependency; the CLI bundle is self-contained, the package root is not.
+        run: |
+          npm pkg set -w packages/pi-provider \
+            "devDependencies.@earendil-works/pi-ai=$PI_HOST" \
+            "devDependencies.@earendil-works/pi-coding-agent=$PI_HOST" \
+            "devDependencies.@earendil-works/pi-server=$PI_HOST" \
+            "devDependencies.@earendil-works/pi-telemetry=$PI_HOST"
+          npm install --no-audit --no-fund
 
-      - run: npm audit --omit=dev
+      - if: matrix.pi-host == 'locked'
+        run: npm run verify
+
+      # Type declarations track the locked host, so the pinned leg runs tests only.
+      - if: matrix.pi-host != 'locked'
+        run: npm test -w packages/pi-provider
+
+      - if: matrix.pi-host == 'locked'
+        run: npm audit --omit=dev

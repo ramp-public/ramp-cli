@@ -5,8 +5,14 @@ Pi refreshes authenticated `GET /v1/models` discovery through its provider
 credential store and caches exactly the models available to the configured
 Router API key. Anthropic-owned models use Router's Anthropic Messages
 compatibility endpoint; other models use the OpenAI Responses API. Rows Router
-marks as unable to serve their selected API (for example TypeSafe, which
-answers only on `/v1/systemone`) are left out.
+marks as unable to serve their selected API are left out.
+
+On Pi 0.99 and later, Router's System One models (TypeSafe's Jev) are
+registered as Pi classifier models and answered through `/v1/systemone`. Like
+other classifiers they do not appear in `/model`; codemode scripts reach them
+with `models.classify()` and extensions with `ctx.modelRegistry.classify()`.
+Calls carry the active Pi session's Router attribution. Older Pi versions do
+not list them.
 Anthropic and OpenAI models are shown only when their IDs also appear in the
 installed Pi version's built-in catalog for the corresponding provider. Pi
 supplies model-specific Messages and Responses compatibility settings, so

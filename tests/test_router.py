@@ -5927,7 +5927,7 @@ def test_agent_picker_escape_returns_to_router_menu(command, monkeypatch, tmp_pa
         assert "ramp router configure [OPTIONS]" in result.output
         assert "disconnect" in result.output
     else:
-        assert "ramp router [OPTIONS] COMMAND [ARGS]" in result.output
+        assert "Usage: ramp router [OPTIONS]" in result.output
     assert "Commands" in result.output
     assert "Aborted!" not in result.output
     assert not (tmp_path / "codex" / "ramp-router-state.json").exists()

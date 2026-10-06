@@ -49,6 +49,25 @@ export type RouterModel = {
   metadata: RouterModelMetadata
 }
 
+/** What Pi needs to describe a System One classifier such as TypeSafe's Jev. */
+export type RouterClassifierMetadata = {
+  displayName: string
+  providerDisplayName: string
+  contextWindow: number
+  pricing?: RouterPricing
+}
+
+export type RouterClassifier = {
+  id: string
+  ownedBy?: string
+  metadata: RouterClassifierMetadata
+}
+
+export type RouterCatalog = {
+  models: RouterModel[]
+  classifiers: RouterClassifier[]
+}
+
 type OpenAIModel = {
   id?: unknown
   owned_by?: unknown
@@ -227,6 +246,39 @@ function servesPiApi(raw: OpenAIModel): boolean {
   )
 }
 
+/**
+ * System One rows answer typed questions on /v1/systemone. Older Routers
+ * without a surfaces field mark them only by owner.
+ */
+function servesSystemOne(raw: OpenAIModel): boolean {
+  const surfaces = record(raw.router).surfaces
+  return Array.isArray(surfaces)
+    ? surfaces.includes("systemone")
+    : raw.owned_by === "typesafe"
+}
+
+/**
+ * Read Router's description of one classifier, or undefined when it cannot
+ * be trusted. Unlike chat rows, one bad classifier row only drops itself:
+ * chat must keep working on hosts that never use classifiers.
+ */
+function parseRouterClassifierMetadata(value: unknown): RouterClassifierMetadata | undefined {
+  const router = record(value)
+  if (router.schema_version !== SUPPORTED_SCHEMA_VERSION) return undefined
+  const contextWindow = count(record(router.limits).context_window)
+  const modalities = record(record(router.capabilities).modalities)
+  if (contextWindow === undefined || !strings(modalities.input).includes("text")) {
+    return undefined
+  }
+  const rates = pricing(router.pricing)
+  return {
+    displayName: text(router.display_name) ?? "",
+    providerDisplayName: text(router.provider_display_name) ?? "",
+    contextWindow,
+    ...(rates !== undefined ? { pricing: rates } : {}),
+  }
+}
+
 export async function discoverRouterModels(input: {
   baseURL: string
   apiKey: string
@@ -234,7 +286,7 @@ export async function discoverRouterModels(input: {
   fetch?: typeof globalThis.fetch
   timeoutMs?: number
   signal?: AbortSignal
-}): Promise<RouterModel[]> {
+}): Promise<RouterCatalog> {
   const fetcher = input.fetch ?? globalThis.fetch
   const baseURL = normalizeBaseURL(input.baseURL)
   const timeoutSignal = AbortSignal.timeout(
@@ -270,25 +322,37 @@ export async function discoverRouterModels(input: {
     throw new Error("Ramp Router model discovery returned an invalid OpenAI model list")
   }
 
-  const models = new Map<string, RouterModel>()
+  const seen = new Set<string>()
+  const models: RouterModel[] = []
+  const classifiers: RouterClassifier[] = []
   for (const raw of payload.data as OpenAIModel[]) {
     const identifier = typeof raw?.id === "string" ? raw.id.trim() : ""
     if (identifier.length === 0) {
       throw new Error("Ramp Router model discovery returned a model without an id")
     }
-    if (models.has(identifier) || !servesPiApi(raw)) {
-      // Keep the first, matching the CLI, so both agree on which entry won.
-      continue
+    // Keep the first, matching the CLI, so both agree on which entry won.
+    if (seen.has(identifier)) continue
+    const ownedBy =
+      typeof raw.owned_by === "string" && raw.owned_by.length > 0 ? { ownedBy: raw.owned_by } : {}
+    if (servesPiApi(raw)) {
+      seen.add(identifier)
+      models.push({
+        id: identifier,
+        ...ownedBy,
+        metadata: parseRouterMetadata(raw.router, raw.created, identifier),
+      })
+    } else if (servesSystemOne(raw)) {
+      const metadata = parseRouterClassifierMetadata(raw.router)
+      if (metadata) {
+        seen.add(identifier)
+        classifiers.push({ id: identifier, ...ownedBy, metadata })
+      }
     }
-    models.set(identifier, {
-      id: identifier,
-      ...(typeof raw.owned_by === "string" && raw.owned_by.length > 0 ? { ownedBy: raw.owned_by } : {}),
-      metadata: parseRouterMetadata(raw.router, raw.created, identifier),
-    })
   }
 
-  if (models.size === 0) {
+  // Classifiers alone leave Pi nothing to chat with, so they do not count.
+  if (models.length === 0) {
     throw new Error("Ramp Router model discovery returned no models for this API key")
   }
-  return [...models.values()]
+  return { models, classifiers }
 }
