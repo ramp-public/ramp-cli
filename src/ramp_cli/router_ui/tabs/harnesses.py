@@ -118,6 +118,26 @@ def priced(
     return labelled, line(PRICE_HEADERS[0], PRICE_HEADERS[1:])
 
 
+def organization_labelled(data: dict) -> list[tuple[str, str]]:
+    """Model choices, marking the one the workspace admin suggests."""
+    suggested = data.get("organization_default")
+    return [
+        (safe_text(label) + (" · Org default" if value == suggested else ""), value)
+        for label, value in data["models"]
+    ]
+
+
+def organization_note(data: dict) -> str:
+    """Point out the admin's suggestion when it isn't already the default."""
+    suggested = data.get("organization_default")
+    if not suggested or suggested == data.get("model"):
+        return ""
+    label = next(
+        (label for label, value in data["models"] if value == suggested), suggested
+    )
+    return f"Your organization suggests {safe_text(label)}."
+
+
 # Claude Desktop is restarted by setup itself, and Cursor applies the values
 # pasted into its own settings at once; every other harness reads its Router
 # configuration when it starts.
@@ -443,10 +463,16 @@ class HarnessesPage(CellEditing, RouterPage):
                 )
 
             choices, header = priced(
-                [(safe_text(label), value) for label, value in data["models"]],
+                organization_labelled(data),
                 data.get("prices") or {},
             )
-            self.message(PRICE_NOTE if header else "")
+            self.message(
+                " ".join(
+                    note
+                    for note in (PRICE_NOTE if header else "", organization_note(data))
+                    if note
+                )
+            )
             self.pick(
                 coordinate,
                 current_first(choices, data["model"]),
@@ -1274,7 +1300,7 @@ class HarnessModelPage(FormPage):
         self.connection_token = data["connection_token"]
         selector = self.query_one("#default-model", Select)
         selector.set_options(
-            [(Text(safe_text(label)), value) for label, value in data["models"]]
+            [(Text(label), value) for label, value in organization_labelled(data)]
         )
         selector.disabled = not data["models"]
         selector.value = (
@@ -1286,6 +1312,7 @@ class HarnessModelPage(FormPage):
         note = data["model_note"]
         if data["model"] and selector.value is Select.NULL:
             note = "The current default is not in this catalog. Choose an available model to replace it."
+        note = " ".join(part for part in (note, organization_note(data)) if part)
         self.query_one("#model-note", Static).update(note)
         self.ready = True
         self.remember()

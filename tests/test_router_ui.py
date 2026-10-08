@@ -94,6 +94,29 @@ class FakeService:
             {"spend_cap_editable": True, **row} for row in copy.deepcopy(self.key_rows)
         ]
 
+    def key_grants(self):
+        return copy.deepcopy(getattr(self, "grant_rows", []))
+
+    def claim_grant(self, grant_id):
+        self.calls.append(("claim", grant_id))
+        grant = next(g for g in self.grant_rows if g["id"] == grant_id)
+        self.grant_rows = [g for g in self.grant_rows if g["id"] != grant_id]
+        key = {
+            "id": f"key-{grant_id}",
+            "name": grant["name"],
+            "enabled": True,
+            "managed_by_workspace_admin": True,
+            # As Router mints it: the admin's cap, on the offering workspace.
+            "core_business_uuid": grant.get("core_business_uuid", "biz"),
+            "spend_cap_amount_usd": grant.get("spend_cap_amount_usd"),
+            "spend_cap_frequency": grant.get("spend_cap_frequency"),
+            "spend_cap_editable": getattr(self, "admin", False),
+            "current_spend_usd": "0",
+            "created_at": "2026-10-07T09:00:00Z",
+        }
+        self.key_rows.append(key)
+        return {**key, "secret": "test-claimed-secret"}
+
     def key_profiles(self):
         return self.profiles()
 
@@ -105,7 +128,9 @@ class FakeService:
 
     def key_details(self, key_id, days=7):
         return {
-            "key": copy.deepcopy(self.key_rows[0]),
+            "key": copy.deepcopy(
+                next(row for row in self.key_rows if row["id"] == key_id)
+            ),
             "days": days,
             "strategies": {},
             "usage": {
@@ -206,7 +231,8 @@ class FakeService:
 
     def set_key_spend_cap(self, key_id, amount):
         self.calls.append(("spend-cap", key_id, amount))
-        self.key_rows[0]["spend_cap_amount_usd"] = amount
+        key = next(row for row in self.key_rows if row["id"] == key_id)
+        key["spend_cap_amount_usd"] = amount
         return {}
 
     def save_profile(self, draft):

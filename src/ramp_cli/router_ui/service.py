@@ -268,6 +268,35 @@ def _key_label(secret: str | None, keys: list[dict]) -> str:
     return safe_text(matches[0].get("name") or "Unnamed key")
 
 
+def key_restriction(key: dict, action: str) -> str | None:
+    """Why Router won't let the owner take ``action`` on ``key``, or None.
+
+    ``action`` is rename, delete, set-strategy, lock or unlock. Keys a
+    workspace admin issued, suspended or budget-locked answer the owner with a
+    409/403, so the reason is given up front rather than after a confirm.
+    """
+    name = safe_text(key.get("name") or key.get("id"))
+    if key.get("managed_by_workspace_admin"):
+        return (
+            f"{name} was issued by your organization's admin; only they can change it."
+        )
+    if action not in ("lock", "unlock") or key.get("enabled"):
+        return None
+    reason = key.get("disabled_reason")
+    if reason == "workspace_admin_suspended":
+        return f"{name} was suspended by your organization's admin."
+    if reason == "member_budget":
+        return (
+            f"{name} is locked because your organization budget is used up. "
+            "It unlocks when an admin raises the budget or the budget period resets."
+        )
+    if reason == "business_access_revoked" and action == "unlock":
+        return f"{name} belongs to an organization you no longer have access to."
+    if action == "unlock" and (key.get("spend_cap_locked") or reason == "spend_cap"):
+        return f"Raise or remove {name}'s spend cap before unlocking it."
+    return None
+
+
 def _routing_strategy_label(settings: dict) -> str:
     profile = settings.get("routing_profile")
     if isinstance(profile, dict) and profile.get("name"):
@@ -348,7 +377,11 @@ class RouterService:
     def prefetch_tabs(self):
         """Warm Harnesses, API Keys, and Strategies once Home has its data."""
         self.cache.prefetch(
-            self.harnesses, self.keys, self.profiles, self.experiment_settings
+            self.harnesses,
+            self.keys,
+            self.key_grants,
+            self.profiles,
+            self.experiment_settings,
         )
 
     def close(self):
@@ -577,6 +610,68 @@ class RouterService:
         return True
 
     @cached
+    def key_grants(self) -> list[dict]:
+        """Keys a workspace admin has offered this sign-in, still claimable.
+
+        Supplemental to the key list: a Router without grants, a personal
+        sign-in, or any failure reads as no offers.
+        """
+        try:
+            return public_data(self._pending_grants())
+        except (ApiError, RampCLIError, httpx.HTTPError):
+            return []
+
+    def _pending_grants(self) -> list[dict]:
+        grants: list[dict] = []
+        cursor = None
+        for _ in range(100):
+            params = {"limit": 100, **({"cursor": cursor} if cursor else {})}
+            page = self.client.get("/client/api-key-grants", params=params)
+            data = page.get("data") if isinstance(page, dict) else None
+            if not isinstance(data, list):
+                raise RampCLIError("Router returned an unexpected key-offer list.")
+            grants.extend(
+                grant
+                for grant in data
+                if isinstance(grant, dict) and grant.get("status") == "pending"
+            )
+            cursor = page.get("next_cursor")
+            if not page.get("has_more") or not cursor:
+                break
+        return grants
+
+    @mutation
+    def claim_grant(self, grant_id: str) -> dict:
+        """Mint an offered key; the admin's name, cap and strategy apply."""
+        # Read live, not through key_grants: a failed list isn't a gone offer.
+        grant = next(
+            (g for g in self._pending_grants() if str(g.get("id")) == grant_id), None
+        )
+        if grant is None:
+            raise click.BadParameter("That key offer is no longer available.")
+        try:
+            key = self.client.post(
+                f"/client/api-key-grants/{grant['id']}/claim", json={}
+            )
+        except (httpx.TransportError, ApiError) as error:
+            # Router mints the key before answering and a claim can't be
+            # replayed, so a lost answer may have used the offer up.
+            if isinstance(error, ApiError) and error.status_code < 500:
+                raise
+            # A claimed key is the admin's to manage, so only they can undo it.
+            raise RampCLIError(
+                "The claim may have gone through without its secret reaching this "
+                "app. Check your keys; if the key is there, ask your admin to "
+                "revoke it and offer it again."
+            ) from error
+        if not isinstance(key, dict) or not key.get("secret"):
+            raise RampCLIError(
+                "Router claimed the key but didn't return its secret. Ask your "
+                "admin to revoke it and offer it again."
+            )
+        return key
+
+    @cached
     def key_details(self, key_id: str, days: int = 7) -> dict:
         return public_data(
             _key_details(self.client, _owned_key(self.client, key_id), days)
@@ -604,6 +699,8 @@ class RouterService:
     @mutation
     def mutate_key(self, key_id: str, action: str, value: str = ""):
         key = _owned_key(self.client, key_id)
+        if blocked := key_restriction(key, action):
+            raise click.ClickException(blocked)
         method, path, body = key_mutation_request(
             self.client,
             key,
@@ -619,6 +716,8 @@ class RouterService:
     def delete_key(self, key_id: str):
         """Revoke a key for good; apps using it stop working immediately."""
         key = _owned_key(self.client, key_id)
+        if blocked := key_restriction(key, "delete"):
+            raise click.ClickException(blocked)
         return self.client.delete(f"/client/api-keys/{key['id']}")
 
     @mutation
@@ -672,11 +771,20 @@ class RouterService:
             raise click.BadParameter(str(valid), param_hint="name")
         profiles = self.profiles()
         default_id = str(_default_profile(profiles)["id"])
-        owned = {str(key["id"]) for key in self.keys()}
-        if draft.keys - owned:
+        keys = {str(key["id"]): key for key in self.keys()}
+        if draft.keys - set(keys):
             raise click.BadParameter(
                 "Some selected keys are no longer in your account."
             )
+        # Router refuses to move an admin-issued key; catch it before any write
+        # so a save never stops halfway through.
+        managed = [
+            keys[key_id]
+            for key_id in sorted(draft.added_keys | draft.removed_keys)
+            if keys.get(key_id, {}).get("managed_by_workspace_admin")
+        ]
+        if managed:
+            raise click.BadParameter(key_restriction(managed[0], "set-strategy"))
         return save_draft(self.client, draft, default_id)
 
     @mutation
@@ -685,6 +793,19 @@ class RouterService:
         target = next((p for p in profiles if str(p["id"]) == profile_id), None)
         if target is None or target.get("is_default"):
             raise click.BadParameter("The default strategy cannot be deleted.")
+        # Router won't move an admin-issued key to the default strategy, which
+        # deleting this one would do.
+        assigned = set(map(str, target.get("assigned_api_key_ids") or []))
+        managed = [
+            key
+            for key in self.keys()
+            if str(key["id"]) in assigned and key.get("managed_by_workspace_admin")
+        ]
+        if managed:
+            raise click.BadParameter(
+                f"{key_restriction(managed[0], 'set-strategy')} "
+                "Ask your admin to move it before deleting this strategy."
+            )
         delete_profile(
             self.client,
             profile_id,

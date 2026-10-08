@@ -239,6 +239,9 @@ export async function discoverRouterModels(input: {
   const response = await fetcher(`${baseURL}/models`, {
     headers: {
       authorization: `Bearer ${input.apiKey}`,
+      // Marks a coding-agent listing, so Router omits rows this key cannot
+      // call (BYOK-only providers such as Bedrock).
+      "X-Gateway-Client": "opencode",
       ...(input.rampCliVersion
         ? { [RAMP_CLI_VERSION_HEADER]: input.rampCliVersion }
         : {}),

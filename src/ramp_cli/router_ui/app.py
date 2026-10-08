@@ -148,6 +148,11 @@ class RouterApp(App):
     #keys { width: auto; height: 1; padding: 0 0 0 2; color: $router-muted; }
     #keys > .keys--key { color: $router-foreground 65%; }
     #status.error { color: $router-error; }
+    #claim { display: none; width: 15; margin: 0 0 0 2; }
+    #status-row.has-claim #claim { display: block; }
+    #status-row.has-claim #keys { display: none; }
+    #status-row.has-claim #status { height: 3; content-align: left middle; }
+    #body > #secret-warning { margin: 1 0 1 1; color: $router-accent; text-style: bold; }
     #activity { display: none; width: 100%; height: 1fr; content-align: center middle; text-align: center; color: $router-accent; }
     RouterPage.loading #activity { display: block; }
     Footer { background: $router-background; color: $router-muted; }
@@ -594,6 +599,13 @@ class RouterApp(App):
     def open(self, page: str):
         if self.busy:
             self.notice_busy()
+            return
+        if isinstance(self.screen, SecretPage):
+            self.confirm(
+                "Leave? This key's secret won't be shown again.",
+                lambda: self.open_confirmed(page),
+                "Leave",
+            )
             return
         if (
             isinstance(self.screen, FormPage)

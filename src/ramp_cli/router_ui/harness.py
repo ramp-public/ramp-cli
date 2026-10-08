@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import click
+import httpx
 
 from ramp_cli.commands import router
 
@@ -89,6 +90,38 @@ def prices(models) -> dict[str, tuple[str | None, str | None, str | None]]:
     return {model: pricing for model, pricing in rates.items() if any(pricing)}
 
 
+# Harnesses a workspace admin can give a starting model in Router.
+ORGANIZATION_DEFAULT_HARNESSES = ("claude-code", "codex", "opencode", "pi")
+
+
+def organization_default(current: Connection) -> str | None:
+    """The model this key's workspace admin suggests for the harness, if any.
+
+    Router resolves it against the workspace's model policy and reports
+    nothing for personal keys. A suggestion only: any failure reads as none,
+    and nothing is applied without the user choosing it.
+    """
+    if current.client not in ORGANIZATION_DEFAULT_HARNESSES or not current.key:
+        return None
+    url = f"{router._router_key_origin(current.base_url)}/self-service/coding-agent-settings"
+    try:
+        response = httpx.get(
+            url,
+            headers={
+                "Authorization": f"Bearer {current.key}",
+                **router._router_telemetry_headers(),
+            },
+            # A label only, so a slow Router mustn't hold up the picker.
+            timeout=2,
+        )
+        response.raise_for_status()
+        entry = response.json()["harnesses"][current.client]
+    except (httpx.HTTPError, ValueError, KeyError, TypeError):
+        return None
+    model = entry.get("effective_model") if isinstance(entry, dict) else None
+    return model if isinstance(model, str) and model else None
+
+
 def editor(client: str) -> dict:
     with connection(client) as current:
         app_managed = client in ("conductor", "cowork")
@@ -96,11 +129,19 @@ def editor(client: str) -> dict:
         selected = (
             None if app_managed else router._configured_model(client, current.path)
         )
+        suggested = None if app_managed else organization_default(current)
+        if suggested is not None and client == "codex":
+            suggested = _codex_slug(suggested, models, choices)
+        # Router lists the policy's models for the workspace; this key may
+        # still not serve one, and then there's nothing to offer.
+        if suggested not in {value for _label, value in choices}:
+            suggested = None
         return {
             "client": client,
             "model": selected,
             "models": choices,
             "prices": prices(models),
+            "organization_default": suggested,
             "connection_token": current.token,
             "model_note": "Choose models inside this app; it has no CLI-managed global default."
             if app_managed

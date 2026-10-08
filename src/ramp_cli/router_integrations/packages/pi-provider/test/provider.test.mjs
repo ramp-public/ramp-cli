@@ -124,6 +124,7 @@ describe("discoverRouterModels", () => {
     assert.deepEqual(fetcher.mock.calls[0].arguments[1].headers, {
       authorization: "Bearer test-secret",
       "user-agent": "ramp-cli-pi-provider",
+      "X-Gateway-Client": "pi",
       "X-Gateway-Ramp-Cli-Version": "0.2.38",
     })
   })
@@ -344,6 +345,7 @@ describe("Pi provider extension", () => {
       assert.deepEqual(init.headers, {
         authorization: "Bearer stored-secret",
         "user-agent": "ramp-cli-pi-provider",
+        "X-Gateway-Client": "pi",
       })
       return new Response(
         JSON.stringify({
@@ -2424,6 +2426,7 @@ describe("Pi provider extension", () => {
       assert.deepEqual(init.headers, {
         authorization: "Bearer test-secret",
         "user-agent": "ramp-cli-pi-provider",
+        "X-Gateway-Client": "pi",
       })
       return new Response(
         JSON.stringify({

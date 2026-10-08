@@ -211,6 +211,14 @@ class RouterTabs(Tabs):
 
     BINDINGS = [Binding("enter", "focus_content", "Open screen", show=False)]
 
+    def action_previous_tab(self):
+        if not getattr(self.screen, "holds_secret", False):
+            super().action_previous_tab()
+
+    def action_next_tab(self):
+        if not getattr(self.screen, "holds_secret", False):
+            super().action_next_tab()
+
     def action_focus_content(self):
         if self.app.busy:
             return

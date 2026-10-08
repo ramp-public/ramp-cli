@@ -5,6 +5,7 @@ from datetime import datetime
 from uuid import uuid4
 
 import click
+import httpx
 from rich.cells import cell_len
 from rich.text import Text
 from textual import on
@@ -25,6 +26,7 @@ from ramp_cli.commands.router_user import (
     _money,
     _validate_key_name,
 )
+from ramp_cli.errors import RampCLIError
 from ramp_cli.router_ui.dialogs import (
     ChoiceDialog,
     Confirm,
@@ -36,6 +38,7 @@ from ramp_cli.router_ui.pages import (
     RouterPage,
 )
 from ramp_cli.router_ui.service import (
+    key_restriction,
     safe_text,
 )
 from ramp_cli.router_ui.widgets import (
@@ -55,6 +58,9 @@ class KeyTable(CellTable):
     spend_cap_column = 3
 
     def cell_locked(self, coordinate: Coordinate) -> bool:
+        # Spend and creation date are read-only; the cursor skips them.
+        if coordinate.column > self.spend_cap_column:
+            return True
         # Organization keys' caps are set by workspace admins only.
         if coordinate.column != self.spend_cap_column:
             return False
@@ -71,6 +77,33 @@ def harness_labels(clients) -> str:
     from ramp_cli.router_ui.tabs.harnesses import ConnectPage  # noqa: PLC0415
 
     return ", ".join(ConnectPage.label(client) for client in clients)
+
+
+def grant_label(grant: dict) -> str:
+    """An offered key as the claim menu lists it: name, cap and expiry."""
+    parts = [safe_text(grant.get("name") or "Unnamed key")]
+    amount = grant.get("spend_cap_amount_usd")
+    if amount is None:
+        parts.append("No Cap")
+    else:
+        period = {
+            "daily": "Day",
+            "weekly": "Week",
+            "monthly": "Month",
+            "yearly": "Year",
+        }.get(grant.get("spend_cap_frequency"))
+        parts.append(_money(amount) + (f" / {period}" if period else ""))
+    try:
+        expires = datetime.fromisoformat(
+            str(grant.get("expires_at")).replace("Z", "+00:00")
+        )
+    except ValueError:
+        pass
+    else:
+        if expires.tzinfo:
+            expires = expires.astimezone()
+        parts.append(f"expires {expires:%b} {expires.day}")
+    return " · ".join(parts)
 
 
 def parse_key_name(text: str) -> str:
@@ -97,6 +130,15 @@ class KeysPage(CellEditing, CollectionPage):
     def __init__(self, days: int = 7):
         super().__init__()
         self.days = days
+        # Keys a workspace admin offered and this sign-in hasn't claimed yet.
+        self.grants: list[dict] = []
+
+    def on_mount(self):
+        # Offers take the key hints' place beside the status, not the action
+        # row. Textual runs each class's on_mount, so this adds only the button.
+        row = self.query_one("#status-row")
+        if not row.query("#claim"):
+            row.mount(Button("Claim key", id="claim"))
 
     def key_hints(self) -> str:
         table = self.query("#table").first(CellTable) if self.is_mounted else None
@@ -107,6 +149,10 @@ class KeysPage(CellEditing, CollectionPage):
     @on(CellTable.ModeChanged, "#table")
     def cell_mode_changed(self):
         self.query_one("#keys", Static).update(self.key_hints())
+        # Leaving cell editing clears what a cell explained; offers return.
+        table = self.query_one("#table", CellTable)
+        if table.cursor_type != "cell":
+            self.show_offers()
 
     @on(DataTable.CellSelected, "#table")
     def edit_cell(self, event: DataTable.CellSelected):
@@ -127,7 +173,17 @@ class KeysPage(CellEditing, CollectionPage):
     def key_label(self, item: dict) -> str:
         return safe_text(item.get("name") or item["id"])
 
+    def restricted(self, item: dict, action: str) -> bool:
+        """Say why Router won't take ``action`` on this key, if it won't."""
+        reason = key_restriction(item, action)
+        if reason:
+            self.message(reason)
+        return bool(reason)
+
     def edit_name(self, item: dict, coordinate: Coordinate):
+        if self.restricted(item, "rename"):
+            return
+
         def chosen(value: str):
             if value == "rename":
                 self.rename_key(item, coordinate)
@@ -343,16 +399,8 @@ class KeysPage(CellEditing, CollectionPage):
 
     def edit_status(self, item: dict, coordinate: Coordinate):
         name = self.key_label(item)
-        if not item.get("enabled"):
-            if item.get("disabled_reason") == "workspace_admin_suspended":
-                self.message(f"{name} was suspended by your organization's admin.")
-                return
-            if (
-                item.get("spend_cap_locked")
-                or item.get("disabled_reason") == "spend_cap"
-            ):
-                self.message(f"Raise or remove {name}'s spend cap before unlocking it.")
-                return
+        if self.restricted(item, "lock" if item.get("enabled") else "unlock"):
+            return
         action = "lock" if item.get("enabled") else "unlock"
         note = (
             "It will stop accepting inference requests."
@@ -382,6 +430,8 @@ class KeysPage(CellEditing, CollectionPage):
         )
 
     def edit_profile(self, item: dict, coordinate: Coordinate):
+        if self.restricted(item, "set-strategy"):
+            return
         name = self.key_label(item)
 
         def loaded(profiles):
@@ -483,7 +533,99 @@ class KeysPage(CellEditing, CollectionPage):
         self.call_after_refresh(show)
 
     def load(self):
-        self.run("Loading API keys", self.service.keys, self.loaded)
+        self.run(
+            "Loading API keys",
+            lambda: (self.service.keys(), self.service.key_grants()),
+            self.loaded,
+        )
+
+    def loaded(self, result):
+        entries, self.grants = result
+        super().loaded(entries)
+
+    def offer_note(self) -> str:
+        count = len(self.grants)
+        offered = "a key" if count == 1 else f"{count} keys"
+        return f"Your organization's admin offered you {offered}."
+
+    def show_offers(self):
+        """Put the offer and its button back in the status row, if any."""
+        if self.grants and self.is_mounted:
+            label = "Claim key" if len(self.grants) == 1 else "Claim keys"
+            self.query_one("#claim", Button).label = label
+            self.message(self.offer_note())
+
+    def message(self, message: str, *, error: bool = False):
+        super().message(message, error=error)
+        # The button belongs to the offer: any other message, from a row
+        # count to a refusal, takes the row back and the key hints with it.
+        if self.is_mounted:
+            offered = bool(self.grants) and not error and message == self.offer_note()
+            self.query_one("#status-row").set_class(offered, "has-claim")
+
+    def populate(self):
+        super().populate()
+        # The offer outranks a row count or "No matches": with no keys yet,
+        # it's how a member gets their first. Not what a cell is explaining.
+        table = self.query_one("#table", CellTable)
+        if table.cursor_type != "cell":
+            self.show_offers()
+
+    @on(Button.Pressed, "#claim")
+    def claim(self):
+        if not self.grants:
+            return
+        if len(self.grants) == 1:
+            self.confirm_claim(self.grants[0])
+            return
+        by_id = {str(grant["id"]): grant for grant in self.grants}
+        self.app.push_screen(
+            ChoiceDialog(
+                "Claim a key",
+                "Your organization's admin offered you these keys.",
+                [(grant_label(grant), key) for key, grant in by_id.items()]
+                + [("Back", "back")],
+            ),
+            lambda value: value in by_id and self.confirm_claim(by_id[value]),
+        )
+
+    def confirm_claim(self, grant: dict):
+        name = safe_text(grant.get("name") or "the offered key")
+
+        def attempt():
+            try:
+                return self.service.claim_grant(str(grant["id"])), None, None
+            except (click.ClickException, RampCLIError, httpx.HTTPError) as error:
+                # The offer may be gone or used up: reread both lists so the
+                # page never offers what can't be claimed. Best effort, so a
+                # failed reread never hides why the claim failed.
+                try:
+                    fresh = (self.service.keys(), self.service.key_grants())
+                except (click.ClickException, RampCLIError, httpx.HTTPError):
+                    fresh = None
+                return None, error, fresh
+
+        def done(result):
+            key, error, fresh = result
+            if key is not None:
+                self.router_app.push(SecretPage(key))
+                return
+            if fresh is not None:
+                self.loaded(fresh)
+            message = (
+                error.format_message()
+                if isinstance(error, click.ClickException)
+                else str(error)
+            )
+            self.message(message, error=True)
+
+        self.router_app.confirm(
+            f"Claim {name}? Your admin chose its name, spend cap and routing strategy, "
+            "and only they can change them. The secret is shown once.",
+            lambda: self.run("Claiming API key", attempt, done),
+            "Claim",
+            focus_accept=True,
+        )
 
     def filter_text(self, item: dict) -> str:
         return f"{item.get('name', '')} {item.get('routing_profile_name', 'Account Defaults')}"
@@ -643,9 +785,16 @@ class KeyPage(RouterPage):
             f"Status: {'Enabled' if self.key.get('enabled') else 'Locked'}\n"
             f"Strategy: {safe_text(profile.get('name') or 'Account defaults')}"
         )
-        self.query_one("#lock", Button).label = (
-            "Lock" if self.key.get("enabled") else "Unlock"
-        )
+        lock = "lock" if self.key.get("enabled") else "unlock"
+        self.query_one("#lock", Button).label = lock.title()
+        for button, action in (
+            ("#rename", "rename"),
+            ("#assignment", "set-strategy"),
+            ("#lock", lock),
+        ):
+            self.query_one(button, Button).disabled = bool(
+                key_restriction(self.key, action)
+            )
         usage = result.get("usage") or {}
         summary = usage.get("summary") or {}
         self.query_one("#key-usage", Static).update(
@@ -676,9 +825,12 @@ class KeyPage(RouterPage):
         table.call_after_refresh(table.spread_columns)
         self.message(
             " · ".join(
-                result.get(name, "")
-                for name in ("usage_error", "strategies_error")
-                if result.get(name)
+                note
+                for note in (
+                    key_restriction(self.key, lock),
+                    *(result.get(name) for name in ("usage_error", "strategies_error")),
+                )
+                if note
             )
         )
 
@@ -798,6 +950,11 @@ class CreateKeyPage(FormPage):
 
 class SecretPage(RouterPage):
     page_title = "API key created"
+    # Leaving clears the secret, so a stray arrow must never switch tabs.
+    holds_secret = True
+
+    def arrow_unused(self, key: str):
+        pass
 
     def __init__(self, key: dict, *, use_secret: Callable | None = None):
         super().__init__()
@@ -807,12 +964,15 @@ class SecretPage(RouterPage):
 
     def content(self) -> ComposeResult:
         yield Static(
-            f"Created {safe_text(self.key.get('name'))}\n{safe_text(self.key.get('id'))}",
+            f"Created {safe_text(self.key.get('name'))}\n"
+            f"Key ID: {safe_text(self.key.get('id'))}",
             markup=False,
         )
         yield Static(
-            "Copy and store this secret now. Leaving this screen clears it.",
-            classes="muted",
+            "This secret is shown only once. Copy it now and store it somewhere "
+            "safe: once you leave this screen, it can't be shown again.",
+            id="secret-warning",
+            markup=False,
         )
         self.secret_input = Input(
             self.secret, password=True, id="secret", disabled=True
@@ -825,6 +985,10 @@ class SecretPage(RouterPage):
         yield Button("Done", id="done")
         if self.use_secret:
             yield Button("Use for connection", id="use")
+
+    def on_mount(self):
+        # Copying is the one thing to do here, so Enter does it.
+        self.restore_focus(self.query_one("#copy", Button))
 
     @on(Button.Pressed, "#copy")
     def copy(self):

@@ -96,6 +96,7 @@ describe("discoverRouterModels", () => {
     )
     assert.deepEqual(fetcher.mock.calls[0].arguments[1].headers, {
       authorization: "Bearer test-secret",
+      "X-Gateway-Client": "opencode",
       "X-Gateway-Ramp-Cli-Version": "0.2.38",
     })
   })

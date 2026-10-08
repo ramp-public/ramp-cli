@@ -192,8 +192,12 @@ class StrategiesPage(CellEditing, CollectionPage):
             owner = owners.get(key_id)
             if owner and owner[0] != str(profile["id"]):
                 label += f" · on {owner[1]}"
+            # Admin-issued keys stay where their admin put them.
+            managed = bool(key.get("managed_by_workspace_admin"))
+            if managed:
+                label += " · Set by your admin"
             # Keys leave the default strategy only by joining another one.
-            locked = draft.is_default and key_id in draft.keys
+            locked = managed or (draft.is_default and key_id in draft.keys)
             choices.append((label, key_id, key_id in draft.keys, locked))
 
         def done(chosen: set[str] | None):

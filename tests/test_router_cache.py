@@ -255,6 +255,7 @@ def test_prefetch_tabs_warms_harnesses_keys_and_strategies(monkeypatch):
     assert [read.__name__ for read in warmed] == [
         "harnesses",
         "keys",
+        "key_grants",
         "profiles",
         "experiment_settings",
     ]

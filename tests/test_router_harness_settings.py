@@ -54,6 +54,8 @@ def installed(monkeypatch, tmp_path):
         return tmp_path / client / "settings", options["selected_model"], False
 
     monkeypatch.setattr(router, "_configure_client", configure)
+    # The admin's suggestion is its own read; tests that want one set it.
+    monkeypatch.setattr(harness, "organization_default", lambda current: None)
     return writes
 
 
@@ -224,3 +226,86 @@ def test_switchyard_custom_configuration_must_be_confirmed(
     else:
         with pytest.raises(click.ClickException, match="did not confirm"):
             harness.save_routing("pi", changes, token)
+
+
+def _settings_response(harnesses: dict, status: int = 200):
+    def get(url, **kwargs):
+        get.calls.append((url, kwargs["headers"]["Authorization"]))
+        return httpx.Response(
+            status,
+            json={"harnesses": harnesses},
+            request=httpx.Request("GET", url),
+        )
+
+    get.calls = []
+    return get
+
+
+def test_organization_default_reads_key_scoped_settings(monkeypatch):
+    get = _settings_response(
+        {"pi": {"model": "new", "effective_model": "new", "status": "available"}}
+    )
+    monkeypatch.setattr(harness.httpx, "get", get)
+    current = harness.Connection(
+        "pi", None, "inference-secret", "https://qa.router.invalid/v1"
+    )
+    assert harness.organization_default(current) == "new"
+    assert get.calls == [
+        (
+            "https://qa.router.invalid/self-service/coding-agent-settings",
+            "Bearer inference-secret",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("harnesses", "status"),
+    [
+        # Set, but no longer allowed by the model policy.
+        ({"pi": {"model": "gone", "effective_model": None}}, 200),
+        # Older Routers and revoked business access.
+        ({}, 404),
+        ({}, 403),
+    ],
+)
+def test_organization_default_fails_open(monkeypatch, harnesses, status):
+    monkeypatch.setattr(harness.httpx, "get", _settings_response(harnesses, status))
+    current = harness.Connection("pi", None, "key", "https://qa.router.invalid/v1")
+    assert harness.organization_default(current) is None
+
+
+@pytest.mark.parametrize(
+    ("suggested", "expected"),
+    [
+        ("new", "new"),
+        # A suggestion this key's catalog doesn't serve is never offered.
+        ("elsewhere", None),
+    ],
+)
+def test_editor_offers_organization_default_only_from_the_catalog(
+    installed, monkeypatch, suggested, expected
+):
+    monkeypatch.setattr(harness, "organization_default", lambda current: suggested)
+    data = harness.editor("pi")
+    assert data["organization_default"] == expected
+    # A suggestion, never applied by reading it.
+    assert data["model"] == "old"
+    assert not installed
+
+
+def test_codex_organization_default_maps_a_router_id_to_its_slug(
+    installed, monkeypatch
+):
+    # Router suggests its own model id; Codex's catalog lists that model by slug.
+    monkeypatch.setattr(
+        router,
+        "_fetch_codex_catalog",
+        lambda *args, **kwargs: {
+            "models": [
+                {"slug": "codex-old", "display_name": "old"},
+                {"slug": "codex-new", "display_name": "new"},
+            ]
+        },
+    )
+    monkeypatch.setattr(harness, "organization_default", lambda current: "new")
+    assert harness.editor("codex")["organization_default"] == "codex-new"

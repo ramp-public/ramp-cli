@@ -299,6 +299,9 @@ export async function discoverRouterModels(input: {
       // can return the catalog. This request is model discovery, not an
       // inference, so use the integration's own stable identifier.
       "user-agent": "ramp-cli-pi-provider",
+      // Marks a coding-agent listing, so Router omits rows this key cannot
+      // call (BYOK-only providers such as Bedrock).
+      "X-Gateway-Client": "pi",
       ...(input.rampCliVersion
         ? { [RAMP_CLI_VERSION_HEADER]: input.rampCliVersion }
         : {}),

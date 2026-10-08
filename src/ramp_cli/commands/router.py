@@ -3619,6 +3619,15 @@ def _strategy_base_url(ctx: click.Context) -> str | None:
     return (ctx.obj or {}).get("strategies_base_url")
 
 
+def _router_key_origin(base_url: str | None) -> str:
+    """The Router origin serving API-key-authenticated reads for ``base_url``."""
+    if base_url is None:
+        return _statusline_origin()
+    return KNOWN_DEPLOYMENT_UI_URLS.get(
+        base_url.rstrip("/"), base_url.rstrip("/").removesuffix("/v1")
+    )
+
+
 def _router_key_request(
     api_key: str,
     path: str,
@@ -3633,14 +3642,7 @@ def _router_key_request(
     These live on the same origin and API-key surface as the status line's
     session-usage reads. ``errors`` overrides the message for a status code.
     """
-    origin = (
-        _statusline_origin()
-        if base_url is None
-        else KNOWN_DEPLOYMENT_UI_URLS.get(
-            base_url.rstrip("/"), base_url.rstrip("/").removesuffix("/v1")
-        )
-    )
-    url = f"{origin}/session-usage/{path}"
+    url = f"{_router_key_origin(base_url)}/session-usage/{path}"
     headers = {"Authorization": f"Bearer {api_key}", **_router_telemetry_headers()}
     try:
         if method == "GET":
