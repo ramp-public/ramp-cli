@@ -149,7 +149,9 @@ _CONFIGURE_WRITTEN_ENV_KEYS = tuple(
 _OWNED_TOP_LEVEL_KEYS = ("model", "disableClaudeAiConnectors")
 _CONFIGURE_WRITTEN_TOP_LEVEL_KEYS = ("model",)
 _LEGACY_TOP_LEVEL_KEYS = ("model",)
-_ROUTER_MODEL_PREFIX = "claude-router-"
+# Router's generated Claude ids: ``claude-router-<…>`` for Claude Code's view
+# and ``claude-fable-router-<…>`` for the Cowork-shaped ids Desktop writes.
+_ROUTER_MODEL_PREFIXES = ("claude-router-", "claude-fable-router-")
 
 # Selects Router's Claude Code view of /v1/models, where models whose ids are
 # not Claude-shaped appear under compatibility aliases. Presentation only; it
@@ -333,7 +335,7 @@ def _replace_user_config_if_unchanged(path: Path, expected: str, content: str) -
 
 def _is_router_model(value: object) -> bool:
     """Return whether Claude Code's selected model is one of Router's aliases."""
-    return isinstance(value, str) and value.startswith(_ROUTER_MODEL_PREFIX)
+    return isinstance(value, str) and value.startswith(_ROUTER_MODEL_PREFIXES)
 
 
 def setting_auto_compact_window(value: object) -> int | None:

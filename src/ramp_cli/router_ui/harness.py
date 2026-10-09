@@ -2,13 +2,11 @@
 
 import hashlib
 import hmac
-import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import click
-import httpx
 
 from ramp_cli.commands import router
 
@@ -99,27 +97,20 @@ def organization_default(current: Connection) -> str | None:
 
     Router resolves it against the workspace's model policy and reports
     nothing for personal keys. A suggestion only: any failure reads as none,
-    and nothing is applied without the user choosing it.
+    and nothing is applied without the user choosing it. (When Router
+    selects Switchyard for the key, configure and refresh push the model
+    themselves; here it is still just the label.)
     """
     if current.client not in ORGANIZATION_DEFAULT_HARNESSES or not current.key:
         return None
-    url = f"{router._router_key_origin(current.base_url)}/self-service/coding-agent-settings"
-    try:
-        response = httpx.get(
-            url,
-            headers={
-                "Authorization": f"Bearer {current.key}",
-                **router._router_telemetry_headers(),
-            },
-            # A label only, so a slow Router mustn't hold up the picker.
-            timeout=2,
-        )
-        response.raise_for_status()
-        entry = response.json()["harnesses"][current.client]
-    except (httpx.HTTPError, ValueError, KeyError, TypeError):
-        return None
-    model = entry.get("effective_model") if isinstance(entry, dict) else None
-    return model if isinstance(model, str) and model else None
+    # A label only, so a slow Router mustn't hold up the picker.
+    harnesses = router._coding_agent_settings(
+        current.key,
+        origin=router._settings_origin(current.client, current.path, current.base_url),
+        timeout=2,
+    )
+    model, _source = router._effective_model(harnesses, current.client)
+    return model
 
 
 def editor(client: str) -> dict:
@@ -147,24 +138,6 @@ def editor(client: str) -> dict:
             if app_managed
             else "",
         }
-
-
-@contextmanager
-def _usage_origin(origin: str | None):
-    """Pin the dashboard origin a rewrite derives, then restore the environment."""
-    previous = os.environ.get(router.ROUTER_UI_URL_ENV)
-    if origin:
-        os.environ[router.ROUTER_UI_URL_ENV] = origin
-    else:
-        # Derive it from the saved endpoint, never from an unrelated override.
-        os.environ.pop(router.ROUTER_UI_URL_ENV, None)
-    try:
-        yield
-    finally:
-        if previous is None:
-            os.environ.pop(router.ROUTER_UI_URL_ENV, None)
-        else:
-            os.environ[router.ROUTER_UI_URL_ENV] = previous
 
 
 def _codex_slug(model: str, models, choices) -> str | None:
@@ -228,7 +201,7 @@ def set_model(
             with connection(client) as latest:
                 check_connection(latest, current.token)
         usage = router._stored_usage_origin(client, current.path)
-        with _usage_origin(usage):
+        with router._pinned_usage_origin(usage):
             _, saved, _ = router._configure_client(
                 client, current.key, models, **options
             )

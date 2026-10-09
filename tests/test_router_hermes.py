@@ -63,7 +63,11 @@ def _mock_models(monkeypatch, models=None, key="router-secret"):
 
     def get(url, *, headers, timeout):
         if "/session-usage/usage/balance" in url or url.endswith(
-            ("/claude-code-statusline", "/codex-cost-hook")
+            (
+                "/claude-code-statusline",
+                "/codex-cost-hook",
+                "/self-service/coding-agent-settings",
+            )
         ):
             # Each optional asset has its own tests; unavailable here, so
             # configure simply skips it.
@@ -988,7 +992,11 @@ def test_unconfigure_restores_after_a_failed_reconfigure_to_a_new_endpoint(
 
     def get_new_endpoint(url, *, headers, timeout):
         if "/session-usage/usage/balance" in url or url.endswith(
-            ("/claude-code-statusline", "/codex-cost-hook")
+            (
+                "/claude-code-statusline",
+                "/codex-cost-hook",
+                "/self-service/coding-agent-settings",
+            )
         ):
             return httpx.Response(404, request=httpx.Request("GET", url))
         assert url == f"{new_base}/models"
@@ -1220,7 +1228,11 @@ def test_unconfigure_recovers_from_two_failed_first_time_configures(
 
     def get_new_endpoint(url, *, headers, timeout):
         if "/session-usage/usage/balance" in url or url.endswith(
-            ("/claude-code-statusline", "/codex-cost-hook")
+            (
+                "/claude-code-statusline",
+                "/codex-cost-hook",
+                "/self-service/coding-agent-settings",
+            )
         ):
             return httpx.Response(404, request=httpx.Request("GET", url))
         assert url == f"{new_base}/models"

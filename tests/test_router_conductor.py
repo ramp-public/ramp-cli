@@ -78,6 +78,8 @@ def _mock_models(monkeypatch, models=None, base_url=ROUTER_BASE_URL):
             return httpx.Response(404, request=httpx.Request("GET", url))
         if url.endswith("/session-usage/usage/balance?include_strategy_settings=true"):
             return httpx.Response(404, request=httpx.Request("GET", url))
+        if url.endswith("/self-service/coding-agent-settings"):
+            return httpx.Response(404, request=httpx.Request("GET", url))
         assert url == f"{base_url}/models"
         assert headers["Authorization"] == "Bearer router-secret"
         if headers.get("X-Gateway-Client") == "codex":

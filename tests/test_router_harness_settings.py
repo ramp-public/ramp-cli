@@ -245,7 +245,7 @@ def test_organization_default_reads_key_scoped_settings(monkeypatch):
     get = _settings_response(
         {"pi": {"model": "new", "effective_model": "new", "status": "available"}}
     )
-    monkeypatch.setattr(harness.httpx, "get", get)
+    monkeypatch.setattr(router.httpx, "get", get)
     current = harness.Connection(
         "pi", None, "inference-secret", "https://qa.router.invalid/v1"
     )
@@ -269,7 +269,7 @@ def test_organization_default_reads_key_scoped_settings(monkeypatch):
     ],
 )
 def test_organization_default_fails_open(monkeypatch, harnesses, status):
-    monkeypatch.setattr(harness.httpx, "get", _settings_response(harnesses, status))
+    monkeypatch.setattr(router.httpx, "get", _settings_response(harnesses, status))
     current = harness.Connection("pi", None, "key", "https://qa.router.invalid/v1")
     assert harness.organization_default(current) is None
 

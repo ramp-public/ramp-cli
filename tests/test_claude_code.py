@@ -1504,6 +1504,31 @@ def test_a_stale_router_model_is_not_captured_as_the_original_setup(tmp_path):
     assert "model" not in claude_code.plan_restoration(updated, path, state)
 
 
+@pytest.mark.parametrize(
+    "stale",
+    [
+        "claude-fable-router-5-6-sol-419255[1m]",
+        "claude-fable-router-model-1e3b36d63ed19af0",
+        "claude-router-switchyard-3e865a[1m]",
+    ],
+)
+def test_cowork_shaped_router_ids_are_router_models_too(tmp_path, stale):
+    # Claude Desktop writes Router's claude-fable-router- ids into the shared
+    # settings; only the claude-router- prefix used to be recognized, so a
+    # Desktop selection was captured as the user's own pre-Router model.
+    assert claude_code._is_router_model(stale)
+    path = tmp_path / "settings.json"
+    updated, state = claude_code.plan_configuration(
+        {"model": stale}, path, "https://router.example", "k", "claude-router-sol"
+    )
+
+    assert state["top_level"]["model"] == {"present": False, "value": None}
+    assert "model" not in claude_code.plan_original_settings(state)
+    assert "model" not in claude_code.plan_restoration(
+        {**updated, "model": stale}, path, state
+    )
+
+
 def test_legacy_state_cannot_restore_a_stale_router_model(tmp_path):
     path = tmp_path / "settings.json"
     updated, state = claude_code.plan_configuration(
