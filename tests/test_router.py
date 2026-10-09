@@ -2945,7 +2945,10 @@ def test_configure_codex_writes_router_provider(tmp_path, monkeypatch):
     assert key_path.read_text() == "router-secret"
     assert "Connecting Ramp Router to your coding agent" in result.output
     assert "Connected to: Codex" in result.output
-    assert "2 models added. Start an agent and pick a model." in result.output
+    assert (
+        "2 models added. Restart any running agents, then pick a model."
+        in result.output
+    )
     assert "Create or copy an API key" not in result.output
     assert "router-secret" not in result.output
     assert config_path.stat().st_mode & 0o777 == 0o600
@@ -5210,7 +5213,10 @@ def test_configure_opencode_installs_plugin_and_preserves_config(tmp_path, monke
     assert tui_path.stat().st_mode & 0o777 == 0o600
     assert "Connecting Ramp Router to your coding agent" in result.output
     assert "Connected to: OpenCode" in result.output
-    assert "2 models added. Start an agent and pick a model." in result.output
+    assert (
+        "2 models added. Restart any running agents, then pick a model."
+        in result.output
+    )
     assert "router-secret" not in result.output
     assert config_path.stat().st_mode & 0o777 == 0o600
 
@@ -5681,7 +5687,9 @@ def test_configure_pi_installs_plugin_and_is_idempotent(tmp_path, monkeypatch):
     )
     assert "Connecting Ramp Router to your coding agent" in first.output
     assert "Connected to: Pi" in first.output
-    assert "2 models added. Start an agent and pick a model." in first.output
+    assert (
+        "2 models added. Restart any running agents, then pick a model." in first.output
+    )
 
 
 def test_unconfigure_pi_removes_router_and_preserves_other_providers(
@@ -8365,7 +8373,7 @@ def test_configure_and_unconfigure_accept_multiple_clients(tmp_path, monkeypatch
         "Skipping the Claude Code Router status line: it could not be "
         "downloaded from https://app.router.com/claude-code-statusline.",
         "Connected to: Claude Code and Codex",
-        "1 model added. Start an agent and pick a model.",
+        "1 model added. Restart any running agents, then pick a model.",
     ]
     notice = _notice_lines(configure.output)
     assert notice[0].startswith("Claude Code & Codex only support one model provider")
@@ -8472,7 +8480,7 @@ def test_configure_and_unconfigure_without_client_targets_everything(
         "Skipping the Claude Code Router status line: it could not be "
         "downloaded from https://app.router.com/claude-code-statusline.",
         "Connected to: Claude Code, Codex, OpenCode, and Pi",
-        "1 model added. Start an agent and pick a model.",
+        "1 model added. Restart any running agents, then pick a model.",
     ]
     notice = _notice_lines(configure.output)
     assert "claude --settings ~/claude/original.settings.json --model default" in notice

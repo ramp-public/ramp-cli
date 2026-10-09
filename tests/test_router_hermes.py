@@ -243,7 +243,10 @@ def test_configure_hermes_writes_config_env_and_receipt(fake_hermes, monkeypatch
     # The receipt can carry a pre-existing key, so it is owner-only.
     assert receipt.stat().st_mode & 0o777 == 0o600
     assert "Connected to: Hermes" in result.output
-    assert "2 models added. Start an agent and pick a model." in result.output
+    assert (
+        "2 models added. Restart any running agents, then pick a model."
+        in result.output
+    )
     assert "router-secret" not in result.output
 
 

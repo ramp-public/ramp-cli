@@ -2004,7 +2004,8 @@ def _run_configure(
             click.echo(f"{model_count} {model_label} discovered.")
         else:
             click.echo(
-                f"{model_count} {model_label} added. Start an agent and pick a model."
+                f"{model_count} {model_label} added. "
+                "Restart any running agents, then pick a model."
             )
         if cowork_note:
             click.echo(cowork_note)
