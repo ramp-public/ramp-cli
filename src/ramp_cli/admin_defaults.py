@@ -18,7 +18,7 @@ depend on its contract:
   default". The admin default is a bonus on top of a working setup.
 * It is cheap to call repeatedly: one process asks Router at most once per
   key and origin within :data:`CACHE_TTL_SECONDS`, so a configure that also
-  reads the same settings for its Switchyard decision shares the response.
+  reads the same response for the one-time Switchyard push shares it.
 
 Only ``configure`` and ``refresh`` call it. The Codex SessionStart and Stop
 hooks apply the value those runs cached in the setup receipt and stay off the
@@ -39,10 +39,14 @@ from ramp_cli.commands.claude_code import RAMP_CLI_VERSION_HEADER
 CACHE_TTL_SECONDS = 60.0
 DEFAULT_TIMEOUT_SECONDS = 2.0
 
-# (api_key, origin) -> (fetched at, Router's ``harnesses`` object or None).
-# Failures are cached too: within one run the Switchyard read and the admin
-# default read must agree, and neither should wait on a Router that just
-# timed out.
+# Routers before the one-time Switchyard push reported ``switchyard`` as every
+# harness's effective model under this source. It is not a workspace default:
+# applying it to each new session would undo whatever model the user picked.
+LEGACY_SWITCHYARD_SOURCE = "switchyard"
+
+# (api_key, origin) -> (fetched at, Router's response body or None). Failures
+# are cached too: within one run the Switchyard read and the admin default
+# read must agree, and neither should wait on a Router that just timed out.
 _cache: dict[tuple[str, str], tuple[float, dict | None]] = {}
 
 
@@ -56,17 +60,7 @@ def clear_cache() -> None:
     _cache.clear()
 
 
-def coding_agent_settings(
-    api_key: str, origin: str, *, timeout: float = DEFAULT_TIMEOUT_SECONDS
-) -> dict | None:
-    """This key's per-harness coding-agent settings, or None when unavailable.
-
-    ``origin`` is the control-plane host a setup already sends its
-    session-usage calls to, so the saved key goes nowhere new. Fail-open:
-    older Routers (404), revoked business access, network errors, and a
-    malformed body all read as None. Callers must keep "Router said nothing"
-    apart from "Router said no", since only the latter may move a selection.
-    """
+def _settings_payload(api_key: str, origin: str, timeout: float) -> dict | None:
     if not api_key:
         return None
     origin = origin.rstrip("/")
@@ -75,9 +69,36 @@ def coding_agent_settings(
     cached = _cache.get(cache_key)
     if cached is not None and now - cached[0] < CACHE_TTL_SECONDS:
         return cached[1]
-    harnesses = _fetch_coding_agent_settings(api_key, origin, timeout)
-    _cache[cache_key] = (now, harnesses)
-    return harnesses
+    payload = _fetch_coding_agent_settings(api_key, origin, timeout)
+    _cache[cache_key] = (now, payload)
+    return payload
+
+
+def coding_agent_settings(
+    api_key: str, origin: str, *, timeout: float = DEFAULT_TIMEOUT_SECONDS
+) -> dict | None:
+    """This key's per-harness coding-agent settings, or None when unavailable.
+
+    ``origin`` is the control-plane host a setup already sends its
+    session-usage calls to, so the saved key goes nowhere new. Fail-open:
+    older Routers (404), revoked business access, network errors, and a
+    malformed body all read as None.
+    """
+    payload = _settings_payload(api_key, origin, timeout)
+    return payload["harnesses"] if payload is not None else None
+
+
+def switchyard_offered(
+    api_key: str, origin: str, *, timeout: float = DEFAULT_TIMEOUT_SECONDS
+) -> bool:
+    """Whether Router offers this key the ``switchyard`` model to push once.
+
+    Router sets the top-level ``switchyard_offered`` when the key's
+    Switchyard configuration stores both tiers. Anything else, including a
+    Router that predates the field or could not be asked, reads as False.
+    """
+    payload = _settings_payload(api_key, origin, timeout)
+    return payload is not None and payload.get("switchyard_offered") is True
 
 
 def _fetch_coding_agent_settings(
@@ -95,20 +116,25 @@ def _fetch_coding_agent_settings(
             timeout=timeout,
         )
         response.raise_for_status()
-        harnesses = response.json()["harnesses"]
-    except (httpx.HTTPError, ValueError, KeyError, TypeError):
+        payload = response.json()
+    except (httpx.HTTPError, ValueError):
         return None
-    return harnesses if isinstance(harnesses, dict) else None
+    if not isinstance(payload, dict) or not isinstance(payload.get("harnesses"), dict):
+        return None
+    return payload
 
 
 def effective_model(harnesses: dict | None, client: str) -> str | None:
     """One harness's ``effective_model``, parsed permissively.
 
     A harness Router does not list, or lists without a usable model, has no
-    default; so does a body of an unexpected shape.
+    default; so does a body of an unexpected shape, and an older Router's
+    per-key ``switchyard`` selection (see ``LEGACY_SWITCHYARD_SOURCE``).
     """
     entry = harnesses.get(client) if isinstance(harnesses, dict) else None
     if not isinstance(entry, dict):
+        return None
+    if entry.get("effective_model_source") == LEGACY_SWITCHYARD_SOURCE:
         return None
     model = entry.get("effective_model")
     return model.strip() if isinstance(model, str) and model.strip() else None

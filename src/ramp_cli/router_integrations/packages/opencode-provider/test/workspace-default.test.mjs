@@ -59,12 +59,22 @@ describe("fetchWorkspaceDefault", () => {
     })
   }
 
-  // Router answers `switchyard` (its virtual model) when the key's own
-  // Switchyard routing outranks the admin default, with the source named in
-  // `effective_model_source`. The name is used as given, and the source
-  // field, unknown or absent, is not read.
+  // Routers before the one-time Switchyard push answered `switchyard` (its
+  // virtual model) for every harness with source "switchyard"; that is not
+  // a workspace default and is ignored. A `switchyard` the admin chose, or
+  // one without a recognized source, is used as given.
+  it("ignores the switchyard model older Routers selected for the key", async () => {
+    const model = await fetchWorkspaceDefault({
+      usageOrigin: "https://router.example",
+        apiKey: "k",
+      fetch: async () =>
+        settings({ opencode: { model: "gpt-5.6-sol", effective_model: "switchyard", status: "available", effective_model_source: "switchyard" } }),
+    })
+    assert.equal(model, undefined)
+  })
+
   for (const [name, entry] of [
-    ["the key's Switchyard routing", { model: "gpt-5.6-sol", effective_model: "switchyard", status: "available", effective_model_source: "switchyard" }],
+    ["a workspace default", { model: "switchyard", effective_model: "switchyard", status: "available", effective_model_source: "workspace" }],
     ["an unknown source", { model: "gpt-5.6-sol", effective_model: "switchyard", status: "available", effective_model_source: "mystery" }],
     ["no source field", { model: "gpt-5.6-sol", effective_model: "switchyard", status: "available" }],
   ]) {

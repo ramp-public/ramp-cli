@@ -140,3 +140,59 @@ def test_failures_are_cached_too_and_clear_cache_forgets_them(monkeypatch):
     admin_defaults.clear_cache()
     assert admin_defaults.admin_default_model("codex", "k", ORIGIN) == "m"
     assert len(calls) == 2
+
+
+def test_ignores_the_switchyard_model_older_routers_selected_per_key(monkeypatch):
+    # Routers before the one-time push named `switchyard` for every harness;
+    # it is not a workspace default, and applying it would undo the user's
+    # own pick on every new session.
+    _settings_get(
+        monkeypatch,
+        _json(
+            200,
+            {
+                "harnesses": {
+                    "codex": {
+                        "model": None,
+                        "effective_model": "switchyard",
+                        "effective_model_source": "switchyard",
+                        "status": "unset",
+                    },
+                    "pi": {
+                        "model": "switchyard",
+                        "effective_model": "switchyard",
+                        "effective_model_source": "workspace",
+                        "status": "available",
+                    },
+                }
+            },
+        ),
+    )
+    assert admin_defaults.admin_default_model("codex", "secret", ORIGIN) is None
+    # An admin may still choose Switchyard as the workspace default.
+    assert admin_defaults.admin_default_model("pi", "secret", ORIGIN) == "switchyard"
+
+
+@pytest.mark.parametrize(
+    ("body", "offered"),
+    [
+        ({"harnesses": {}, "switchyard_offered": True}, True),
+        ({"harnesses": {}, "switchyard_offered": False}, False),
+        # Routers that predate the field.
+        ({"harnesses": {}}, False),
+        ({"harnesses": {}, "switchyard_offered": "true"}, False),
+        ({"switchyard_offered": True}, False),
+    ],
+)
+def test_switchyard_offered(monkeypatch, body, offered):
+    calls = _settings_get(monkeypatch, _json(200, body))
+    assert admin_defaults.switchyard_offered("secret", ORIGIN) is offered
+    # Shares the one cached read with the admin default.
+    admin_defaults.admin_default_model("codex", "secret", ORIGIN)
+    assert len(calls) == 1
+
+
+def test_switchyard_is_not_offered_when_router_cannot_be_asked(monkeypatch):
+    _settings_get(monkeypatch, _json(404, {"detail": "Not Found"}))
+    assert admin_defaults.switchyard_offered("secret", ORIGIN) is False
+    assert admin_defaults.switchyard_offered("", ORIGIN) is False

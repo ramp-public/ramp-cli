@@ -110,8 +110,7 @@ def organization_default(current: Connection) -> str | None:
         origin=router._settings_origin(current.client, current.path, current.base_url),
         timeout=2,
     )
-    model, _source = router._effective_model(harnesses, current.client)
-    return model
+    return router.admin_defaults.effective_model(harnesses, current.client)
 
 
 def editor(client: str) -> dict:

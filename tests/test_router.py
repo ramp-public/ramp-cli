@@ -90,8 +90,11 @@ def _mock_models(
     base_url=ROUTER_BASE_URL,
     cost_hook=_COST_HOOK_SCRIPT,
     coding_agent_settings=None,
+    switchyard_offered=None,
 ):
     models = models or [{"id": "gpt-5.4"}]
+    if switchyard_offered is not None and coding_agent_settings is None:
+        coding_agent_settings = {}
     models = [
         {**m, "router": m.get("router", _router_metadata(m["id"]))} for m in models
     ]
@@ -102,11 +105,10 @@ def _mock_models(
             assert headers["Authorization"] == f"Bearer {key}"
             if coding_agent_settings is not None:
                 get.settings_requests.append(url)
-                return httpx.Response(
-                    200,
-                    json={"harnesses": coding_agent_settings},
-                    request=httpx.Request("GET", url),
-                )
+                body = {"harnesses": coding_agent_settings}
+                if switchyard_offered is not None:
+                    body["switchyard_offered"] = switchyard_offered
+                return httpx.Response(200, json=body, request=httpx.Request("GET", url))
             return httpx.Response(404, request=httpx.Request("GET", url))
         if url.endswith("/claude-code-statusline"):
             # The status line asset has its own tests in test_claude_code.py;
@@ -142,7 +144,15 @@ def _mock_models(
         if "X-Gateway-Model-View" in headers:
             assert headers["X-Gateway-Model-View"] == "all"
         assert timeout == 10
-        if headers.get("X-Gateway-Client") == "codex":
+        # A model naming "views" is listed only in those projections (None
+        # is the generic one); every other model is listed in all of them.
+        view = headers.get("X-Gateway-Client")
+        listed = [
+            {key: value for key, value in model.items() if key != "views"}
+            for model in models
+            if view in model.get("views", (view,))
+        ]
+        if view == "codex":
             return httpx.Response(
                 200,
                 json={
@@ -154,13 +164,13 @@ def _mock_models(
                             "display_name": model["router"]["display_name"],
                             "base_instructions": "",
                         }
-                        for model in models
+                        for model in listed
                     ]
                 },
                 request=httpx.Request("GET", url),
             )
         return httpx.Response(
-            200, json={"data": models}, request=httpx.Request("GET", url)
+            200, json={"data": listed}, request=httpx.Request("GET", url)
         )
 
     get.settings_requests = []
@@ -2054,13 +2064,19 @@ def test_refresh_reapplies_claude_config_and_preserves_selected_model(
     assert settings["env"]["ANTHROPIC_BASE_URL"] == "https://stored.example"
 
 
-def _switchyard_settings(model="switchyard", source="switchyard", **harnesses):
-    """Router's coding-agent settings naming the same model for every harness."""
-    entry = {"effective_model": model, "effective_model_source": source}
-    return {
-        **{client: entry for client in ("claude-code", "codex", "opencode", "pi")},
-        **harnesses,
-    }
+SWITCHYARD = {"id": "switchyard", "views": (None, "codex")}
+# Claude Code's projection serves Switchyard under a Claude-shaped id; the
+# request name is what marks it in every view.
+CLAUDE_SWITCHYARD = {
+    "id": "claude-router-switchyard-3e865a[1m]",
+    "views": ("claude-code",),
+    "router": _router_metadata(
+        "claude-router-switchyard-3e865a[1m]",
+        request_name="switchyard",
+        display_name="Switchyard",
+    ),
+}
+SWITCHYARD_MODELS = [{"id": "gpt-5.6-sol"}, SWITCHYARD]
 
 
 def _opencode_model(tmp_path):
@@ -2069,9 +2085,9 @@ def _opencode_model(tmp_path):
     return f"ramp-router/{model}" if model else None
 
 
-def _connect_opencode(tmp_path, monkeypatch, **mock):
+def _connect_opencode(tmp_path, monkeypatch, models=SWITCHYARD_MODELS, **mock):
     monkeypatch.setenv("OPENCODE_CONFIG", str(tmp_path / "opencode" / "opencode.json"))
-    _mock_models(monkeypatch, [{"id": "gpt-5.6-sol"}, {"id": "switchyard"}], **mock)
+    _mock_models(monkeypatch, models, **mock)
     result = CliRunner().invoke(
         cli,
         ["--human", "router", "configure", "opencode", "--api-key", "router-secret"],
@@ -2080,269 +2096,642 @@ def _connect_opencode(tmp_path, monkeypatch, **mock):
     return result
 
 
-@pytest.mark.parametrize("generation", ["1", "2"])
-def test_configure_applies_routers_switchyard_model_and_says_so(
-    tmp_path, monkeypatch, generation
+def _refresh(*args):
+    result = CliRunner().invoke(cli, ["--human", "router", "refresh", *args])
+    assert result.exit_code == 0, result.output
+    return result
+
+
+def _choose(client, model):
+    chosen = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "model", client, "--model", model],
+    )
+    assert chosen.exit_code == 0, chosen.output
+
+
+def _pushes():
+    return router_module._read_switchyard_pushes()
+
+
+def _push_states(key="router-secret"):
+    """Each harness's part in the push for one key: "owed" or "done"."""
+    return _pushes()[_push_token(key)]["harnesses"]
+
+
+def _push_token(key="router-secret", base_url=ROUTER_BASE_URL):
+    return router_module._switchyard_push_token(key, base_url)
+
+
+def test_refresh_pushes_switchyard_once_into_every_supported_harness(
+    tmp_path, monkeypatch
 ):
-    monkeypatch.setenv("RAMP_OPENCODE_MAJOR", generation)
-    result = _connect_opencode(
-        tmp_path, monkeypatch, coding_agent_settings=_switchyard_settings()
+    claude_home = tmp_path / "claude"
+    codex_home = tmp_path / "codex"
+    pi_home = tmp_path / "pi"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(pi_home))
+    monkeypatch.setenv("OPENCODE_CONFIG", str(tmp_path / "opencode" / "opencode.json"))
+    # The generic view and Codex's
+    # catalog name the model `switchyard`, Claude Code's a Claude-shaped id.
+    models = [{"id": "gpt-5.6-sol"}, SWITCHYARD, CLAUDE_SWITCHYARD]
+    _mock_models(monkeypatch, models)
+    configured = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure",
+            "claude-code",
+            "codex",
+            "opencode",
+            "pi",
+            "--api-key",
+            "router-secret",
+        ],
+    )
+    assert configured.exit_code == 0, configured.output
+    assert "Switched" not in configured.output
+    pi_path = router_module._client_config_path("pi")
+    assert router_module._configured_model("pi", pi_path) == "gpt-5.6-sol"
+    config_path = codex_home / "config.toml"
+    settings_path = claude_home / "settings.json"
+    assert tomllib.loads(config_path.read_text())["model"] == "gpt-5.6-sol"
+    assert json.loads(settings_path.read_text())["model"] == "gpt-5.6-sol"
+    assert _opencode_model(tmp_path) == "ramp-router/gpt-5.6-sol"
+    assert _pushes() == {}
+
+    # The user saves a Switchyard pair: the first refresh moves every
+    # supported harness onto it, says so, and remembers it did.
+    get = _mock_models(monkeypatch, models, switchyard_offered=True)
+    refreshed = CliRunner().invoke(cli, ["--agent", "router", "refresh"])
+    assert refreshed.exit_code == 0, refreshed.output
+    assert tomllib.loads(config_path.read_text())["model"] == "switchyard"
+    assert (
+        json.loads(settings_path.read_text())["model"]
+        == "claude-router-switchyard-3e865a[1m]"
+    )
+    assert _opencode_model(tmp_path) == "ramp-router/switchyard"
+    assert router_module._configured_model("pi", pi_path) == "switchyard"
+    by_client = {
+        result["client"]: result
+        for result in json.loads(refreshed.stdout)["data"][0]["clients"]
+    }
+    assert by_client["codex"]["switchyard_model"] == "switchyard"
+    assert by_client["opencode"]["switchyard_model"] == "switchyard"
+    assert by_client["pi"]["switchyard_model"] == "switchyard"
+    assert (
+        by_client["claude-code"]["switchyard_model"]
+        == "claude-router-switchyard-3e865a[1m]"
+    )
+    # One key, one read of Router's settings, however many harnesses use it.
+    assert len(get.settings_requests) == 1
+    assert list(_pushes()) == [_push_token()]
+    assert router_module._switchyard_push_path().stat().st_mode & 0o777 == 0o600
+
+    # Nothing more to push or announce.
+    refreshed = _refresh()
+    assert "Switched" not in refreshed.output
+
+
+def test_the_push_is_announced_in_human_output(tmp_path, monkeypatch):
+    _connect_opencode(tmp_path, monkeypatch)
+    _mock_models(monkeypatch, SWITCHYARD_MODELS, switchyard_offered=True)
+    refreshed = _refresh()
+    assert "Refreshed the Ramp Router configuration for OpenCode." in refreshed.output
+    assert (
+        "Switched OpenCode to switchyard: Switchyard is now a model you select "
+        "instead of a strategy toggle. This happens once; choose another with "
+        "'ramp router configure model opencode --model MODEL'." in refreshed.output
     )
 
-    assert _opencode_model(tmp_path) == "ramp-router/switchyard"
-    assert (
-        "Switched OpenCode to switchyard, the model Router selects for this "
-        "key's Switchyard configuration. Choose another with "
-        "'ramp router configure model opencode --model MODEL'." in result.output
+
+def test_a_model_chosen_after_the_push_is_never_reverted(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _connect_opencode(tmp_path, monkeypatch)
+    configured = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
     )
-    recorded = json.loads(router_module._switchyard_defaults_path().read_text())
-    token = router_module._switchyard_default_token("router-secret", ROUTER_BASE_URL)
-    assert recorded == {token: {"opencode": "switchyard"}}
-    assert router_module._switchyard_defaults_path().stat().st_mode & 0o777 == 0o600
+    assert configured.exit_code == 0, configured.output
+    _mock_models(monkeypatch, SWITCHYARD_MODELS, switchyard_offered=True)
+    _refresh()
+    config_path = codex_home / "config.toml"
+    assert _opencode_model(tmp_path) == "ramp-router/switchyard"
+    assert tomllib.loads(config_path.read_text())["model"] == "switchyard"
+
+    # The user goes back to another model; Router keeps offering Switchyard,
+    # and neither later refreshes nor session-start hooks push it again.
+    _choose("opencode", "gpt-5.6-sol")
+    _choose("codex", "gpt-5.6-sol")
+    for _ in range(2):
+        refreshed = _refresh()
+        assert "Switched" not in refreshed.output
+        assert _opencode_model(tmp_path) == "ramp-router/gpt-5.6-sol"
+        assert tomllib.loads(config_path.read_text())["model"] == "gpt-5.6-sol"
+    assert _hook_sync().exit_code == 0
+    assert _hook_sync("--event", "stop").exit_code == 0
+    assert tomllib.loads(config_path.read_text())["model"] == "gpt-5.6-sol"
+
+    # Nor does reconnecting with the same key and endpoint.
+    reconnected = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "opencode", "--api-key", "router-secret"],
+    )
+    assert reconnected.exit_code == 0, reconnected.output
+    assert "Switched" not in reconnected.output
+    assert _opencode_model(tmp_path) == "ramp-router/gpt-5.6-sol"
 
 
 @pytest.mark.parametrize(
-    "coding_agent_settings",
+    "settings",
     [
         # Older Routers without the endpoint.
-        None,
-        # A workspace default stays a display-only hint.
-        _switchyard_settings(source="workspace"),
-        # Routers that predate the source field.
-        {"opencode": {"effective_model": "switchyard"}},
-        _switchyard_settings(model=None, source=None),
+        {},
+        # Routers that predate the field.
+        {"coding_agent_settings": {"opencode": {"effective_model": None}}},
+        {"switchyard_offered": False},
+        # Routers that selected Switchyard per harness and session instead.
+        {
+            "coding_agent_settings": {
+                client: {
+                    "effective_model": "switchyard",
+                    "effective_model_source": "switchyard",
+                }
+                for client in ("claude-code", "codex", "opencode", "pi")
+            }
+        },
     ],
 )
-def test_configure_leaves_the_default_alone_unless_router_selects_switchyard(
-    tmp_path, monkeypatch, coding_agent_settings
+def test_nothing_is_pushed_unless_router_offers_switchyard(
+    tmp_path, monkeypatch, settings
 ):
-    result = _connect_opencode(
-        tmp_path, monkeypatch, coding_agent_settings=coding_agent_settings
-    )
-
-    assert _opencode_model(tmp_path) == "ramp-router/gpt-5.6-sol"
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    result = _connect_opencode(tmp_path, monkeypatch, **settings)
     assert "Switched" not in result.output
-    assert not router_module._switchyard_defaults_path().exists()
-
-
-def test_configure_reports_the_switchyard_model_in_agent_mode(tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENCODE_CONFIG", str(tmp_path / "opencode" / "opencode.json"))
-    _mock_models(
-        monkeypatch,
-        [{"id": "gpt-5.6-sol"}, {"id": "switchyard"}],
-        coding_agent_settings=_switchyard_settings(),
+    configured = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
     )
+    assert configured.exit_code == 0, configured.output
 
+    _mock_models(monkeypatch, SWITCHYARD_MODELS, **settings)
+    refreshed = _refresh()
+    assert "Switched" not in refreshed.output
+    assert _opencode_model(tmp_path) == "ramp-router/gpt-5.6-sol"
+    # An older Router's per-key selection is not a Codex admin default either.
+    assert tomllib.loads((codex_home / "config.toml").read_text())["model"] == (
+        "gpt-5.6-sol"
+    )
+    assert router_module.CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY not in (
+        _codex_router_state(codex_home)
+    )
+    assert not router_module._switchyard_push_path().exists()
+
+
+def test_configure_pushes_when_it_is_the_first_to_see_the_offer(tmp_path, monkeypatch):
+    result = _connect_opencode(tmp_path, monkeypatch, switchyard_offered=True)
+    assert _opencode_model(tmp_path) == "ramp-router/switchyard"
+    assert "Switched OpenCode to switchyard" in result.output
+    assert list(_pushes()) == [_push_token()]
+
+    _choose("opencode", "gpt-5.6-sol")
+    refreshed = _refresh()
+    assert "Switched" not in refreshed.output
+    assert _opencode_model(tmp_path) == "ramp-router/gpt-5.6-sol"
+
+
+def test_configure_reports_the_pushed_model_in_agent_mode(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_CONFIG", str(tmp_path / "opencode" / "opencode.json"))
+    _mock_models(monkeypatch, SWITCHYARD_MODELS, switchyard_offered=True)
     result = CliRunner().invoke(
         cli,
         ["--agent", "router", "configure", "opencode", "--api-key", "router-secret"],
     )
-
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)["data"][0]
     assert payload["default_model"] == "switchyard"
     assert payload["switchyard_model"] == "switchyard"
 
 
-def test_configure_does_not_announce_a_switchyard_model_the_key_cannot_serve(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setenv("OPENCODE_CONFIG", str(tmp_path / "opencode" / "opencode.json"))
+def test_the_push_is_once_per_endpoint_and_credential(tmp_path, monkeypatch):
+    _connect_opencode(tmp_path, monkeypatch, switchyard_offered=True)
+    _choose("opencode", "gpt-5.6-sol")
+
+    # A different key is a different credential: it gets its own push.
     _mock_models(
-        monkeypatch,
-        [{"id": "gpt-5.6-sol"}],
-        coding_agent_settings=_switchyard_settings(),
+        monkeypatch, SWITCHYARD_MODELS, key="other-secret", switchyard_offered=True
     )
-
-    result = CliRunner().invoke(
+    reconnected = CliRunner().invoke(
         cli,
-        ["--human", "router", "configure", "opencode", "--api-key", "router-secret"],
+        ["--human", "router", "configure", "opencode", "--api-key", "other-secret"],
     )
-
-    assert result.exit_code == 0, result.output
-    assert _opencode_model(tmp_path) == "ramp-router/gpt-5.6-sol"
-    assert "Switched" not in result.output
-    assert not router_module._switchyard_defaults_path().exists()
+    assert reconnected.exit_code == 0, reconnected.output
+    assert _opencode_model(tmp_path) == "ramp-router/switchyard"
+    assert set(_pushes()) == {_push_token(), _push_token("other-secret")}
 
 
-def test_refresh_migrates_a_harness_to_routers_switchyard_model_once(
-    tmp_path, monkeypatch
-):
+def test_a_push_recorded_by_an_older_cli_counts(tmp_path, monkeypatch):
+    # CLIs that applied Router's per-key selection recorded each push; a key
+    # found there already met Switchyard and is not pushed again.
     _connect_opencode(tmp_path, monkeypatch)
+    legacy = router_module._legacy_switchyard_defaults_path()
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text(json.dumps({_push_token(): {"opencode": "switchyard"}}))
+    _mock_models(monkeypatch, SWITCHYARD_MODELS, switchyard_offered=True)
+    refreshed = _refresh()
+    assert "Switched" not in refreshed.output
     assert _opencode_model(tmp_path) == "ramp-router/gpt-5.6-sol"
 
-    # Router now selects Switchyard for this key: the next refresh moves the
-    # harness onto it and says why.
-    _mock_models(
-        monkeypatch,
-        [{"id": "gpt-5.6-sol"}, {"id": "switchyard"}],
-        coding_agent_settings=_switchyard_settings(),
-    )
-    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
-    assert refreshed.exit_code == 0, refreshed.output
-    assert _opencode_model(tmp_path) == "ramp-router/switchyard"
-    assert "Refreshed the Ramp Router configuration for OpenCode." in refreshed.output
-    assert "Switched OpenCode to switchyard" in refreshed.output
 
-    # A repeat refresh has nothing to announce.
-    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
-    assert refreshed.exit_code == 0, refreshed.output
-    assert "Switched" not in refreshed.output
-
-    # The push is a default, not a lock: a model the user picks afterwards
-    # survives later refreshes even though Router still selects Switchyard.
-    chosen = CliRunner().invoke(
-        cli,
-        [
-            "--human",
-            "router",
-            "configure",
-            "model",
-            "opencode",
-            "--model",
-            "gpt-5.6-sol",
-        ],
-    )
-    assert chosen.exit_code == 0, chosen.output
-    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
-    assert refreshed.exit_code == 0, refreshed.output
-    assert _opencode_model(tmp_path) == "ramp-router/gpt-5.6-sol"
-    assert "Switched" not in refreshed.output
-
-
-def test_refresh_falls_back_when_router_stops_selecting_switchyard(
-    tmp_path, monkeypatch
-):
-    _connect_opencode(
-        tmp_path, monkeypatch, coding_agent_settings=_switchyard_settings()
-    )
-    assert _opencode_model(tmp_path) == "ramp-router/switchyard"
-
-    # The user cleared the capable model, so Router no longer selects
-    # Switchyard, even while the id is still listed: the pushed selection is
-    # dropped the way a vanished model would be, back to the shared default.
-    _mock_models(
-        monkeypatch,
-        [{"id": "gpt-5.6-sol"}, {"id": "switchyard"}],
-        coding_agent_settings=_switchyard_settings(model=None, source=None),
-    )
-    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
-    assert refreshed.exit_code == 0, refreshed.output
-    assert _opencode_model(tmp_path) == "ramp-router/gpt-5.6-sol"
-    assert not json.loads(router_module._switchyard_defaults_path().read_text())
-
-    # Setting a capable model again pushes the model again.
-    _mock_models(
-        monkeypatch,
-        [{"id": "gpt-5.6-sol"}, {"id": "switchyard"}],
-        coding_agent_settings=_switchyard_settings(),
-    )
-    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
-    assert refreshed.exit_code == 0, refreshed.output
-    assert _opencode_model(tmp_path) == "ramp-router/switchyard"
-    assert "Switched OpenCode to switchyard" in refreshed.output
-
-
-def test_refresh_keeps_the_pushed_model_when_router_cannot_be_asked(
-    tmp_path, monkeypatch
-):
-    _connect_opencode(
-        tmp_path, monkeypatch, coding_agent_settings=_switchyard_settings()
-    )
-
-    # An unreachable or older control plane says nothing, which is not the
-    # same as saying no: the selection stays and so does the record.
-    _mock_models(monkeypatch, [{"id": "gpt-5.6-sol"}, {"id": "switchyard"}])
-    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
-
-    assert refreshed.exit_code == 0, refreshed.output
-    assert _opencode_model(tmp_path) == "ramp-router/switchyard"
-    token = router_module._switchyard_default_token("router-secret", ROUTER_BASE_URL)
-    assert json.loads(router_module._switchyard_defaults_path().read_text()) == {
-        token: {"opencode": "switchyard"}
-    }
-
-
-def test_refresh_records_a_switchyard_model_the_user_selected_themselves(
-    tmp_path, monkeypatch
-):
-    _connect_opencode(tmp_path, monkeypatch)
-    chosen = CliRunner().invoke(
-        cli,
-        [
-            "--human",
-            "router",
-            "configure",
-            "model",
-            "opencode",
-            "--model",
-            "switchyard",
-        ],
-    )
-    assert chosen.exit_code == 0, chosen.output
-
-    _mock_models(
-        monkeypatch,
-        [{"id": "gpt-5.6-sol"}, {"id": "switchyard"}],
-        coding_agent_settings=_switchyard_settings(),
-    )
-    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
-
-    assert refreshed.exit_code == 0, refreshed.output
-    assert "Switched" not in refreshed.output
-    token = router_module._switchyard_default_token("router-secret", ROUTER_BASE_URL)
-    assert json.loads(router_module._switchyard_defaults_path().read_text()) == {
-        token: {"opencode": "switchyard"}
-    }
-
-
-def test_refresh_keeps_the_record_when_the_switchyard_fallback_write_fails(
-    tmp_path, monkeypatch
-):
-    _connect_opencode(
-        tmp_path, monkeypatch, coding_agent_settings=_switchyard_settings()
-    )
-    _mock_models(
-        monkeypatch,
-        [{"id": "gpt-5.6-sol"}, {"id": "switchyard"}],
-        coding_agent_settings=_switchyard_settings(model=None, source=None),
-    )
-    monkeypatch.setattr(
-        router_module,
-        "_configure_plugin_client",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            click.ClickException("disk full")
-        ),
-    )
-
-    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
-
-    assert refreshed.exit_code != 0
-    assert "disk full" in refreshed.output
-    # The harness still holds the pushed id, so the record must survive for
-    # the next refresh to fall back instead of mistaking it for a user pick.
-    assert _opencode_model(tmp_path) == "ramp-router/switchyard"
-    token = router_module._switchyard_default_token("router-secret", ROUTER_BASE_URL)
-    assert json.loads(router_module._switchyard_defaults_path().read_text()) == {
-        token: {"opencode": "switchyard"}
-    }
-
-
-def test_refresh_does_not_push_switchyard_over_a_codex_pick_made_during_discovery(
-    tmp_path, monkeypatch
-):
+def test_harnesses_that_cannot_take_the_push_are_skipped(tmp_path, monkeypatch):
     codex_home = tmp_path / "codex"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
-    models = [{"id": "gpt-5.6-sol"}, {"id": "other"}, {"id": "switchyard"}]
+    _connect_opencode(tmp_path, monkeypatch)
+    configured = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert configured.exit_code == 0, configured.output
+
+    # Router offers Switchyard, but the key's model list does not carry it:
+    # refresh succeeds and leaves every harness where it was, and a later
+    # refresh that can push still does.
+    _mock_models(monkeypatch, [{"id": "gpt-5.6-sol"}], switchyard_offered=True)
+    refreshed = _refresh()
+    assert "Switched" not in refreshed.output
+    assert _opencode_model(tmp_path) == "ramp-router/gpt-5.6-sol"
+    assert _pushes() == {}
+
+    _mock_models(monkeypatch, SWITCHYARD_MODELS, switchyard_offered=True)
+    refreshed = _refresh()
+    assert _opencode_model(tmp_path) == "ramp-router/switchyard"
+    assert tomllib.loads((codex_home / "config.toml").read_text())["model"] == (
+        "switchyard"
+    )
+
+
+def test_hermes_is_not_pushed(tmp_path, monkeypatch):
+    # Router's coding-agent settings have no Hermes entry, so Hermes keeps the
+    # 'configure model hermes --model switchyard' path.
+    push = router_module._SwitchyardPush(("hermes",))
+    _mock_models(monkeypatch, SWITCHYARD_MODELS, switchyard_offered=True)
+    models = [
+        router_module.RouterModel(
+            id="switchyard",
+            metadata=router_module._model_metadata(
+                _router_metadata("switchyard"), "switchyard"
+            ),
+        )
+    ]
+    assert (
+        push.plan(
+            "hermes",
+            "router-secret",
+            ROUTER_BASE_URL,
+            origin="https://router.example",
+            models=models,
+        )
+        is None
+    )
+    assert not router_module._switchyard_push_path().exists()
+
+
+def test_switchyard_is_not_pushed_when_the_record_cannot_be_saved(
+    tmp_path, monkeypatch
+):
+    # An unremembered push would be repeated by later refreshes, over
+    # whatever the user picked in between; so no record, no push.
+    real_write = router_module._write_private_file
+
+    def failing_write(path, content):
+        if path == router_module._switchyard_push_path():
+            raise OSError("read-only")
+        return real_write(path, content)
+
+    monkeypatch.setattr(router_module, "_write_private_file", failing_write)
+    result = _connect_opencode(tmp_path, monkeypatch, switchyard_offered=True)
+    assert "Switched OpenCode" not in result.output
+    assert _opencode_model(tmp_path) == "ramp-router/gpt-5.6-sol"
+    assert not router_module._switchyard_push_path().exists()
+
+
+def test_a_push_whose_write_fails_is_retried(tmp_path, monkeypatch):
+    _connect_opencode(tmp_path, monkeypatch)
+    _mock_models(monkeypatch, SWITCHYARD_MODELS, switchyard_offered=True)
+    real_configure = router_module._configure_client
+
+    def failing_configure(client, *args, **kwargs):
+        if client == "opencode":
+            raise click.ClickException("disk full")
+        return real_configure(client, *args, **kwargs)
+
+    monkeypatch.setattr(router_module, "_configure_client", failing_configure)
+    failed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+    assert failed.exit_code != 0
+    assert "disk full" in failed.output
+    assert _push_states() == {"opencode": "owed"}
+    assert _opencode_model(tmp_path) == "ramp-router/gpt-5.6-sol"
+
+    monkeypatch.setattr(router_module, "_configure_client", real_configure)
+    _refresh()
+    assert _opencode_model(tmp_path) == "ramp-router/switchyard"
+    assert _push_states() == {"opencode": "done"}
+
+
+def test_a_push_that_landed_before_a_later_write_failed_stays_recorded(
+    tmp_path, monkeypatch
+):
+    # OpenCode's setup spans its config and its terminal settings. When the
+    # model write landed and only the second file failed, the harness is on
+    # Switchyard: the record must stand, or a later pick would be pushed over.
+    _connect_opencode(tmp_path, monkeypatch)
+    _mock_models(monkeypatch, SWITCHYARD_MODELS, switchyard_offered=True)
+    config_path = tmp_path / "opencode" / "opencode.json"
+    real_write = router_module._write_private_file
+
+    def failing_write(path, content):
+        if (
+            path not in (config_path, router_module._switchyard_push_path())
+            and _opencode_model(tmp_path) == "ramp-router/switchyard"
+        ):
+            raise OSError("disk full")
+        return real_write(path, content)
+
+    monkeypatch.setattr(router_module, "_write_private_file", failing_write)
+    failed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+    assert failed.exit_code != 0
+    assert _opencode_model(tmp_path) == "ramp-router/switchyard"
+    assert list(_pushes()) == [_push_token()]
+
+    monkeypatch.setattr(router_module, "_write_private_file", real_write)
+    _choose("opencode", "gpt-5.6-sol")
+    _refresh()
+    assert _opencode_model(tmp_path) == "ramp-router/gpt-5.6-sol"
+
+
+def test_a_harness_whose_write_failed_is_retried_alone(tmp_path, monkeypatch):
+    # The push is once per key and endpoint, but per harness in effect: one
+    # that took it is never pushed again, and one whose write failed gets it
+    # on a later run instead of being skipped for good.
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _connect_opencode(tmp_path, monkeypatch)
+    configured = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert configured.exit_code == 0, configured.output
+    config_path = codex_home / "config.toml"
+    _mock_models(monkeypatch, SWITCHYARD_MODELS, switchyard_offered=True)
+    real_configure = router_module._configure_client
+
+    def failing_configure(client, *args, **kwargs):
+        if client == "codex":
+            raise click.ClickException("disk full")
+        return real_configure(client, *args, **kwargs)
+
+    monkeypatch.setattr(router_module, "_configure_client", failing_configure)
+    failed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+    assert failed.exit_code != 0
+    assert _opencode_model(tmp_path) == "ramp-router/switchyard"
+    assert tomllib.loads(config_path.read_text())["model"] == "gpt-5.6-sol"
+    assert _push_states() == {"codex": "owed", "opencode": "done"}
+
+    # The user moves OpenCode off Switchyard; the retry reaches Codex only.
+    monkeypatch.setattr(router_module, "_configure_client", real_configure)
+    _choose("opencode", "gpt-5.6-sol")
+    refreshed = _refresh()
+    assert "Switched Codex to switchyard" in refreshed.output
+    assert "Switched OpenCode" not in refreshed.output
+    assert tomllib.loads(config_path.read_text())["model"] == "switchyard"
+    assert _opencode_model(tmp_path) == "ramp-router/gpt-5.6-sol"
+    assert _push_states() == {"codex": "done", "opencode": "done"}
+
+    # Neither is pushed again, and a harness connected later is not pushed.
+    _choose("codex", "gpt-5.6-sol")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "pi"))
+    connected = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "pi", "--api-key", "router-secret"]
+    )
+    assert connected.exit_code == 0, connected.output
+    refreshed = _refresh()
+    assert "Switched" not in connected.output + refreshed.output
+    assert tomllib.loads(config_path.read_text())["model"] == "gpt-5.6-sol"
+    assert router_module._configured_model(
+        "pi", router_module._client_config_path("pi")
+    ) == ("gpt-5.6-sol")
+
+
+def test_harnesses_an_interrupted_run_did_not_finish_are_retried(tmp_path, monkeypatch):
+    # Codex's write fails and the run is interrupted before OpenCode is even
+    # read: both are still owed the push, and the next run delivers it.
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _connect_opencode(tmp_path, monkeypatch)
+    configured = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert configured.exit_code == 0, configured.output
+    _mock_models(monkeypatch, SWITCHYARD_MODELS, switchyard_offered=True)
+    real_configure = router_module._configure_client
+
+    def failing_configure(client, *args, **kwargs):
+        if client == "codex":
+            raise click.ClickException("disk full")
+        return real_configure(client, *args, **kwargs)
+
+    # Codex fails as a reported failure; then the user interrupts while
+    # OpenCode is still being read.
+    monkeypatch.setattr(router_module, "_configure_client", failing_configure)
+    monkeypatch.setattr(
+        router_module, "configured_router_clients", lambda: ("codex", "opencode")
+    )
+    real_stored_key = router_module._stored_router_api_key
+
+    def stored_key(client, path):
+        if client == "opencode":
+            raise KeyboardInterrupt
+        return real_stored_key(client, path)
+
+    monkeypatch.setattr(router_module, "_stored_router_api_key", stored_key)
+    interrupted = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+    assert interrupted.exit_code != 0
+    assert _push_states() == {"codex": "owed", "opencode": "owed"}
+
+    monkeypatch.setattr(router_module, "_configure_client", real_configure)
+    monkeypatch.setattr(router_module, "_stored_router_api_key", real_stored_key)
+    _refresh()
+    assert _opencode_model(tmp_path) == "ramp-router/switchyard"
+    assert tomllib.loads((codex_home / "config.toml").read_text())["model"] == (
+        "switchyard"
+    )
+
+
+def test_a_partly_failed_write_is_settled_before_the_next_harness(
+    tmp_path, monkeypatch
+):
+    # OpenCode's model landed but a later file of its setup failed. That is
+    # settled at once: a pick the user makes while the next harness is being
+    # discovered is not pushed over by a later refresh.
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _connect_opencode(tmp_path, monkeypatch)
+    configured = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert configured.exit_code == 0, configured.output
+    _mock_models(monkeypatch, SWITCHYARD_MODELS, switchyard_offered=True)
+    monkeypatch.setattr(
+        router_module, "configured_router_clients", lambda: ("opencode", "codex")
+    )
+    config_path = tmp_path / "opencode" / "opencode.json"
+    real_write = router_module._write_private_file
+
+    def failing_write(path, content):
+        if (
+            path not in (config_path, router_module._switchyard_push_path())
+            and _opencode_model(tmp_path) == "ramp-router/switchyard"
+            and "codex" not in str(path)
+        ):
+            raise OSError("disk full")
+        return real_write(path, content)
+
+    fetch_catalog = router_module._fetch_codex_catalog
+
+    def pick_during_codex_discovery(*args, **kwargs):
+        monkeypatch.setattr(router_module, "_write_private_file", real_write)
+        config = json.loads(config_path.read_text())
+        config["model"] = "ramp-router/gpt-5.6-sol"
+        config_path.write_text(json.dumps(config))
+        return fetch_catalog(*args, **kwargs)
+
+    monkeypatch.setattr(router_module, "_write_private_file", failing_write)
+    monkeypatch.setattr(
+        router_module, "_fetch_codex_catalog", pick_during_codex_discovery
+    )
+    failed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+    assert failed.exit_code != 0
+    assert _push_states()["opencode"] == "done"
+
+    monkeypatch.setattr(router_module, "_fetch_codex_catalog", fetch_catalog)
+    _refresh()
+    assert _opencode_model(tmp_path) == "ramp-router/gpt-5.6-sol"
+
+
+def test_claude_code_follows_a_renamed_switchyard_alias(tmp_path, monkeypatch):
+    # Claude Code's alias carries "[1m]" only while the capable model has a
+    # 1M window; a harness on Switchyard stays on it when that changes.
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    models = [{"id": "gpt-5.6-sol"}, SWITCHYARD, CLAUDE_SWITCHYARD]
+    _mock_models(monkeypatch, models, switchyard_offered=True)
+    configured = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "claude-code", "--api-key", "router-secret"],
+    )
+    assert configured.exit_code == 0, configured.output
+    settings_path = claude_home / "settings.json"
+    assert json.loads(settings_path.read_text())["model"] == (
+        "claude-router-switchyard-3e865a[1m]"
+    )
+
+    renamed = {
+        **CLAUDE_SWITCHYARD,
+        "id": "claude-router-switchyard-3e865a",
+        "router": _router_metadata(
+            "claude-router-switchyard-3e865a", request_name="switchyard"
+        ),
+    }
+    _mock_models(
+        monkeypatch,
+        [{"id": "gpt-5.6-sol"}, SWITCHYARD, renamed],
+        switchyard_offered=True,
+    )
+    refreshed = _refresh()
+    assert "Switched" not in refreshed.output
+    assert json.loads(settings_path.read_text())["model"] == (
+        "claude-router-switchyard-3e865a"
+    )
+
+    # A model the user picked is not mistaken for one.
+    _choose("claude-code", "gpt-5.6-sol")
+    _mock_models(monkeypatch, models, switchyard_offered=True)
+    _refresh()
+    assert json.loads(settings_path.read_text())["model"] == "gpt-5.6-sol"
+
+
+def test_a_non_click_failure_releases_the_claim(tmp_path, monkeypatch):
+    _connect_opencode(tmp_path, monkeypatch)
+    _mock_models(monkeypatch, SWITCHYARD_MODELS, switchyard_offered=True)
+    real_configure = router_module._configure_client
+    monkeypatch.setattr(
+        router_module,
+        "_configure_client",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError("locked")),
+    )
+    failed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+    assert failed.exit_code != 0
+    assert _push_states() == {"opencode": "owed"}
+
+    monkeypatch.setattr(router_module, "_configure_client", real_configure)
+    _refresh()
+    assert _opencode_model(tmp_path) == "ramp-router/switchyard"
+
+
+def test_a_harness_is_claimed_by_one_run_at_a_time(tmp_path, monkeypatch):
+    # A manual refresh overlapping the detached session-start one: only the
+    # first to claim a harness pushes it, whether the push is new or a retry.
+    token = _push_token()
+    owed = {"opencode", "pi"}
+    claim = router_module._claim_switchyard_push
+    assert claim(token, "opencode", owed=owed, skipped=set())
+    assert not claim(token, "opencode", owed=owed, skipped=set())
+    router_module._release_switchyard_push(token, "opencode")
+    assert claim(token, "opencode", owed=owed, skipped=set())
+    assert not claim(token, "opencode", owed=owed, skipped=set())
+    assert _push_states() == {"opencode": "done", "pi": "owed"}
+
+
+def test_a_landed_push_is_not_retried_when_recording_fails(tmp_path, monkeypatch):
+    # The claim marks the harness done before it changes, so a push that
+    # landed needs no later write to stop it repeating.
+    _connect_opencode(tmp_path, monkeypatch)
+    _mock_models(monkeypatch, SWITCHYARD_MODELS, switchyard_offered=True)
+    real_write = router_module._write_private_file
+    push_path = router_module._switchyard_push_path()
+    writes = []
+
+    def write_once(path, content):
+        if path == push_path:
+            writes.append(path)
+            if len(writes) > 1:
+                raise OSError("read-only")
+        return real_write(path, content)
+
+    monkeypatch.setattr(router_module, "_write_private_file", write_once)
+    _refresh()
+    assert _opencode_model(tmp_path) == "ramp-router/switchyard"
+    assert _push_states() == {"opencode": "done"}
+    assert len(writes) == 1
+
+    _choose("opencode", "gpt-5.6-sol")
+    refreshed = _refresh()
+    assert "Switched" not in refreshed.output
+    assert _opencode_model(tmp_path) == "ramp-router/gpt-5.6-sol"
+
+
+def test_a_codex_pick_made_during_discovery_answers_the_push(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    models = [{"id": "gpt-5.6-sol"}, {"id": "other"}, SWITCHYARD]
     _mock_models(monkeypatch, models)
     configured = CliRunner().invoke(
         cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
     )
     assert configured.exit_code == 0, configured.output
     config_path = codex_home / "config.toml"
-    assert tomllib.loads(config_path.read_text())["model"] == "gpt-5.6-sol"
 
-    _mock_models(monkeypatch, models, coding_agent_settings=_switchyard_settings())
+    _mock_models(monkeypatch, models, switchyard_offered=True)
     fetch_catalog = router_module._fetch_codex_catalog
 
     def pick_during_discovery(*args, **kwargs):
@@ -2355,66 +2744,75 @@ def test_refresh_does_not_push_switchyard_over_a_codex_pick_made_during_discover
         return fetch_catalog(*args, **kwargs)
 
     monkeypatch.setattr(router_module, "_fetch_codex_catalog", pick_during_discovery)
-    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
-
-    assert refreshed.exit_code == 0, refreshed.output
+    refreshed = _refresh()
     assert tomllib.loads(config_path.read_text())["model"] == "other"
     assert "Switched" not in refreshed.output
-    # The preserved choice counts as the user's answer to the migration, so
-    # the next refresh does not push (or announce) Switchyard over it...
-    token = router_module._switchyard_default_token("router-secret", ROUTER_BASE_URL)
-    assert json.loads(router_module._switchyard_defaults_path().read_text()) == {
-        token: {"codex": "switchyard"}
-    }
+    # The preserved choice is the user's answer: no later push over it.
+    assert list(_pushes()) == [_push_token()]
     monkeypatch.setattr(router_module, "_fetch_codex_catalog", fetch_catalog)
-    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
-    assert refreshed.exit_code == 0, refreshed.output
+    refreshed = _refresh()
     assert "Switched" not in refreshed.output
-    # ...but Router still names Switchyard as the model every new Codex
-    # session starts on, which a settled refresh writes back, the same way
-    # the OpenCode and Pi plugins start each new session on it. The pick
-    # made mid-flight was protected from the race, not made permanent.
-    assert tomllib.loads(config_path.read_text())["model"] == "switchyard"
+    assert tomllib.loads(config_path.read_text())["model"] == "other"
 
 
-def test_refresh_keeps_a_codex_pick_made_during_the_switchyard_fallback(
-    tmp_path, monkeypatch
-):
+def test_org_defaults_still_start_new_sessions_after_the_push(tmp_path, monkeypatch):
     codex_home = tmp_path / "codex"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
-    models = [{"id": "gpt-5.6-sol"}, {"id": "other"}, {"id": "switchyard"}]
-    _mock_models(monkeypatch, models, coding_agent_settings=_switchyard_settings())
+    monkeypatch.setenv("RAMP_OPENCODE_MAJOR", "2")
+    models = [{"id": "gpt-5.6-sol"}, {"id": "gpt-5.5"}, SWITCHYARD]
+    org_defaults = {
+        **_admin_default("gpt-5.5"),
+        "opencode": {
+            "model": "gpt-5.5",
+            "effective_model": "gpt-5.5",
+            "effective_model_source": "workspace",
+            "status": "available",
+        },
+    }
+    _connect_opencode(tmp_path, monkeypatch, models=models)
     configured = CliRunner().invoke(
         cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
     )
     assert configured.exit_code == 0, configured.output
     config_path = codex_home / "config.toml"
-    assert tomllib.loads(config_path.read_text())["model"] == "switchyard"
 
-    # Router stopped selecting Switchyard, so refresh plans a fallback to the
-    # default, but the user picks a model while discovery is in flight.
     _mock_models(
         monkeypatch,
         models,
-        coding_agent_settings=_switchyard_settings(model=None, source=None),
+        coding_agent_settings=org_defaults,
+        switchyard_offered=True,
     )
-    fetch_catalog = router_module._fetch_codex_catalog
+    refreshed = _refresh()
+    # Codex has a single model setting that its hooks hold on the org
+    # default for every new session, so the push leaves it alone.
+    assert tomllib.loads(config_path.read_text())["model"] == "gpt-5.5"
+    assert "Switched Codex" not in refreshed.output
+    assert (
+        _codex_router_state(codex_home)[
+            router_module.CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY
+        ]
+        == "gpt-5.5"
+    )
+    # OpenCode v2 keeps a saved preference (the plugin's defaultModel) apart
+    # from the org default its plugin starts each new session on: the push
+    # sets the preference only.
+    assert _opencode_model(tmp_path) == "ramp-router/switchyard"
+    opencode_path = tmp_path / "opencode" / "opencode.json"
+    assert "model" not in json.loads(opencode_path.read_text())
+    assert _opencode_default_model_option(opencode_path) == "switchyard"
 
-    def pick_during_discovery(*args, **kwargs):
-        config_path.write_text(
-            config_path.read_text().replace('model = "switchyard"', 'model = "other"')
-        )
-        return fetch_catalog(*args, **kwargs)
-
-    monkeypatch.setattr(router_module, "_fetch_codex_catalog", pick_during_discovery)
-    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
-
-    assert refreshed.exit_code == 0, refreshed.output
-    assert tomllib.loads(config_path.read_text())["model"] == "other"
-    assert not json.loads(router_module._switchyard_defaults_path().read_text())
+    # A session's own pick in Codex is put back to the org default for the
+    # next session, as before the push.
+    config_path.write_text(
+        config_path.read_text().replace('model = "gpt-5.5"', 'model = "switchyard"')
+    )
+    assert _hook_sync("--event", "stop").exit_code == 0
+    assert tomllib.loads(config_path.read_text())["model"] == "gpt-5.5"
+    refreshed = _refresh()
+    assert tomllib.loads(config_path.read_text())["model"] == "gpt-5.5"
 
 
-def test_switchyard_settings_are_read_from_the_setups_dashboard_origin(
+def test_switchyard_offer_is_read_from_the_setups_dashboard_origin(
     tmp_path, monkeypatch
 ):
     # A split deployment serves the control plane on a host that is not the
@@ -2422,12 +2820,11 @@ def test_switchyard_settings_are_read_from_the_setups_dashboard_origin(
     # records it in each setup, so refresh must ask there, not derive one.
     monkeypatch.setenv("OPENCODE_CONFIG", str(tmp_path / "opencode" / "opencode.json"))
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
-    models = [{"id": "gpt-5.6-sol"}, {"id": "switchyard"}]
     get = _mock_models(
         monkeypatch,
-        models,
+        SWITCHYARD_MODELS,
         base_url="https://gw.example/v1",
-        coding_agent_settings=_switchyard_settings(),
+        coding_agent_settings={},
     )
     configured = CliRunner().invoke(
         cli,
@@ -2449,28 +2846,27 @@ def test_switchyard_settings_are_read_from_the_setups_dashboard_origin(
     assert get.settings_requests == [
         "https://dash.example/self-service/coding-agent-settings"
     ]
-    assert _opencode_model(tmp_path) == "ramp-router/switchyard"
-    assert tomllib.loads((tmp_path / "codex" / "config.toml").read_text())["model"] == (
-        "switchyard"
-    )
 
     # Without the configure-time override in the environment, refresh still
     # finds the recorded origin in both setups and reads it once per key.
     get = _mock_models(
         monkeypatch,
-        models,
+        SWITCHYARD_MODELS,
         base_url="https://gw.example/v1",
-        coding_agent_settings=_switchyard_settings(),
+        switchyard_offered=True,
     )
     # ...and every refresh keeps that origin in the rewritten setups, even
     # under an unrelated override, so the next one still asks there.
     monkeypatch.setenv("RAMP_ROUTER_UI_URL", "https://other.example")
     for _ in range(2):
-        refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
-        assert refreshed.exit_code == 0, refreshed.output
+        _refresh()
     assert (
         get.settings_requests
         == ["https://dash.example/self-service/coding-agent-settings"] * 2
+    )
+    assert _opencode_model(tmp_path) == "ramp-router/switchyard"
+    assert tomllib.loads((tmp_path / "codex" / "config.toml").read_text())["model"] == (
+        "switchyard"
     )
     assert router_module._stored_usage_origin(
         "codex", tmp_path / "codex" / "config.toml"
@@ -2485,16 +2881,10 @@ def test_refresh_writes_back_a_model_saved_during_its_settings_request(
 ):
     # The settings round trip is new network time between reading OpenCode's
     # selection and writing it back; a model saved meanwhile must win.
-    models = [{"id": "gpt-5.6-sol"}, {"id": "gpt-5.5"}, {"id": "switchyard"}]
+    models = [{"id": "gpt-5.6-sol"}, {"id": "gpt-5.5"}, SWITCHYARD]
     _connect_opencode(tmp_path, monkeypatch)
     assert _opencode_model(tmp_path) == "ramp-router/gpt-5.6-sol"
-    real_get = _mock_models(
-        monkeypatch,
-        models,
-        coding_agent_settings=_switchyard_settings(
-            source="workspace", model="gpt-5.6-sol"
-        ),
-    )
+    real_get = _mock_models(monkeypatch, models, switchyard_offered=False)
 
     def racing_get(url, **kwargs):
         response = real_get(url, **kwargs)
@@ -2506,318 +2896,8 @@ def test_refresh_writes_back_a_model_saved_during_its_settings_request(
         return response
 
     monkeypatch.setattr(router_module.httpx, "get", racing_get)
-    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
-    assert refreshed.exit_code == 0, refreshed.output
+    _refresh()
     assert _opencode_model(tmp_path) == "ramp-router/gpt-5.5"
-
-
-def test_refresh_pushes_switchyard_into_codex_and_claude_code(tmp_path, monkeypatch):
-    claude_home = tmp_path / "claude"
-    codex_home = tmp_path / "codex"
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
-    monkeypatch.setenv("CODEX_HOME", str(codex_home))
-    # One list stands in for every view here; Router's generic view lists
-    # the canonical id and its Claude Code view the Claude-shaped one.
-    models = [
-        {"id": "gpt-5.6-sol"},
-        {"id": "switchyard"},
-        {"id": "claude-router-switchyard-3e865a"},
-    ]
-    _mock_models(monkeypatch, models)
-    configured = CliRunner().invoke(
-        cli,
-        [
-            "--human",
-            "router",
-            "configure",
-            "claude-code",
-            "codex",
-            "--api-key",
-            "router-secret",
-        ],
-    )
-    assert configured.exit_code == 0, configured.output
-    config_path = codex_home / "config.toml"
-    settings_path = claude_home / "settings.json"
-    assert tomllib.loads(config_path.read_text())["model"] == "gpt-5.6-sol"
-    assert json.loads(settings_path.read_text())["model"] == "gpt-5.6-sol"
-
-    get = _mock_models(
-        monkeypatch,
-        models,
-        coding_agent_settings=_switchyard_settings(
-            **{
-                "claude-code": {
-                    "effective_model": "claude-router-switchyard-3e865a",
-                    "effective_model_source": "switchyard",
-                }
-            }
-        ),
-    )
-    refreshed = CliRunner().invoke(cli, ["--agent", "router", "refresh"])
-
-    assert refreshed.exit_code == 0, refreshed.output
-    # Codex writes the catalog slug; refresh must not re-read its config and
-    # keep the old selection.
-    assert tomllib.loads(config_path.read_text())["model"] == "switchyard"
-    assert (
-        json.loads(settings_path.read_text())["model"]
-        == "claude-router-switchyard-3e865a"
-    )
-    by_client = {
-        result["client"]: result
-        for result in json.loads(refreshed.stdout)["data"][0]["clients"]
-    }
-    assert by_client["codex"]["switchyard_model"] == "switchyard"
-    assert (
-        by_client["claude-code"]["switchyard_model"]
-        == "claude-router-switchyard-3e865a"
-    )
-    # One key, one read of Router's settings, however many harnesses use it.
-    assert len(get.settings_requests) == 1
-
-
-def test_a_harness_still_on_the_pushed_id_follows_router_to_a_new_one(
-    tmp_path, monkeypatch
-):
-    # Claude Code's Switchyard id carries a hash of the configuration, so a
-    # capable-tier change renames it. The harness holding exactly the id that
-    # was pushed is on the default, not on a choice: it moves to the new id
-    # instead of falling off Switchyard because the old one vanished.
-    claude_home = tmp_path / "claude"
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
-    old_id, new_id = (
-        "claude-router-switchyard-3e865a",
-        "claude-router-switchyard-9f1c2b",
-    )
-    settings = lambda model: _switchyard_settings(  # noqa: E731
-        **{
-            "claude-code": {
-                "effective_model": model,
-                "effective_model_source": "switchyard",
-            }
-        }
-    )
-    _mock_models(
-        monkeypatch,
-        [{"id": "gpt-5.6-sol"}, {"id": old_id}],
-        coding_agent_settings=settings(old_id),
-    )
-    configured = CliRunner().invoke(
-        cli,
-        ["--human", "router", "configure", "claude-code", "--api-key", "router-secret"],
-    )
-    assert configured.exit_code == 0, configured.output
-    settings_path = claude_home / "settings.json"
-    assert json.loads(settings_path.read_text())["model"] == old_id
-
-    _mock_models(
-        monkeypatch,
-        [{"id": "gpt-5.6-sol"}, {"id": new_id}],
-        coding_agent_settings=settings(new_id),
-    )
-    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
-    assert refreshed.exit_code == 0, refreshed.output
-    assert json.loads(settings_path.read_text())["model"] == new_id
-    assert f"Switched Claude Code to {new_id}" in refreshed.output
-    (record,) = router_module._read_switchyard_defaults().values()
-    assert record == {"claude-code": new_id}
-
-    # A model the user picked is a choice, and stays through such a rename.
-    chosen = CliRunner().invoke(
-        cli,
-        [
-            "--human",
-            "router",
-            "configure",
-            "model",
-            "claude-code",
-            "--model",
-            "gpt-5.6-sol",
-        ],
-    )
-    assert chosen.exit_code == 0, chosen.output
-    _mock_models(
-        monkeypatch,
-        [{"id": "gpt-5.6-sol"}, {"id": old_id}],
-        coding_agent_settings=settings(old_id),
-    )
-    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
-    assert refreshed.exit_code == 0, refreshed.output
-    assert json.loads(settings_path.read_text())["model"] == "gpt-5.6-sol"
-
-
-def test_switchyard_is_not_pushed_when_the_record_cannot_be_saved(
-    tmp_path, monkeypatch
-):
-    # An unremembered push would be repeated by every later refresh, over
-    # whatever the user picked in between; so no record, no push.
-    real_write = router_module._write_private_file
-
-    def failing_write(path, content):
-        if path == router_module._switchyard_defaults_path():
-            raise OSError("read-only")
-        return real_write(path, content)
-
-    monkeypatch.setattr(router_module, "_write_private_file", failing_write)
-    result = _connect_opencode(
-        tmp_path, monkeypatch, coding_agent_settings=_switchyard_settings()
-    )
-    assert "Switched OpenCode" not in result.output
-    assert _opencode_model(tmp_path) == "ramp-router/gpt-5.6-sol"
-    assert not router_module._switchyard_defaults_path().exists()
-
-
-def test_a_push_whose_write_fails_is_forgotten(tmp_path, monkeypatch):
-    # The record is made before the write; a write that fails must not leave
-    # it behind, or the next refresh would skip the push for good.
-    _connect_opencode(tmp_path, monkeypatch)
-    _mock_models(
-        monkeypatch,
-        [{"id": "gpt-5.6-sol"}, {"id": "switchyard"}],
-        coding_agent_settings=_switchyard_settings(),
-    )
-    real_configure = router_module._configure_client
-
-    def failing_configure(client, *args, **kwargs):
-        if client == "opencode":
-            raise click.ClickException("disk full")
-        return real_configure(client, *args, **kwargs)
-
-    monkeypatch.setattr(router_module, "_configure_client", failing_configure)
-    failed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
-    assert failed.exit_code != 0
-    assert "disk full" in failed.output
-    assert router_module._read_switchyard_defaults() == {}
-    assert _opencode_model(tmp_path) == "ramp-router/gpt-5.6-sol"
-
-    monkeypatch.setattr(router_module, "_configure_client", real_configure)
-    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
-    assert refreshed.exit_code == 0, refreshed.output
-    assert _opencode_model(tmp_path) == "ramp-router/switchyard"
-
-
-def test_a_push_that_landed_before_a_later_write_failed_stays_recorded(
-    tmp_path, monkeypatch
-):
-    # OpenCode's setup spans its config and its terminal settings. When the
-    # model write landed and only the second file failed, the harness is on
-    # the pushed id: the record must stand, or a later pick would be pushed
-    # over on the next refresh.
-    _connect_opencode(tmp_path, monkeypatch)
-    _mock_models(
-        monkeypatch,
-        [{"id": "gpt-5.6-sol"}, {"id": "switchyard"}],
-        coding_agent_settings=_switchyard_settings(),
-    )
-    config_path = tmp_path / "opencode" / "opencode.json"
-    real_write = router_module._write_private_file
-
-    def failing_write(path, content):
-        if (
-            path not in (config_path, router_module._switchyard_defaults_path())
-            and _opencode_model(tmp_path) == "ramp-router/switchyard"
-        ):
-            raise OSError("disk full")
-        return real_write(path, content)
-
-    monkeypatch.setattr(router_module, "_write_private_file", failing_write)
-    failed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
-    assert failed.exit_code != 0
-    assert _opencode_model(tmp_path) == "ramp-router/switchyard"
-    (record,) = router_module._read_switchyard_defaults().values()
-    assert record == {"opencode": "switchyard"}
-
-    monkeypatch.setattr(router_module, "_write_private_file", real_write)
-    chosen = CliRunner().invoke(
-        cli,
-        [
-            "--human",
-            "router",
-            "configure",
-            "model",
-            "opencode",
-            "--model",
-            "gpt-5.6-sol",
-        ],
-    )
-    assert chosen.exit_code == 0, chosen.output
-    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
-    assert refreshed.exit_code == 0, refreshed.output
-    assert _opencode_model(tmp_path) == "ramp-router/gpt-5.6-sol"
-
-
-def test_a_failed_reconfigure_restores_the_earlier_push_record(tmp_path, monkeypatch):
-    # A reconnect pushes regardless of the record, so its record overwrites
-    # the earlier push's. Should that write fail with a non-Click error, the
-    # earlier record is what comes back, not nothing and not the new one:
-    # the user's pick since the first push is still a pick.
-    claude_home = tmp_path / "claude"
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
-    old_id, new_id = (
-        "claude-router-switchyard-3e865a",
-        "claude-router-switchyard-9f1c2b",
-    )
-    settings = lambda model: _switchyard_settings(  # noqa: E731
-        **{
-            "claude-code": {
-                "effective_model": model,
-                "effective_model_source": "switchyard",
-            }
-        }
-    )
-    _mock_models(
-        monkeypatch,
-        [{"id": "gpt-5.6-sol"}, {"id": old_id}],
-        coding_agent_settings=settings(old_id),
-    )
-    connect = [
-        "--human",
-        "router",
-        "configure",
-        "claude-code",
-        "--api-key",
-        "router-secret",
-    ]
-    assert CliRunner().invoke(cli, connect).exit_code == 0
-    chosen = CliRunner().invoke(
-        cli,
-        [
-            "--human",
-            "router",
-            "configure",
-            "model",
-            "claude-code",
-            "--model",
-            "gpt-5.6-sol",
-        ],
-    )
-    assert chosen.exit_code == 0, chosen.output
-    (before,) = router_module._read_switchyard_defaults().values()
-    assert before == {"claude-code": old_id}
-
-    _mock_models(
-        monkeypatch,
-        [{"id": "gpt-5.6-sol"}, {"id": new_id}],
-        coding_agent_settings=settings(new_id),
-    )
-    real_configure = router_module._configure_client
-
-    def failing_configure(client, *args, **kwargs):
-        raise PermissionError("locked")
-
-    monkeypatch.setattr(router_module, "_configure_client", failing_configure)
-    failed = CliRunner().invoke(cli, connect)
-    assert failed.exit_code != 0
-    settings_path = claude_home / "settings.json"
-    assert json.loads(settings_path.read_text())["model"] == "gpt-5.6-sol"
-    (after,) = router_module._read_switchyard_defaults().values()
-    assert after == before
-
-    monkeypatch.setattr(router_module, "_configure_client", real_configure)
-    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
-    assert refreshed.exit_code == 0, refreshed.output
-    assert json.loads(settings_path.read_text())["model"] == "gpt-5.6-sol"
 
 
 def test_codex_keeps_its_dashboard_origin_without_the_cost_hook(tmp_path, monkeypatch):
@@ -2825,7 +2905,7 @@ def test_codex_keeps_its_dashboard_origin_without_the_cost_hook(tmp_path, monkey
     # carries is also recorded in the receipt and read back from there.
     codex_home = tmp_path / "codex"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
-    models = [{"id": "gpt-5.6-sol"}, {"id": "switchyard"}]
+    models = SWITCHYARD_MODELS
     _mock_models(monkeypatch, models, base_url="https://gw.example/v1", cost_hook=None)
     configured = CliRunner().invoke(
         cli,
@@ -2863,7 +2943,7 @@ def test_codex_keeps_its_dashboard_origin_without_the_cost_hook(tmp_path, monkey
         models,
         base_url="https://gw.example/v1",
         cost_hook=None,
-        coding_agent_settings=_switchyard_settings(),
+        switchyard_offered=True,
     )
     refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
     assert refreshed.exit_code == 0, refreshed.output

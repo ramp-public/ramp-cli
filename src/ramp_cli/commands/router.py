@@ -18,7 +18,7 @@ import sys
 import tempfile
 import time
 import tomllib
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager, nullcontext
 from copy import copy
 from dataclasses import dataclass
@@ -1071,7 +1071,6 @@ def _pick_installed_clients() -> tuple[str, ...]:
 
 
 _BACK_TO_ROUTER_MENU = object()
-_UNFETCHED = object()
 _UNCHECKED = object()
 
 
@@ -1846,8 +1845,9 @@ def _run_configure(
     results = []
     failures = []
     cowork_note = None
-    # One key per run, so Router's coding-agent settings are read at most once.
-    coding_agent_settings: dict | None | object = _UNFETCHED
+    # A push started here is owed to every harness on this machine, not
+    # only the ones this run connects.
+    switchyard_push = _SwitchyardPush((*clients, *configured_router_clients()))
     # Everything from here to the summary is silent work against the network
     # and each agent's files, so it is the stretch that needs to look alive.
     stop_spinner = (
@@ -1994,50 +1994,32 @@ def _run_configure(
                 configure_options = {"base_url": base_url}
                 if item == "claude-code":
                     configure_options["claude_model_view"] = claude_models
-                switchyard = _SwitchyardPlan(None)
-                if item in CODING_AGENT_SETTINGS_HARNESSES:
-                    if coding_agent_settings is _UNFETCHED:
-                        # The same origin this setup is being written to
-                        # send its session-usage calls to.
-                        coding_agent_settings = _coding_agent_settings(
-                            api_key, origin=_statusline_origin(base_url)
-                        )
-                    switchyard = _plan_switchyard_default(
-                        item,
-                        api_key,
-                        base_url,
-                        coding_agent_settings,
-                        models,
-                        None,
-                        configuring=True,
-                    )
-                    if switchyard.pushed is not None:
-                        configure_options["selected_model"] = switchyard.selected_model
-                        if item == "codex":
-                            configure_options["explicit_model"] = True
-                try:
-                    path, default_model, repaired = _configure_client(
-                        item,
-                        api_key,
-                        models,
-                        **configure_options,
-                    )
-                except BaseException:
-                    # Any failure exit, not only the reported kind: a record
-                    # left behind for a push that never landed would read as
-                    # the user's own choice on every later refresh.
-                    if switchyard.pushed is not None:
-                        switchyard.abandon(
-                            _switchyard_default_token(api_key, base_url),
-                            item,
-                            _client_config_path(item),
-                        )
-                    raise
+                # The same origin this setup is being written to send its
+                # session-usage calls to.
+                pushed = switchyard_push.plan(
+                    item,
+                    api_key,
+                    base_url,
+                    origin=_statusline_origin(base_url),
+                    models=models,
+                )
+                if pushed is not None:
+                    configure_options["selected_model"] = pushed
+                    if item == "codex":
+                        configure_options["explicit_model"] = True
+                path, default_model, repaired = _configure_client(
+                    item,
+                    api_key,
+                    models,
+                    **configure_options,
+                )
             except click.ClickException as exc:
+                switchyard_push.settle(written=False)
                 failures.append(f"{AGENT_NAMES[item]}: {exc.message}")
                 continue
-            switchyard_model = switchyard.settle(
-                _switchyard_default_token(api_key, base_url), item, default_model
+            switchyard_push.settle(written=True)
+            switchyard_model = (
+                pushed if pushed is not None and default_model == pushed else None
             )
             result = {
                 "client": item,
@@ -2088,6 +2070,7 @@ def _run_configure(
                     f"the setup file {setup_file} could not be deleted: {exc}"
                 ) from None
     finally:
+        switchyard_push.finish()
         # Stopped on the way out too, so a failed key does not leave the
         # terminal spinning with the cursor hidden.
         stop_spinner()
@@ -2129,7 +2112,7 @@ def _run_configure(
         for result in results:
             if result.get("switchyard_model"):
                 click.echo(
-                    _switchyard_default_notice(
+                    _switchyard_push_notice(
                         result["client"], result["switchyard_model"]
                     )
                 )
@@ -2330,7 +2313,9 @@ def router_refresh(ctx: click.Context) -> None:
     results = []
     failures = []
     models_by_request: dict[tuple[str, bool, str, bool], list[RouterModel]] = {}
-    settings_by_key: dict[tuple[str, str], dict | None] = {}
+    switchyard_push = _SwitchyardPush(clients)
+    # However the command ends, a push an interrupt left in flight is settled.
+    ctx.call_on_close(switchyard_push.finish)
     for client in clients:
         path = _client_config_path(client)
         try:
@@ -2406,36 +2391,30 @@ def router_refresh(ctx: click.Context) -> None:
                         else _fetch_models(api_key, base_url=base_url)
                     )
                     models_by_request[request_key] = models
-                settings_key = (api_key, settings_origin)
-                if (
-                    client in CODING_AGENT_SETTINGS_HARNESSES
-                    and settings_key not in settings_by_key
-                ):
-                    settings_by_key[settings_key] = _coding_agent_settings(
-                        api_key, origin=settings_origin
-                    )
+                # Asks Router's coding-agent settings once per key and
+                # origin; before the selection is read, like discovery.
+                pushed = switchyard_push.plan(
+                    client,
+                    api_key,
+                    base_url,
+                    origin=settings_origin,
+                    models=models,
+                )
                 # Read the selection after the network round trips, so a
                 # model saved while they were in flight is the one written
                 # back rather than the one from before them.
                 selected_model = _configured_model(client, path)
-                switchyard = _SwitchyardPlan(selected_model)
-                if client in CODING_AGENT_SETTINGS_HARNESSES:
-                    switchyard = _plan_switchyard_default(
-                        client,
-                        api_key,
-                        base_url,
-                        settings_by_key[settings_key],
-                        models,
-                        selected_model,
-                    )
                 configure_options = {
                     "base_url": base_url,
-                    "selected_model": switchyard.selected_model,
+                    "selected_model": (
+                        _follow_switchyard_rename(selected_model, models)
+                        if pushed is None
+                        else pushed
+                    ),
                 }
-                if client == "codex" and switchyard.selected_model != selected_model:
+                if client == "codex" and pushed is not None:
                     # Refresh normally re-reads Codex's own selection after
-                    # discovery. A pushed model, or the fallback from one
-                    # Router no longer selects, is the change itself, but
+                    # discovery. A pushed model is the change itself, but
                     # only while the selection it replaces is still there.
                     configure_options["replace_model"] = selected_model
                 if client == "claude-code":
@@ -2456,24 +2435,24 @@ def router_refresh(ctx: click.Context) -> None:
                     # scan and the write must win, not be resurrected.
                     configure_options["conductor_require_receipt"] = True
                     configure_options["conductor_lock_held"] = True
-                try:
-                    with _pinned_usage_origin(usage_origin, keep_override=True):
-                        _, default_model, _ = _configure_client(
-                            client, api_key, models, **configure_options
-                        )
-                except BaseException:
-                    switchyard.abandon(
-                        _switchyard_default_token(api_key, base_url), client, path
+                with _pinned_usage_origin(usage_origin, keep_override=True):
+                    _, default_model, _ = _configure_client(
+                        client, api_key, models, **configure_options
                     )
-                    raise
-                switchyard_model = switchyard.settle(
-                    _switchyard_default_token(api_key, base_url),
-                    client,
-                    default_model,
-                )
         except click.ClickException as exc:
+            switchyard_push.settle(written=False)
             failures.append(f"{CLIENT_NAMES[client]}: {exc.message}")
             continue
+        # Also when Codex kept a model the user chose during discovery: that
+        # choice is their answer, not something to push over later.
+        switchyard_push.settle(written=True)
+        switchyard_model = (
+            pushed
+            if pushed is not None
+            and default_model == pushed
+            and selected_model != pushed
+            else None
+        )
         result = {
             "client": client,
             "config_path": str(path),
@@ -2505,7 +2484,7 @@ def router_refresh(ctx: click.Context) -> None:
             click.echo(f"Refreshed the Ramp Router configuration for {name}.")
             if result["switchyard_model"]:
                 click.echo(
-                    _switchyard_default_notice(
+                    _switchyard_push_notice(
                         result["client"], result["switchyard_model"]
                     )
                 )
@@ -3937,13 +3916,17 @@ def _strategy_settings_request(
     return payload
 
 
-# Harnesses Router's coding-agent settings describe. Hermes has no entry in
-# Router's CodingHarness enum, so it never fetches these and stays on the
+# Harnesses Router's coding-agent settings describe, and so the ones the
+# one-time Switchyard push reaches. Hermes has no entry in Router's
+# CodingHarness enum, so it never fetches these and stays on the
 # `configure model` path for Switchyard.
 CODING_AGENT_SETTINGS_HARNESSES = ("claude-code", "codex", "opencode", "pi")
-# Router's effective_model_source when the key's Switchyard configuration
-# names both tiers: the user should be on the `switchyard` model.
-SWITCHYARD_MODEL_SOURCE = "switchyard"
+# Router's request name for its Switchyard virtual model in every /v1/models
+# projection. The id differs: `switchyard` in the generic view and Codex's
+# catalog, a Claude-shaped alias in Claude Code's.
+SWITCHYARD_REQUEST_NAME = "switchyard"
+# Router's marker on Claude Code ids for models with a 1M-token window.
+CLAUDE_ONE_MILLION_SUFFIX = "[1m]"
 
 
 def _coding_agent_settings(
@@ -3954,11 +3937,9 @@ def _coding_agent_settings(
     ``origin`` is the control-plane host a setup already sends its
     session-usage calls to (see ``_settings_origin``), so the saved key goes
     nowhere new. Fail-open: older Routers (404), revoked business access,
-    and network errors all read as None. Callers must keep "Router said
-    nothing" apart from "Router said no", since only the latter may move a
-    selection. The response is cached per key and origin for a short while
-    (see ``admin_defaults``), so the Switchyard decision and the admin
-    default read in one run share a single request.
+    and network errors all read as None. The response is cached per key and
+    origin for a short while (see ``admin_defaults``), so the Switchyard
+    push and the admin default read in one run share a single request.
     """
     return admin_defaults.coding_agent_settings(api_key, origin, timeout=timeout)
 
@@ -3973,175 +3954,256 @@ def _settings_origin(client: str, path: Path | None, base_url: str | None) -> st
     return _stored_usage_origin(client, path) or _router_key_origin(base_url)
 
 
-def _effective_model(
-    harnesses: dict | None, client: str
-) -> tuple[str | None, str | None]:
-    """One harness's (effective_model, effective_model_source), parsed permissively."""
-    entry = harnesses.get(client) if isinstance(harnesses, dict) else None
-    if not isinstance(entry, dict):
-        return None, None
-    model = entry.get("effective_model")
-    source = entry.get("effective_model_source")
-    return (
-        model if isinstance(model, str) and model else None,
-        source if isinstance(source, str) else None,
-    )
+def _switchyard_push_path() -> Path:
+    return config_dir() / "router-switchyard-push.json"
 
 
-def _switchyard_defaults_path() -> Path:
+def _legacy_switchyard_defaults_path() -> Path:
+    # Written by CLIs that applied Router's per-key Switchyard selection on
+    # every refresh. A key recorded there was already moved to Switchyard.
     return config_dir() / "router-switchyard-defaults.json"
 
 
-def _switchyard_default_token(api_key: str, base_url: str | None) -> str:
+def _switchyard_push_token(api_key: str, base_url: str | None) -> str:
+    """Names one Router endpoint and credential without storing either."""
     return hashlib.sha256(
         f"{api_key}\0{_router_key_origin(base_url)}".encode()
     ).hexdigest()
 
 
-def _read_switchyard_defaults() -> dict:
-    """Which keys had Router's Switchyard model pushed into which harnesses."""
-    return _read_state_file(_switchyard_defaults_path())
+def _read_switchyard_pushes() -> dict:
+    """The endpoint and credential pairs the one-time push already ran for."""
+    return _read_state_file(_switchyard_push_path())
 
 
-def _record_switchyard_default(token: str, client: str, model: str | None) -> bool:
-    """Remember (or with None, forget) the model pushed for one key and harness.
+def _switchyard_model_id(models: list[RouterModel]) -> str | None:
+    """The id this harness's model list serves Switchyard under, if any."""
+    return next(
+        (
+            model.id
+            for model in models
+            if model.metadata.request_name == SWITCHYARD_REQUEST_NAME
+        ),
+        None,
+    )
 
-    The whole map is rewritten from a snapshot, and a configure can run
-    alongside a detached session-start refresh, so the read-modify-write is
-    serialized on a lock file beside it. Reports whether the record saved:
-    a push is only made once it is remembered, since an unremembered push
-    would be repeated by every later refresh, over whatever the user picked
-    in between. A forget that fails is retried by the next refresh.
+
+def _edit_switchyard_pushes(edit: Callable[[dict], object]) -> object | None:
+    """Apply ``edit`` to the push records under their lock; None if unsaved.
+
+    ``edit`` changes the map in place and returns its result; returning
+    None skips the write. A configure and a detached session-start refresh
+    can race, so every read-modify-write shares the lock.
     """
-    path = _switchyard_defaults_path()
+    path = _switchyard_push_path()
     try:
-        with claude_code.advisory_lock(
-            path.parent / ".router-switchyard-defaults.lock"
-        ):
-            defaults = _read_switchyard_defaults()
-            entry = defaults.get(token)
-            entry = dict(entry) if isinstance(entry, dict) else {}
-            if model is None:
-                entry.pop(client, None)
-            else:
-                entry[client] = model
-            if entry:
-                defaults[token] = entry
-            else:
-                defaults.pop(token, None)
-            _write_private_file(path, json.dumps(defaults, indent=2) + "\n")
+        with claude_code.advisory_lock(path.parent / ".router-switchyard-push.lock"):
+            pushes = _read_switchyard_pushes()
+            result = edit(pushes)
+            if result is not None:
+                _write_private_file(path, json.dumps(pushes, indent=2) + "\n")
+            return result
     except OSError as exc:
         log_failure(f"could not save {path}: {exc!r}")
-        return False
-    return True
-
-
-@dataclass(frozen=True)
-class _SwitchyardPlan:
-    """What a configure or refresh does about Router's Switchyard model."""
-
-    # The model to write; None lets the write fall back to the shared default.
-    selected_model: str | None
-    # Router's Switchyard id when it is being pushed into the harness; it is
-    # already recorded, so a failed write must ``abandon`` it.
-    pushed: str | None = None
-    # The record as it stood before the push was recorded, for ``abandon``.
-    previous: str | None = None
-    # A recorded push that no longer applies, to forget once the write lands.
-    stale: str | None = None
-
-    def settle(self, token: str, client: str, written: str) -> str | None:
-        """Record the outcome of a successful write; the id pushed, if any.
-
-        A push is planned only for an id the key serves, so a write that
-        settled elsewhere means Codex kept a model the user chose during
-        discovery. That counts as handled too: the record made when the push
-        was planned stands, so the next refresh does not push over the
-        choice it just preserved.
-        """
-        if self.pushed is not None:
-            return self.pushed if written == self.pushed else None
-        if self.stale is not None:
-            _record_switchyard_default(token, client, None)
         return None
 
-    def abandon(self, token: str, client: str, path: Path) -> None:
-        """Put the record back after a failed write, so a later refresh retries the push.
 
-        Unless the selection itself landed: a setup spanning several files
-        (OpenCode's config and its terminal settings) can fail after the
-        model was written, and then the record must stand, or the push would
-        look like the user's own choice and be repeated over a later one.
-        """
-        if self.pushed is None:
-            return
-        try:
-            landed = _configured_model(client, path) == self.pushed
-        except (click.ClickException, OSError, UnicodeError, ValueError):
-            landed = False
-        if not landed:
-            _record_switchyard_default(token, client, self.previous)
+# A harness's part in a push: still owed it, or done with it (pushed, being
+# pushed, or skipped for good).
+_SWITCHYARD_OWED = "owed"
+_SWITCHYARD_DONE = "done"
 
 
-def _plan_switchyard_default(
-    client: str,
-    api_key: str,
-    base_url: str | None,
-    harnesses: dict | None,
-    models: list[RouterModel],
-    selected_model: str | None,
-    *,
-    configuring: bool = False,
-) -> _SwitchyardPlan:
-    """Decide the model a configure or refresh settles on when Router selects Switchyard.
+def _switchyard_push_state(entry: object, client: str) -> str:
+    harnesses = entry.get("harnesses") if isinstance(entry, dict) else None
+    if isinstance(harnesses, dict) and harnesses.get(client) == _SWITCHYARD_OWED:
+        return _SWITCHYARD_OWED
+    return _SWITCHYARD_DONE
 
-    The push is a default, not a lock: it is recorded per key and harness,
-    and a model the user picks afterwards stays. ``configuring`` means a
-    fresh connect, which resets the selection anyway, so the push applies
-    regardless of that record. When Router stops selecting Switchyard for a
-    key while the harness still holds the pushed id, the selection is
-    dropped so the write falls back exactly as it does for a model that
-    vanished from the catalog. A harness still holding exactly the id that
-    was pushed is on the default, not on a choice, so it follows Router to a
-    new id (Claude Code's carries a hash of the configuration). The record
-    is written before a push and only forgotten through ``settle``, after
-    the fallback write succeeded: a failed fallback must not leave the
-    pushed id behind looking like the user's own choice.
+
+def _set_switchyard_push_state(
+    token: str, client: str, state: str, *, expect: str
+) -> bool:
+    """Move one harness from ``expect`` to ``state``; report whether it moved."""
+
+    def update(pushes: dict) -> bool | None:
+        entry = pushes.get(token)
+        if not isinstance(entry, dict):
+            return None
+        harnesses = entry.get("harnesses")
+        if not isinstance(harnesses, dict):
+            return None
+        if _switchyard_push_state(entry, client) != expect:
+            return None
+        pushes[token] = {**entry, "harnesses": {**harnesses, client: state}}
+        return True
+
+    return _edit_switchyard_pushes(update) is True
+
+
+def _claim_switchyard_push(
+    token: str, client: str, *, owed: set[str], skipped: set[str]
+) -> bool:
+    """Take one harness's part of the one-time push for a token.
+
+    Each Router endpoint and credential gets one push. The first claim
+    records it, owing it to every harness configured at that moment
+    (``owed``) except those already passed over for good (``skipped``);
+    one connected later is not pushed at all. A claim marks the harness
+    done before it changes, and only one run can make that move, so a
+    push is never repeated over whatever the user picked since: not by a
+    later refresh, not by one running alongside, and not when recording the
+    outcome fails. A write known not to have landed hands the part back
+    (see ``_release_switchyard_push``). No record, no push.
     """
-    if client not in CODING_AGENT_SETTINGS_HARNESSES or harnesses is None:
-        return _SwitchyardPlan(selected_model)
-    model, source = _effective_model(harnesses, client)
-    token = _switchyard_default_token(api_key, base_url)
-    recorded = _read_switchyard_defaults().get(token)
-    recorded = recorded.get(client) if isinstance(recorded, dict) else None
-    if (
-        source == SWITCHYARD_MODEL_SOURCE
-        and model
-        # Router lists the id for the key whenever it selects it; a mismatch
-        # is not something to write, announce, or remember.
-        and model in {item.id for item in models}
-    ):
-        if selected_model == model and not configuring:
-            if recorded != model:
-                _record_switchyard_default(token, client, model)
-            return _SwitchyardPlan(selected_model)
-        if recorded is not None and selected_model != recorded and not configuring:
-            return _SwitchyardPlan(selected_model)
-        if not _record_switchyard_default(token, client, model):
-            return _SwitchyardPlan(selected_model)
-        return _SwitchyardPlan(model, pushed=model, previous=recorded)
-    if recorded is not None:
-        if selected_model == recorded:
-            return _SwitchyardPlan(None, stale=recorded)
-        return _SwitchyardPlan(selected_model, stale=recorded)
-    return _SwitchyardPlan(selected_model)
+    legacy = _read_state_file(_legacy_switchyard_defaults_path())
+
+    def claim(pushes: dict) -> bool | None:
+        entry = pushes.get(token)
+        if entry is None:
+            if token in legacy:
+                return None
+            entry = {
+                "pushed_at": int(time.time()),
+                "harnesses": {
+                    name: _SWITCHYARD_DONE if name in skipped else _SWITCHYARD_OWED
+                    for name in {*owed, client}
+                },
+            }
+        elif _switchyard_push_state(entry, client) != _SWITCHYARD_OWED:
+            return None
+        pushes[token] = {
+            **entry,
+            "harnesses": {**entry["harnesses"], client: _SWITCHYARD_DONE},
+        }
+        return True
+
+    return _edit_switchyard_pushes(claim) is True
 
 
-def _switchyard_default_notice(client: str, model: str) -> str:
+def _release_switchyard_push(token: str, client: str) -> None:
+    """Owe the push to a harness again after a write that did not land."""
+    _set_switchyard_push_state(token, client, _SWITCHYARD_OWED, expect=_SWITCHYARD_DONE)
+
+
+def _skip_switchyard_push(token: str, client: str) -> None:
+    """Pass over a harness for good: the push is not one it can take."""
+    _set_switchyard_push_state(token, client, _SWITCHYARD_DONE, expect=_SWITCHYARD_OWED)
+
+
+class _SwitchyardPush:
+    """The one-time Switchyard push across the harnesses of one configure or refresh.
+
+    When Router reports ``switchyard_offered`` for a key, every configured
+    harness that lists Switchyard gets it as its saved model, once per
+    Router endpoint and credential; a harness whose write did not land (or
+    that was not reached) is retried by later runs until it takes the push.
+    Afterwards the user's own choices stand: nothing re-applies Switchyard,
+    and Router no longer names it as a per-session default. Workspace
+    defaults keep their own lifecycle in the harness integrations, so on a
+    harness with one the org default still starts each new session.
+    """
+
+    def __init__(self, clients: Iterable[str]) -> None:
+        # The harnesses a push started now is owed to.
+        self._owed = {
+            client for client in clients if client in CODING_AGENT_SETTINGS_HARNESSES
+        }
+        # token -> harnesses this run passed over for good.
+        self._skipped: dict[str, set[str]] = {}
+        # (token, client, model) of the push handed out and not yet settled.
+        self._in_flight: tuple[str, str, str] | None = None
+
+    def plan(
+        self,
+        client: str,
+        api_key: str,
+        base_url: str | None,
+        *,
+        origin: str,
+        models: list[RouterModel],
+    ) -> str | None:
+        """The Switchyard id to save for this harness now, or None to leave it."""
+        if client not in CODING_AGENT_SETTINGS_HARNESSES:
+            return None
+        if not admin_defaults.switchyard_offered(api_key, origin):
+            return None
+        token = _switchyard_push_token(api_key, base_url)
+        # Router offers Switchyard only when the key can reach it; a harness
+        # whose list lacks it (a BYOK-only capable model, say) is passed
+        # over, as is Codex under an org default: it has one model setting,
+        # which its hooks keep on that default for every new session.
+        model = _switchyard_model_id(models)
+        if model is None or (
+            client == CODEX_CLIENT_NAME
+            and admin_defaults.admin_default_model(client, api_key, origin) is not None
+        ):
+            self._skipped.setdefault(token, set()).add(client)
+            _skip_switchyard_push(token, client)
+            return None
+        if not _claim_switchyard_push(
+            token, client, owed=self._owed, skipped=self._skipped.get(token, set())
+        ):
+            return None
+        self._in_flight = (token, client, model)
+        return model
+
+    def settle(self, *, written: bool) -> None:
+        """Record the outcome of the harness write that carried the push, if any.
+
+        Called right after the write, before any other harness is touched.
+        The claim already counts the harness as done; only a write known not
+        to have landed owes it the push again. A failed write still took the
+        push when the model itself landed: a setup spanning several files
+        (OpenCode's config and its terminal settings) can fail after the
+        model was written, and a later pick must not be pushed over.
+        """
+        if self._in_flight is None:
+            return
+        token, client, model = self._in_flight
+        self._in_flight = None
+        if not written and not _holds_model(client, model):
+            _release_switchyard_push(token, client)
+
+    def finish(self) -> None:
+        """Settle a push an interrupt left in flight."""
+        self.settle(written=False)
+
+
+def _follow_switchyard_rename(
+    selected: str | None, models: list[RouterModel]
+) -> str | None:
+    """A saved Switchyard id Router has since renamed, mapped to today's id.
+
+    Claude Code's Switchyard alias carries the "[1m]" suffix only while the
+    capable model has a 1M-token window, so changing the capable model
+    renames it. A harness on Switchyard stays on it, rather than falling
+    back to the default the way a vanished model does.
+    """
+    if selected is None or any(model.id == selected for model in models):
+        return selected
+    current = _switchyard_model_id(models)
+    if current is None:
+        return selected
+    suffix = CLAUDE_ONE_MILLION_SUFFIX
+    if selected.removesuffix(suffix) == current.removesuffix(suffix):
+        return current
+    return selected
+
+
+def _holds_model(client: str, model: str) -> bool:
+    try:
+        return _configured_model(client, _client_config_path(client)) == model
+    except (click.ClickException, OSError, UnicodeError, ValueError):
+        return False
+
+
+def _switchyard_push_notice(client: str, model: str) -> str:
     return (
-        f"Switched {CLIENT_NAMES[client]} to {model}, the model Router selects "
-        "for this key's Switchyard configuration. Choose another with "
-        f"'ramp router configure model {_command_name(client)} --model MODEL'."
+        f"Switched {CLIENT_NAMES[client]} to {model}: Switchyard is now a model "
+        "you select instead of a strategy toggle. This happens once; choose "
+        f"another with 'ramp router configure model {_command_name(client)} "
+        "--model MODEL'."
     )
 
 

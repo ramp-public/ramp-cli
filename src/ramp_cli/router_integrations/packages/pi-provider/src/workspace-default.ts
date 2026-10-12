@@ -15,6 +15,7 @@ export const WORKSPACE_DEFAULT_HARNESS = "pi"
 /** Reused for every session started within this window, then refetched. */
 export const WORKSPACE_DEFAULT_TTL_MS = 60_000
 const DEFAULT_TIMEOUT_MS = 2_000
+const LEGACY_SWITCHYARD_SOURCE = "switchyard"
 
 export type WorkspaceDefaultInput = {
   usageOrigin: string
@@ -55,7 +56,14 @@ export async function fetchWorkspaceDefault(
     if (!harnesses || typeof harnesses !== "object") return undefined
     const entry = (harnesses as Record<string, unknown>)[WORKSPACE_DEFAULT_HARNESS]
     if (!entry || typeof entry !== "object") return undefined
-    const model = (entry as { effective_model?: unknown }).effective_model
+    const { effective_model: model, effective_model_source: source } = entry as {
+      effective_model?: unknown
+      effective_model_source?: unknown
+    }
+    // Routers before the one-time Switchyard push named `switchyard` here
+    // for every harness; that is not a workspace default, and applying it
+    // would undo the user's own pick on every new session.
+    if (source === LEGACY_SWITCHYARD_SOURCE) return undefined
     return typeof model === "string" && model ? model : undefined
   } catch {
     return undefined
