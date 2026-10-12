@@ -211,6 +211,28 @@ def test_command_runs_session_sync_requires_an_invocation(command, expected):
     assert sync_module.command_runs_session_sync(command) is expected
 
 
+def test_event_registrations_are_told_apart(monkeypatch):
+    monkeypatch.setattr(sync_module, "ramp_executable", lambda: Path("/opt/ramp"))
+    start = sync_module.session_sync_hook_command("codex")
+    stop = sync_module.session_sync_hook_command(
+        "codex", sync_module.SYNC_HOOK_STOP_EVENT
+    )
+    assert stop == (
+        "[ -x /opt/ramp ] && /opt/ramp router sync --hook --client codex "
+        "--event stop || true"
+    )
+    # Each registration answers only for its own event, so a Stop group is
+    # never mistaken for the SessionStart one and vice versa.
+    assert sync_module.command_runs_session_sync(start) is True
+    assert sync_module.command_runs_session_sync(start, "stop") is False
+    assert sync_module.command_runs_session_sync(stop) is False
+    assert sync_module.command_runs_session_sync(stop, "stop") is True
+    assert (
+        sync_module.command_runs_session_sync("/opt/ramp router sync --hook", "stop")
+        is False
+    )
+
+
 def test_ramp_executable_resolution(monkeypatch, tmp_path):
     # The invoked entrypoint wins when it is a real executable named ramp.
     fake = tmp_path / "bin" / "ramp"

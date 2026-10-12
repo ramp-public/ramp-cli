@@ -50,7 +50,11 @@ import type {
   RouterClassifier as DiscoveredClassifier,
   RouterModel as DiscoveredModel,
 } from "./discovery.ts"
-import { registerUsageWidget } from "./usage.ts"
+import { registerUsageWidget, usageOriginFromBaseURL } from "./usage.ts"
+import {
+  applyWorkspaceDefaultOnSessionStart,
+  workspaceDefaultCache,
+} from "./workspace-default.ts"
 
 const PROVIDER_ID = "ramp-router"
 const API_KEY_ENVS = ["RAMP_ROUTER_API_KEY", "LLM_GATEWAY_API_KEY"]
@@ -85,6 +89,8 @@ const MODEL_CACHE_VERSION = 6
 const MAX_MODEL_CACHE_BYTES = 4 * 1024 * 1024
 const MAX_MODEL_CACHE_KEY_BYTES = 65
 const RUNTIME_BOOTSTRAP_MINIMUM = [0, 84, 1] as const
+/** `setModel` stopped rewriting the configured default in Pi 0.84.3. */
+const SESSION_SCOPED_SET_MODEL_MINIMUM = [0, 84, 3] as const
 const PROCESS_CREDENTIAL_IDENTITY_KEY = randomBytes(32)
 let cacheIdentityState:
   | { path: string; key?: Buffer; persistent: boolean }
@@ -223,6 +229,21 @@ async function hostSupport(): Promise<HostSupport> {
  * load so ordinary Pi startup remains usable.
  */
 export function supportsRuntimeModelBootstrap(version: string): boolean {
+  return releaseAtLeast(version, RUNTIME_BOOTSTRAP_MINIMUM)
+}
+
+/**
+ * Whether this Pi's `setModel` changes only the session.
+ *
+ * Before 0.84.3 it also wrote the model into the global settings as the
+ * default for every later launch, which is exactly what the organization
+ * default must not do, so such hosts keep Pi's own starting model.
+ */
+export function supportsSessionScopedSetModel(version: string): boolean {
+  return releaseAtLeast(version, SESSION_SCOPED_SET_MODEL_MINIMUM)
+}
+
+function releaseAtLeast(version: string, minimum: readonly number[]): boolean {
   const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(
     version,
   )
@@ -231,9 +252,9 @@ export function supportsRuntimeModelBootstrap(version: string): boolean {
 
   const actual = match.slice(1, 4).map(Number)
   if (actual.some((part) => !Number.isSafeInteger(part))) return false
-  for (let index = 0; index < RUNTIME_BOOTSTRAP_MINIMUM.length; index += 1) {
+  for (let index = 0; index < minimum.length; index += 1) {
     const actualPart = actual[index] ?? 0
-    const minimumPart = RUNTIME_BOOTSTRAP_MINIMUM[index] ?? 0
+    const minimumPart = minimum[index] ?? 0
     if (actualPart !== minimumPart) return actualPart > minimumPart
   }
   return true
@@ -1705,10 +1726,34 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
     snapshotRefreshPending = true
     flushSnapshotRefresh()
   }
-  pi.on?.("session_start", (_event, context) => {
+  // The organization default is applied per new conversation through Pi's
+  // own `setModel`, which from 0.84.3 changes this session's model (and
+  // records it in the session, so a later resume keeps it) without touching
+  // the configured default. Resumed, forked, and reloaded sessions never
+  // qualify, and a switch the user makes afterwards stands. Fetched in the
+  // background from here on, so a slow Router never holds up a session start.
+  const workspaceDefaults = workspaceDefaultCache({
+    usageOrigin: usageOrigin ?? usageOriginFromBaseURL(baseUrl),
+    resolveAPIKey: routerApiKey,
+    ...(rampCliVersion ? { rampCliVersion } : {}),
+  })
+  const appliesWorkspaceDefault =
+    Boolean(apiKey) &&
+    process.env.PI_OFFLINE === undefined &&
+    supportsSessionScopedSetModel(PI_VERSION) &&
+    typeof pi.on === "function" &&
+    typeof pi.setModel === "function"
+  if (appliesWorkspaceDefault) workspaceDefaults.prefetch()
+  const startOnWorkspaceDefault = applyWorkspaceDefaultOnSessionStart({
+    providerId: PROVIDER_ID,
+    defaults: workspaceDefaults,
+    setModel: (model) => pi.setModel(model as Model<any>),
+  })
+  pi.on?.("session_start", async (event, context) => {
     activeSession = context.sessionManager
     snapshotRegistry = context.modelRegistry
     flushSnapshotRefresh()
+    if (appliesWorkspaceDefault) await startOnWorkspaceDefault(event, context)
   })
   pi.on?.("session_shutdown", () => {
     activeSession = undefined

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import hmac
 import io
@@ -34,10 +35,11 @@ import questionary
 import zstandard
 from click.core import ParameterSource
 
-from ramp_cli import __version__, claude_cowork, hermes_agent
+from ramp_cli import __version__, admin_defaults, claude_cowork, hermes_agent
 from ramp_cli.commands import claude_code, conductor, cursor
 from ramp_cli.commands import router_sync as router_sync_module
 from ramp_cli.commands.router_sync import (
+    SYNC_HOOK_STOP_EVENT,
     SYNC_HOOK_USER_MANAGED,
     SYNC_OPT_OUT_ENV,
     claim_sync_slot,
@@ -63,6 +65,7 @@ from ramp_cli.router_setup import (
     ROUTER_SETUP_DEFERRED_EXIT_CODE,
     acquire_router_api_key,
     confirm_router_browser_setup,
+    record_mdm_event,
 )
 from ramp_cli.router_ui import launch as router_ui
 from ramp_cli.version_check import (
@@ -129,6 +132,16 @@ CODEX_USAGE_ORIGIN_KEY = "usage_origin"
 # user-managed sentinel when a user group already invokes the sync — so only
 # that group is ever replaced or removed.
 CODEX_SYNC_HOOK_STATE_KEY = "session_sync_hook"
+# The Codex catalog slug of the admin default model this setup enforces for
+# new sessions, cached from the last configure or refresh. The session-start
+# and Stop hooks read it without the network and put config.toml's model back
+# to it whenever a session's own pick moved it, so every new session starts on
+# the admin default. Absent when no admin default is set.
+CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY = "admin_default_model"
+# The receipt record of the managed [[hooks.Stop]] group that runs the sync in
+# its Stop event mode; the same digest-or-user-managed contract as the
+# SessionStart group's CODEX_SYNC_HOOK_STATE_KEY.
+CODEX_STOP_SYNC_HOOK_STATE_KEY = "stop_sync_hook"
 CODEX_CATALOG_MODEL_LIMIT = 100
 CLIENT_NAMES = {
     "claude-code": "Claude Code",
@@ -1487,7 +1500,8 @@ def router_configure(
         os.environ[ROUTER_BASE_URL_ENV] = base_url
     if ui_url:
         os.environ[ROUTER_UI_URL_ENV] = ui_url
-    _run_configure(
+    run = functools.partial(
+        _run_configure,
         ctx,
         clients=clients,
         setup_file=setup_file,
@@ -1499,6 +1513,40 @@ def router_configure(
         reuse_existing_key=reuse_existing_key,
         confirm_browser=confirm_browser,
     )
+    if confirm_browser:
+        _run_mdm_configure(run)
+    else:
+        run()
+
+
+def _run_mdm_configure(run: Callable[[], None]) -> None:
+    """Bracket an MDM run with start/finish events so every exit is visible."""
+    record_mdm_event(
+        "router_mdm_started",
+        router_ui_url=router_ui_url(),
+        base_url=router_base_url(),
+    )
+    outcome, detail = "failed", None
+    try:
+        run()
+        outcome = "configured"
+    except SystemExit as exc:
+        if exc.code == ROUTER_SETUP_DEFERRED_EXIT_CODE:
+            outcome = "deferred"
+        raise
+    except click.ClickException as exc:
+        detail = exc.message
+        raise
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        record_mdm_event(
+            "router_mdm_finished",
+            outcome=outcome,
+            detail=detail,
+            router_ui_url=router_ui_url(),
+        )
 
 
 def _with_claude_desktop(
@@ -1572,6 +1620,9 @@ def _run_configure(
     # picker, the host preflight, and Codex itself all inherit what this
     # process still carries.
     os.environ.pop(CONFIGURE_KEY_ENV, None)
+    # A command the user runs reads Router's current coding-agent settings;
+    # the harnesses it configures then share that one response.
+    admin_defaults.clear_cache()
     if (
         not no_browser
         and not reuse_existing_key
@@ -1684,12 +1735,24 @@ def _run_configure(
     if reuse_existing_key and setup_file is None and api_key is None:
         credentials = _stored_router_api_key_choices()
         if len(credentials) > 1:
+            if confirm_browser:
+                record_mdm_event(
+                    "router_mdm_key_lookup",
+                    outcome="conflict",
+                    saved_keys=len(credentials),
+                )
             raise click.UsageError(
                 "Saved Ramp Router keys disagree. Run 'ramp router configure' "
                 "interactively to choose a key, or supply --api-key."
             )
         if credentials:
             api_key = credentials[0][0]
+        if confirm_browser:
+            record_mdm_event(
+                "router_mdm_key_lookup",
+                outcome="reused" if credentials else "none_saved",
+                saved_by=",".join(credentials[0][1]) if credentials else None,
+            )
 
     if ctx.obj["no_input"] and setup_file is None and api_key is None:
         raise click.UsageError(
@@ -1771,7 +1834,9 @@ def _run_configure(
                 # main() uses Click's non-standalone mode, which returns ctx.exit
                 # codes instead of propagating them to the invoking MDM policy.
                 raise SystemExit(ROUTER_SETUP_DEFERRED_EXIT_CODE)
-        api_key = acquire_router_api_key(router_ui_url(), no_browser=no_browser)
+            api_key = acquire_router_api_key(router_ui_url(), mdm=True)
+        else:
+            api_key = acquire_router_api_key(router_ui_url(), no_browser=no_browser)
         browser_acquired_key = True
     api_key = api_key.strip()
     if not api_key:
@@ -1985,7 +2050,16 @@ def _run_configure(
                 "original_setup_command": _original_setup_command(item, path),
                 "switchyard_model": switchyard_model,
             }
+            if item == "opencode" and (notes := _opencode_user_model_note(path)):
+                result["note_lines"] = notes
             results.append(result)
+        if confirm_browser:
+            record_mdm_event(
+                "router_mdm_clients_configured",
+                key_source="browser" if browser_acquired_key else "reused",
+                configured=",".join(result["client"] for result in results) or None,
+                failed="; ".join(failures) or None,
+            )
         # A Cursor-only run writes the key to no agent config, so when the
         # clipboard also failed to take it, the setup file is the only copy
         # of the credential left; deleting it would strand the user with a
@@ -2088,8 +2162,15 @@ def _run_configure(
                 )
             _echo_cursor_guidance(cursor_result["instructions"])
             show_notice("NOTE", cursor_result["note_lines"])
+        for result in results:
+            if result["client"] != CURSOR_CLIENT and result.get("note_lines"):
+                show_notice("NOTE", result["note_lines"])
         if notice:
             show_notice("NOTICE", notice)
+        if any(result["client"] == CODEX_CLIENT_NAME for result in results):
+            trust_lines = _codex_hook_trust_note_lines(_codex_config_path())
+            if trust_lines:
+                show_notice("NOTE", trust_lines)
 
     if failures:
         cursor_result = next(
@@ -2244,6 +2325,7 @@ def _cowork_refresh_message(result: dict) -> str:
 )
 @click.pass_context
 def router_refresh(ctx: click.Context) -> None:
+    admin_defaults.clear_cache()
     clients = configured_router_clients()
     results = []
     failures = []
@@ -2392,15 +2474,16 @@ def router_refresh(ctx: click.Context) -> None:
         except click.ClickException as exc:
             failures.append(f"{CLIENT_NAMES[client]}: {exc.message}")
             continue
-        results.append(
-            {
-                "client": client,
-                "config_path": str(path),
-                "default_model": default_model,
-                "models_available": len(models),
-                "switchyard_model": switchyard_model,
-            }
-        )
+        result = {
+            "client": client,
+            "config_path": str(path),
+            "default_model": default_model,
+            "models_available": len(models),
+            "switchyard_model": switchyard_model,
+        }
+        if client == "opencode" and (notes := _opencode_user_model_note(path)):
+            result["note_lines"] = notes
+        results.append(result)
 
     cowork_result = _refresh_cowork_model_selections()
     if cowork_result is not None:
@@ -2426,6 +2509,12 @@ def router_refresh(ctx: click.Context) -> None:
                         result["client"], result["switchyard_model"]
                     )
                 )
+            for line in result.get("note_lines", []):
+                click.echo(line)
+        if any(result["client"] == CODEX_CLIENT_NAME for result in results):
+            trust_lines = _codex_hook_trust_note_lines(_codex_config_path())
+            if trust_lines:
+                show_notice("NOTE", trust_lines)
 
     if failures:
         raise click.ClickException("Could not refresh " + "; ".join(failures))
@@ -2921,9 +3010,20 @@ def _copy_to_clipboard(text: str) -> bool:
     hidden=True,
     help="Internal: the spawned background half of --hook.",
 )
+@click.option(
+    "--event",
+    type=click.Choice((SYNC_HOOK_STOP_EVENT,)),
+    default=None,
+    hidden=True,
+    help="Internal: the hook event when it is not the session start.",
+)
 @click.pass_context
 def router_sync(
-    ctx: click.Context, hook_mode: bool, client: str | None, detached_mode: bool
+    ctx: click.Context,
+    hook_mode: bool,
+    client: str | None,
+    detached_mode: bool,
+    event: str | None,
 ) -> None:
     """Keep locally installed Router artifacts fresh.
 
@@ -2939,30 +3039,42 @@ def router_sync(
         ctx.invoke(router_refresh)
         return
     if hook_mode:
-        _run_hook_sync(client)
+        _run_hook_sync(client, event)
         return
     raise click.UsageError("Use --hook for session-start sync or 'router refresh'.")
 
 
-def _run_hook_sync(client: str | None) -> None:
+def _run_hook_sync(client: str | None, event: str | None = None) -> None:
     """The session-start path: never block, never fail, no model-visible output.
 
     Plain SessionStart stdout can be injected into the model's context, which
     must never see the update notice lest it run `ramp update` itself. Output
     is therefore emitted only in a host-specific structured envelope consumed
     by user UI. The shutdown update notice is suppressed for the same reason,
-    and failures go to the state-dir log.
+    and failures go to the state-dir log. Codex's Stop event runs the same
+    path with ``event`` set: it exists to reset the default model, so it
+    emits nothing on a channel whose JSON has other meanings.
     """
     suppress_next_update_notice()
     try:
         if os.environ.get(SYNC_OPT_OUT_ENV):
             return
+        if client == CODEX_CLIENT_NAME:
+            # Every start and every turn end, no cooldown: a local line
+            # rewrite that is a no-op unless a session's own pick moved the
+            # model, so the next new session starts on the admin default.
+            try:
+                _apply_codex_admin_default(_codex_config_path())
+            except (OSError, click.ClickException, tomllib.TOMLDecodeError) as exc:
+                log_failure(f"admin default model reset failed: {exc!r}")
         # claim_sync_slot re-checks dueness and advances the cooldown under
         # an exclusive lock, so concurrent session starts cannot stampede;
         # losers fall through silently. Spawned before the notice because the
         # spawn truncates the log to this run.
         if sync_is_due() and claim_sync_slot():
             spawn_detached_refresh()
+        if event is not None:
+            return
         # Every session start, fast path included: these are user-only
         # channels reading cached state, so recurring per session is nudging,
         # not context spam, and it stops the moment the install is current.
@@ -3844,25 +3956,11 @@ def _coding_agent_settings(
     nowhere new. Fail-open: older Routers (404), revoked business access,
     and network errors all read as None. Callers must keep "Router said
     nothing" apart from "Router said no", since only the latter may move a
-    selection.
+    selection. The response is cached per key and origin for a short while
+    (see ``admin_defaults``), so the Switchyard decision and the admin
+    default read in one run share a single request.
     """
-    if not api_key:
-        return None
-    url = f"{origin}/self-service/coding-agent-settings"
-    try:
-        response = httpx.get(
-            url,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                **_router_telemetry_headers(),
-            },
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        harnesses = response.json()["harnesses"]
-    except (httpx.HTTPError, ValueError, KeyError, TypeError):
-        return None
-    return harnesses if isinstance(harnesses, dict) else None
+    return admin_defaults.coding_agent_settings(api_key, origin, timeout=timeout)
 
 
 def _settings_origin(client: str, path: Path | None, base_url: str | None) -> str:
@@ -5163,6 +5261,7 @@ def _unconfigure_codex(path: Path) -> None:
         original_instructions_digest = state.get(CODEX_ORIGINAL_INSTRUCTIONS_DIGEST_KEY)
         cost_hook_managed = state.get(CODEX_COST_HOOK_MANAGED_KEY)
         recorded_sync_hook = state.get(CODEX_SYNC_HOOK_STATE_KEY)
+        recorded_stop_sync_hook = state.get(CODEX_STOP_SYNC_HOOK_STATE_KEY)
         preexisting_router_sessions = state.get(
             CODEX_PREEXISTING_ROUTER_SESSIONS_STATE_KEY
         )
@@ -5185,6 +5284,9 @@ def _unconfigure_codex(path: Path) -> None:
 
     chunks = _drop_recorded_sync_hook_chunk(
         _config_chunks(existing), recorded_sync_hook
+    )
+    chunks = _drop_recorded_sync_hook_chunk(
+        chunks, recorded_stop_sync_hook, _CODEX_STOP_HOOK_TABLE
     )
     chunks[0] = [_render_root_config(chunks[0], root_values)]
     preserved = "".join(
@@ -6326,8 +6428,22 @@ hooks = [{{ type = "command", command = {json.dumps(command)} }}]
 """
 
 
-def _command_runs_session_sync(command: str) -> bool:
-    return command_runs_session_sync(command)
+def _render_codex_stop_sync_hook_group(command: str) -> str:
+    """Render the [[hooks.Stop]] group that resets the model after each turn.
+
+    A session's own ``/model`` pick lands in config.toml, where the next new
+    session would inherit it. Rerunning the sync in Stop mode after every
+    turn puts the admin default back before that can happen; the live
+    session keeps the model it holds in memory. Same flag-free exposure as
+    the SessionStart group and the cost hook.
+    """
+    return f"""[[hooks.Stop]]
+hooks = [{{ type = "command", command = {json.dumps(command)} }}]
+"""
+
+
+def _command_runs_session_sync(command: str, event: str | None = None) -> bool:
+    return command_runs_session_sync(command, event)
 
 
 def _sync_hook_chunk_digest(chunk_text: str) -> str:
@@ -6335,13 +6451,17 @@ def _sync_hook_chunk_digest(chunk_text: str) -> str:
     return _content_digest(chunk_text.strip() + "\n")
 
 
-def _is_recorded_sync_hook_chunk(chunk: list[str], recorded: object) -> bool:
+def _is_recorded_sync_hook_chunk(
+    chunk: list[str],
+    recorded: object,
+    table: re.Pattern[str] = _CODEX_SESSION_START_HOOK_TABLE,
+) -> bool:
     """Report whether one chunk is exactly the sync group the receipt records.
 
     Only that rendering is ours; user-authored or user-edited groups never
     match, and the user-managed sentinel matches nothing.
     """
-    if not chunk or not _CODEX_SESSION_START_HOOK_TABLE.match(chunk[0]):
+    if not chunk or not table.match(chunk[0]):
         return False
     if not isinstance(recorded, str) or not recorded:
         return False
@@ -6349,37 +6469,49 @@ def _is_recorded_sync_hook_chunk(chunk: list[str], recorded: object) -> bool:
 
 
 def _drop_recorded_sync_hook_chunk(
-    chunks: list[list[str]], recorded: object
+    chunks: list[list[str]],
+    recorded: object,
+    table: re.Pattern[str] = _CODEX_SESSION_START_HOOK_TABLE,
 ) -> list[list[str]]:
     """Drop one receipt-owned group, preserving byte-identical user copies."""
     preserved = []
     consumed = False
     for chunk in chunks:
-        if not consumed and _is_recorded_sync_hook_chunk(chunk, recorded):
+        if not consumed and _is_recorded_sync_hook_chunk(chunk, recorded, table):
             consumed = True
             continue
         preserved.append(chunk)
     return preserved
 
 
-def _codex_sync_hook_registered(config: dict) -> bool:
-    """Report whether any SessionStart hook in the parsed config runs the sync."""
+def _codex_sync_hook_registered(
+    config: dict, event_table: str = "SessionStart", event: str | None = None
+) -> bool:
+    """Report whether any hook group for the event in the parsed config runs the sync."""
     hooks = config.get("hooks")
-    groups = hooks.get("SessionStart") if isinstance(hooks, dict) else None
+    groups = hooks.get(event_table) if isinstance(hooks, dict) else None
     if not isinstance(groups, list):
         return False
     # Any command actually invoking the sync makes registration stand down.
     # Ownership is only the receipt-recorded rendering; see
     # _is_recorded_sync_hook_chunk.
     return any(
-        command is not None and _command_runs_session_sync(command)
+        command is not None and _command_runs_session_sync(command, event)
         for group in groups
         for command in _hook_group_commands(group)
     )
 
 
 def _register_codex_sync_hook(
-    path: Path, config: str, command: str, receipt: dict
+    path: Path,
+    config: str,
+    command: str,
+    receipt: dict,
+    *,
+    state_key: str = CODEX_SYNC_HOOK_STATE_KEY,
+    event_table: str = "SessionStart",
+    event: str | None = None,
+    render=_render_codex_sync_hook_group,
 ) -> tuple[str, bool]:
     """Register the managed SessionStart group; return (config, receipt changed).
 
@@ -6387,19 +6519,22 @@ def _register_codex_sync_hook(
     rendering and records its digest — which is what repairs a stale ramp
     path. A surviving group that already invokes the sync is user-authored (or
     user-edited): it is left untouched, nothing is added, and the skip is
-    recorded as user-managed.
+    recorded as user-managed. The Stop group registers through the same path
+    with its own receipt key, event, and rendering.
     """
     try:
-        already_registered = _codex_sync_hook_registered(tomllib.loads(config))
+        already_registered = _codex_sync_hook_registered(
+            tomllib.loads(config), event_table, event
+        )
     except tomllib.TOMLDecodeError:
         # The caller validates and reports against the document it writes.
         return config, False
     if already_registered:
-        if receipt.get(CODEX_SYNC_HOOK_STATE_KEY) == SYNC_HOOK_USER_MANAGED:
+        if receipt.get(state_key) == SYNC_HOOK_USER_MANAGED:
             return config, False
-        receipt[CODEX_SYNC_HOOK_STATE_KEY] = SYNC_HOOK_USER_MANAGED
+        receipt[state_key] = SYNC_HOOK_USER_MANAGED
         return config, True
-    rendered = _render_codex_sync_hook_group(command)
+    rendered = render(command)
     registered = f"{config}\n{rendered}"
     try:
         tomllib.loads(registered)
@@ -6408,15 +6543,15 @@ def _register_codex_sync_hook(
         # an extra, so the user's layout wins. Stderr keeps agent-mode JSON
         # on stdout parseable.
         click.echo(
-            f"Skipping the Codex session sync hook: the existing hooks in "
+            f"Skipping the Codex {event_table} sync hook: the existing hooks in "
             f"{path} could not take another entry.",
             err=True,
         )
         return config, False
     digest = _sync_hook_chunk_digest(rendered)
-    if receipt.get(CODEX_SYNC_HOOK_STATE_KEY) == digest:
+    if receipt.get(state_key) == digest:
         return registered, False
-    receipt[CODEX_SYNC_HOOK_STATE_KEY] = digest
+    receipt[state_key] = digest
     return registered, True
 
 
@@ -6797,6 +6932,44 @@ def _opencode_plugin_options(entry: object) -> dict | None:
     if isinstance(entry, dict) and isinstance(entry.get("options"), dict):
         return entry["options"]
     return None
+
+
+def _is_router_model_setting(value: object) -> bool:
+    """Whether an OpenCode top-level ``model`` names the Router provider."""
+    if isinstance(value, str):
+        return value.startswith(f"{ROUTER_PROVIDER}/")
+    return isinstance(value, dict) and value.get("providerID") == ROUTER_PROVIDER
+
+
+def _opencode_router_model_setting(value: object) -> str | None:
+    """The Router model id an OpenCode top-level ``model`` selects, if any."""
+    if not _is_router_model_setting(value):
+        return None
+    if isinstance(value, dict):
+        model = value.get("model")
+        return model if isinstance(model, str) and model else None
+    return str(value)[len(ROUTER_PROVIDER) + 1 :] or None
+
+
+def _opencode_user_model_note(path: Path) -> list[str]:
+    """Explain a top-level ``model`` of the user's own that configure left alone.
+
+    OpenCode's TUI starts new sessions on the agent model the Router plugin
+    sets, but a session created without a model (``opencode run``) takes the
+    config's ``model`` before the plugin's default.
+    """
+    try:
+        model = _read_json_config("opencode", path).get("model")
+    except click.ClickException:
+        return []
+    if model is None or _is_router_model_setting(model):
+        return []
+    setting = model if isinstance(model, str) else json.dumps(model)
+    return [
+        f'OpenCode keeps your own "model": {setting} in {path}. Sessions started '
+        "with 'opencode run' use it instead of the Router default; remove it "
+        "to let the Router default apply there too.",
+    ]
 
 
 def _client_config_path(client: str) -> Path:
@@ -7192,12 +7365,17 @@ def _configured_model(client: str, path: Path) -> str | None:
     else:
         config = _read_json_config(client, path)
         if client == "opencode":
-            model = config.get("model")
-            prefix = f"{ROUTER_PROVIDER}/"
-            if isinstance(model, str) and model.startswith(prefix):
-                model = model[len(prefix) :]
-            else:
-                model = None
+            # A top-level model from before configure recorded its choice as
+            # a plugin option (or that the user pinned since) still counts.
+            model = _opencode_router_model_setting(config.get("model"))
+            if model is None:
+                package_path = integration_package_path(client).resolve()
+                for entry in _opencode_plugin_entries(config):
+                    if not _is_router_plugin_entry(client, entry, package_path):
+                        continue
+                    options = _opencode_plugin_options(entry) or {}
+                    model = options.get("defaultModel")
+                    break
         elif client == "pi" and config.get("defaultProvider") == ROUTER_PROVIDER:
             model = config.get("defaultModel")
         else:
@@ -7262,6 +7440,204 @@ def _preferred_model(
     return DEFAULT_MODEL if DEFAULT_MODEL in identifiers else identifiers[0]
 
 
+def _codex_admin_default_model(
+    admin_default: str | None, models: list[RouterModel], router_catalog: dict
+) -> str | None:
+    """The Codex catalog slug for the admin default, when Router can serve it.
+
+    ``admin_default`` is Router's answer (see ``admin_defaults``), read
+    before the config lock is taken. Codex's config.toml names models by
+    the slug of Router's Codex catalog, which mostly carries display names
+    ("Claude Fable 5.1") rather than request ids ("claude-fable-5-1"). The
+    admin setting may use either, so a request id is mapped through its
+    display name the same way the explicit ``configure model`` command maps
+    one. A default naming a model Router no longer offers is ignored rather
+    than written: Codex would otherwise start every new session on a model
+    that cannot answer.
+    """
+    if admin_default is None:
+        return None
+    entries = [
+        entry
+        for entry in router_catalog.get("models") or []
+        if isinstance(entry, dict) and isinstance(entry.get("slug"), str)
+    ]
+    if any(entry["slug"] == admin_default for entry in entries):
+        return admin_default
+    display_name = next(
+        (model.metadata.display_name for model in models if model.id == admin_default),
+        None,
+    )
+    if not display_name:
+        return None
+    return next(
+        (
+            entry["slug"]
+            for entry in entries
+            if display_name in (entry["slug"], entry.get("display_name"))
+        ),
+        None,
+    )
+
+
+def _recorded_admin_default_model(state_path: Path) -> str | None:
+    """The admin default the Codex setup caches for the hooks, if any.
+
+    Read leniently: a missing or unreadable receipt is reported in full by
+    the configure path itself; here it only means there is nothing to apply.
+    """
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    recorded = state.get(CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY)
+    return recorded if isinstance(recorded, str) and recorded else None
+
+
+_CODEX_MODEL_LINE = re.compile(r"^\s*(?:model|\"model\"|'model')\s*=")
+
+
+def _apply_codex_admin_default(path: Path) -> bool:
+    """Put config.toml's model back to the cached admin default; report a write.
+
+    The hook half of enforcement: no network, one lock, and a no-op when the
+    model already matches, which is the common case. Only the root ``model``
+    line changes, so a session's other edits survive, and only while this
+    config is still the Router setup the receipt describes: after an
+    unconfigure the restored file is the user's, whatever a stale hook group
+    still says.
+
+    Codex resolves a session's model before it runs SessionStart, so this
+    reset reaches the sessions started after it, not the one running it. A
+    pick made with ``/model`` and abandoned without a finished turn (``/new``
+    or quit before the model answers) therefore starts exactly one more
+    session on the pick; that session's own start puts the default back.
+    """
+    state_path = path.parent / "ramp-router-state.json"
+    if not state_path.is_file():
+        return False
+    with codex_config_lock(path):
+        # Read under the lock: a refresh clearing the default while this
+        # hook waited must not have its config overwritten from a receipt
+        # read before it ran.
+        admin_default = _recorded_admin_default_model(state_path)
+        if admin_default is None:
+            return False
+        existing, existing_data = _read_codex_config(path)
+        if existing_data.get("model_provider") != ROUTER_PROVIDER:
+            return False
+        if existing_data.get("model") == admin_default:
+            return False
+        updated = _rewrite_codex_root_model(existing, existing_data, admin_default)
+        if updated is None:
+            # A model set in a way this line rewrite cannot reach (a
+            # dotted-key table, say) is left alone rather than guessed at.
+            return False
+        _write_private_file(path, updated)
+        return True
+
+
+def _rewrite_codex_root_model(
+    existing: str, existing_data: dict, model: str
+) -> str | None:
+    """Return ``existing`` with only its root ``model`` set to ``model``, or None.
+
+    Chunking splits on table headers only, so a root-level multiline string
+    can carry lines that look like ``model = ...``. Each candidate line is
+    tried in turn and accepted only when the result parses to the same
+    document with just the root ``model`` changed; a line inside a string
+    changes that string and is rejected. With no ``model`` key at all, the
+    assignment is appended to the root table under the same check.
+    """
+    chunks = _config_chunks(existing)
+    root = chunks[0]
+    rest = "".join("".join(chunk) for chunk in chunks[1:])
+    replacement = f"model = {json.dumps(model)}\n"
+    expected = {**existing_data, "model": model}
+    candidates = (
+        [
+            [*root[:index], replacement, *root[index + 1 :]]
+            for index, line in enumerate(root)
+            if _CODEX_MODEL_LINE.match(line)
+        ]
+        if "model" in existing_data
+        else [[*root, replacement]]
+    )
+    for candidate in candidates:
+        updated = "".join(candidate) + rest
+        try:
+            parsed = tomllib.loads(updated)
+        except tomllib.TOMLDecodeError:
+            continue
+        if parsed == expected:
+            return updated
+    return None
+
+
+def _codex_hooks_awaiting_trust(path: Path) -> list[str]:
+    """Name the managed Codex hook events whose handlers Codex has not trusted.
+
+    Codex skips a non-managed hook until the user reviews it, recording trust
+    under ``hooks.state."<config path>:<event>:<group>:<handler>"``. Nothing
+    here can grant that trust — the review is Codex's safeguard — but a setup
+    whose hooks have never run is one the user needs to hear about, because
+    the admin default reset and the session sync both live in those hooks.
+    An entry present but stale (Codex re-flags a changed command) reads as
+    trusted here; Codex itself warns about that case at startup.
+    """
+    try:
+        _, config = _read_codex_config(path)
+    except click.ClickException:
+        return []
+    hooks = config.get("hooks")
+    if not isinstance(hooks, dict):
+        return []
+    state = hooks.get("state")
+    state = state if isinstance(state, dict) else {}
+    awaiting = []
+    for event_table, snake, event in (
+        ("SessionStart", "session_start", None),
+        ("Stop", "stop", SYNC_HOOK_STOP_EVENT),
+    ):
+        groups = hooks.get(event_table)
+        if not isinstance(groups, list):
+            continue
+        for group_index, group in enumerate(groups):
+            handlers = group.get("hooks") if isinstance(group, dict) else None
+            if not isinstance(handlers, list):
+                continue
+            for handler_index, handler in enumerate(handlers):
+                command = handler.get("command") if isinstance(handler, dict) else None
+                if not isinstance(command, str) or not _command_runs_session_sync(
+                    command, event
+                ):
+                    continue
+                record = state.get(f"{path}:{snake}:{group_index}:{handler_index}")
+                if not (isinstance(record, dict) and record.get("trusted_hash")):
+                    awaiting.append(event_table)
+    return awaiting
+
+
+def _codex_hook_trust_note_lines(path: Path) -> list[str]:
+    events = _codex_hooks_awaiting_trust(path)
+    if not events:
+        return []
+    return [
+        "Codex has not trusted Ramp's hooks yet, so they are not running:",
+        *(f"  {event}" for event in dict.fromkeys(events)),
+        "",
+        "Until they are trusted, the admin default model is applied only by "
+        "'ramp router refresh', and a model picked in one session carries over "
+        "to the next.",
+        "",
+        'To trust them, start the Codex CLI and choose "Trust all and continue" '
+        "at the hooks prompt, or run /hooks and press t. Codex asks again "
+        "whenever a hook's command changes.",
+    ]
+
+
 def _configure_client(
     client: str,
     api_key: str,
@@ -7277,16 +7653,18 @@ def _configure_client(
     conductor_lock_held: bool = False,
     strict_model: bool = False,
     explicit_model: bool = False,
-    replace_model: str | None | object = _UNCHECKED,
+    replace_model: str | bool | None | object = _UNCHECKED,
     expected_connection: tuple[str, str] | None = None,
 ) -> tuple[Path, str, bool]:
     """Configure one client, reporting whether it replaced an outdated setup.
 
     ``explicit_model`` makes Codex write ``selected_model`` as given instead of
     re-reading its config for a selection; ``strict_model`` implies it.
-    ``replace_model`` does the same, but only while Codex's config still holds
+    For Codex, ``replace_model`` does the same, but only while its config still holds
     that selection (None for no selection) when the write happens; a selection
     changed since is kept instead.
+    For OpenCode, ``replace_model=True`` marks an explicit model change, which
+    may displace a setting setup and refresh otherwise leave to the user.
     """
     if client == "claude-code":
         path = _client_config_path(client)
@@ -7353,7 +7731,14 @@ def _configure_client(
 
     path = _json_config_path(client)
     default_model = _preferred_model(models, selected_model)
-    _configure_plugin_client(client, path, api_key, default_model, base_url=base_url)
+    _configure_plugin_client(
+        client,
+        path,
+        api_key,
+        default_model,
+        base_url=base_url,
+        replace_model=replace_model is True,
+    )
     return path, default_model, False
 
 
@@ -7416,6 +7801,10 @@ def _bundled_plugin_path(client: str) -> Path:
     return path
 
 
+def _dump_state(payload: dict) -> str:
+    return json.dumps(payload, indent=2) + "\n"
+
+
 def _opencode_layout(generation: int) -> tuple[str, Path, str]:
     """The plugin array key, terminal-client config, and its schema URL."""
     if generation >= 2:
@@ -7440,6 +7829,7 @@ def _configure_opencode(
     default_model: str,
     *,
     base_url: str | None,
+    replace_model: bool = False,
 ) -> tuple[str | None, list[tuple[Path, dict]]]:
     """Register the bundled plugin for whichever OpenCode generation is installed.
 
@@ -7481,34 +7871,57 @@ def _configure_opencode(
             if not _is_router_plugin_entry("opencode", entry, package_path)
         ]
 
+    # v1 owns the config's ``model`` outright. v2 keeps the choice in the
+    # plugin option and takes the top-level key only to move an earlier
+    # Router model there, or to displace a user's own model on an explicit
+    # model change, which would otherwise outrank the option for sessions
+    # created without a model. The receipt records whether the key was
+    # taken, so unconfigure restores only what this CLI removed.
+    model_taken = generation < 2 or (
+        "model" in existing
+        and (_is_router_model_setting(existing.get("model")) or replace_model)
+    )
+
     state = None
     if not state_path.exists():
         # A hand-written static entry for the same provider id is recorded
         # and removed, whichever key it lives under: v2 layers config
         # providers over plugin-registered ones, so leaving it would let a
         # stale static block shadow the discovered catalog.
-        state = (
-            json.dumps(
+        state = _dump_state(
+            {
+                "opencode_generation": generation,
+                "provider_present": ROUTER_PROVIDER in providers,
+                "provider": providers.get(ROUTER_PROVIDER),
+                "providers_present": ROUTER_PROVIDER in providers_v2,
+                "providers": providers_v2.get(ROUTER_PROVIDER),
+                "model_present": "model" in existing,
+                "model": existing.get("model"),
+                "model_taken": model_taken,
+                "plugin_present": "plugin" in existing,
+                "plugin_entries": router_entries(existing.get("plugin", [])),
+                "plugins_present": "plugins" in existing,
+                "plugins_entries": router_entries(existing.get("plugins", [])),
+                "tui_file_present": tui_existed,
+                "tui_plugin_present": plugin_key in tui_config,
+                "tui_plugin_entries": router_entries(tui_plugins),
+            }
+        )
+    elif model_taken:
+        # Taking the key now, after an earlier configure left it to the
+        # user: the receipt comes to hold what is being removed (or its
+        # absence, as when v1 takes over a v2 setup), so that is what
+        # unconfigure brings back.
+        recorded = _read_json_config("opencode", state_path)
+        if not recorded.get("model_taken", True):
+            state = _dump_state(
                 {
-                    "opencode_generation": generation,
-                    "provider_present": ROUTER_PROVIDER in providers,
-                    "provider": providers.get(ROUTER_PROVIDER),
-                    "providers_present": ROUTER_PROVIDER in providers_v2,
-                    "providers": providers_v2.get(ROUTER_PROVIDER),
+                    **recorded,
                     "model_present": "model" in existing,
                     "model": existing.get("model"),
-                    "plugin_present": "plugin" in existing,
-                    "plugin_entries": router_entries(existing.get("plugin", [])),
-                    "plugins_present": "plugins" in existing,
-                    "plugins_entries": router_entries(existing.get("plugins", [])),
-                    "tui_file_present": tui_existed,
-                    "tui_plugin_present": plugin_key in tui_config,
-                    "tui_plugin_entries": router_entries(tui_plugins),
-                },
-                indent=2,
+                    "model_taken": True,
+                }
             )
-            + "\n"
-        )
 
     options = {
         "providerID": ROUTER_PROVIDER,
@@ -7527,6 +7940,11 @@ def _configure_opencode(
             if (executable := router_sync_module.ramp_executable()) is not None
             else {}
         ),
+        # v2 starts new sessions on the model the plugin gives the agents
+        # and the registry, so the choice travels with the plugin rather
+        # than as the config's own ``model``, which would outrank the
+        # organization default the plugin applies.
+        **({"defaultModel": default_model} if generation >= 2 else {}),
     }
     plugin_entry: object = (
         {"package": package_path.as_uri(), "options": options}
@@ -7549,7 +7967,10 @@ def _configure_opencode(
             existing[key] = mapping
         else:
             existing.pop(key, None)
-    existing["model"] = f"{ROUTER_PROVIDER}/{default_model}"
+    if generation < 2:
+        existing["model"] = f"{ROUTER_PROVIDER}/{default_model}"
+    elif model_taken:
+        existing.pop("model")
 
     if not tui_existed:
         tui_config["$schema"] = tui_schema
@@ -7564,6 +7985,7 @@ def _configure_plugin_client(
     api_key: str,
     default_model: str,
     base_url: str | None = None,
+    replace_model: bool = False,
 ) -> None:
     package_path = _bundled_plugin_path(client)
     state_path = path.parent / "ramp-router-state.json"
@@ -7577,6 +7999,7 @@ def _configure_plugin_client(
             api_key,
             default_model,
             base_url=base_url,
+            replace_model=replace_model,
         )
     else:
         settings = _read_json_config(client, path)
@@ -7755,7 +8178,13 @@ def _unconfigure_opencode(
             existing[key] = mapping
         else:
             existing.pop(key, None)
-    if str(existing.get("model", "")).startswith(f"{ROUTER_PROVIDER}/"):
+    # Only a model this CLI wrote (v1) or removed (v2) is undone; a receipt
+    # from before the flag belongs to a configure that always took the key.
+    # A different model present now was chosen by the user afterwards, and
+    # an absent one that configure left in place was removed by them.
+    if state.get("model_taken", True) and (
+        "model" not in existing or _is_router_model_setting(existing.get("model"))
+    ):
         _restore_json_value(
             existing,
             "model",
@@ -8262,6 +8691,13 @@ def _configure_codex(
     )
     # None (Windows or no resolvable ramp entrypoint) registers nothing.
     sync_hook_command = None if strict_model else session_sync_hook_command("codex")
+    # Router's answer for this connection, asked at the same origin the
+    # setup's session-usage calls go to (and that the receipt records).
+    # Another network read, so it too stays outside the lock; the mapping
+    # onto Codex's catalog happens inside, against the catalog just fetched.
+    admin_default = admin_defaults.admin_default_model(
+        CODEX_CLIENT_NAME, api_key, _statusline_origin(base_url)
+    )
     with codex_config_lock(path):
         if strict_model and (
             _stored_router_api_key("codex", path) != api_key
@@ -8281,6 +8717,7 @@ def _configure_codex(
             sync_hook_command=sync_hook_command,
             explicit_model=strict_model or explicit_model,
             replace_model=replace_model,
+            admin_default=admin_default,
         )
 
 
@@ -8296,6 +8733,7 @@ def _configure_codex_in_lock(
     sync_hook_command: str | None,
     explicit_model: bool = False,
     replace_model: str | None | object = _UNCHECKED,
+    admin_default: str | None = None,
 ) -> tuple[str, bool]:
     existing, existing_data = _read_codex_config(path)
     if replace_model is not _UNCHECKED:
@@ -8313,6 +8751,19 @@ def _configure_codex_in_lock(
         # the change itself, so it is kept as given.
         selected_model = existing_data.get("model")
     default_model = _preferred_codex_model(models, router_catalog, selected_model)
+    state_path = path.parent / "ramp-router-state.json"
+    # An admin default is what every new session starts on: it wins over the
+    # preferred model and over whatever a session's own pick left in
+    # config.toml. Codex pins the model per thread in its own index and a
+    # running CLI session holds its model in memory, so rewriting the config
+    # default only reaches sessions started afterwards. Between refreshes the
+    # SessionStart and Stop hooks keep it in place from the receipt's cached
+    # copy (see _apply_codex_admin_default). A model the user names
+    # explicitly is written as asked; the next hook run puts the default back
+    # for the sessions after it.
+    admin_default = _codex_admin_default_model(admin_default, models, router_catalog)
+    if admin_default is not None and not explicit_model:
+        default_model = admin_default
     router_catalog_body = _render_codex_catalog(router_catalog, default_model)
     chunks = _config_chunks(existing)
     repaired = _codex_provider_is_out_of_date(existing_data)
@@ -8331,7 +8782,6 @@ def _configure_codex_in_lock(
             harness_prompt = instructions_path.read_text(encoding="utf-8") or None
         except (OSError, UnicodeError):
             harness_prompt = None
-    state_path = path.parent / "ramp-router-state.json"
     previous_state = None
     # The receipt as it will be written, or None when this run changes nothing
     # in it.
@@ -8399,6 +8849,18 @@ def _configure_codex_in_lock(
     usage_origin = _statusline_origin(base_url)
     if receipt.get(CODEX_USAGE_ORIGIN_KEY) != usage_origin:
         receipt[CODEX_USAGE_ORIGIN_KEY] = usage_origin
+        state_document = receipt
+    # Cache the enforced default for the hooks, which run without the
+    # network. A cleared admin default drops the record so the hooks stand
+    # down. The receipt is written before config.toml and restored on
+    # failure (below), and a stale cache is self-correcting: the next hook
+    # run or refresh applies whatever is current.
+    if admin_default is not None:
+        if receipt.get(CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY) != admin_default:
+            receipt[CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY] = admin_default
+            state_document = receipt
+    elif CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY in receipt:
+        del receipt[CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY]
         state_document = receipt
     # Lets unconfigure know the script and its Stop group are ours to remove.
     if (
@@ -8517,8 +8979,22 @@ def _configure_codex_in_lock(
         )
     ]
 
+    # The Stop group is registered under the same conditions as the
+    # SessionStart group: it is the other half of keeping the admin default
+    # in place between sessions.
+    stop_sync_hook_command = (
+        session_sync_hook_command(CODEX_CLIENT_NAME, SYNC_HOOK_STOP_EVENT)
+        if sync_hook_command is not None
+        else None
+    )
     if sync_hook_command is not None:
         chunks = _drop_recorded_sync_hook_chunk(chunks, recorded_sync_hook)
+    if stop_sync_hook_command is not None:
+        chunks = _drop_recorded_sync_hook_chunk(
+            chunks,
+            receipt.get(CODEX_STOP_SYNC_HOOK_STATE_KEY),
+            _CODEX_STOP_HOOK_TABLE,
+        )
     preserved = "".join(
         "".join(chunk)
         for chunk in chunks
@@ -8538,6 +9014,19 @@ def _configure_codex_in_lock(
     if sync_hook_command is not None:
         updated, receipt_changed = _register_codex_sync_hook(
             path, updated, sync_hook_command, receipt
+        )
+        if receipt_changed:
+            state_document = receipt
+    if stop_sync_hook_command is not None:
+        updated, receipt_changed = _register_codex_sync_hook(
+            path,
+            updated,
+            stop_sync_hook_command,
+            receipt,
+            state_key=CODEX_STOP_SYNC_HOOK_STATE_KEY,
+            event_table="Stop",
+            event=SYNC_HOOK_STOP_EVENT,
+            render=_render_codex_stop_sync_hook_group,
         )
         if receipt_changed:
             state_document = receipt

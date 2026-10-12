@@ -13,11 +13,18 @@ import {
   nonEmpty,
   resolveAPIKey,
   resolveBaseURL,
+  resolveDefaultModel,
   resolveProviderID,
   resolveProviderName,
   resolveRampCliVersion,
+  resolveUsageOrigin,
   routerPluginOptions,
 } from "./options.ts"
+import {
+  type SessionDomainLike,
+  workspaceDefaultApplier,
+  workspaceDefaultCache,
+} from "./workspace-default.ts"
 
 /**
  * Router speaks the OpenAI Responses API for every model it serves, so the
@@ -168,7 +175,9 @@ export function toV2Provider(input: {
  * The OpenCode v2 plugin body. Discovery runs once before the synchronous
  * provider transform, as v2 requires, and the result is captured for replay.
  */
-export async function setupRouterProviderV2(ctx: Plugin.Context): Promise<void> {
+export async function setupRouterProviderV2(
+  ctx: Plugin.Context,
+): Promise<Plugin.Cleanup> {
   const options = routerPluginOptions(ctx.options)
   const providerID = resolveProviderID(options)
   const name = resolveProviderName(options)
@@ -181,6 +190,15 @@ export async function setupRouterProviderV2(ctx: Plugin.Context): Promise<void> 
       `Set the plugin apiKey option or ${apiKeyEnv} before starting OpenCode`,
     )
   }
+
+  // Read alongside discovery so the answer is usually in by the time the
+  // provider registers; its own short timeout bounds any wait below.
+  const defaults = workspaceDefaultCache({
+    usageOrigin: resolveUsageOrigin(options),
+    apiKey,
+    ...(rampCliVersion ? { rampCliVersion } : {}),
+  })
+  defaults.prefetch()
 
   const discovered = await discoverRouterModels({
     baseURL,
@@ -206,4 +224,26 @@ export async function setupRouterProviderV2(ctx: Plugin.Context): Promise<void> 
       models: models as unknown as Parameters<typeof editor.add>[0]["models"],
     })
   })
+
+  // The organization default reaches new sessions through the primary
+  // agents' model (what the TUI consults for a session that has no model
+  // yet) and the registry default; sessions in progress or resumed keep the
+  // model recorded on them. Later reads happen in the background as
+  // sessions are created.
+  const applier = workspaceDefaultApplier({
+    // OpenCode brands its ids; the applier only reads and writes plain strings.
+    agent: ctx.agent as unknown as Parameters<typeof workspaceDefaultApplier>[0]["agent"],
+    model: ctx.model,
+    session: ctx.session as unknown as SessionDomainLike,
+    configured: resolveDefaultModel(options),
+    providerID,
+    modelIDs: new Set(models.filter((model) => model.enabled).map((model) => model.id)),
+    defaults,
+  })
+  await applier.refresh()
+  const subscription = new AbortController()
+  void applier.watch(ctx.event.subscribe({ signal: subscription.signal })).catch(() => {
+    // An ended event stream only stops later refreshes.
+  })
+  return () => subscription.abort()
 }

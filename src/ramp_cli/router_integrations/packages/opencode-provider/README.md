@@ -43,7 +43,8 @@ would otherwise guess both from the model's name and ask every upstream for
 
 For development, install this package by adding its directory to OpenCode's
 global plugin array. Both forms accept `apiKey`, `baseURL`, `usageBaseURL`,
-`providerID`, `name`, `apiKeyEnv`, `rampCliVersion`, and `rampExecutable`:
+`providerID`, `name`, `apiKeyEnv`, `rampCliVersion`, `rampExecutable`, and
+`defaultModel`:
 
 ```jsonc
 // OpenCode v1
@@ -117,6 +118,32 @@ resolved from the `usageBaseURL` option (written by `ramp router configure
 opencode`), then the `RAMP_ROUTER_USAGE_BASE_URL` environment variable, and
 otherwise derived from `baseURL`. Every failure is silent: the display never
 interrupts a working chat.
+
+## Organization default model
+
+A Router workspace admin can choose the model new OpenCode sessions start on
+(Router's coding-agent settings). On OpenCode v2 the provider gives the
+primary agents (`build`, `plan`, and any user-defined primary agent,
+including ones OpenCode materializes from the user's config after plugins
+load) that model when the key's catalog serves it, which is what the TUI
+starts a new session on; the registry default is set as well. Sessions in
+progress or resumed keep the model recorded on them (a session `opencode
+run` starts without `--model` records none, so the provider records the
+model its first request uses, keeping `opencode run --continue` on it), a
+model the user picks on the home screen or within a session stands, and
+subagents (including a built-in agent the user's config turns into one) and
+agents whose definition names a model keep it. The setting is read from the
+dashboard origin once at startup alongside model discovery and then once a
+minute while the process runs, each with a short timeout; any failure leaves
+OpenCode's own defaults in place. Without an organization default the same mechanism
+applies the `defaultModel` option, which is where `ramp router configure
+opencode` records its choice on v2 (an earlier top-level `model` pointing at
+the Router provider is moved there on refresh): a session created without a
+model, as `opencode run` does, takes the config's own `model` before the
+plugin's registry default, so a `model` of the user's own pointing elsewhere
+is left alone and noted. OpenCode v1 keeps the picked model client-side, so
+the default is not applied there; configure still writes the top-level
+`model` for v1.
 
 ## Layout
 

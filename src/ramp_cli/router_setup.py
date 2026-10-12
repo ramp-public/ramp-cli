@@ -19,6 +19,21 @@ import click
 
 from ramp_cli.auth.oauth import _callback_html, _open_browser
 
+try:
+    from ramp_cli_private.mdm_telemetry import record_event as _record_mdm_event
+except ModuleNotFoundError as e:
+    if e.name != "ramp_cli_private":
+        raise
+
+    def _record_mdm_event(event: str, **attributes: object) -> None:
+        pass
+
+
+def record_mdm_event(event: str, **attributes: object) -> None:
+    """Log one stage of an MDM-driven Router setup; a no-op in public builds."""
+    _record_mdm_event(event, **attributes)
+
+
 ROUTER_SETUP_TIMEOUT_SECONDS = 900
 ROUTER_SETUP_DEFERRED_EXIT_CODE = 3
 ROUTER_SETUP_PATH = "/cli/setup"
@@ -43,7 +58,7 @@ def confirm_router_browser_setup(router_ui_url: str) -> bool:
         set setupMessage to "Your IT team installed Ramp Router to give your coding tools access to company-approved AI models." & return & return
         set setupMessage to setupMessage & "Connect with your work account. Your browser will open to finish setup at " & (item 1 of argv) & "."
         set setupDialog to display dialog setupMessage with title "Connect Ramp Router" buttons {"Later", "Connect"} default button "Connect" cancel button "Later" with icon note giving up after 300
-        if gave up of setupDialog then return "Later"
+        if gave up of setupDialog then return "Timeout"
         return button returned of setupDialog
     on error number -128
         return "Later"
@@ -58,16 +73,30 @@ end run"""
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
+        _record_mdm_event(
+            "router_mdm_dialog", action="failed", router_ui_url=router_ui_url
+        )
         raise click.ClickException(
             "Could not show the Connect/Later dialog. Browser setup was not started; "
             "rerun the setup policy or run 'ramp router configure' manually."
         ) from exc
-    if result.returncode != 0 or result.stdout.strip() not in {"Connect", "Later"}:
+    answer = result.stdout.strip()
+    if result.returncode != 0 or answer not in {"Connect", "Later", "Timeout"}:
+        _record_mdm_event(
+            "router_mdm_dialog", action="failed", router_ui_url=router_ui_url
+        )
         raise click.ClickException(
             "The Connect/Later dialog did not complete. Browser setup was not started; "
             "rerun the setup policy or run 'ramp router configure' manually."
         )
-    return result.stdout.strip() == "Connect"
+    _record_mdm_event(
+        "router_mdm_dialog", action=answer.lower(), router_ui_url=router_ui_url
+    )
+    return answer == "Connect"
+
+
+class RouterSetupTimeout(click.ClickException):
+    pass
 
 
 @dataclass
@@ -84,10 +113,14 @@ class RouterKeyCallback:
 
     def wait_for_key(self, timeout: int = ROUTER_SETUP_TIMEOUT_SECONDS) -> str:
         if not self._event.wait(timeout=timeout):
-            raise click.ClickException("Router setup timed out after 15 minutes")
+            raise RouterSetupTimeout("Router setup timed out after 15 minutes")
         if "error" in self._result:
             raise click.ClickException(str(self._result["error"]))
         return str(self._result["api_key"])
+
+    @property
+    def failure_outcome(self) -> str:
+        return str(self._result.get("outcome", "failed"))
 
     def shutdown(self) -> None:
         self._server.shutdown()
@@ -168,6 +201,7 @@ def start_router_key_callback(router_ui_url: str) -> RouterKeyCallback:
                     "Router setup was cancelled",
                     description,
                     cli_error=f"Router setup failed: {description}",
+                    outcome="cancelled",
                 )
                 return
 
@@ -233,6 +267,7 @@ def start_router_key_callback(router_ui_url: str) -> RouterKeyCallback:
             detail: str,
             *,
             cli_error: str | None = None,
+            outcome: str = "failed",
         ) -> None:
             with result_lock:
                 if result.get("consumed"):
@@ -240,6 +275,7 @@ def start_router_key_callback(router_ui_url: str) -> RouterKeyCallback:
                     return
                 result["consumed"] = True
                 result["error"] = cli_error or detail
+                result["outcome"] = outcome
                 event.set()
             self._send_page(
                 status,
@@ -281,8 +317,14 @@ def start_router_key_callback(router_ui_url: str) -> RouterKeyCallback:
     )
 
 
-def acquire_router_api_key(router_ui_url: str, *, no_browser: bool = False) -> str:
-    """Open Router setup and wait for its one-time key handoff."""
+def acquire_router_api_key(
+    router_ui_url: str, *, no_browser: bool = False, mdm: bool = False
+) -> str:
+    """Open Router setup and wait for its one-time key handoff.
+
+    ``mdm`` runs report how the browser step ended so the deployment funnel is
+    visible alongside the Connect/Later dialog answer.
+    """
 
     callback = start_router_key_callback(router_ui_url)
     query = urlencode(
@@ -295,21 +337,55 @@ def acquire_router_api_key(router_ui_url: str, *, no_browser: bool = False) -> s
         }
     )
     setup_url = f"{router_ui_url.rstrip('/')}{ROUTER_SETUP_PATH}?{query}"
+    state_hash = _setup_state_hash(callback.state)
+    outcome = "failed"
+    detail: str | None = None
     try:
         if no_browser:
             click.echo(
                 f"Open this URL in your browser to connect Ramp Router:\n\n  {setup_url}\n",
                 err=True,
             )
-        elif not _open_browser(setup_url):
-            click.echo(
-                f"Could not open browser. Open this URL manually:\n\n  {setup_url}\n",
-                err=True,
-            )
+        else:
+            opened = _open_browser(setup_url)
+            if mdm:
+                _record_mdm_event(
+                    "router_mdm_browser_opened",
+                    opened=opened,
+                    router_ui_url=router_ui_url,
+                    setup_state_hash=state_hash,
+                )
+            if not opened:
+                click.echo(
+                    f"Could not open browser. Open this URL manually:\n\n  {setup_url}\n",
+                    err=True,
+                )
         click.echo("Waiting for Ramp Router setup in browser...", err=True)
-        return callback.wait_for_key()
+        try:
+            api_key = callback.wait_for_key()
+        except RouterSetupTimeout:
+            outcome = "timed_out"
+            raise
+        except click.ClickException as exc:
+            outcome, detail = callback.failure_outcome, exc.message
+            raise
+        outcome = "connected"
+        return api_key
     finally:
         callback.shutdown()
+        if mdm:
+            _record_mdm_event(
+                "router_mdm_browser_setup",
+                outcome=outcome,
+                detail=detail,
+                router_ui_url=router_ui_url,
+                setup_state_hash=state_hash,
+            )
+
+
+def _setup_state_hash(state: str) -> str:
+    """A join key shared with Router's own logs that does not expose ``state``."""
+    return hashlib.sha256(state.encode()).hexdigest()[:16]
 
 
 def _single_value(form: dict[str, list[str]], field: str) -> str | None:

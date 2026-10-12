@@ -88,18 +88,19 @@ def prices(models) -> dict[str, tuple[str | None, str | None, str | None]]:
     return {model: pricing for model, pricing in rates.items() if any(pricing)}
 
 
-# Harnesses a workspace admin can give a starting model in Router.
-ORGANIZATION_DEFAULT_HARNESSES = ("claude-code", "codex", "opencode", "pi")
+# Harnesses a workspace admin can give a starting model in Router: the ones
+# whose Router integration can apply it to each new session (the OpenCode
+# and Pi plugins in process, Codex through its setup and session hooks).
+ORGANIZATION_DEFAULT_HARNESSES = ("codex", "opencode", "pi")
 
 
 def organization_default(current: Connection) -> str | None:
-    """The model this key's workspace admin suggests for the harness, if any.
+    """The model this key's workspace admin chose for the harness, if any.
 
     Router resolves it against the workspace's model policy and reports
-    nothing for personal keys. A suggestion only: any failure reads as none,
-    and nothing is applied without the user choosing it. (When Router
-    selects Switchyard for the key, configure and refresh push the model
-    themselves; here it is still just the label.)
+    nothing for personal keys. The harness's Router integration applies it
+    to new sessions; here it only labels the picker, so any failure (or a
+    Router that doesn't list this harness) reads as none.
     """
     if current.client not in ORGANIZATION_DEFAULT_HARNESSES or not current.key:
         return None
@@ -185,6 +186,10 @@ def set_model(
         options = {"base_url": current.base_url, "selected_model": model}
         if client == "codex":
             options["strict_model"] = True
+        if client == "opencode":
+            # The user asked for this model: a top-level ``model`` of their
+            # own, which setup and refresh leave alone, gives way to it.
+            options["replace_model"] = True
         if client == "claude-code":
             options.update(
                 claude_model_view="all"

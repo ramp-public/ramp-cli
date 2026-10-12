@@ -20,6 +20,8 @@ export type RouterPluginOptions = PluginOptions & {
   apiKeyEnv?: string
   rampExecutable?: string
   rampCliVersion?: string
+  /** The model `ramp router configure` chose for new sessions. */
+  defaultModel?: string
 }
 
 export function nonEmpty(value: unknown, fallback: string): string {
@@ -66,6 +68,11 @@ export function resolveAPIKey(options: RouterPluginOptions): string | undefined 
 /** The CLI version recorded at configure time, absent for a hand-written entry. */
 export function resolveRampCliVersion(options: RouterPluginOptions): string | undefined {
   return nonEmpty(options.rampCliVersion, "") || undefined
+}
+
+/** The configured starting model, absent for a hand-written entry. */
+export function resolveDefaultModel(options: RouterPluginOptions): string | undefined {
+  return nonEmpty(options.defaultModel, "") || undefined
 }
 
 /**

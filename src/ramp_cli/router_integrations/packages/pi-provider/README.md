@@ -46,6 +46,18 @@ pi --provider ramp-router --model <model-id> --thinking high --print \
   "Reply with exactly: ROUTER_OK"
 ```
 
+A Router workspace admin can choose the model new Pi sessions start on
+(Router's coding-agent settings). The extension applies it through Pi's
+`setModel` on a fresh launch and on `/new`, when the key's catalog serves it,
+without touching Pi's configured default model. `--continue`, `--resume`,
+forks, reloads, and a launch with an explicit `--model` keep their model, and
+`/model` switches within a session stand, including one made before Router
+has answered. The setting is read from the dashboard origin at most once a
+minute per process with a short timeout, in the background interactively
+and before the first prompt in `--print`/`--mode json`, and never in
+`PI_OFFLINE` mode; any failure leaves Pi's own model in place. Pi 0.84.1 and
+0.84.2 are skipped: their `setModel` also rewrote the configured default.
+
 Production Router is the default endpoint. Set `RAMP_ROUTER_BASE_URL` only to
 override it. Reasoning-capable models expose their supported Pi thinking
 levels; non-OpenAI reasoning providers currently use the portable `off`,

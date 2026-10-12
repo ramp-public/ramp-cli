@@ -135,14 +135,22 @@ def ramp_executable() -> Path | None:
     return Path(os.path.abspath(resolved)) if resolved else None
 
 
-def session_sync_hook_command(client: str) -> str | None:
+# The hook event a sync command declares when it is not the session start.
+# Codex's Stop hook reruns the same command after every turn so the Codex
+# default model is reset for the next session; the flag keeps that run from
+# emitting the session-start envelope on a channel with other semantics.
+SYNC_HOOK_STOP_EVENT = "stop"
+
+
+def session_sync_hook_command(client: str, event: str | None = None) -> str | None:
     """The SessionStart command written into one agent's hook config, or None.
 
     POSIX-only, like the cost scripts. The `[ -x ]` guard and `|| true` make
     a moved binary or failing sync a silent no-op at session start. --client
     names the hosting agent so hook mode can emit that agent's structured
     output instead of plain stdout, which both agents inject into the model's
-    context.
+    context. ``event`` names a non-session-start hook event (see
+    ``SYNC_HOOK_STOP_EVENT``) the same command is registered for.
     """
     if os.name == "nt":
         return None
@@ -150,11 +158,19 @@ def session_sync_hook_command(client: str) -> str | None:
     if executable is None:
         return None
     quoted = shlex.quote(str(executable))
-    return f"[ -x {quoted} ] && {quoted} {SYNC_HOOK_MARKER} --client {client} || true"
+    suffix = f" --event {event}" if event else ""
+    return (
+        f"[ -x {quoted} ] && {quoted} {SYNC_HOOK_MARKER} --client {client}{suffix}"
+        " || true"
+    )
 
 
-def command_runs_session_sync(command: str) -> bool:
-    """Return whether a shell command actually invokes `ramp router sync --hook`."""
+def command_runs_session_sync(command: str, event: str | None = None) -> bool:
+    """Return whether a shell command actually invokes `ramp router sync --hook`.
+
+    With ``event`` None this recognizes the session-start registration only;
+    with an event name it recognizes the registration for that event.
+    """
     try:
         tokens = shlex.split(command)
     except ValueError:
@@ -178,7 +194,12 @@ def command_runs_session_sync(command: str) -> bool:
         return False
     if tokens[1:4] != ["router", "sync", "--hook"]:
         return False
-    return tokens[4:] in (
+    tail = tokens[4:]
+    if event is not None:
+        if tail[-2:] != ["--event", event]:
+            return False
+        tail = tail[:-2]
+    return tail in (
         [],
         ["--client", "claude-code"],
         ["--client", "codex"],

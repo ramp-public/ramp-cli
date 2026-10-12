@@ -20,6 +20,7 @@ import registerRouterProvider, {
   discoverRouterModels,
   normalizeBaseURL,
   supportsRuntimeModelBootstrap,
+  supportsSessionScopedSetModel,
 } from "../src/index.ts"
 
 function routerMetadata(id, inputModalities = ["text", "image"]) {
@@ -80,6 +81,17 @@ describe("supportsRuntimeModelBootstrap", () => {
     assert.equal(supportsRuntimeModelBootstrap("1.0.0"), true)
     assert.equal(supportsRuntimeModelBootstrap("9007199254740992.0.0"), false)
     assert.equal(supportsRuntimeModelBootstrap("unknown"), false)
+  })
+})
+
+describe("supportsSessionScopedSetModel", () => {
+  it("requires the Pi whose setModel no longer rewrites the configured default", () => {
+    assert.equal(supportsSessionScopedSetModel("0.84.1"), false)
+    assert.equal(supportsSessionScopedSetModel("0.84.2"), false)
+    assert.equal(supportsSessionScopedSetModel("0.84.3-beta.1"), false)
+    assert.equal(supportsSessionScopedSetModel("0.84.3"), true)
+    assert.equal(supportsSessionScopedSetModel("1.1.0"), true)
+    assert.equal(supportsSessionScopedSetModel("unknown"), false)
   })
 })
 
@@ -293,7 +305,7 @@ describe("discoverRouterModels", () => {
       fetch: fetcher,
     })
     const writes = Object.fromEntries(
-      discovered.map(({ id, metadata }) => [id, metadata.pricing?.cacheWrite]),
+      discovered.models.map(({ id, metadata }) => [id, metadata.pricing?.cacheWrite]),
     )
     assert.deepEqual(writes, {
       "claude-ttl": 6.25,

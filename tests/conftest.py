@@ -86,5 +86,8 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     # Hook-mode sync suppresses the shutdown update notice; only main() —
     # which CliRunner never reaches — resets the flag, so clear it here.
     monkeypatch.setattr("ramp_cli.version_check._SUPPRESS_NEXT_UPDATE_NOTICE", False)
+    # Router's coding-agent settings are cached per process; one test's
+    # Router must not answer the next one's configure.
+    monkeypatch.setattr("ramp_cli.admin_defaults._cache", {})
     monkeypatch.setattr("ramp_cli.config.settings.default_environment", lambda: "")
     yield tmp_path

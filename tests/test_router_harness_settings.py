@@ -74,6 +74,9 @@ def test_model_update_uses_existing_writer_and_saved_endpoint(installed, client)
     if client == "claude-code":
         assert options["claude_model_view"] == "compact"
         assert options["preserve_model_view_ownership"]
+    # Only OpenCode keeps a user's own top-level model through refresh, so
+    # only there does an explicit change have one to displace.
+    assert options.get("replace_model", False) is (client == "opencode")
 
 
 @pytest.mark.parametrize("flags", [["--agent"], ["--output", "json"], ["--human"]])
@@ -266,12 +269,35 @@ def test_organization_default_reads_key_scoped_settings(monkeypatch):
         # Older Routers and revoked business access.
         ({}, 404),
         ({}, 403),
+        # Router lists only the harnesses that can apply a default.
+        ({"opencode": {"model": "new", "effective_model": "new"}}, 200),
     ],
 )
 def test_organization_default_fails_open(monkeypatch, harnesses, status):
     monkeypatch.setattr(router.httpx, "get", _settings_response(harnesses, status))
     current = harness.Connection("pi", None, "key", "https://qa.router.invalid/v1")
     assert harness.organization_default(current) is None
+
+
+def test_organization_default_labels_codex_too(monkeypatch):
+    # Codex applies the default through its setup and session hooks, so the
+    # picker labels it like the plugin-backed harnesses.
+    get = _settings_response({"codex": {"model": "new", "effective_model": "new"}})
+    monkeypatch.setattr(router.httpx, "get", get)
+    current = harness.Connection("codex", None, "key", "https://qa.router.invalid/v1")
+    assert harness.organization_default(current) == "new"
+    assert len(get.calls) == 1
+
+
+@pytest.mark.parametrize("client", ["claude-code", "hermes"])
+def test_organization_default_is_only_read_for_harnesses_that_apply_it(
+    monkeypatch, client
+):
+    get = _settings_response({client: {"model": "new", "effective_model": "new"}})
+    monkeypatch.setattr(router.httpx, "get", get)
+    current = harness.Connection(client, None, "key", "https://qa.router.invalid/v1")
+    assert harness.organization_default(current) is None
+    assert get.calls == []
 
 
 @pytest.mark.parametrize(

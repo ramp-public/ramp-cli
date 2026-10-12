@@ -67,6 +67,15 @@ function fakeContext(options, { existing } = {}) {
         },
         reload: async () => {},
       },
+      // The organization-default applier has its own tests; here there is
+      // no default to apply and the event stream is empty.
+      agent: {
+        transform: async () => ({ dispose: async () => {} }),
+        reload: async () => {},
+        list: async () => ({ location: { directory: "/work" }, data: [] }),
+      },
+      model: { transform: async () => {}, reload: async () => {} },
+      event: { subscribe: () => (async function* () {})() },
     },
     added,
     removed,
@@ -307,9 +316,14 @@ describe("toV2Provider", () => {
 describe("OpenCode v2 setup", () => {
   it("discovers Router's models once and registers them through the provider editor", async () => {
     const fetcher = mock.method(globalThis, "fetch", async (url, init) => {
-      assert.equal(url, "https://router.example/v1/models")
       assert.equal(init.headers.authorization, "Bearer inline-secret")
       assert.equal(init.headers["X-Gateway-Ramp-Cli-Version"], "0.2.38")
+      if (url === "https://router.example/self-service/coding-agent-settings") {
+        // The organization default, read alongside discovery; an older
+        // Router has no such endpoint.
+        return new Response("", { status: 404 })
+      }
+      assert.equal(url, "https://router.example/v1/models")
       return modelList(
         { id: "gpt-5.6-sol", created: 1767225600, owned_by: "openai", router: routerMetadata("gpt-5.6-sol", { reasoning: openaiReasoning }) },
         { id: "claude-sonnet-4-6", created: 1e15, owned_by: "anthropic", router: routerMetadata("claude-sonnet-4-6", { provider: "Anthropic", reasoning: translatedReasoning }) },
@@ -324,7 +338,13 @@ describe("OpenCode v2 setup", () => {
 
     await plugin.setup(ctx)
 
-    assert.equal(fetcher.mock.callCount(), 1)
+    assert.deepEqual(
+      fetcher.mock.calls.map((call) => call.arguments[0]),
+      [
+        "https://router.example/self-service/coding-agent-settings",
+        "https://router.example/v1/models",
+      ],
+    )
     assert.equal(transforms.length, 1)
     assert.deepEqual(removed, [])
     assert.equal(added.length, 1)
@@ -348,7 +368,7 @@ describe("OpenCode v2 setup", () => {
     // rebuild and must get the same models without another discovery call.
     const replay = fakeContext({})
     transforms[0]({ ...replay.ctx, get: () => undefined, remove: () => {}, add: (input) => replay.added.push(input) })
-    assert.equal(fetcher.mock.callCount(), 1)
+    assert.equal(fetcher.mock.callCount(), 2)
     assert.deepEqual(replay.added[0].models, models)
   })
 

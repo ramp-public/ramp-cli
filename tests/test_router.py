@@ -11,6 +11,7 @@ import sqlite3
 import stat
 import subprocess
 import tomllib
+from contextlib import contextmanager
 from decimal import Decimal
 
 import click
@@ -96,6 +97,17 @@ def _mock_models(
     ]
 
     def get(url, *, headers, timeout):
+        if url.endswith("/self-service/coding-agent-settings"):
+            # Older Routers without the endpoint leave selections alone.
+            assert headers["Authorization"] == f"Bearer {key}"
+            if coding_agent_settings is not None:
+                get.settings_requests.append(url)
+                return httpx.Response(
+                    200,
+                    json={"harnesses": coding_agent_settings},
+                    request=httpx.Request("GET", url),
+                )
+            return httpx.Response(404, request=httpx.Request("GET", url))
         if url.endswith("/claude-code-statusline"):
             # The status line asset has its own tests in test_claude_code.py;
             # here it is simply unavailable, so configure skips it.
@@ -112,18 +124,6 @@ def _mock_models(
             # The credits line has its own tests; here the endpoint is simply
             # unavailable, so configure skips the line.
             return httpx.Response(404, request=httpx.Request("GET", url))
-        if url.endswith("/self-service/coding-agent-settings"):
-            # Router's per-harness model push has its own tests; an older
-            # Router without the endpoint leaves selections alone.
-            if coding_agent_settings is None:
-                return httpx.Response(404, request=httpx.Request("GET", url))
-            assert headers["Authorization"] == f"Bearer {key}"
-            get.settings_requests.append(url)
-            return httpx.Response(
-                200,
-                json={"harnesses": coding_agent_settings},
-                request=httpx.Request("GET", url),
-            )
         assert url == f"{base_url}/models"
         assert headers["Authorization"] == f"Bearer {key}"
         assert headers.items() >= _TELEMETRY_HEADERS.items()
@@ -1528,6 +1528,494 @@ def test_refresh_reapplies_codex_config_and_preserves_selected_model(
     ] == ["a", "Claude Fable 5.1"]
 
 
+def _codex_router_state(codex_home):
+    return json.loads((codex_home / "ramp-router-state.json").read_text())
+
+
+def _admin_default(model, source="workspace"):
+    """Router's coding-agent settings with ``model`` as the Codex default.
+
+    ``None`` is a listed harness with nothing set (or a model the policy no
+    longer allows), the shape Router reports for a cleared default.
+    """
+    return {
+        "codex": {
+            "model": model,
+            "effective_model": model,
+            "effective_model_source": source if model else None,
+            "status": "available" if model else "unset",
+        },
+        "pi": {"model": None, "effective_model": None, "status": "unset"},
+    }
+
+
+def test_configure_codex_starts_new_sessions_on_the_admin_default_model(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    get = _mock_models(
+        monkeypatch,
+        [{"id": "a"}, {"id": "b"}],
+        coding_agent_settings=_admin_default("b"),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "codex"],
+        input="router-secret\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    config = tomllib.loads((codex_home / "config.toml").read_text())
+    # Without an admin default the preferred model "a" would have been written.
+    assert config["model"] == "b"
+    # One read of Router's settings serves the whole configure: the admin
+    # default and the Switchyard decision share it.
+    assert get.settings_requests == [
+        f"{router_module._router_key_origin(ROUTER_BASE_URL)}"
+        "/self-service/coding-agent-settings"
+    ]
+    assert (
+        _codex_router_state(codex_home)[
+            router_module.CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY
+        ]
+        == "b"
+    )
+
+
+def test_refresh_puts_the_admin_default_back_over_a_sessions_own_pick(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    models = [{"id": "a"}, {"id": "b"}, {"id": "c"}]
+    _mock_models(monkeypatch, models, coding_agent_settings=_admin_default("b"))
+    configured = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "codex"],
+        input="router-secret\n",
+    )
+    assert configured.exit_code == 0, configured.output
+    config_path = codex_home / "config.toml"
+    assert tomllib.loads(config_path.read_text())["model"] == "b"
+
+    # A session's /model pick lands in config.toml. Every new session must
+    # still start on the admin default, so refresh puts it back.
+    config_path.write_text(
+        config_path.read_text().replace('model = "b"', 'model = "c"')
+    )
+    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+    assert refreshed.exit_code == 0, refreshed.output
+    assert tomllib.loads(config_path.read_text())["model"] == "b"
+
+    # A changed admin default follows on the next refresh: each command
+    # asks Router afresh rather than trusting the process cache.
+    _mock_models(monkeypatch, models, coding_agent_settings=_admin_default("a"))
+    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+    assert refreshed.exit_code == 0, refreshed.output
+    assert tomllib.loads(config_path.read_text())["model"] == "a"
+    assert (
+        _codex_router_state(codex_home)[
+            router_module.CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY
+        ]
+        == "a"
+    )
+
+
+def _hook_sync(*extra):
+    return CliRunner().invoke(
+        cli, ["router", "sync", "--hook", "--client", "codex", *extra]
+    )
+
+
+def test_session_start_and_stop_hooks_reset_the_model_without_the_network(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(
+        monkeypatch,
+        [{"id": "a"}, {"id": "b"}, {"id": "c"}],
+        coding_agent_settings=_admin_default("b"),
+    )
+    configured = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "codex"],
+        input="router-secret\n",
+    )
+    assert configured.exit_code == 0, configured.output
+    config_path = codex_home / "config.toml"
+    # The hooks must work offline and must not wait on the cooldown.
+    monkeypatch.setattr(
+        "ramp_cli.commands.router.httpx.get",
+        lambda *a, **k: pytest.fail("hook reset must not use the network"),
+    )
+    monkeypatch.setattr(router_module, "sync_is_due", lambda: False)
+    monkeypatch.setattr(router_module, "update_notice", lambda: None)
+
+    picked = config_path.read_text().replace('model = "b"', 'model = "c"')
+    config_path.write_text(picked)
+
+    # Stop: after the turn that followed a /model pick.
+    stop = _hook_sync("--event", "stop")
+    assert stop.exit_code == 0, stop.output
+    assert stop.output == ""
+    assert tomllib.loads(config_path.read_text())["model"] == "b"
+    # Only the model line changed.
+    assert config_path.read_text() == picked.replace('model = "c"', 'model = "b"')
+
+    # SessionStart: the same reset, for a pick that outlived its session.
+    config_path.write_text(picked)
+    start = _hook_sync()
+    assert start.exit_code == 0, start.output
+    assert tomllib.loads(config_path.read_text())["model"] == "b"
+
+    # A matching model is left byte-for-byte alone.
+    before = config_path.read_text()
+    assert _hook_sync("--event", "stop").exit_code == 0
+    assert config_path.read_text() == before
+
+
+def test_hook_reset_leaves_model_lines_inside_multiline_strings_alone(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(
+        monkeypatch,
+        [{"id": "a"}, {"id": "b"}, {"id": "c"}],
+        coding_agent_settings=_admin_default("b"),
+    )
+    configured = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "codex"],
+        input="router-secret\n",
+    )
+    assert configured.exit_code == 0, configured.output
+    monkeypatch.setattr(router_module, "sync_is_due", lambda: False)
+    monkeypatch.setattr(router_module, "update_notice", lambda: None)
+    config_path = codex_home / "config.toml"
+    # A root-level multiline string whose body carries a TOML example sits
+    # in the root chunk; its inner `model = ...` line is not the root key.
+    instructions = 'developer_instructions = """\nExample config:\nmodel = "c"\n"""\n'
+    picked = instructions + config_path.read_text().replace(
+        'model = "b"', 'model = "c"', 1
+    )
+    config_path.write_text(picked)
+
+    assert _hook_sync("--event", "stop").exit_code == 0
+    assert config_path.read_text() == instructions + picked[
+        len(instructions) :
+    ].replace('model = "c"', 'model = "b"', 1)
+    assert tomllib.loads(config_path.read_text())["developer_instructions"] == (
+        'Example config:\nmodel = "c"\n'
+    )
+
+    # The root model is a table this line rewrite cannot reach, and the only
+    # `model = ...` line left is the string's: nothing is rewritten.
+    config_path.write_text(
+        instructions
+        + 'model.name = "c"\n'
+        + picked[len(instructions) :].replace('model = "c"\n', "", 1)
+    )
+    before = config_path.read_text()
+    assert _hook_sync("--event", "stop").exit_code == 0
+    assert config_path.read_text() == before
+
+
+def test_hook_reset_reads_the_receipt_under_the_config_lock(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(
+        monkeypatch,
+        [{"id": "a"}, {"id": "b"}],
+        coding_agent_settings=_admin_default("b"),
+    )
+    configured = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "codex"],
+        input="router-secret\n",
+    )
+    assert configured.exit_code == 0, configured.output
+    monkeypatch.setattr(router_module, "sync_is_due", lambda: False)
+    monkeypatch.setattr(router_module, "update_notice", lambda: None)
+    config_path = codex_home / "config.toml"
+    state_path = codex_home / "ramp-router-state.json"
+    config_path.write_text(
+        config_path.read_text().replace('model = "b"', 'model = "a"')
+    )
+
+    # While the hook waits on the lock, a refresh clears the admin default
+    # (the admin unset it). The hook must see that, not its earlier read.
+    real_lock = router_module.codex_config_lock
+
+    @contextmanager
+    def lock_then_clear(path):
+        with real_lock(path):
+            state = json.loads(state_path.read_text())
+            state.pop(router_module.CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY, None)
+            state_path.write_text(json.dumps(state))
+            yield
+
+    monkeypatch.setattr(router_module, "codex_config_lock", lock_then_clear)
+    assert _hook_sync("--event", "stop").exit_code == 0
+    assert tomllib.loads(config_path.read_text())["model"] == "a"
+
+
+def test_configure_and_refresh_say_when_codex_has_not_trusted_the_hooks(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch, [{"id": "a"}, {"id": "b"}])
+    configured = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "codex"],
+        input="router-secret\n",
+    )
+    assert configured.exit_code == 0, configured.output
+    # Codex skips non-managed hooks until the user trusts them, so a fresh
+    # setup names the events still waiting and how to trust them.
+    assert "Codex has not trusted Ramp's hooks yet" in configured.output
+    assert "SessionStart" in configured.output
+    assert "Stop" in configured.output
+    assert "Trust all and continue" in configured.output
+    assert router_module._codex_hooks_awaiting_trust(codex_home / "config.toml") == [
+        "SessionStart",
+        "Stop",
+    ]
+
+    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+    assert refreshed.exit_code == 0, refreshed.output
+    assert "Codex has not trusted Ramp's hooks yet" in refreshed.output
+
+    # Trust is what Codex records under hooks.state for each handler; the
+    # Stop sync group sits after the cost hook's group in that event.
+    config_path = codex_home / "config.toml"
+    config_path.write_text(
+        config_path.read_text() + f'\n[hooks.state."{config_path}:session_start:0:0"]\n'
+        'trusted_hash = "sha256:aa"\n'
+        f'\n[hooks.state."{config_path}:stop:1:0"]\n'
+        'trusted_hash = "sha256:bb"\n'
+    )
+    assert router_module._codex_hooks_awaiting_trust(config_path) == []
+    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+    assert refreshed.exit_code == 0, refreshed.output
+    assert "has not trusted" not in refreshed.output
+    # And refresh left Codex's trust records in place.
+    assert "trusted_hash" in config_path.read_text()
+
+
+def test_hook_reset_stands_down_without_an_admin_default_or_after_unconfigure(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    models = [{"id": "a"}, {"id": "b"}]
+    # Router lists Codex with nothing set.
+    _mock_models(monkeypatch, models, coding_agent_settings=_admin_default(None))
+    configured = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "codex"],
+        input="router-secret\n",
+    )
+    assert configured.exit_code == 0, configured.output
+    monkeypatch.setattr(router_module, "sync_is_due", lambda: False)
+    monkeypatch.setattr(router_module, "update_notice", lambda: None)
+    config_path = codex_home / "config.toml"
+
+    # No admin default: a user's pick is theirs to keep.
+    config_path.write_text(
+        config_path.read_text().replace('model = "a"', 'model = "b"')
+    )
+    assert _hook_sync("--event", "stop").exit_code == 0
+    assert tomllib.loads(config_path.read_text())["model"] == "b"
+
+    # An admin default set later is enforced once refresh has cached it...
+    _mock_models(monkeypatch, models, coding_agent_settings=_admin_default("a"))
+    assert _hook_sync("--event", "stop").exit_code == 0
+    assert tomllib.loads(config_path.read_text())["model"] == "b"
+    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+    assert refreshed.exit_code == 0, refreshed.output
+    assert tomllib.loads(config_path.read_text())["model"] == "a"
+
+    # ...and never touches a config that is no longer the Router setup, even
+    # if a stale receipt and hook group were left behind.
+    unconfigured = CliRunner().invoke(
+        cli, ["--human", "router", "unconfigure", "codex"]
+    )
+    assert unconfigured.exit_code == 0, unconfigured.output
+    (codex_home / "ramp-router-state.json").write_text(
+        json.dumps({router_module.CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY: "a"})
+    )
+    config_path.write_text('model = "b"\n')
+    assert _hook_sync("--event", "stop").exit_code == 0
+    assert config_path.read_text() == 'model = "b"\n'
+
+
+def test_codex_admin_default_outside_the_catalog_is_ignored(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(
+        monkeypatch,
+        [{"id": "a"}, {"id": "b"}],
+        coding_agent_settings=_admin_default("retired-model"),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "codex"],
+        input="router-secret\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert tomllib.loads((codex_home / "config.toml").read_text())["model"] == "a"
+    assert router_module.CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY not in _codex_router_state(
+        codex_home
+    )
+
+
+def test_codex_admin_default_given_as_a_router_id_is_written_as_the_catalog_slug(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(
+        monkeypatch,
+        [
+            {"id": "a"},
+            {
+                "id": "claude-fable-5-1",
+                "codex_slug": "Claude Fable 5.1",
+                "router": _router_metadata(
+                    "claude-fable-5-1", display_name="Claude Fable 5.1"
+                ),
+            },
+        ],
+        coding_agent_settings=_admin_default("claude-fable-5-1"),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "codex"],
+        input="router-secret\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    config = tomllib.loads((codex_home / "config.toml").read_text())
+    assert config["model"] == "Claude Fable 5.1"
+    assert (
+        _codex_router_state(codex_home)[
+            router_module.CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY
+        ]
+        == "Claude Fable 5.1"
+    )
+
+
+def test_explicit_model_choice_is_written_but_the_admin_default_returns(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(
+        monkeypatch,
+        [{"id": "a"}, {"id": "b"}, {"id": "c"}],
+        coding_agent_settings=_admin_default("b"),
+    )
+    configured = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "codex"],
+        input="router-secret\n",
+    )
+    assert configured.exit_code == 0, configured.output
+
+    # The command does what it says for the sessions started right after...
+    chosen = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "model", "codex", "--model", "c"]
+    )
+    assert chosen.exit_code == 0, chosen.output
+    config_path = codex_home / "config.toml"
+    assert tomllib.loads(config_path.read_text())["model"] == "c"
+    # ...and the next sync puts the admin default back for the ones after.
+    monkeypatch.setattr(router_module, "sync_is_due", lambda: False)
+    monkeypatch.setattr(router_module, "update_notice", lambda: None)
+    assert _hook_sync("--event", "stop").exit_code == 0
+    assert tomllib.loads(config_path.read_text())["model"] == "b"
+
+
+def test_clearing_the_codex_admin_default_forgets_the_applied_record(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    models = [{"id": "a"}, {"id": "b"}]
+    _mock_models(monkeypatch, models, coding_agent_settings=_admin_default("b"))
+    configured = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "codex"],
+        input="router-secret\n",
+    )
+    assert configured.exit_code == 0, configured.output
+
+    _mock_models(monkeypatch, models, coding_agent_settings=_admin_default(None))
+    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+    assert refreshed.exit_code == 0, refreshed.output
+    # Clearing the default changes nothing for the user...
+    assert tomllib.loads((codex_home / "config.toml").read_text())["model"] == "b"
+    assert router_module.CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY not in _codex_router_state(
+        codex_home
+    )
+
+
+def test_a_failed_codex_config_write_leaves_no_cached_admin_default(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    models = [{"id": "a"}, {"id": "b"}]
+    # An older Router without the endpoint: no default.
+    _mock_models(monkeypatch, models)
+    configured = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "codex"],
+        input="router-secret\n",
+    )
+    assert configured.exit_code == 0, configured.output
+    config_path = codex_home / "config.toml"
+    assert tomllib.loads(config_path.read_text())["model"] == "a"
+
+    # The receipt is restored with the config, so the hooks cannot start
+    # enforcing a default that refresh never managed to write.
+    _mock_models(monkeypatch, models, coding_agent_settings=_admin_default("b"))
+    real_write = router_module._write_private_file
+
+    def failing_write(target, content):
+        if target == config_path:
+            raise OSError("disk full")
+        real_write(target, content)
+
+    monkeypatch.setattr(router_module, "_write_private_file", failing_write)
+    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+    assert refreshed.exit_code != 0
+    assert "disk full" in refreshed.output
+    assert tomllib.loads(config_path.read_text())["model"] == "a"
+    assert router_module.CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY not in _codex_router_state(
+        codex_home
+    )
+
+    monkeypatch.setattr(router_module, "_write_private_file", real_write)
+    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+    assert refreshed.exit_code == 0, refreshed.output
+    assert tomllib.loads(config_path.read_text())["model"] == "b"
+    assert (
+        _codex_router_state(codex_home)[
+            router_module.CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY
+        ]
+        == "b"
+    )
+
+
 def test_refresh_reapplies_claude_config_and_preserves_selected_model(
     tmp_path, monkeypatch
 ):
@@ -1576,9 +2064,9 @@ def _switchyard_settings(model="switchyard", source="switchyard", **harnesses):
 
 
 def _opencode_model(tmp_path):
-    return json.loads((tmp_path / "opencode" / "opencode.json").read_text()).get(
-        "model"
-    )
+    path = tmp_path / "opencode" / "opencode.json"
+    model = router_module._configured_model("opencode", path)
+    return f"ramp-router/{model}" if model else None
 
 
 def _connect_opencode(tmp_path, monkeypatch, **mock):
@@ -1592,7 +2080,11 @@ def _connect_opencode(tmp_path, monkeypatch, **mock):
     return result
 
 
-def test_configure_applies_routers_switchyard_model_and_says_so(tmp_path, monkeypatch):
+@pytest.mark.parametrize("generation", ["1", "2"])
+def test_configure_applies_routers_switchyard_model_and_says_so(
+    tmp_path, monkeypatch, generation
+):
+    monkeypatch.setenv("RAMP_OPENCODE_MAJOR", generation)
     result = _connect_opencode(
         tmp_path, monkeypatch, coding_agent_settings=_switchyard_settings()
     )
@@ -1869,7 +2361,7 @@ def test_refresh_does_not_push_switchyard_over_a_codex_pick_made_during_discover
     assert tomllib.loads(config_path.read_text())["model"] == "other"
     assert "Switched" not in refreshed.output
     # The preserved choice counts as the user's answer to the migration, so
-    # the next refresh does not push over it either.
+    # the next refresh does not push (or announce) Switchyard over it...
     token = router_module._switchyard_default_token("router-secret", ROUTER_BASE_URL)
     assert json.loads(router_module._switchyard_defaults_path().read_text()) == {
         token: {"codex": "switchyard"}
@@ -1877,7 +2369,12 @@ def test_refresh_does_not_push_switchyard_over_a_codex_pick_made_during_discover
     monkeypatch.setattr(router_module, "_fetch_codex_catalog", fetch_catalog)
     refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
     assert refreshed.exit_code == 0, refreshed.output
-    assert tomllib.loads(config_path.read_text())["model"] == "other"
+    assert "Switched" not in refreshed.output
+    # ...but Router still names Switchyard as the model every new Codex
+    # session starts on, which a settled refresh writes back, the same way
+    # the OpenCode and Pi plugins start each new session on it. The pick
+    # made mid-flight was protected from the race, not made permanent.
+    assert tomllib.loads(config_path.read_text())["model"] == "switchyard"
 
 
 def test_refresh_keeps_a_codex_pick_made_during_the_switchyard_fallback(
@@ -2348,7 +2845,15 @@ def test_codex_keeps_its_dashboard_origin_without_the_cost_hook(tmp_path, monkey
     assert configured.exit_code == 0, configured.output
     assert "Skipping the Codex Router cost hook" in configured.output
     config_path = codex_home / "config.toml"
-    assert "Stop" not in tomllib.loads(config_path.read_text()).get("hooks", {})
+    # The Stop table still carries the admin-default sync group; only the
+    # cost hook (the one reading the key file) is missing.
+    stop_commands = [
+        hook["command"]
+        for group in tomllib.loads(config_path.read_text())["hooks"].get("Stop", [])
+        for hook in group["hooks"]
+    ]
+    assert stop_commands
+    assert not any("ROUTER_API_KEY=" in command for command in stop_commands)
     assert router_module._stored_usage_origin("codex", config_path) == (
         "https://dash.example"
     )
@@ -4058,7 +4563,34 @@ base_url = "https://stale.example.com"
 def _cost_hook_groups(codex_home):
     config = tomllib.loads((codex_home / "config.toml").read_text())
     hooks = config.get("hooks", {})
-    return hooks.get("Stop", [])
+    # The Stop event also carries the managed sync group that resets the
+    # admin default model; these tests are about the cost hook's group.
+    return [
+        group
+        for group in hooks.get("Stop", [])
+        if not any(
+            router_module.command_runs_session_sync(
+                entry.get("command", ""), router_module.SYNC_HOOK_STOP_EVENT
+            )
+            for entry in group.get("hooks", [])
+            if isinstance(entry, dict)
+        )
+    ]
+
+
+def _stop_sync_hook_groups(codex_home):
+    config = tomllib.loads((codex_home / "config.toml").read_text())
+    return [
+        group
+        for group in config.get("hooks", {}).get("Stop", [])
+        if any(
+            router_module.command_runs_session_sync(
+                entry.get("command", ""), router_module.SYNC_HOOK_STOP_EVENT
+            )
+            for entry in group.get("hooks", [])
+            if isinstance(entry, dict)
+        )
+    ]
 
 
 def test_configure_codex_installs_the_cost_hook(tmp_path, monkeypatch):
@@ -4764,6 +5296,18 @@ def test_configure_codex_registers_the_session_sync_hook(tmp_path, monkeypatch):
     assert state["session_sync_hook"] == router_module._sync_hook_chunk_digest(
         router_module._render_codex_sync_hook_group(entry["command"])
     )
+    # The Stop group reruns the sync after every turn, receipt-recorded the
+    # same way so refresh can repair it and unconfigure can remove it.
+    (stop_group,) = _stop_sync_hook_groups(codex_home)
+    assert "matcher" not in stop_group
+    (stop_entry,) = stop_group["hooks"]
+    assert stop_entry["command"] == router_module.session_sync_hook_command(
+        "codex", router_module.SYNC_HOOK_STOP_EVENT
+    )
+    assert stop_entry["command"].endswith("--client codex --event stop || true")
+    assert state["stop_sync_hook"] == router_module._sync_hook_chunk_digest(
+        router_module._render_codex_stop_sync_hook_group(stop_entry["command"])
+    )
 
 
 def test_refresh_repairs_a_stale_codex_sync_hook_path(tmp_path, monkeypatch):
@@ -4773,13 +5317,22 @@ def test_refresh_repairs_a_stale_codex_sync_hook_path(tmp_path, monkeypatch):
     _configure_agent("codex")
 
     moved = "[ -x /new/home/ramp ] && /new/home/ramp router sync --hook || true"
+    moved_stop = (
+        "[ -x /new/home/ramp ] && /new/home/ramp router sync --hook "
+        "--client codex --event stop || true"
+    )
     monkeypatch.setattr(
-        router_module, "session_sync_hook_command", lambda _client: moved
+        router_module,
+        "session_sync_hook_command",
+        lambda _client, event=None: moved_stop if event else moved,
     )
     _refresh_agents()
 
     (group,) = _sync_hook_groups(codex_home)
     assert group["hooks"][0]["command"] == moved
+    # The Stop group moves with it.
+    (stop_group,) = _stop_sync_hook_groups(codex_home)
+    assert stop_group["hooks"][0]["command"] == moved_stop
 
 
 def test_a_manual_sync_hook_registration_is_not_duplicated(tmp_path, monkeypatch):
@@ -4897,14 +5450,16 @@ def test_no_ramp_entrypoint_skips_codex_sync_hook_registration(tmp_path, monkeyp
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     _mock_models(monkeypatch)
     monkeypatch.setattr(
-        router_module, "session_sync_hook_command", lambda _client: None
+        router_module, "session_sync_hook_command", lambda _client, event=None: None
     )
 
     _configure_agent("codex")
 
     assert _sync_hook_groups(codex_home) == []
+    assert _stop_sync_hook_groups(codex_home) == []
     state = json.loads((codex_home / "ramp-router-state.json").read_text())
     assert "session_sync_hook" not in state
+    assert "stop_sync_hook" not in state
 
 
 def test_unconfigure_removes_the_codex_sync_hook(tmp_path, monkeypatch):
@@ -4924,6 +5479,8 @@ def test_unconfigure_removes_the_codex_sync_hook(tmp_path, monkeypatch):
     groups = _sync_hook_groups(codex_home)
     # The user's own SessionStart hook survives; only the managed group goes.
     assert [group["hooks"][0]["command"] for group in groups] == ["/home/me/context.sh"]
+    # And the managed Stop group goes with it.
+    assert _stop_sync_hook_groups(codex_home) == []
 
 
 def test_configure_claude_registers_the_session_start_sync_hook(tmp_path, monkeypatch):
@@ -5619,6 +6176,12 @@ def test_configure_reuses_one_existing_router_key_without_browser(
         return Prompt()
 
     monkeypatch.setattr(router_module.questionary, "select", select)
+    events = []
+    monkeypatch.setattr(
+        router_module,
+        "record_mdm_event",
+        lambda event, **attributes: events.append((event, attributes)),
+    )
 
     args = ["--human"]
     if unattended:
@@ -5631,7 +6194,17 @@ def test_configure_reuses_one_existing_router_key_without_browser(
     assert result.exit_code == 0, result.output
     if unattended:
         assert not captured
+        assert [event for event, _ in events] == [
+            "router_mdm_started",
+            "router_mdm_key_lookup",
+            "router_mdm_clients_configured",
+            "router_mdm_finished",
+        ]
+        assert events[1][1] == {"outcome": "reused", "saved_by": "codex"}
+        assert events[2][1]["key_source"] == "reused"
+        assert events[3][1]["outcome"] == "configured"
     else:
+        assert not events
         assert captured["message"] == "Choose a Ramp Router API key"
         assert [choice.title for choice in captured["choices"]] == [
             "Reuse existing key used by Codex",
@@ -5660,14 +6233,21 @@ def test_configure_waits_for_macos_confirmation_before_browser_or_config_changes
         calls.append(("dialog", url))
         return connect
 
-    def acquire(url, *, no_browser):
+    def acquire(url, *, mdm):
         assert calls == [("dialog", "https://app.router.com")]
+        assert mdm is True
         calls.append(("browser", url))
         return "browser-key"
 
     monkeypatch.setattr(router_module, "confirm_router_browser_setup", confirm)
     monkeypatch.setattr(router_module, "acquire_router_api_key", acquire)
     _mock_models(monkeypatch, key="browser-key")
+    events = []
+    monkeypatch.setattr(
+        router_module,
+        "record_mdm_event",
+        lambda event, **attributes: events.append((event, attributes)),
+    )
 
     result = CliRunner().invoke(
         cli,
@@ -5681,6 +6261,14 @@ def test_configure_waits_for_macos_confirmation_before_browser_or_config_changes
         ],
     )
 
+    assert events[0] == (
+        "router_mdm_started",
+        {"router_ui_url": "https://app.router.com", "base_url": ROUTER_BASE_URL},
+    )
+    assert events[1] == (
+        "router_mdm_key_lookup",
+        {"outcome": "none_saved", "saved_by": None},
+    )
     if connect:
         assert result.exit_code == 0, result.output
         assert calls == [
@@ -5688,11 +6276,35 @@ def test_configure_waits_for_macos_confirmation_before_browser_or_config_changes
             ("browser", "https://app.router.com"),
         ]
         assert json.loads(auth_path.read_text())["ramp-router"]["key"] == "browser-key"
+        assert events[2:] == [
+            (
+                "router_mdm_clients_configured",
+                {"key_source": "browser", "configured": "pi", "failed": None},
+            ),
+            (
+                "router_mdm_finished",
+                {
+                    "outcome": "configured",
+                    "detail": None,
+                    "router_ui_url": "https://app.router.com",
+                },
+            ),
+        ]
     else:
         assert result.exit_code == 3, result.output
         assert calls == [("dialog", "https://app.router.com")]
         assert auth_path.read_text() == original_auth
         assert list(pi_home.iterdir()) == [auth_path]
+        assert events[2:] == [
+            (
+                "router_mdm_finished",
+                {
+                    "outcome": "deferred",
+                    "detail": None,
+                    "router_ui_url": "https://app.router.com",
+                },
+            ),
+        ]
 
 
 def test_router_key_reuse_does_not_cross_into_a_distinct_deployment(
@@ -6361,12 +6973,19 @@ def test_configure_opencode_v2_writes_plugins_objects_and_cli_json(
             "apiKey": "router-secret",
             "rampCliVersion": __version__,
             "rampExecutable": "/opt/ramp-cli/bin/ramp",
+            # v2's starting model rides with the plugin, which gives it to
+            # the agents and the registry, so the config's own ``model``
+            # cannot outrank an organization default the plugin applies.
+            "defaultModel": "a",
         },
     }
     assert config["plugins"] == ["some-other-plugin", expected_entry]
     assert "plugin" not in config
     assert config["providers"] == {"existing": {"models": {"model": {}}}}
-    assert config["model"] == "ramp-router/a"
+    # The user's own non-Router model stays, and is pointed out.
+    assert config["model"] == "existing/model"
+    assert 'keeps your own "model": existing/model' in result.output
+    assert router_module._configured_model("opencode", config_path) == "a"
     # v2 loads the sidebar from cli.json, never tui.json, and the auto-loaded
     # TUI half of a server plugin gets no options, so the same object goes
     # there too.
@@ -6454,6 +7073,259 @@ def test_configure_opencode_v2_replaces_v1_tuple_left_by_an_upgrade(
     cli_config = json.loads(router_module._opencode_cli_config_path().read_text())
     assert "plugins" not in cli_config
     assert not tui_path.exists()
+
+
+def _opencode_default_model_option(config_path) -> str | None:
+    config = json.loads(config_path.read_text())
+    (entry,) = [
+        entry
+        for entry in config["plugins"]
+        if isinstance(entry, dict) and entry["options"]["providerID"] == "ramp-router"
+    ]
+    return entry["options"].get("defaultModel")
+
+
+def test_configure_opencode_v2_records_the_model_as_a_plugin_option(
+    tmp_path, monkeypatch
+):
+    """v2 gets no top-level model: the plugin applies the default per session."""
+    monkeypatch.setenv("RAMP_OPENCODE_MAJOR", "2")
+    config_path = tmp_path / "opencode" / "opencode.json"
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
+    _mock_models(monkeypatch, [{"id": "a"}, {"id": "b"}])
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        ["--agent", "router", "configure", "opencode", "--api-key", "router-secret"],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = json.loads(config_path.read_text())
+    assert "model" not in config
+    assert _opencode_default_model_option(config_path) == "a"
+    assert (
+        json.loads(router_module._opencode_cli_config_path().read_text())["plugins"][0][
+            "options"
+        ]["defaultModel"]
+        == "a"
+    )
+    (reported,) = json.loads(result.output)["data"]
+    assert reported["default_model"] == "a"
+    assert "note_lines" not in reported
+    assert router_module._configured_model("opencode", config_path) == "a"
+
+    # Refresh keeps the recorded choice, through the plugin option.
+    config = json.loads(config_path.read_text())
+    config["plugins"][0]["options"]["defaultModel"] = "b"
+    config_path.write_text(json.dumps(config))
+    refreshed = runner.invoke(cli, ["--human", "router", "refresh"])
+    assert refreshed.exit_code == 0
+    assert _opencode_default_model_option(config_path) == "b"
+    assert "model" not in json.loads(config_path.read_text())
+
+    unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "opencode"])
+    assert unconfigure.exit_code == 0
+    restored = json.loads(config_path.read_text())
+    assert "model" not in restored
+    assert "plugins" not in restored
+
+
+@pytest.mark.parametrize(
+    "stale_model",
+    ["ramp-router/b", {"providerID": "ramp-router", "model": "b", "variant": "high"}],
+)
+def test_refresh_opencode_v2_moves_router_model_into_the_plugin_option(
+    tmp_path, monkeypatch, stale_model
+):
+    """A top-level Router model from an earlier CLI migrates on refresh."""
+    monkeypatch.setenv("RAMP_OPENCODE_MAJOR", "2")
+    config_path = tmp_path / "opencode" / "opencode.json"
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
+    _mock_models(monkeypatch, [{"id": "a"}, {"id": "b"}])
+    runner = CliRunner()
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "opencode"], input="router-secret\n"
+    )
+    assert configured.exit_code == 0
+    # What an earlier CLI left: the model at the top level, no plugin option,
+    # and a receipt from before the CLI recorded whether it took the key.
+    config = json.loads(config_path.read_text())
+    config["model"] = stale_model
+    del config["plugins"][0]["options"]["defaultModel"]
+    config_path.write_text(json.dumps(config))
+    state_path = config_path.parent / "ramp-router-state.json"
+    state = json.loads(state_path.read_text())
+    del state["model_taken"]
+    state_path.write_text(json.dumps(state))
+    assert router_module._configured_model("opencode", config_path) == "b"
+
+    refreshed = runner.invoke(cli, ["--human", "router", "refresh"])
+
+    assert refreshed.exit_code == 0
+    assert "Refreshed the Ramp Router configuration for OpenCode." in refreshed.output
+    assert "keeps your own" not in refreshed.output
+    config = json.loads(config_path.read_text())
+    assert "model" not in config
+    assert _opencode_default_model_option(config_path) == "b"
+
+    # The receipt predates the stale model, so unconfigure restores the
+    # original absence rather than resurrecting a Router model.
+    unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "opencode"])
+    assert unconfigure.exit_code == 0
+    assert "model" not in json.loads(config_path.read_text())
+
+
+def test_refresh_opencode_v2_leaves_the_users_own_model_and_says_so(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("RAMP_OPENCODE_MAJOR", "2")
+    config_path = tmp_path / "opencode" / "opencode.json"
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
+    _mock_models(monkeypatch, [{"id": "a"}, {"id": "b"}])
+    runner = CliRunner()
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "opencode"], input="router-secret\n"
+    )
+    assert configured.exit_code == 0
+    config = json.loads(config_path.read_text())
+    config["model"] = "anthropic/claude-opus-4"
+    config_path.write_text(json.dumps(config))
+
+    refreshed = runner.invoke(cli, ["--agent", "router", "refresh"])
+
+    assert refreshed.exit_code == 0
+    (reported,) = json.loads(refreshed.output)["data"][0]["clients"]
+    assert reported["default_model"] == "a"
+    assert reported["note_lines"] == [
+        f'OpenCode keeps your own "model": anthropic/claude-opus-4 in {config_path}. '
+        "Sessions started with 'opencode run' use it instead of the Router "
+        "default; remove it to let the Router default apply there too."
+    ]
+    config = json.loads(config_path.read_text())
+    assert config["model"] == "anthropic/claude-opus-4"
+    assert _opencode_default_model_option(config_path) == "a"
+    human = runner.invoke(cli, ["--human", "router", "refresh"])
+    assert 'keeps your own "model": anthropic/claude-opus-4' in human.output
+
+    unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "opencode"])
+    assert unconfigure.exit_code == 0
+    assert json.loads(config_path.read_text())["model"] == "anthropic/claude-opus-4"
+
+
+def test_configure_model_opencode_v2_replaces_the_users_own_model(
+    tmp_path, monkeypatch
+):
+    """An explicit model change displaces the top-level model refresh keeps."""
+    monkeypatch.setenv("RAMP_OPENCODE_MAJOR", "2")
+    config_path = tmp_path / "opencode" / "opencode.json"
+    config_path.parent.mkdir()
+    config_path.write_text(json.dumps({"model": "anthropic/claude-opus-4"}))
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
+    _mock_models(monkeypatch, [{"id": "a"}, {"id": "b"}])
+    runner = CliRunner()
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "opencode"], input="router-secret\n"
+    )
+    assert configured.exit_code == 0
+    assert json.loads(config_path.read_text())["model"] == "anthropic/claude-opus-4"
+
+    changed = runner.invoke(
+        cli, ["--human", "router", "configure", "model", "opencode", "--model", "b"]
+    )
+
+    assert changed.exit_code == 0, changed.output
+    config = json.loads(config_path.read_text())
+    assert "model" not in config
+    assert _opencode_default_model_option(config_path) == "b"
+    # A later refresh has nothing of the user's left to point out.
+    refreshed = runner.invoke(cli, ["--human", "router", "refresh"])
+    assert refreshed.exit_code == 0
+    assert "keeps your own" not in refreshed.output
+    assert "model" not in json.loads(config_path.read_text())
+
+    # The CLI removed the pin, so unconfigure brings it back.
+    unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "opencode"])
+    assert unconfigure.exit_code == 0
+    assert json.loads(config_path.read_text()) == {"model": "anthropic/claude-opus-4"}
+
+
+def test_unconfigure_opencode_v2_does_not_resurrect_a_model_the_user_removed(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("RAMP_OPENCODE_MAJOR", "2")
+    config_path = tmp_path / "opencode" / "opencode.json"
+    config_path.parent.mkdir()
+    config_path.write_text(json.dumps({"model": "anthropic/claude-opus-4"}))
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
+    _mock_models(monkeypatch, [{"id": "a"}])
+    runner = CliRunner()
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "opencode"], input="router-secret\n"
+    )
+    assert configured.exit_code == 0
+    # Configure left the pin alone; the user then deletes it themselves.
+    config = json.loads(config_path.read_text())
+    del config["model"]
+    config_path.write_text(json.dumps(config))
+
+    unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "opencode"])
+
+    assert unconfigure.exit_code == 0
+    assert "model" not in json.loads(config_path.read_text())
+
+
+def test_refresh_under_v1_after_a_v2_setup_records_the_absent_model(
+    tmp_path, monkeypatch
+):
+    """v1 takes the top-level key a v2 setup never had; unconfigure drops it."""
+    monkeypatch.setenv("RAMP_OPENCODE_MAJOR", "2")
+    config_path = tmp_path / "opencode" / "opencode.json"
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
+    _mock_models(monkeypatch, [{"id": "a"}])
+    runner = CliRunner()
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "opencode"], input="router-secret\n"
+    )
+    assert configured.exit_code == 0
+    assert "model" not in json.loads(config_path.read_text())
+
+    monkeypatch.setenv("RAMP_OPENCODE_MAJOR", "1")
+    refreshed = runner.invoke(cli, ["--human", "router", "refresh"])
+    assert refreshed.exit_code == 0
+    assert json.loads(config_path.read_text())["model"] == "ramp-router/a"
+    state = json.loads((config_path.parent / "ramp-router-state.json").read_text())
+    assert state["model_taken"] is True
+    assert state["model_present"] is False
+
+    unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "opencode"])
+    assert unconfigure.exit_code == 0
+    assert "model" not in json.loads(config_path.read_text())
+
+
+def test_unconfigure_opencode_v2_restores_a_router_model_it_lifted_out(
+    tmp_path, monkeypatch
+):
+    """A hand-written Router model from before configure comes back."""
+    monkeypatch.setenv("RAMP_OPENCODE_MAJOR", "2")
+    config_path = tmp_path / "opencode" / "opencode.json"
+    config_path.parent.mkdir()
+    config_path.write_text(json.dumps({"model": "ramp-router/hand-picked"}))
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_path))
+    _mock_models(monkeypatch, [{"id": "a"}, {"id": "hand-picked"}])
+    runner = CliRunner()
+
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "opencode"], input="router-secret\n"
+    )
+
+    assert configured.exit_code == 0
+    assert "model" not in json.loads(config_path.read_text())
+    assert _opencode_default_model_option(config_path) == "a"
+
+    unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "opencode"])
+    assert unconfigure.exit_code == 0
+    assert json.loads(config_path.read_text()) == {"model": "ramp-router/hand-picked"}
 
 
 def test_configure_pi_installs_plugin_and_is_idempotent(tmp_path, monkeypatch):

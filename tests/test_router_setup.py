@@ -15,18 +15,25 @@ ROUTER_UI_URL = "https://app.router.com"
 
 
 @pytest.mark.parametrize(
-    ("output", "returncode", "expected"),
+    ("output", "returncode", "expected", "recorded_action"),
     [
-        ("Connect\n", 0, True),
-        ("Later\n", 0, False),
-        ("", 1, None),
-        ("unexpected", 0, None),
+        ("Connect\n", 0, True, "connect"),
+        ("Later\n", 0, False, "later"),
+        ("Timeout\n", 0, False, "timeout"),
+        ("", 1, None, "failed"),
+        ("unexpected", 0, None, "failed"),
     ],
 )
 def test_macos_dialog_requires_an_explicit_connect_result(
-    monkeypatch, output, returncode, expected
+    monkeypatch, output, returncode, expected, recorded_action
 ):
     monkeypatch.setattr(router_setup.sys, "platform", "darwin")
+    events = []
+    monkeypatch.setattr(
+        router_setup,
+        "_record_mdm_event",
+        lambda event, **attributes: events.append((event, attributes)),
+    )
 
     def run(args, **kwargs):
         assert args[0] == "osascript"
@@ -39,6 +46,12 @@ def test_macos_dialog_requires_an_explicit_connect_result(
             router_setup.confirm_router_browser_setup(ROUTER_UI_URL)
     else:
         assert router_setup.confirm_router_browser_setup(ROUTER_UI_URL) is expected
+    assert events == [
+        (
+            "router_mdm_dialog",
+            {"action": recorded_action, "router_ui_url": ROUTER_UI_URL},
+        )
+    ]
 
 
 @pytest.mark.parametrize(
@@ -55,6 +68,93 @@ def test_macos_dialog_execution_failure_does_not_authorize_browser_setup(
     monkeypatch.setattr(router_setup.subprocess, "run", run)
     with pytest.raises(click.ClickException, match="Browser setup was not started"):
         router_setup.confirm_router_browser_setup(ROUTER_UI_URL)
+
+
+def _complete_in_browser(callback):
+    _post(callback, {"state": callback.state, "api_key": "browser-key"})
+
+
+def _decline_in_browser(callback):
+    _post(
+        callback,
+        {
+            "state": callback.state,
+            "error": "access_denied",
+            "error_description": "User declined",
+        },
+    )
+
+
+def _never_return_from_browser(callback):
+    def time_out(self, timeout=None):
+        raise router_setup.RouterSetupTimeout("Router setup timed out after 15 minutes")
+
+    callback.wait_for_key = time_out.__get__(callback)
+
+
+@pytest.mark.parametrize(
+    ("browser", "outcome", "detail"),
+    [
+        (_complete_in_browser, "connected", None),
+        (_decline_in_browser, "cancelled", "Router setup failed: User declined"),
+        (_never_return_from_browser, "timed_out", None),
+    ],
+)
+def test_mdm_browser_setup_reports_how_the_handoff_ended(
+    monkeypatch, browser, outcome, detail
+):
+    events = []
+    monkeypatch.setattr(
+        router_setup,
+        "_record_mdm_event",
+        lambda event, **attributes: events.append((event, attributes)),
+    )
+    callbacks = []
+    real_start = router_setup.start_router_key_callback
+
+    def start(url):
+        callbacks.append(real_start(url))
+        return callbacks[-1]
+
+    monkeypatch.setattr(router_setup, "start_router_key_callback", start)
+
+    def open_browser(url):
+        assert f"state={callbacks[-1].state}" in url
+        browser(callbacks[-1])
+        return True
+
+    monkeypatch.setattr(router_setup, "_open_browser", open_browser)
+
+    if outcome == "connected":
+        assert router_setup.acquire_router_api_key(ROUTER_UI_URL, mdm=True) == (
+            "browser-key"
+        )
+    else:
+        with pytest.raises(click.ClickException):
+            router_setup.acquire_router_api_key(ROUTER_UI_URL, mdm=True)
+
+    state_hash = router_setup._setup_state_hash(callbacks[-1].state)
+    assert len(state_hash) == 16
+    assert callbacks[-1].state not in str(events)
+    assert events == [
+        (
+            "router_mdm_browser_opened",
+            {
+                "opened": True,
+                "router_ui_url": ROUTER_UI_URL,
+                "setup_state_hash": state_hash,
+            },
+        ),
+        (
+            "router_mdm_browser_setup",
+            {
+                "outcome": outcome,
+                "detail": detail,
+                "router_ui_url": ROUTER_UI_URL,
+                "setup_state_hash": state_hash,
+            },
+        ),
+    ]
 
 
 def _post(callback, fields, *, content_type="application/x-www-form-urlencoded"):
