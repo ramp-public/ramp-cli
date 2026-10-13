@@ -15,6 +15,8 @@ import {
   type ClassifierResult,
   type Credential,
   type Model,
+  type ModelCostRates,
+  type ModelCostTier,
   type ProviderClassifier,
   type ProviderRequestOptions,
   type ProviderStreams,
@@ -48,6 +50,7 @@ import {
 import type {
   RouterCatalog as DiscoveredCatalog,
   RouterClassifier as DiscoveredClassifier,
+  RouterClassifierApi as ClassifierApi,
   RouterModel as DiscoveredModel,
 } from "./discovery.ts"
 import { registerUsageWidget, usageOriginFromBaseURL } from "./usage.ts"
@@ -82,7 +85,7 @@ const CONFIG_FILE = "ramp-router-config.json"
 const RUNTIME_MODELS_FILE = "ramp-router-runtime-models.json"
 const MODEL_CACHE_FILE = "ramp-router-model-cache.json"
 const MODEL_CACHE_KEY_FILE = "ramp-router-model-cache-key"
-const MODEL_CACHE_VERSION = 6
+const MODEL_CACHE_VERSION = 9
 // Local safety ceilings, not Router catalog limits. Oversized private state is
 // discarded and rebuilt from the bounded startup request instead of read into
 // memory during every Pi launch.
@@ -110,9 +113,14 @@ type RouterOwner = "anthropic" | "openai" | "other"
 // Discovery owns this classification; Pi's Responses adapter also serves
 // non-OpenAI Router models, so API alone is not enough to enable native tools.
 type RouterModel = Model<RouterApi> & { routerOwner: RouterOwner }
-// Pi's TypeSafe adapter speaks System One, which Router serves on /v1/systemone.
-const CLASSIFIER_API = "typesafe-system-one"
-type RouterClassifier = ClassifierModel<typeof CLASSIFIER_API>
+// Pi's TypeSafe adapter speaks System One, which Router serves on
+// /v1/systemone; its OpenAI adapter speaks Decisions, served on /v1/decisions.
+// Each classifier API is run by the built-in Pi provider that owns its adapter.
+const CLASSIFIER_HOSTS = {
+  "typesafe-system-one": "typesafe",
+  "openai-decisions": "openai",
+} as const satisfies Record<ClassifierApi, string>
+type RouterClassifier = ClassifierModel<ClassifierApi>
 type RouterCatalog = { models: RouterModel[]; classifiers: RouterClassifier[] }
 type SessionManager = ExtensionContext["sessionManager"]
 
@@ -182,13 +190,16 @@ async function hostApi(providerId: string): Promise<ProviderStreams> {
 
 type HostSupport = {
   modelIDs: ReadonlyMap<RouterApi, ReadonlySet<string>>
-  /** Pi's built-in TypeSafe classifier; absent on hosts before classifier support. */
-  classifier?: ProviderClassifier
+  /** Pi's built-in classifiers by API; empty on hosts before classifier support. */
+  classifiers: ReadonlyMap<ClassifierApi, ProviderClassifier>
+  /** OpenAI's Decisions models in Pi's catalog, with the window Pi states for each. */
+  decisionModels: ReadonlyMap<string, number>
 }
 
 async function hostSupport(): Promise<HostSupport> {
   const ids = new Map<RouterApi, ReadonlySet<string>>()
-  let classifier: ProviderClassifier | undefined
+  const classifiers = new Map<ClassifierApi, ProviderClassifier>()
+  const decisionModels = new Map<string, number>()
   try {
     // Router models are dynamic, but both Pi adapters have native per-model
     // compatibility settings. Upgrading Pi unlocks models without changing
@@ -204,20 +215,26 @@ async function hostSupport(): Promise<HostSupport> {
     ] as const) {
       ids.set(api, new Set(runtime.getProvider(provider)?.getModels().map((model) => model.id)))
     }
-    // Classifier models arrived with Pi 0.99. Only a host whose TypeSafe
-    // provider lists them can run Router's System One models.
-    const typesafe = runtime.getProvider("typesafe")
-    if (
-      typeof typesafe?.classify === "function" &&
-      (typesafe.getAllModels?.() ?? []).some((model) => model.type === "classifier")
-    ) {
-      classifier = { classify: typesafe.classify.bind(typesafe) }
+    // Classifier models arrived with Pi 0.99, OpenAI's Decisions models with
+    // 1.1. A host can run a Router classifier API only if the built-in
+    // provider that owns its adapter lists a classifier on that API.
+    for (const [api, providerID] of Object.entries(CLASSIFIER_HOSTS) as [ClassifierApi, string][]) {
+      const provider = runtime.getProvider(providerID)
+      const native = (provider?.getAllModels?.() ?? []).flatMap((model) =>
+        model.type === "classifier" && model.api === api ? [model] : [],
+      )
+      if (provider && typeof provider.classify === "function" && native.length > 0) {
+        classifiers.set(api, { classify: provider.classify.bind(provider) })
+        if (api === "openai-decisions") {
+          for (const model of native) decisionModels.set(model.id, model.contextWindow)
+        }
+      }
     }
   } catch {
     // No native compatibility catalog means neither adapter can safely
     // advertise Router models until Pi loads on the next launch.
   }
-  return { modelIDs: ids, ...(classifier ? { classifier } : {}) }
+  return { modelIDs: ids, classifiers, decisionModels }
 }
 
 /**
@@ -489,8 +506,6 @@ function toPiModel(model: DiscoveredModel, baseUrl: string): RouterModel {
       cacheRead: 0,
       cacheWrite: 0,
     },
-    // A shared default silently truncated long-context models and
-    // over-promised short ones. Each model states its own.
     contextWindow: metadata.contextWindow,
     maxTokens: metadata.maxOutputTokens,
   }
@@ -498,24 +513,64 @@ function toPiModel(model: DiscoveredModel, baseUrl: string): RouterModel {
 
 function toPiClassifier(classifier: DiscoveredClassifier, baseUrl: string): RouterClassifier {
   const metadata = classifier.metadata
+  const decisions = classifier.api === "openai-decisions"
+  const rates = metadata.pricing ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
   return {
     type: "classifier",
     id: classifier.id,
     name: `${metadata.displayName} via ${metadata.providerDisplayName || classifier.ownedBy || "Ramp Router"}`,
-    api: CLASSIFIER_API,
+    api: classifier.api,
     provider: PROVIDER_ID,
-    // Pi's System One adapter appends /systemone to this.
+    // Pi's adapters append /systemone or /decisions to this.
     baseUrl,
-    input: ["text"],
-    cost: metadata.pricing ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    input: decisions ? piInputModalities(metadata.inputModalities) : ["text"],
+    // Router bills Decisions on input tokens only, as OpenAI prices the endpoint.
+    cost: decisions ? { input: rates.input, output: 0, cacheRead: 0, cacheWrite: 0 } : rates,
     contextWindow: metadata.contextWindow,
   }
 }
 
-function toPiCatalog(discovered: DiscoveredCatalog, baseUrl: string): RouterCatalog {
+/**
+ * Router lists OpenAI's Decisions models as chat rows, without a "decisions"
+ * surface. Until it advertises one, Pi's own catalog says which ids also
+ * answer on /v1/decisions. Pi states the window OpenAI enforces there, which
+ * is smaller than the chat window Router reports.
+ */
+function nativeDecisionClassifiers(
+  discovered: DiscoveredCatalog,
+  host: HostSupport,
+): DiscoveredClassifier[] {
+  const advertised = new Set(discovered.classifiers.map((classifier) => classifier.id))
+  return discovered.models.flatMap((model): DiscoveredClassifier[] => {
+    const nativeWindow = host.decisionModels.get(model.id)
+    if (model.ownedBy !== "openai" || nativeWindow === undefined || advertised.has(model.id)) {
+      return []
+    }
+    const { metadata } = model
+    return [{
+      id: model.id,
+      ownedBy: model.ownedBy,
+      api: "openai-decisions",
+      metadata: {
+        displayName: metadata.displayName,
+        providerDisplayName: metadata.providerDisplayName,
+        contextWindow: Math.min(metadata.contextWindow, nativeWindow),
+        inputModalities: metadata.inputModalities,
+        ...(metadata.pricing ? { pricing: metadata.pricing } : {}),
+      },
+    }]
+  })
+}
+
+function toPiCatalog(
+  discovered: DiscoveredCatalog,
+  baseUrl: string,
+  host: HostSupport,
+): RouterCatalog {
   return {
     models: discovered.models.map((model) => toPiModel(model, baseUrl)),
-    classifiers: discovered.classifiers.map((classifier) => toPiClassifier(classifier, baseUrl)),
+    classifiers: [...discovered.classifiers, ...nativeDecisionClassifiers(discovered, host)]
+      .map((classifier) => toPiClassifier(classifier, baseUrl)),
   }
 }
 
@@ -853,12 +908,14 @@ function routerProvider(
     if (
       composed.type !== "classifier" ||
       composed.provider !== PROVIDER_ID ||
-      composed.api !== CLASSIFIER_API ||
+      !Object.hasOwn(CLASSIFIER_HOSTS, composed.api) ||
       composed.baseUrl !== baseUrl
     ) {
       throw new Error("Ramp Router model does not match this provider")
     }
-    const canonical = currentClassifiers.find((candidate) => candidate.id === composed.id)
+    const canonical = currentClassifiers.find(
+      (candidate) => candidate.id === composed.id && candidate.api === composed.api,
+    )
     if (!canonical) throw new Error("Ramp Router model is not in the active catalog")
     // As for chat, keep models.json presentation and pricing tuning but pin
     // identity and destination to the private catalog.
@@ -893,7 +950,7 @@ function routerProvider(
         } catch {
           throw new Error("Ramp Router request payload violates provider invariants")
         }
-        // System One answers in one JSON response.
+        // System One and Decisions answer in one JSON response.
         if (stream !== undefined && stream !== false) {
           throw new Error("Ramp Router request payload violates provider invariants")
         }
@@ -907,12 +964,13 @@ function routerProvider(
     options?: ClassifierOptions,
   ): Promise<ClassifierResult> => {
     try {
-      if (!host.classifier) {
-        throw new Error("Update Pi to use classifier models through Ramp Router")
-      }
       const requestOptions = snapshotRequestOptions(options)
       const canonical = requestClassifier(model, requestOptions)
-      return await host.classifier.classify(
+      const hostClassifier = host.classifiers.get(canonical.api)
+      if (!hostClassifier) {
+        throw new Error("Update Pi to use classifier models through Ramp Router")
+      }
+      return await hostClassifier.classify(
         canonical,
         context,
         guardedClassifierOptions(canonical.id, requestOptions),
@@ -920,7 +978,7 @@ function routerProvider(
     } catch (error) {
       // Pi's contract: classify reports failures in its result, never rejects.
       return {
-        api: CLASSIFIER_API,
+        api: typeof model?.api === "string" ? model.api : "",
         provider: PROVIDER_ID,
         model: typeof model?.id === "string" ? model.id : "",
         answers: {},
@@ -930,6 +988,8 @@ function routerProvider(
       }
     }
   }
+  const hostRunsClassifier = (classifier: RouterClassifier) =>
+    host.classifiers.has(classifier.api)
   const getModels = () => copyModels(currentModels.filter(isSupportedByPi))
   const registeredProvider = {
     ...provider,
@@ -938,9 +998,9 @@ function routerProvider(
       credentialMatchesCatalog(credential) ? candidateModels.filter(isAvailableChatModel) : [],
     // Classifier members exist only on hosts that can run them; older Pi
     // reads getModels and never sees a classifier.
-    ...(host.classifier
+    ...(host.classifiers.size > 0
       ? {
-          getAllModels: () => [...getModels(), ...structuredClone(currentClassifiers)],
+          getAllModels: () => [...getModels(), ...structuredClone(currentClassifiers.filter(hostRunsClassifier))],
           filterAllModels: (
             candidates: readonly (Model<RouterApi> | RouterClassifier)[],
             credential?: Credential,
@@ -950,7 +1010,9 @@ function routerProvider(
                   candidate.type === "classifier"
                     ? currentClassifiers.some(
                         (classifier) =>
-                          classifier.id === candidate.id && classifier.api === candidate.api,
+                          classifier.id === candidate.id &&
+                          classifier.api === candidate.api &&
+                          hostRunsClassifier(classifier),
                       )
                     : isAvailableChatModel(candidate),
                 )
@@ -1017,7 +1079,7 @@ function routerProvider(
         ...(signal ? { signal } : {}),
       })
       if (signal.aborted) return
-      const refreshed = toPiCatalog(discovered, baseUrl)
+      const refreshed = toPiCatalog(discovered, baseUrl, host)
       if (refreshGeneration !== catalogGeneration.current) return
       if (signal.aborted || refreshGeneration !== catalogGeneration.current) return
       // Cross Pi's refresh-generation gate before mutating either catalog.
@@ -1366,7 +1428,7 @@ function cacheCredentialIdentity(apiKey: string): string | undefined {
     : createHmac("sha256", key).update(apiKey).digest("hex")
 }
 
-function cachedCost(value: unknown): RouterModel["cost"] | undefined {
+function cachedCostRates(value: unknown): ModelCostRates | undefined {
   if (!value || typeof value !== "object") return undefined
   const cost = value as Record<string, unknown>
   const costKeys = ["input", "output", "cacheRead", "cacheWrite"] as const
@@ -1387,6 +1449,29 @@ function cachedCost(value: unknown): RouterModel["cost"] | undefined {
     cacheRead: cost.cacheRead as number,
     cacheWrite: cost.cacheWrite as number,
   }
+}
+
+function cachedCost(value: unknown): RouterModel["cost"] | undefined {
+  if (!value || typeof value !== "object") return undefined
+  const { tiers, ...rates } = value as Record<string, unknown>
+  const parsedRates = cachedCostRates(rates)
+  if (!parsedRates) return undefined
+  if (tiers === undefined) return parsedRates
+  if (!Array.isArray(tiers)) return undefined
+  const parsedTiers: ModelCostTier[] = []
+  for (const tier of tiers) {
+    if (!tier || typeof tier !== "object") return undefined
+    const { inputTokensAbove, ...tierRates } = tier as Record<string, unknown>
+    if (
+      typeof inputTokensAbove !== "number" ||
+      !Number.isSafeInteger(inputTokensAbove) ||
+      inputTokensAbove < 0
+    ) return undefined
+    const parsedTierRates = cachedCostRates(tierRates)
+    if (!parsedTierRates) return undefined
+    parsedTiers.push({ inputTokensAbove, ...parsedTierRates })
+  }
+  return { ...parsedRates, tiers: parsedTiers }
 }
 
 function cachedRouterModel(value: unknown, baseUrl: string): RouterModel | undefined {
@@ -1479,6 +1564,12 @@ function cachedRouterModel(value: unknown, baseUrl: string): RouterModel | undef
   }
 }
 
+// System One reads text only; Decisions also judges images.
+function cachedClassifierInput(api: ClassifierApi, input: unknown[]): boolean {
+  const allowed = api === "openai-decisions" ? [["text"], ["text", "image"]] : [["text"]]
+  return allowed.some((modalities) => modalities.join() === input.join())
+}
+
 function cachedRouterClassifier(value: unknown, baseUrl: string): RouterClassifier | undefined {
   if (!value || typeof value !== "object") return undefined
   const classifier = value as Record<string, unknown>
@@ -1491,12 +1582,12 @@ function cachedRouterClassifier(value: unknown, baseUrl: string): RouterClassifi
     typeof classifier.id !== "string" ||
     !classifier.id ||
     typeof classifier.name !== "string" ||
-    classifier.api !== CLASSIFIER_API ||
+    typeof classifier.api !== "string" ||
+    !Object.hasOwn(CLASSIFIER_HOSTS, classifier.api) ||
     classifier.provider !== PROVIDER_ID ||
     classifier.baseUrl !== baseUrl ||
     !Array.isArray(classifier.input) ||
-    classifier.input.length !== 1 ||
-    classifier.input[0] !== "text" ||
+    !cachedClassifierInput(classifier.api as ClassifierApi, classifier.input) ||
     typeof classifier.contextWindow !== "number" ||
     !Number.isSafeInteger(classifier.contextWindow) ||
     classifier.contextWindow <= 0
@@ -1509,10 +1600,10 @@ function cachedRouterClassifier(value: unknown, baseUrl: string): RouterClassifi
     type: "classifier",
     id: classifier.id,
     name: classifier.name,
-    api: CLASSIFIER_API,
+    api: classifier.api as ClassifierApi,
     provider: PROVIDER_ID,
     baseUrl,
-    input: ["text"],
+    input: classifier.input as RouterClassifier["input"],
     cost,
     contextWindow: classifier.contextWindow,
   }
@@ -1595,6 +1686,7 @@ async function discoverModels(
   baseUrl: string,
   apiKey: string,
   rampCliVersion: string | undefined,
+  host: HostSupport,
   signal?: AbortSignal,
 ): Promise<RouterCatalog> {
   const discovered = await discoverRouterModels({
@@ -1603,7 +1695,7 @@ async function discoverModels(
     ...(rampCliVersion ? { rampCliVersion } : {}),
     ...(signal ? { signal } : {}),
   })
-  return toPiCatalog(discovered, baseUrl)
+  return toPiCatalog(discovered, baseUrl, host)
 }
 
 export default async function registerRouterProvider(pi: ExtensionAPI): Promise<void> {
@@ -1648,6 +1740,7 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
         baseUrl,
         apiKey,
         rampCliVersion,
+        host,
         AbortSignal.timeout(STARTUP_DISCOVERY_TIMEOUT_MS),
       )
       if (!(await routerCredentialIsCurrent(apiKey))) {
@@ -1764,7 +1857,7 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
   // private cache is an optional next-launch optimization, not a prerequisite
   // for using the newer catalog in this process.
   if (apiKey && backgroundGeneration !== undefined) {
-    void discoverModels(baseUrl, apiKey, rampCliVersion)
+    void discoverModels(baseUrl, apiKey, rampCliVersion, host)
       .then(async (refreshed) => {
         if (refreshed.models.length > 0) {
           // Pi resolves auth again for inference. If /login or a concurrent

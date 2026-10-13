@@ -1,15 +1,12 @@
+import type { ModelCost, ModelCostRates } from "@earendil-works/pi-ai"
+
 export type RouterEffort = {
   value: string
   description: string
 }
 
-export type RouterPricing = {
-  /** US dollars per million tokens, as published by Router. */
-  input: number
-  output: number
-  cacheRead: number
-  cacheWrite: number
-}
+/** US dollars per million tokens, as published by Router. */
+export type RouterPricing = ModelCost
 
 export type RouterModelMetadata = {
   schemaVersion: number
@@ -20,7 +17,7 @@ export type RouterModelMetadata = {
   description?: string
   /** Router's stable presentation order. Not a quality ranking. */
   listingOrder: number
-  /** Router states a window for every model it serves. */
+  /** Router's window, capped at the standard-price input threshold when stated. */
   contextWindow: number
   maxOutputTokens: number
   inputModalities: string[]
@@ -49,17 +46,25 @@ export type RouterModel = {
   metadata: RouterModelMetadata
 }
 
-/** What Pi needs to describe a System One classifier such as TypeSafe's Jev. */
+/**
+ * The typed-question APIs Router serves. Pi's adapter for each is chosen by
+ * this name: System One for TypeSafe's Jev, Decisions for OpenAI.
+ */
+export type RouterClassifierApi = "typesafe-system-one" | "openai-decisions"
+
+/** What Pi needs to describe a classifier such as TypeSafe's Jev. */
 export type RouterClassifierMetadata = {
   displayName: string
   providerDisplayName: string
   contextWindow: number
+  inputModalities: string[]
   pricing?: RouterPricing
 }
 
 export type RouterClassifier = {
   id: string
   ownedBy?: string
+  api: RouterClassifierApi
   metadata: RouterClassifierMetadata
 }
 
@@ -138,7 +143,7 @@ function isoDate(value: unknown): string | undefined {
   return new Date(value * 1000).toISOString().slice(0, 10)
 }
 
-function pricing(value: unknown): RouterPricing | undefined {
+function pricingRates(value: unknown): ModelCostRates | undefined {
   const rates = record(value)
   const input = rate(rates.input)
   const output = rate(rates.output)
@@ -150,6 +155,20 @@ function pricing(value: unknown): RouterPricing | undefined {
     // Anthropic rows publish writes per TTL and leave cache_write_input at 0.
     // Pi prices 1h writes itself (2x input), so the 5m rate is its base rate.
     cacheWrite: rate(rates.cache_write_input) || rate(rates.cache_write_input_5m) || 0,
+  }
+}
+
+function pricing(value: unknown): RouterPricing | undefined {
+  const rates = pricingRates(value)
+  if (!rates) return undefined
+  const bands = record(value)
+  const threshold = count(bands.long_context_token_threshold)
+  const longContext = pricingRates(bands.long_context)
+  return {
+    ...rates,
+    ...(threshold !== undefined && longContext !== undefined
+      ? { tiers: [{ inputTokensAbove: threshold, ...longContext }] }
+      : {}),
   }
 }
 
@@ -206,6 +225,10 @@ export function parseRouterMetadata(
   const toolCalls = flag(tools.supported)
   const defaultEffort = text(reasoning.default_effort)
   const rates = pricing(router.pricing)
+  const priceBands = record(router.pricing)
+  const longContextThreshold = pricingRates(priceBands.long_context) !== undefined
+    ? count(priceBands.long_context_token_threshold)
+    : undefined
   const status = text(router.status)
   const temperature = flag(capabilities.temperature)
   const releaseDate = isoDate(created)
@@ -220,7 +243,8 @@ export function parseRouterMetadata(
     reasoningEfforts: efforts(reasoning.efforts),
     reasoningSummaryValues: strings(summary.values),
     reasoningInclude: strings(continuation.request_include),
-    contextWindow,
+    // Router charges the long-context band strictly above the threshold.
+    contextWindow: Math.min(contextWindow, longContextThreshold ?? contextWindow),
     maxOutputTokens,
     ...(description !== undefined ? { description } : {}),
     ...(toolCalls !== undefined ? { toolCalls } : {}),
@@ -248,13 +272,18 @@ function servesPiApi(raw: OpenAIModel): boolean {
 
 /**
  * System One rows answer typed questions on /v1/systemone. Older Routers
- * without a surfaces field mark them only by owner.
+ * without a surfaces field mark them only by owner. OpenAI rows that also
+ * list "decisions" answer on /v1/decisions. Jev lists it too, but Pi reaches
+ * Jev through System One, so only OpenAI's rows take the Decisions adapter.
  */
-function servesSystemOne(raw: OpenAIModel): boolean {
+function classifierApi(raw: OpenAIModel): RouterClassifierApi | undefined {
   const surfaces = record(raw.router).surfaces
-  return Array.isArray(surfaces)
-    ? surfaces.includes("systemone")
-    : raw.owned_by === "typesafe"
+  if (!Array.isArray(surfaces)) {
+    return raw.owned_by === "typesafe" ? "typesafe-system-one" : undefined
+  }
+  if (surfaces.includes("systemone")) return "typesafe-system-one"
+  if (raw.owned_by === "openai" && surfaces.includes("decisions")) return "openai-decisions"
+  return undefined
 }
 
 /**
@@ -275,6 +304,7 @@ function parseRouterClassifierMetadata(value: unknown): RouterClassifierMetadata
     displayName: text(router.display_name) ?? "",
     providerDisplayName: text(router.provider_display_name) ?? "",
     contextWindow,
+    inputModalities: strings(modalities.input),
     ...(rates !== undefined ? { pricing: rates } : {}),
   }
 }
@@ -325,7 +355,10 @@ export async function discoverRouterModels(input: {
     throw new Error("Ramp Router model discovery returned an invalid OpenAI model list")
   }
 
-  const seen = new Set<string>()
+  // A model can be both a chat row and a classifier (OpenAI's Decisions
+  // models), so each kind keeps its own first-wins set.
+  const seenModels = new Set<string>()
+  const seenClassifiers = new Set<string>()
   const models: RouterModel[] = []
   const classifiers: RouterClassifier[] = []
   for (const raw of payload.data as OpenAIModel[]) {
@@ -334,21 +367,22 @@ export async function discoverRouterModels(input: {
       throw new Error("Ramp Router model discovery returned a model without an id")
     }
     // Keep the first, matching the CLI, so both agree on which entry won.
-    if (seen.has(identifier)) continue
     const ownedBy =
       typeof raw.owned_by === "string" && raw.owned_by.length > 0 ? { ownedBy: raw.owned_by } : {}
-    if (servesPiApi(raw)) {
-      seen.add(identifier)
+    if (servesPiApi(raw) && !seenModels.has(identifier)) {
+      seenModels.add(identifier)
       models.push({
         id: identifier,
         ...ownedBy,
         metadata: parseRouterMetadata(raw.router, raw.created, identifier),
       })
-    } else if (servesSystemOne(raw)) {
+    }
+    const api = classifierApi(raw)
+    if (api && !seenClassifiers.has(identifier)) {
       const metadata = parseRouterClassifierMetadata(raw.router)
       if (metadata) {
-        seen.add(identifier)
-        classifiers.push({ id: identifier, ...ownedBy, metadata })
+        seenClassifiers.add(identifier)
+        classifiers.push({ id: identifier, ...ownedBy, api, metadata })
       }
     }
   }

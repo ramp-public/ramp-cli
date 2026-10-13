@@ -7,12 +7,33 @@ Router API key. Anthropic-owned models use Router's Anthropic Messages
 compatibility endpoint; other models use the OpenAI Responses API. Rows Router
 marks as unable to serve their selected API are left out.
 
+For chat models with `router.pricing.long_context` and a valid
+`long_context_token_threshold`, the discovered context window is capped at
+that threshold so Pi compacts before entering the higher-priced band. Models
+without that pricing band keep their stated window. Published output limits and
+standard rates are unchanged. This is a cost-aware default, not a hard spending
+limit: manual window overrides or a large prompt/tool result can still cross it.
+
+As in native Pi, the capped window controls both compaction and per-request
+output budgeting. Available output shrinks as the context fills. Caller output
+limits and model tuning still follow Pi's normal adapter behavior.
+
+The cost object also includes Pi's native input-token pricing tiers. Long-context
+rates apply to the whole request strictly above Router's threshold, counting
+cached input as well as uncached input. These tiers persist in the offline cache.
+
 On Pi 0.99 and later, Router's System One models (TypeSafe's Jev) are
 registered as Pi classifier models and answered through `/v1/systemone`. Like
 other classifiers they do not appear in `/model`; codemode scripts reach them
 with `models.classify()` and extensions with `ctx.modelRegistry.classify()`.
 Calls carry the active Pi session's Router attribution. Older Pi versions do
 not list them.
+
+On Pi 1.1 and later, OpenAI's Decisions models (today `gpt-6-luna`) are also
+classifier models, answered through `/v1/decisions` with image input. They stay
+available as chat models too. A model qualifies when Router lists a
+`decisions` surface for it or Pi's built-in `openai` provider lists it as a
+classifier. Router bills these calls on input tokens only.
 Anthropic and OpenAI models are shown only when their IDs also appear in the
 installed Pi version's built-in catalog for the corresponding provider. Pi
 supplies model-specific Messages and Responses compatibility settings, so

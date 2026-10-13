@@ -20,7 +20,7 @@ export type RouterModelMetadata = {
   description?: string
   /** Router's stable presentation order. Not a quality ranking. */
   listingOrder: number
-  /** Router states a window for every model it serves. */
+  /** Router's window, capped at the standard-price input threshold when stated. */
   contextWindow: number
   maxOutputTokens: number
   inputModalities: string[]
@@ -188,6 +188,10 @@ export function parseRouterMetadata(
   const toolCalls = flag(tools.supported)
   const defaultEffort = text(reasoning.default_effort)
   const rates = pricing(router.pricing)
+  const priceBands = record(router.pricing)
+  const longContextThreshold = pricing(priceBands.long_context) !== undefined
+    ? count(priceBands.long_context_token_threshold)
+    : undefined
   const status = text(router.status)
   const temperature = flag(capabilities.temperature)
   const summaryRequestable = flag(summary.request_parameter_supported) ?? false
@@ -204,7 +208,8 @@ export function parseRouterMetadata(
     reasoningSummaryValues: strings(summary.values),
     reasoningSummaryRequestable: summaryRequestable,
     reasoningInclude: strings(continuation.request_include),
-    contextWindow,
+    // Router charges the long-context band strictly above the threshold.
+    contextWindow: Math.min(contextWindow, longContextThreshold ?? contextWindow),
     maxOutputTokens,
     ...(description !== undefined ? { description } : {}),
     ...(toolCalls !== undefined ? { toolCalls } : {}),

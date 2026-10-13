@@ -135,8 +135,6 @@ export const RouterProviderV1: Plugin = async (_input, rawOptions) => {
                 output: openCodeModalities(metadata.outputModalities),
               },
               limit: {
-                // A shared default silently truncated long-context models and
-                // over-promised short ones. Each model states its own.
                 context: metadata.contextWindow,
                 output: metadata.maxOutputTokens,
               },

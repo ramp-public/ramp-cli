@@ -202,12 +202,24 @@ describe("discoverRouterModels", () => {
       {
         id: "jev-by-surface",
         ownedBy: "router",
-        metadata: { displayName: "jev-by-surface", providerDisplayName: "", contextWindow: 128000 },
+        api: "typesafe-system-one",
+        metadata: {
+          displayName: "jev-by-surface",
+          providerDisplayName: "",
+          contextWindow: 128000,
+          inputModalities: ["text", "image"],
+        },
       },
       {
         id: "jev-by-owner",
         ownedBy: "typesafe",
-        metadata: { displayName: "jev-by-owner", providerDisplayName: "", contextWindow: 128000 },
+        api: "typesafe-system-one",
+        metadata: {
+          displayName: "jev-by-owner",
+          providerDisplayName: "",
+          contextWindow: 128000,
+          inputModalities: ["text", "image"],
+        },
       },
     ])
   })
@@ -243,19 +255,62 @@ describe("discoverRouterModels", () => {
       {
         id: "jev-latest",
         ownedBy: "typesafe",
+        api: "typesafe-system-one",
         metadata: {
           displayName: "Jev 1.13",
           providerDisplayName: "TypeSafe",
           contextWindow: 65536,
+          inputModalities: ["text"],
           pricing: { input: 0.042, output: 0, cacheRead: 0, cacheWrite: 0 },
         },
       },
       {
         id: "jev-preview",
         ownedBy: "typesafe",
-        metadata: { displayName: "jev-preview", providerDisplayName: "", contextWindow: 128000 },
+        api: "typesafe-system-one",
+        metadata: {
+          displayName: "jev-preview",
+          providerDisplayName: "",
+          contextWindow: 128000,
+          inputModalities: ["text"],
+        },
       },
     ])
+  })
+
+  it("lists an OpenAI row that advertises decisions as both chat and a Decisions classifier", async () => {
+    const fetcher = mock.fn(async () => new Response(JSON.stringify({ data: [
+      {
+        id: "gpt-6-luna",
+        owned_by: "openai",
+        router: { ...routerMetadata("gpt-6-luna"), surfaces: ["responses", "messages", "decisions"] },
+      },
+      // Jev lists "decisions" too but stays on System One.
+      {
+        id: "jev-latest",
+        owned_by: "typesafe",
+        router: { ...routerMetadata("jev-latest", ["text"]), surfaces: ["systemone", "decisions"] },
+      },
+      {
+        id: "claude-x",
+        owned_by: "anthropic",
+        router: { ...routerMetadata("claude-x"), surfaces: ["messages", "decisions"] },
+      },
+    ] }), { status: 200 }))
+
+    const discovered = await discoverRouterModels({
+      baseURL: "http://localhost:8002",
+      apiKey: "test-secret",
+      fetch: fetcher,
+    })
+    assert.deepEqual(discovered.models.map(({ id }) => id), ["gpt-6-luna", "claude-x"])
+    assert.deepEqual(
+      discovered.classifiers.map(({ id, api }) => ({ id, api })),
+      [
+        { id: "gpt-6-luna", api: "openai-decisions" },
+        { id: "jev-latest", api: "typesafe-system-one" },
+      ],
+    )
   })
 
   it("rejects a catalog with classifiers but no chat models", async () => {
@@ -2794,6 +2849,189 @@ describe("Router classifiers", () => {
       const { provider: restored } = await register()
       assert.deepEqual(restored.getModels(), [])
     }
+  })
+})
+
+// OpenAI's Decisions models arrived in Pi 1.1. Older hosts must not list them.
+async function hostDecides() {
+  const runtime = await ModelRuntime.create({
+    modelsPath: null,
+    refreshOnCreate: false,
+    allowModelNetwork: false,
+  })
+  const openai = runtime.getProvider("openai")
+  return typeof openai?.classify === "function" &&
+    (openai.getAllModels?.() ?? []).some(({ type, api }) => type === "classifier" && api === "openai-decisions")
+}
+
+const LUNA_ROW = {
+  id: "gpt-6-luna",
+  owned_by: "openai",
+  router: {
+    ...routerMetadata("gpt-6-luna"),
+    display_name: "GPT-6 Luna",
+    provider_display_name: "OpenAI",
+    surfaces: ["responses", "messages"],
+    limits: { context_window: 1050000, max_output_tokens: 128000 },
+    pricing: { input: "0.1", output: "0.5", cache_read_input: "0.01", cache_write_input: "0.125" },
+  },
+}
+
+const LUNA_MODEL = {
+  type: "classifier",
+  id: "gpt-6-luna",
+  name: "GPT-6 Luna via OpenAI",
+  api: "openai-decisions",
+  provider: "ramp-router",
+  baseUrl: "https://api.router.com/v1",
+  input: ["text", "image"],
+  // Router bills Decisions on input tokens only; the window is OpenAI's, not the chat window.
+  cost: { input: 0.1, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: 922000,
+}
+
+describe("Router OpenAI Decisions classifiers", () => {
+  let decisionRequests
+  beforeEach(() => {
+    decisionRequests = []
+    writeFileSync(join(process.env.PI_CODING_AGENT_DIR, "auth.json"), JSON.stringify({
+      "ramp-router": { type: "api_key", key: "current-secret" },
+    }))
+    mock.method(globalThis, "fetch", async (url, init) => {
+      if (String(url).endsWith("/v1/models")) {
+        return new Response(JSON.stringify({ data: [LUNA_ROW, JEV_ROW] }), { status: 200 })
+      }
+      decisionRequests.push({
+        url: String(url),
+        headers: Object.fromEntries(
+          Object.entries(init.headers).map(([name, value]) => [name.toLowerCase(), value]),
+        ),
+        body: JSON.parse(init.body),
+      })
+      return new Response(JSON.stringify({
+        model: "gpt-6-luna",
+        answers: [{ type: "predicate", name: "approved", probability: 0.95 }],
+        usage: { input_tokens: 1_000_000, output_tokens: 0 },
+      }), { status: 200, headers: { "content-type": "application/json" } })
+    })
+  })
+
+  async function register() {
+    const handlers = {}
+    const registerProvider = mock.fn()
+    await registerRouterProvider({
+      registerProvider,
+      on: (event, handler) => { handlers[event] = handler },
+    })
+    return { provider: registerProvider.mock.calls[0].arguments[0], handlers }
+  }
+
+  it("exposes Pi's OpenAI Decisions models next to their chat rows, only on hosts that run them", async () => {
+    const { provider } = await register()
+    const cache = JSON.parse(readFileSync(join(process.env.PI_CODING_AGENT_DIR, "ramp-router-model-cache.json"), "utf8"))
+
+    if (!(await hostDecides())) {
+      assert.deepEqual(cache.classifiers.map(({ id }) => id), ["jev-latest"])
+      return assert.deepEqual(
+        (provider.getAllModels?.() ?? []).filter(({ type }) => type === "classifier").map(({ id }) => id),
+        (await hostClassifies()) ? ["jev-latest"] : [],
+      )
+    }
+    // Router's own classifiers come first, then the ones Pi's catalog adds.
+    assert.deepEqual(cache.classifiers, [JEV_MODEL, LUNA_MODEL])
+    assert.deepEqual(
+      provider.getAllModels().filter(({ type }) => type === "classifier"),
+      [JEV_MODEL, LUNA_MODEL],
+    )
+    // Chat is unaffected: Luna stays a chat model too.
+    assert.ok(provider.getModels().some(({ id }) => id === "gpt-6-luna"))
+  })
+
+  it("lists a Decisions classifier that Router advertises even if Pi does not know the id", async () => {
+    if (!(await hostDecides())) return
+    globalThis.fetch.mock.mockImplementation(async () => new Response(JSON.stringify({ data: [
+      LUNA_ROW,
+      {
+        ...LUNA_ROW,
+        id: "gpt-7-luna",
+        router: { ...LUNA_ROW.router, surfaces: ["responses", "decisions"] },
+      },
+    ] }), { status: 200 }))
+    const { provider } = await register()
+    assert.deepEqual(
+      provider.getAllModels().filter(({ type }) => type === "classifier").map(({ id, api }) => [id, api]),
+      [["gpt-7-luna", "openai-decisions"], ["gpt-6-luna", "openai-decisions"]],
+    )
+  })
+
+  it("classifies through Router's Decisions surface with Pi session attribution", async () => {
+    if (!(await hostDecides())) return
+    const { provider, handlers } = await register()
+    const sessionID = "019ff2af-7ce1-7000-8000-000000000001"
+    handlers.session_start(
+      { type: "session_start", reason: "startup" },
+      {
+        sessionManager: { getSessionId: () => sessionID, getHeader: () => ({ type: "session", id: sessionID }) },
+        modelRegistry: { refresh: async () => {} },
+      },
+    )
+    const luna = provider.getAllModels().find(({ type, id }) => type === "classifier" && id === "gpt-6-luna")
+    const result = await provider.classify(luna, QUESTION, { apiKey: "current-secret", maxRetries: 0 })
+
+    assert.equal(result.stopReason, "stop", result.errorMessage)
+    assert.deepEqual(result.answers, { approved: { type: "bool", probability: 0.95 } })
+    assert.equal(result.usage.cost.input, 0.1)
+    assert.equal(result.usage.cost.output, 0)
+    const [request] = decisionRequests
+    assert.equal(request.url, "https://api.router.com/v1/decisions")
+    assert.equal(request.headers.authorization, "Bearer current-secret")
+    assert.equal(request.headers["user-agent"], "ramp-cli-pi-provider")
+    assert.equal(request.headers["x-gateway-client"], "pi")
+    assert.equal(request.headers["x-session-id"], sessionID)
+    assert.equal(request.body.model, "gpt-6-luna")
+    assert.equal(request.body.input, JSON.stringify(QUESTION.state))
+    assert.equal(request.body.questions[0].type, "predicate")
+    assert.equal(request.body.stream, undefined)
+  })
+
+  it("refuses Decisions calls that do not match the active catalog", async () => {
+    if (!(await hostDecides())) return
+    const { provider } = await register()
+    const luna = provider.getAllModels().find(({ type, id }) => type === "classifier" && id === "gpt-6-luna")
+    const refused = async (model, options, pattern) => {
+      const result = await provider.classify(model, QUESTION, { apiKey: "current-secret", maxRetries: 0, ...options })
+      assert.equal(result.stopReason, "error")
+      assert.match(result.errorMessage, pattern)
+    }
+    await refused({ ...luna, api: "typesafe-system-one" }, {}, /not in the active catalog/)
+    await refused({ ...luna, baseUrl: "https://elsewhere.example/v1" }, {}, /does not match this provider/)
+    await refused(luna, { onPayload: (payload) => ({ ...payload, model: "gpt-6-sol" }) }, /not in the active catalog/)
+    await refused(luna, { onPayload: (payload) => ({ ...payload, stream: true }) }, /violates provider invariants/)
+    assert.equal(decisionRequests.length, 0)
+  })
+
+  it("restores Decisions classifiers from the private cache", async () => {
+    await register()
+    process.env.PI_OFFLINE = "1"
+    globalThis.fetch.mock.mockImplementation(async () => {
+      throw new Error("offline launch attempted a network request")
+    })
+    const { provider } = await register()
+    if (!(await hostDecides())) return
+    assert.deepEqual(
+      provider.getAllModels().filter(({ type, id }) => type === "classifier" && id === "gpt-6-luna"),
+      [LUNA_MODEL],
+    )
+
+    // System One models read text only, so an image-capable one is not ours.
+    const cachePath = join(process.env.PI_CODING_AGENT_DIR, "ramp-router-model-cache.json")
+    const cache = JSON.parse(readFileSync(cachePath, "utf8"))
+    writeFileSync(cachePath, JSON.stringify({
+      ...cache,
+      classifiers: [{ ...JEV_MODEL, input: ["text", "image"] }],
+    }))
+    const { provider: restored } = await register()
+    assert.deepEqual(restored.getModels(), [])
   })
 })
 
