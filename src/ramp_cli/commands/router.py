@@ -58,7 +58,12 @@ from ramp_cli.commands.router_user_strategies import (
     use_account_strategies,
 )
 from ramp_cli.config.settings import config_dir
-from ramp_cli.output.formatter import print_agent_json, print_json, resolve_format
+from ramp_cli.output.formatter import (
+    print_agent_json,
+    print_json,
+    print_table,
+    resolve_format,
+)
 from ramp_cli.output.style import show_notice, start_spinner
 from ramp_cli.router_integrations import integration_package_path
 from ramp_cli.router_setup import (
@@ -3412,36 +3417,13 @@ _NO_SWITCHYARD_CONFIG_CHANGE = object()
     is_flag=True,
     help="Use the Router login account's strategies instead of an API key's.",
 )
-@click.option(
-    "--harness",
-    "harness_client",
-    type=_AgentChoice(),
-    help=(
-        "Act for the API key and Router endpoint a connected harness uses, "
-        "like the workspace's harness routing page."
-    ),
-)
 @click.pass_context
 def router_strategy_group(
-    ctx: click.Context, api_key: str | None, account: bool, harness_client: str | None
+    ctx: click.Context, api_key: str | None, account: bool
 ) -> None:
     # Subcommands resolve their own --api-key; keep a group-level value so
     # 'ramp router strategies --api-key KEY enable ...' acts on KEY's account
     # instead of silently falling back to a stored key.
-    if harness_client is not None:
-        # The group option also binds the env var; only a typed key conflicts.
-        typed_key = ctx.get_parameter_source("api_key") == ParameterSource.COMMANDLINE
-        if typed_key or account:
-            raise click.UsageError(
-                "--harness cannot be combined with --api-key or --account."
-            )
-        from ramp_cli.router_ui import harness  # noqa: PLC0415
-
-        with harness.connection(harness_client) as current:
-            api_key = current.key
-            ctx.obj["strategies_base_url"] = current.base_url
-        # A harness's key outranks the environment variable, as --api-key does.
-        ctx.obj["strategies_api_key_from_flag"] = True
     ctx.obj["strategies_api_key"] = api_key
     ctx.obj["strategies_account"] = account
     if account and api_key is not None:
@@ -3451,31 +3433,24 @@ def router_strategy_group(
             "--account is not supported by enable/disable; use strategies edit."
         )
     ctx.obj["strategies_api_key_from_flag"] = (
-        harness_client is not None
-        or ctx.get_parameter_source("api_key") == ParameterSource.COMMANDLINE
+        ctx.get_parameter_source("api_key") == ParameterSource.COMMANDLINE
     )
     if ctx.invoked_subcommand is not None:
         return
-    if harness_client is not None and router_ui.launch(
-        ctx, "harness-routing", client=harness_client
-    ):
-        return
-    if harness_client is None and router_ui.launch(
-        ctx, "legacy" if api_key else "strategies", api_key=api_key
-    ):
+    if router_ui.launch(ctx, "legacy" if api_key else "strategies", api_key=api_key):
         return
     if api_key is None and use_account_strategies(ctx):
         run_user_strategies(ctx, style=_picker_style(), pointer=_PICKER_POINTER)
         return
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     key = _resolve_strategy_api_key(ctx, api_key, fmt)
-    payload = _strategy_settings_request(key, base_url=_strategy_base_url(ctx))
+    payload = _strategy_settings_request(key)
     if not _can_prompt(ctx, fmt):
         # Without a terminal to toggle on, the bare command still answers the
         # question it was asked: what is the current configuration?
         _print_strategy_settings(fmt, payload)
         return
-    _toggle_strategies_interactively(key, payload, base_url=_strategy_base_url(ctx))
+    _toggle_strategies_interactively(key, payload)
 
 
 register_user_strategy_commands(
@@ -3483,9 +3458,7 @@ register_user_strategy_commands(
 )
 
 
-def _toggle_strategies_interactively(
-    key: str, payload: dict, *, base_url: str | None = None
-) -> None:
+def _toggle_strategies_interactively(key: str, payload: dict) -> None:
     """Offer every strategy with its current state and apply what changed."""
     settings = _strategy_states(payload)
     selected = questionary.checkbox(
@@ -3521,7 +3494,7 @@ def _toggle_strategies_interactively(
     )
     if configure_switchyard:
         changes["switchyard_config"] = _pick_switchyard_config(switchyard)
-    updated_payload = _strategy_settings_request(key, changes, base_url=base_url)
+    updated_payload = _strategy_settings_request(key, changes)
     updated = _strategy_states(updated_payload)
     withheld = []
     for name, enabled in desired.items():
@@ -3753,10 +3726,6 @@ def _resolve_strategy_api_key(ctx: click.Context, api_key: str | None, fmt: str)
     """
     if api_key is None:
         api_key = ctx.obj.get("strategies_api_key")
-    elif _strategy_base_url(ctx) is not None:
-        if ctx.get_parameter_source("api_key") == ParameterSource.COMMANDLINE:
-            raise click.UsageError("--harness cannot be combined with --api-key.")
-        api_key = ctx.obj["strategies_api_key"]
     elif (
         ctx.obj.get("strategies_api_key_from_flag")
         and ctx.obj.get("strategies_api_key") is not None
@@ -3810,11 +3779,6 @@ def _resolve_strategy_api_key(ctx: click.Context, api_key: str | None, fmt: str)
         "Multiple Ramp Router API keys are configured. Pass --api-key "
         f"(or set {CONFIGURE_KEY_ENV}) to choose the account to change."
     )
-
-
-def _strategy_base_url(ctx: click.Context) -> str | None:
-    """The harness endpoint chosen with 'strategies --harness', if any."""
-    return (ctx.obj or {}).get("strategies_base_url")
 
 
 def _router_key_origin(base_url: str | None) -> str:
@@ -4323,9 +4287,7 @@ def router_strategy_list(
         return
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     key = _resolve_strategy_api_key(ctx, api_key, fmt)
-    _print_strategy_settings(
-        fmt, _strategy_settings_request(key, base_url=_strategy_base_url(ctx))
-    )
+    _print_strategy_settings(fmt, _strategy_settings_request(key))
 
 
 def _run_strategy_update(
@@ -4346,7 +4308,7 @@ def _run_strategy_update(
     changes: dict[str, object] = {STRATEGY_SETTINGS[name]: enabled for name in names}
     if switchyard_config is not _NO_SWITCHYARD_CONFIG_CHANGE:
         changes["switchyard_config"] = switchyard_config
-    payload = _strategy_settings_request(key, changes, base_url=_strategy_base_url(ctx))
+    payload = _strategy_settings_request(key, changes)
     settings = _strategy_states(payload)
     # Router answers with the effective state, which can decline a change:
     # Shadow models stay off for accounts whose content recording is off.
@@ -9968,6 +9930,75 @@ def router_set_model(
         )
 
 
+@click.command(
+    "list",
+    help="List harnesses and how they connect to Router.",
+)
+@click.pass_context
+def router_configure_list(ctx: click.Context):
+    from ramp_cli.router_ui.harness import summaries  # noqa: PLC0415
+
+    rows = summaries()
+    fmt = resolve_format(ctx.obj.get("format"), ctx.obj.get("config_format"))
+    if ctx.obj.get("agent_mode"):
+        print_agent_json(rows)
+    elif fmt == "json":
+        print_json(rows)
+    else:
+        print_table(
+            ["Harness", "Installed", "Connected", "Model", "Endpoint", "Key"],
+            [
+                {
+                    "Harness": row["harness"],
+                    "Installed": "yes" if row["installed"] else "no",
+                    "Connected": "yes" if row["connected"] else "no",
+                    "Model": row["model"]
+                    or (
+                        "(unreadable)"
+                        if row.get("error")
+                        else "(set in app)"
+                        if row["connected"] and row["model_managed_by_app"]
+                        else "-"
+                    ),
+                    "Endpoint": row["endpoint"]
+                    or ("(unreadable)" if row.get("error") else "-"),
+                    "Key": row["api_key"]
+                    or ("(unreadable)" if row.get("error") else "-"),
+                }
+                for row in rows
+            ],
+        )
+
+
+@click.command(
+    "models",
+    help="List models a connected harness can switch to.",
+)
+@click.argument("client", type=click.Choice(tuple(CLIENT_NAMES), case_sensitive=False))
+@click.pass_context
+def router_configure_models(ctx: click.Context, client: str):
+    from ramp_cli.router_ui.harness import catalog  # noqa: PLC0415
+
+    result = catalog(client.lower())
+    fmt = resolve_format(ctx.obj.get("format"), ctx.obj.get("config_format"))
+    if ctx.obj.get("agent_mode"):
+        print_agent_json(result)
+    elif fmt == "json":
+        print_json(result)
+    else:
+        print_table(
+            ["Model", "Name", "Default"],
+            [
+                {
+                    "Model": model["id"],
+                    "Name": model["name"],
+                    "Default": "yes" if model["is_default"] else "",
+                }
+                for model in result["models"]
+            ],
+        )
+
+
 class ConfigureMenuGroup(click.Group):
     """Expose setup actions while preserving legacy configure arguments."""
 
@@ -10017,6 +10048,8 @@ def _organize_router_menu() -> None:
     connect = router_group.commands.pop("configure")
     connect.short_help = "Connect coding harnesses."
     configure.add_command(connect, "connect")
+    configure.add_command(router_configure_list)
+    configure.add_command(router_configure_models)
     configure.add_command(router_set_model)
     # 'configure cursor [CLIENTS] [OPTIONS]' stays the connect command it has
     # always been; guided Cursor setup stays 'ramp router cursor', which the

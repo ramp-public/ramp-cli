@@ -54,6 +54,18 @@ def connection(client: str):
         yield Connection(client, path, key, endpoint)
 
 
+def connected(client: str) -> Connection:
+    """The saved connection of a harness, or a usage error if it isn't connected."""
+    try:
+        with connection(client) as current:
+            return current
+    except click.UsageError:
+        raise click.UsageError(
+            f"{router.AGENT_NAMES[client]} isn't connected to Router. "
+            "Connect it with 'ramp router configure' first."
+        ) from None
+
+
 def check_connection(current: Connection, expected: str | None):
     if expected and not hmac.compare_digest(current.token, expected):
         raise click.ClickException(
@@ -80,6 +92,79 @@ def _models(current: Connection):
     released = {model.id: getattr(model, "created", 0) for model in models}
     choices = sorted(choices, key=lambda choice: -released.get(choice[1], 0))
     return models, choices
+
+
+def mask_key(key: str) -> str:
+    """A key's first and last four characters; short keys reveal nothing."""
+    key = key.strip()
+    if len(key) < 16:
+        return "…"
+    return f"{key[:4]}…{key[-4:]}"
+
+
+def summaries() -> list[dict]:
+    """Every supported harness, from local state only (no network).
+
+    ``installed`` is whether the harness is on this machine, ``connected``
+    whether Router set it up here. A connected harness also reports its
+    default ``model``, Router ``endpoint``, and a masked ``api_key``.
+    """
+    installed = set(router._installed_clients())
+    if router._codex_app_installed():
+        installed.add("codex")
+    if router.conductor.is_installed():
+        installed.add("conductor")
+    connected_clients = set(router.configured_router_clients())
+    rows = []
+    for client, name in router.CLIENT_NAMES.items():
+        row = {
+            "harness": client,
+            "name": name,
+            "installed": client in installed,
+            "connected": client in connected_clients,
+            "model": None,
+            "endpoint": None,
+            "api_key": None,
+            "model_managed_by_app": client == "conductor",
+            "error": None,
+        }
+        if client in connected_clients:
+            try:
+                path = router._client_config_path(client)
+                row["endpoint"] = router._stored_router_base_url(client, path)
+                row["api_key"] = mask_key(router._stored_router_api_key(client, path))
+                if client != "conductor":
+                    row["model"] = router._configured_model(client, path)
+                if client == "codex":
+                    _, live = router._read_codex_config(path)
+                    if live.get("model_provider") != router.ROUTER_PROVIDER:
+                        # A receipt outlived the switch back to another provider.
+                        row.update(connected=False, model=None, endpoint=None)
+                        row["api_key"] = None
+            except (click.ClickException, OSError, UnicodeError, ValueError):
+                row.update(model=None, endpoint=None, api_key=None)
+                row["error"] = "Can't read this harness's configuration."
+        rows.append(row)
+    return rows
+
+
+def catalog(client: str) -> dict:
+    """The models a connected harness's key can switch to, newest first."""
+    if client == "conductor":
+        raise click.UsageError(
+            "This harness chooses models inside its app, not in a global CLI setting."
+        )
+    current = connected(client)
+    selected = router._configured_model(client, current.path)
+    _, choices = _models(current)
+    return {
+        "harness": client,
+        "default_model": selected,
+        "models": [
+            {"id": value, "name": label, "is_default": value == selected}
+            for label, value in choices
+        ],
+    }
 
 
 def prices(models) -> dict[str, tuple[str | None, str | None, str | None]]:

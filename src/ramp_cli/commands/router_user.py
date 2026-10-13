@@ -104,17 +104,32 @@ def _money(value: object) -> str:
         return "Unavailable"
 
 
+def _credits_wallet(billing: dict) -> tuple[bool, object]:
+    """Pick the wallet behind the balance: (billed to business, wallet)."""
+    business = bool(billing.get("billed_to_business"))
+    return business, billing.get("business_wallet" if business else "snapshot")
+
+
+def _credits_fields(billing: object) -> dict:
+    """The balance behind ``credits`` as data: raw amount, whose it is, unlimited."""
+    billing = billing if isinstance(billing, dict) else {}
+    business, wallet = _credits_wallet(billing)
+    return {
+        "credits_usd": wallet.get("remaining_credit_usd")
+        if isinstance(wallet, dict)
+        else None,
+        "credits_scope": "business" if business else "personal",
+        "credits_unlimited": billing.get("ramp_employee_session_unlimited") is True,
+    }
+
+
 def _credits(billing: object, origin: str | None = None) -> str:
     """Remaining credit as the workspace shows it."""
     if not isinstance(billing, dict):
         return "Unavailable"
     if billing.get("ramp_employee_session_unlimited") is True:
         return "Unlimited"
-    wallet = (
-        billing.get("business_wallet")
-        if billing.get("billed_to_business")
-        else billing.get("snapshot")
-    )
+    _, wallet = _credits_wallet(billing)
     if isinstance(wallet, dict):
         return _money(wallet.get("remaining_credit_usd"))
     # Routers other than production (internal.router.com among them) don't
@@ -607,13 +622,17 @@ def _mutate_key(
     name: str | None = None,
     routing_profile: str | None = None,
     dry_run: bool = False,
+    transition: tuple[str, str] | None = None,
 ) -> None:
     """Change only the selected key; leave shared profile settings untouched."""
     method, path, body = key_mutation_request(
         client, key, action, name=name, routing_profile=routing_profile
     )
     if dry_run:
-        _output(ctx, {"method": method, "path": path, "body": body})
+        request = {"method": method, "path": path, "body": body}
+        if transition is not None:
+            request["transition"] = _transition_json(transition)
+        _output(ctx, request)
         return
     if method == "PATCH":
         result = client.patch(path, json=body)
@@ -624,7 +643,7 @@ def _mutate_key(
         return
     messages = {
         "rename": f"Renamed API key to {_single_line(name)}.",
-        "set-strategy": "Updated this key's routing strategy.",
+        "set-strategy": _strategy_message(transition),
         "lock": "Locked API key. It can no longer make requests.",
         "unlock": "Unlocked API key.",
     }
@@ -836,6 +855,154 @@ def _output_key_details(ctx: click.Context, result: dict) -> None:
         click.echo("Strategies: unavailable.")
 
 
+_TARGET_ERROR = "Pass exactly one of KEY_ID or --harness."
+
+
+def _require_one_target(key_id: str | None, harness_client: str | None) -> None:
+    if (key_id is None) == (harness_client is None):
+        raise click.UsageError(_TARGET_ERROR)
+
+
+def _harness_connection(harness_client: str):
+    """The saved key and endpoint of a connected harness, read locally."""
+    from ramp_cli.router_ui import harness  # noqa: PLC0415
+
+    return harness.connected(harness_client)
+
+
+def _harness_profiles(harness_client: str) -> tuple[object, list[dict]]:
+    from ramp_cli.commands import router  # noqa: PLC0415
+
+    current = _harness_connection(harness_client)
+    profiles = router._key_routing_profiles(current.key, base_url=current.base_url)
+    return current, profiles
+
+
+def _harness_strategies(
+    harness_client: str, current: object, profiles: list[dict]
+) -> dict:
+    """Effective strategies for a harness's key, shaped like 'keys strategies'."""
+    from ramp_cli.commands import router  # noqa: PLC0415
+
+    selected = next((p for p in profiles if p.get("is_current")), None)
+    if selected is not None:
+        result = {
+            "source": "routing_profile",
+            "routing_profile": {
+                "id": selected.get("id"),
+                "name": selected.get("name"),
+                "is_default": bool(selected.get("is_default")),
+            },
+            "allow_flex_tier_default": bool(
+                selected.get("cost_efficient_routing_enabled")
+            ),
+            "switchyard_routing_enabled": bool(
+                selected.get("switchyard_routing_enabled")
+            ),
+            "auto_routing_enabled": bool(selected.get("auto_routing_enabled")),
+            "shadow_models_enabled": selected.get("shadow_models_enabled"),
+        }
+    else:
+        defaults = router._strategy_settings_request(
+            current.key, base_url=current.base_url
+        )
+        result = {
+            "source": "account_defaults",
+            "routing_profile": None,
+            "allow_flex_tier_default": bool(defaults.get("allow_flex_tier_default")),
+            "switchyard_routing_enabled": bool(
+                defaults.get("switchyard_routing_enabled")
+            ),
+            "auto_routing_enabled": bool(defaults.get("auto_routing_enabled")),
+            "shadow_models_enabled": defaults.get("shadow_models_enabled"),
+        }
+    result["harness"] = harness_client
+    result["routing_profiles"] = [
+        {
+            "id": profile.get("id"),
+            "name": profile.get("name"),
+            "is_default": bool(profile.get("is_default")),
+            "is_current": bool(profile.get("is_current")),
+        }
+        for profile in profiles
+    ]
+    return result
+
+
+_ACCOUNT_DEFAULTS = "account defaults"
+
+
+def _profile_title(profile: dict | None) -> str:
+    if profile is None:
+        return _ACCOUNT_DEFAULTS
+    return _single_line(str(profile.get("name") or profile.get("id")))
+
+
+def _transition_json(transition: tuple[str, str]) -> dict[str, str]:
+    return {"from": transition[0], "to": transition[1]}
+
+
+def _strategy_message(transition: tuple[str, str] | None) -> str:
+    if transition is None:
+        return "Updated this key's routing strategy."
+    return f"Routing strategy changed from '{transition[0]}' to '{transition[1]}'."
+
+
+def _check_from_profile(current: dict | None, expected: str) -> None:
+    """Refuse a change when the key's profile is not the one --from names.
+
+    Best-effort: the assignment endpoints take no expected source profile, so
+    a change landing between this read and the write is not detected.
+    """
+    wanted = expected.strip()
+    if wanted.casefold() == "none":
+        matches = current is None
+    else:
+        matches = current is not None and (
+            str(current.get("id")) == wanted
+            or str(current.get("name") or "").casefold() == wanted.casefold()
+        )
+    if not matches:
+        raise click.ClickException(
+            f"This key now uses '{_profile_title(current)}', not "
+            f"'{_single_line(wanted)}'. Nothing was changed."
+        )
+
+
+def _set_harness_strategy(
+    ctx: click.Context,
+    harness_client: str,
+    routing_profile: str,
+    from_profile: str,
+    dry_run: bool,
+) -> None:
+    from ramp_cli.commands import router  # noqa: PLC0415
+
+    current, profiles = _harness_profiles(harness_client)
+    profile = _match_profile(profiles, routing_profile)
+    selected = next((p for p in profiles if p.get("is_current")), None)
+    _check_from_profile(selected, from_profile)
+    transition = (_profile_title(selected), _profile_title(profile))
+    if dry_run:
+        _output(
+            ctx,
+            {
+                "method": "PUT",
+                "path": "/session-usage/routing-profile",
+                "body": {"name": profile["name"]},
+                "transition": _transition_json(transition),
+            },
+        )
+        return
+    result = router._select_key_routing_profile(
+        current.key, profile["name"], base_url=current.base_url
+    )
+    if not _human(ctx):
+        _output(ctx, result)
+        return
+    click.echo(_strategy_message(transition))
+
+
 def _strategy_source(strategies: dict) -> str:
     profile = strategies.get("routing_profile")
     if isinstance(profile, dict) and profile.get("name"):
@@ -850,6 +1017,18 @@ def register_router_user_commands(
     picker_pointer: str = "▶",
     copy_to_clipboard: Callable[[str], bool] = lambda _text: False,
 ) -> None:
+    from ramp_cli.commands.router import _AgentChoice  # noqa: PLC0415
+
+    harness_option = click.option(
+        "--harness",
+        "harness_client",
+        type=_AgentChoice(),
+        help=(
+            "Act for the key a connected harness is configured with, instead "
+            "of naming KEY_ID."
+        ),
+    )
+
     @group.command(
         "login",
         help="Connect a Router web-user session (separate from inference keys).",
@@ -907,13 +1086,25 @@ def register_router_user_commands(
         show_default=True,
         help="Break daily usage down by model or API key.",
     )
+    @click.option(
+        "--harness",
+        "harness_client",
+        type=_AgentChoice(case_sensitive=False),
+        default=None,
+        help="Only count requests Router tagged with this harness (claude-code "
+        "and codex include Conductor and Claude Desktop Code-tab launches, "
+        "which send the same tags). Adds 'harness' to the JSON. Usage is unavailable for harnesses without their own "
+        "request tag: conductor, desktop, and cursor.",
+    )
     @click.pass_context
-    def usage(ctx, days, group_by):
+    def usage(ctx, days, group_by, harness_client):
         # The service imports router commands, so it can't load with this module.
         from ramp_cli.router_ui.service import RouterService  # noqa: PLC0415
 
         result = RouterService(dict(ctx.obj)).account(
-            int(days) if days else None, group_by
+            int(days) if days else None,
+            group_by,
+            harness_client.lower() if harness_client else None,
         )
         if not result["session"].get("authenticated"):
             raise RampCLIError("Not signed in to Router. Run 'ramp router login'.")
@@ -922,6 +1113,7 @@ def register_router_user_commands(
         data = {
             **result["usage"],
             "credits": _credits(result.get("billing"), result.get("origin")),
+            **_credits_fields(result.get("billing")),
         }
         if not _human(ctx):
             _output(ctx, data)
@@ -1084,25 +1276,77 @@ def register_router_user_commands(
         )
 
     @keys.command(
-        "set-strategy", help="Assign only this key to an existing routing profile."
+        "set-strategy",
+        help=(
+            "Move one key from its current routing strategy to another: assign "
+            "only this key to an existing routing profile. Name the key with "
+            "KEY_ID, or with --harness for the key a connected harness uses. "
+            "--from names the strategy you are changing away from; the change "
+            "is refused if the key has already moved to another one. The check "
+            "runs just before the write, so it catches a stale view, not a "
+            "change racing this command."
+        ),
     )
-    @click.argument("key_id")
+    @click.argument("key_id", required=False)
+    @harness_option
     @click.option(
-        "--routing-profile", required=True, help="Routing profile name or ID."
+        "--from",
+        "from_profile",
+        metavar="CURRENT",
+        help=(
+            "The routing profile the key uses now (name or ID, or 'none' for "
+            "account defaults). Nothing changes if the key uses another one "
+            "when the command checks, just before it writes. Required with "
+            "--harness; optional with KEY_ID."
+        ),
+    )
+    @click.option(
+        "--to",
+        "--routing-profile",
+        "routing_profile",
+        required=True,
+        metavar="PROFILE",
+        help="Routing profile to move the key to (name or ID).",
     )
     @click.option(
         "--dry-run", is_flag=True, help="Print the request without sending it."
     )
     @click.pass_context
-    def set_key_strategy(ctx, key_id, routing_profile, dry_run):
+    def set_key_strategy(
+        ctx, key_id, harness_client, from_profile, routing_profile, dry_run
+    ):
+        _require_one_target(key_id, harness_client)
+        if harness_client is not None:
+            if from_profile is None:
+                raise click.UsageError(
+                    "With --harness, --from is required: name the strategy you "
+                    "are changing away from so a stale view can't overwrite "
+                    "someone else's change."
+                )
+            _set_harness_strategy(
+                ctx, harness_client, routing_profile, from_profile, dry_run
+            )
+            return
         client = _client(ctx)
+        key = _owned_key(client, key_id)
+        transition = None
+        if from_profile is not None:
+            current = _key_strategies(client, key["id"])["routing_profile"]
+            _check_from_profile(current, from_profile)
+            profiles = _routing_profiles(client)
+            if profiles:
+                transition = (
+                    _profile_title(current),
+                    _profile_title(_match_profile(profiles, routing_profile)),
+                )
         _mutate_key(
             ctx,
             client,
-            _owned_key(client, key_id),
+            key,
             "set-strategy",
             routing_profile=routing_profile,
             dry_run=dry_run,
+            transition=transition,
         )
 
     def register_key_lock_command(action: str) -> None:
@@ -1179,11 +1423,21 @@ def register_router_user_commands(
         )
 
     @keys.command(
-        "strategies", help="Read effective strategies for one of your API keys."
+        "strategies",
+        help=(
+            "Read effective strategies for one of your API keys, or with "
+            "--harness for the key a connected harness uses."
+        ),
     )
-    @click.argument("key_id")
+    @click.argument("key_id", required=False)
+    @harness_option
     @click.pass_context
-    def strategies(ctx, key_id):
+    def strategies(ctx, key_id, harness_client):
+        _require_one_target(key_id, harness_client)
+        if harness_client is not None:
+            current, profiles = _harness_profiles(harness_client)
+            _output(ctx, _harness_strategies(harness_client, current, profiles))
+            return
         if (
             not key_id
             or any(char in key_id for char in "/?#\\")

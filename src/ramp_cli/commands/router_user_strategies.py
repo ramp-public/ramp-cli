@@ -731,16 +731,16 @@ def output_user_strategies(ctx: click.Context) -> None:
 
 
 def _reject_key_selectors(ctx: click.Context, command: str) -> None:
-    """Account strategies belong to the Router login, never to a key or harness.
+    """Account strategies belong to the Router login, never to a key.
 
-    'strategies --api-key KEY' and '--harness NAME' pick a key's account; acting
-    on the saved login instead could change or delete another account's data.
+    'strategies --api-key KEY' picks a key's account; acting on the saved login
+    instead could change or delete another account's data.
     """
     state = ctx.obj or {}
-    if state.get("strategies_api_key_from_flag") or state.get("strategies_base_url"):
+    if state.get("strategies_api_key_from_flag"):
         raise click.UsageError(
             f"'strategies {command}' works on your Router login's strategies and "
-            "doesn't accept --api-key or --harness. Remove them, or use "
+            "doesn't accept --api-key. Remove it, or use "
             "'strategies enable'/'disable' to change a key's own settings."
         )
 

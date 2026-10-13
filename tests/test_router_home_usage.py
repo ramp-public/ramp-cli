@@ -1,5 +1,6 @@
 """Home uses real local-day analytics, never a rolling window or guessed savings."""
 
+import json
 import time as system_time
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -194,3 +195,122 @@ def test_account_usage_fails_instead_of_printing_an_empty_dashboard(
     result = CliRunner().invoke(cli, ["--agent", "router", "account", "usage"])
     assert result.exit_code != 0
     assert message in str(result.exception)
+
+
+def _harness_service(monkeypatch):
+    zone = operations.ZoneInfo("America/New_York")
+    monkeypatch.setattr(operations, "local_timezone", lambda: zone)
+    calls = []
+
+    def get(path, **kwargs):
+        calls.append((path, kwargs["params"] if "params" in kwargs else None))
+        if path == "/client/billing":
+            return {"snapshot": {"remaining_credit_usd": "87.75"}}
+        return {"summary": {"spend_usd": "1.5", "total_tokens": 9}, "series": []}
+
+    service = RouterService({})
+    service._client = SimpleNamespace(
+        origin="https://router.invalid", status=lambda: {"authenticated": True}, get=get
+    )
+    return service, calls
+
+
+def test_harness_usage_filters_the_local_day_to_one_harness(monkeypatch):
+    service, calls = _harness_service(monkeypatch)
+    usage = service.account(1, "model", "claude-code")["usage"]
+    dashboard = next(p for path, p in calls if path == "/client/usage/dashboard")
+    assert json.loads(dashboard["filters"]) == {"client": ["claude_code"]}
+    assert dashboard["timezone"] == "America/New_York"
+    assert [path for path, _ in calls] == ["/client/billing", "/client/usage/dashboard"]
+    assert usage["harness"] == "claude-code"
+    assert usage["summary"]["spend_usd"] == "1.5"
+    assert "strategy_savings" not in usage
+
+
+@pytest.mark.parametrize("harness", ["conductor", "cowork", "cursor"])
+def test_usage_is_unavailable_rather_than_a_zero_without_a_request_tag(
+    monkeypatch, harness
+):
+    service, calls = _harness_service(monkeypatch)
+    result = service.account(1, "model", harness)
+    assert "usage" not in result
+    assert result["usage_error"] == "Usage analytics are unavailable."
+    assert [path for path, _ in calls] == ["/client/billing"]
+
+
+def test_account_usage_without_a_harness_is_unchanged(monkeypatch):
+    service, calls = _harness_service(monkeypatch)
+    usage = service.account(1)["usage"]
+    assert [path for path, _ in calls] == ["/client/billing", "/client/usage/dashboard"]
+    assert "filters" not in calls[1][1]
+    assert "harness" not in usage
+    assert "strategy_savings" not in usage
+
+
+def _account(billing, extra=None):
+    return {
+        "session": {"authenticated": True},
+        "origin": "https://router.invalid",
+        "billing": billing,
+        "usage": {"days": 1, "summary": {}, "models": [], **(extra or {})},
+    }
+
+
+@pytest.mark.parametrize(
+    ("billing", "expected"),
+    [
+        (
+            {"snapshot": {"remaining_credit_usd": "87.75"}},
+            ("$87.75", "87.75", "personal", False),
+        ),
+        (
+            {
+                "billed_to_business": True,
+                "business_wallet": {"remaining_credit_usd": "1200"},
+            },
+            ("$1,200.00", "1200", "business", False),
+        ),
+        (
+            {"ramp_employee_session_unlimited": True},
+            ("Unlimited", None, "personal", True),
+        ),
+        (None, ("Unavailable", None, "personal", False)),
+    ],
+)
+def test_account_usage_json_exposes_credits_as_data(monkeypatch, billing, expected):
+    monkeypatch.setattr(RouterService, "account", lambda self, *a: _account(billing))
+    result = CliRunner().invoke(cli, ["--agent", "router", "account", "usage"])
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)["data"][0]
+    assert (
+        data["credits"],
+        data["credits_usd"],
+        data["credits_scope"],
+        data["credits_unlimited"],
+    ) == expected
+
+
+def test_account_usage_harness_option_reaches_the_service(monkeypatch):
+    seen = []
+
+    def account(self, *args):
+        seen.append(args)
+        return _account(None, {"harness": "codex"})
+
+    monkeypatch.setattr(RouterService, "account", account)
+    result = CliRunner().invoke(
+        cli,
+        ["--agent", "router", "account", "usage", "--days", "1", "--harness", "Codex"],
+    )
+    assert result.exit_code == 0, result.output
+    assert seen == [(1, "model", "codex")]
+    assert json.loads(result.output)["data"][0]["harness"] == "codex"
+    desktop = CliRunner().invoke(
+        cli, ["router", "account", "usage", "--harness", "Desktop"]
+    )
+    assert "Invalid value" not in desktop.output
+    assert seen[-1] == (None, "model", "cowork")
+    bad = CliRunner().invoke(
+        cli, ["router", "account", "usage", "--harness", "notepad"]
+    )
+    assert bad.exit_code == 2

@@ -1,3 +1,4 @@
+import json
 import socket
 import subprocess
 import threading
@@ -9,9 +10,39 @@ import click
 import pytest
 
 import ramp_cli.router_setup as router_setup
+from ramp_cli import __version__
 from ramp_cli.router_setup import start_router_key_callback
 
 ROUTER_UI_URL = "https://app.router.com"
+
+
+def test_mdm_events_are_appended_as_json_lines_for_the_policy(monkeypatch, tmp_path):
+    event_log = tmp_path / "events.jsonl"
+    monkeypatch.delenv(router_setup.ROUTER_SETUP_EVENT_LOG_ENV, raising=False)
+    router_setup.record_mdm_event("router_mdm_started", base_url="https://r/v1")
+    assert not event_log.exists()
+
+    monkeypatch.setenv(router_setup.ROUTER_SETUP_EVENT_LOG_ENV, str(event_log))
+    router_setup.record_mdm_event("router_mdm_started", base_url="https://r/v1")
+    router_setup.record_mdm_event(
+        "router_mdm_finished", outcome="configured", detail=None
+    )
+    # An unwritable path must not disturb the setup run.
+    monkeypatch.setenv(router_setup.ROUTER_SETUP_EVENT_LOG_ENV, str(tmp_path))
+    router_setup.record_mdm_event("router_mdm_finished", outcome="failed")
+
+    lines = [json.loads(line) for line in event_log.read_text().splitlines()]
+    assert [line["event"] for line in lines] == [
+        "router_mdm_started",
+        "router_mdm_finished",
+    ]
+    assert lines[0]["base_url"] == "https://r/v1"
+    assert lines[1] == {
+        "timestamp": lines[1]["timestamp"],
+        "event": "router_mdm_finished",
+        "cli_version": __version__,
+        "outcome": "configured",
+    }
 
 
 @pytest.mark.parametrize(
@@ -31,7 +62,7 @@ def test_macos_dialog_requires_an_explicit_connect_result(
     events = []
     monkeypatch.setattr(
         router_setup,
-        "_record_mdm_event",
+        "record_mdm_event",
         lambda event, **attributes: events.append((event, attributes)),
     )
 
@@ -106,7 +137,7 @@ def test_mdm_browser_setup_reports_how_the_handoff_ended(
     events = []
     monkeypatch.setattr(
         router_setup,
-        "_record_mdm_event",
+        "record_mdm_event",
         lambda event, **attributes: events.append((event, attributes)),
     )
     callbacks = []

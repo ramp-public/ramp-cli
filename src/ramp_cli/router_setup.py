@@ -5,33 +5,49 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import secrets
 import socket
 import subprocess
 import sys
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import click
 
+from ramp_cli import __version__
 from ramp_cli.auth.oauth import _callback_html, _open_browser
 
-try:
-    from ramp_cli_private.mdm_telemetry import record_event as _record_mdm_event
-except ModuleNotFoundError as e:
-    if e.name != "ramp_cli_private":
-        raise
-
-    def _record_mdm_event(event: str, **attributes: object) -> None:
-        pass
+ROUTER_SETUP_EVENT_LOG_ENV = "RAMP_ROUTER_SETUP_EVENT_LOG"
 
 
 def record_mdm_event(event: str, **attributes: object) -> None:
-    """Log one stage of an MDM-driven Router setup; a no-op in public builds."""
-    _record_mdm_event(event, **attributes)
+    """Append one stage of an MDM-driven Router setup to the policy's event log.
+
+    The MDM policy that runs the CLI names the file in
+    ``RAMP_ROUTER_SETUP_EVENT_LOG`` and ships the JSON lines to its own
+    observability backend after the run; the CLI itself never sends telemetry
+    anywhere. Without that variable this is a no-op, and a file the CLI cannot
+    write never changes how the setup run behaves.
+    """
+    path = os.environ.get(ROUTER_SETUP_EVENT_LOG_ENV)
+    if not path:
+        return
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "event": event,
+        "cli_version": __version__,
+        **{key: value for key, value in attributes.items() if value is not None},
+    }
+    try:
+        with open(path, "a", encoding="utf-8") as event_log:
+            event_log.write(json.dumps(entry, default=str) + "\n")
+    except OSError:
+        pass
 
 
 ROUTER_SETUP_TIMEOUT_SECONDS = 900
@@ -73,7 +89,7 @@ end run"""
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        _record_mdm_event(
+        record_mdm_event(
             "router_mdm_dialog", action="failed", router_ui_url=router_ui_url
         )
         raise click.ClickException(
@@ -82,14 +98,14 @@ end run"""
         ) from exc
     answer = result.stdout.strip()
     if result.returncode != 0 or answer not in {"Connect", "Later", "Timeout"}:
-        _record_mdm_event(
+        record_mdm_event(
             "router_mdm_dialog", action="failed", router_ui_url=router_ui_url
         )
         raise click.ClickException(
             "The Connect/Later dialog did not complete. Browser setup was not started; "
             "rerun the setup policy or run 'ramp router configure' manually."
         )
-    _record_mdm_event(
+    record_mdm_event(
         "router_mdm_dialog", action=answer.lower(), router_ui_url=router_ui_url
     )
     return answer == "Connect"
@@ -349,7 +365,7 @@ def acquire_router_api_key(
         else:
             opened = _open_browser(setup_url)
             if mdm:
-                _record_mdm_event(
+                record_mdm_event(
                     "router_mdm_browser_opened",
                     opened=opened,
                     router_ui_url=router_ui_url,
@@ -374,7 +390,7 @@ def acquire_router_api_key(
     finally:
         callback.shutdown()
         if mdm:
-            _record_mdm_event(
+            record_mdm_event(
                 "router_mdm_browser_setup",
                 outcome=outcome,
                 detail=detail,

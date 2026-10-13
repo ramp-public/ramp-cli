@@ -8,6 +8,7 @@ No Click prompts or process-wide stdout redirection run on the UI thread.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -51,6 +52,23 @@ from ramp_cli.router_ui.cache import CACHE_TTL, ReadCache, cached, mutation
 USAGE_WINDOWS = ((1, "Today"), (3, "3 days"), (7, "7 days"), (30, "1 month"))
 USAGE_DAYS = tuple(days for days, _label in USAGE_WINDOWS)
 USAGE_GROUPS = ("model", "key")
+# Router tags each request with the harness that sent it. Claude Code is the
+# one harness whose tag differs from its CLI id: Router records "claude_code".
+CLIENT_KINDS = {"claude-code": "claude_code"}
+# These harnesses have no request tag that matches only their own usage, so
+# filtering on one would read as an authoritative zero or a partial count. Their
+# usage is unavailable instead.
+# - Conductor launches the vendored Claude Code and Codex, which send those
+#   harnesses' tags.
+# - Claude Desktop ("cowork") covers the Cowork and Code tabs, and the Code tab
+#   is not known to carry a tag of its own.
+# - Cursor has no Router request tag.
+UNTAGGED_CLIENTS = frozenset({"conductor", "cowork", "cursor"})
+
+
+def client_kind(client: str) -> str:
+    """The request tag Router records for one harness."""
+    return CLIENT_KINDS.get(client, client)
 
 
 def local_timezone() -> tzinfo:
@@ -388,8 +406,16 @@ class RouterService:
         self.cache.close()
         self.client.close()
 
-    def account(self, days: int | None = None, group_by: str = "model") -> dict:
-        """``days=None`` picks the longest window the usage history fills."""
+    def account(
+        self,
+        days: int | None = None,
+        group_by: str = "model",
+        client: str | None = None,
+    ) -> dict:
+        """``days=None`` picks the longest window the usage history fills.
+
+        ``client`` limits the usage to the requests one harness sent.
+        """
         result = {"session": self.client.status(), "origin": self.client.origin}
         if result["session"].get("authenticated"):
             try:
@@ -405,15 +431,15 @@ class RouterService:
                 result["billing_error"] = str(error)
             try:
                 if days is None:
-                    usage = self.daily_usage(7, group_by)
+                    usage = self.daily_usage(7, group_by, client)
                     days = history_days(usage)
                     # Summary stats come from the server, so a shorter
                     # window is fetched rather than sliced from the week.
                     if days != 7:
-                        usage = self.daily_usage(days, group_by)
+                        usage = self.daily_usage(days, group_by, client)
                     result["usage"] = usage
                 else:
-                    result["usage"] = self.daily_usage(days, group_by)
+                    result["usage"] = self.daily_usage(days, group_by, client)
             except (ApiError, RampCLIError, httpx.HTTPError, ValueError):
                 result["usage_error"] = "Usage analytics are unavailable."
         return public_data(result)
@@ -423,27 +449,34 @@ class RouterService:
         return self.client.get("/client/billing", timeout=10)
 
     @cached
-    def daily_usage(self, days: int = 7, group_by: str = "model") -> dict:
+    def daily_usage(
+        self, days: int = 7, group_by: str = "model", client: str | None = None
+    ) -> dict:
         if days not in USAGE_DAYS:
             raise click.BadParameter(f"Choose {', '.join(map(str, USAGE_DAYS))} days.")
         if group_by not in USAGE_GROUPS:
             raise click.BadParameter("Break usage down by model or key.")
+        if client in UNTAGGED_CLIENTS:
+            raise RampCLIError("Usage analytics are unavailable for this harness.")
         zone = local_timezone()
         start, end, dates = local_days_window(days, zone)
-        usage = self.client.get(
-            "/client/usage/dashboard",
-            params={
-                "start_at": start.isoformat(),
-                "end_at": end.isoformat(),
-                "group_by": group_by,
-                "timezone": zone_name(zone),
-                "include_summary_stats": "true",
-            },
-            timeout=15,
-        )
+        params = {
+            "start_at": start.isoformat(),
+            "end_at": end.isoformat(),
+            "group_by": group_by,
+            "timezone": zone_name(zone),
+            "include_summary_stats": "true",
+        }
+        if client is not None:
+            params["filters"] = json.dumps({"client": [client_kind(client)]})
+        usage = self.client.get("/client/usage/dashboard", params=params, timeout=15)
         if not isinstance(usage, dict):
             raise RampCLIError("Usage analytics are unavailable.")
+        harness_fields = {}
+        if client is not None:
+            harness_fields = {"harness": client}
         return {
+            **harness_fields,
             "days": days,
             "group_by": group_by,
             "timezone": zone_name(zone),

@@ -563,8 +563,6 @@ class RouterApp(App):
             return StrategiesPage(target=profile_id, intent=intent)
         if name == "legacy":
             return LegacyPage(api_key=options.get("api_key"))
-        if name == "harness-routing":
-            return HarnessRoutingPage(options["client"])
         if name == "account":
             return AccountPage(**options)
         if name == "keys":

@@ -29,7 +29,6 @@ from ramp_cli.commands import claude_code, cursor
 from ramp_cli.commands.router import DEFAULT_ROUTER_BASE_URL as ROUTER_BASE_URL
 from ramp_cli.config.settings import config_dir
 from ramp_cli.main import cli
-from ramp_cli.router_ui import harness as router_harness
 
 
 @pytest.fixture(autouse=True)
@@ -11378,89 +11377,14 @@ def test_strategy_disable_patches_false(monkeypatch):
     assert "Disabled Cost-efficient routing." in result.output
 
 
-def _connected_harness(monkeypatch, base_url="https://router.example/v1"):
-    @contextlib.contextmanager
-    def connection(client):
-        yield router_harness.Connection(client, None, f"{client}-secret", base_url)
-
-    monkeypatch.setattr(router_harness, "connection", connection)
-
-
-def test_strategy_harness_flag_uses_that_harness_key_and_endpoint(monkeypatch):
-    _connected_harness(monkeypatch)
-    monkeypatch.setenv(router_module.CONFIGURE_KEY_ENV, "env-secret")
-    captured = {}
-
-    def patch(url, *, headers, json, timeout):
-        captured["request"] = (url, headers["Authorization"], json)
-        return httpx.Response(
-            200,
-            json={**_STRATEGY_SETTINGS_PAYLOAD, "allow_flex_tier_default": False},
-            request=httpx.Request("PATCH", url),
-        )
-
-    monkeypatch.setattr("ramp_cli.commands.router.httpx.patch", patch)
+def test_strategies_has_no_harness_option():
+    # --harness lives on 'router keys'; strategies are tied to keys, not harnesses.
     result = CliRunner().invoke(
-        cli,
-        [
-            "--no-input",
-            "--human",
-            "router",
-            "strategies",
-            "--harness",
-            "codex",
-            "disable",
-            "cost-efficient-routing",
-        ],
+        cli, ["router", "strategies", "--harness", "claude-code"]
     )
-    assert result.exit_code == 0, result.output
-    assert captured["request"] == (
-        "https://router.example/session-usage/strategies",
-        "Bearer codex-secret",
-        {"allow_flex_tier_default": False},
-    )
-
-
-def test_strategy_harness_flag_reads_settings_noninteractively(monkeypatch):
-    _connected_harness(monkeypatch)
-    urls = []
-
-    def get(url, *, headers, timeout):
-        urls.append((url, headers["Authorization"]))
-        return httpx.Response(
-            200, json=_STRATEGY_SETTINGS_PAYLOAD, request=httpx.Request("GET", url)
-        )
-
-    monkeypatch.setattr("ramp_cli.commands.router.httpx.get", get)
-    result = CliRunner().invoke(
-        cli, ["-o", "json", "router", "strategies", "--harness", "claude-code"]
-    )
-    assert result.exit_code == 0, result.output
-    assert urls == [
-        (
-            "https://router.example/session-usage/strategies",
-            "Bearer claude-code-secret",
-        )
-    ]
-
-
-@pytest.mark.parametrize(
-    "arguments",
-    [
-        ["--harness", "codex", "--api-key", "other"],
-        ["--harness", "codex", "--account"],
-        ["--harness", "codex", "enable", "switchyard-routing", "--api-key", "other"],
-    ],
-)
-def test_strategy_harness_flag_rejects_a_second_key_source(monkeypatch, arguments):
-    _connected_harness(monkeypatch)
-    monkeypatch.setattr(
-        "ramp_cli.commands.router.httpx.patch",
-        lambda *a, **kw: pytest.fail("Changed settings for the wrong key"),
-    )
-    result = CliRunner().invoke(cli, ["router", "strategies", *arguments])
     assert result.exit_code == 2, result.output
-    assert "--harness cannot be combined" in result.output
+    assert "No such option" in result.output
+    assert "--harness" in result.output
 
 
 def test_strategy_enable_reports_a_change_router_declined(monkeypatch):
