@@ -71,16 +71,19 @@ export function defaultReasoningSettings(
  *
  * Router also describes modalities OpenCode has no case for, and passing one
  * through would put a value in the provider config it cannot act on. A model
- * whose modalities OpenCode does not share still handles text.
+ * whose modalities OpenCode does not share still handles text. Router calls
+ * document input "file"; OpenCode calls it "pdf".
  */
 export type OpenCodeModality = "text" | "audio" | "image" | "video" | "pdf"
 const OPEN_CODE_MODALITIES: readonly string[] = ["text", "audio", "image", "video", "pdf"]
 
 export function openCodeModalities(modalities: readonly string[]): OpenCodeModality[] {
-  const supported = modalities.filter((kind): kind is OpenCodeModality =>
-    OPEN_CODE_MODALITIES.includes(kind),
+  const supported = new Set(
+    modalities
+      .map((kind) => (kind === "file" ? "pdf" : kind))
+      .filter((kind): kind is OpenCodeModality => OPEN_CODE_MODALITIES.includes(kind)),
   )
-  return supported.length > 0 ? supported : ["text"]
+  return supported.size > 0 ? [...supported] : ["text"]
 }
 
 /** The picker label: the vendor's own name rather than a resource path. */
