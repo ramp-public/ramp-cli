@@ -136,6 +136,11 @@ def test_codex_model_removed_between_catalog_reads_does_not_write_hooks_or_confi
     )
     monkeypatch.setattr(
         router,
+        "_fetch_models",
+        lambda *args, **kwargs: pytest.fail("must validate before shortlist discovery"),
+    )
+    monkeypatch.setattr(
+        router,
         "_install_codex_cost_hook",
         lambda *args, **kwargs: pytest.fail("must validate before changing hooks"),
     )

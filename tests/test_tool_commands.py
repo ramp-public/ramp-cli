@@ -1892,6 +1892,15 @@ class TestCLIIntegration:
             lambda env: {"agent": [agent_tool]},
         )
 
+        # The handwritten agent group discovers its generated commands through
+        # list_tool_defs, independently of the root's category projection.
+        # Pin both readers so a preceding test's registry cache cannot decide
+        # whether the synthetic singleton appears.
+        monkeypatch.setattr("ramp_cli.tools.commands.maybe_sync", lambda env: None)
+        monkeypatch.setattr(
+            "ramp_cli.tools.commands.list_tool_defs", lambda env: [agent_tool]
+        )
+
         runner = CliRunner()
         root_help = runner.invoke(cli, ["--help"])
         agent_help = runner.invoke(cli, ["agent", "--help"])

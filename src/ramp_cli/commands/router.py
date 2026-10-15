@@ -127,6 +127,7 @@ CODEX_CLIENT_NAME = "codex"
 CODEX_ROUTER_CATALOG = "ramp-router-models.json"
 CODEX_ROUTER_CATALOG_DIGEST_KEY = "router_catalog_digest"
 CODEX_ROUTER_CATALOG_MANAGED_KEY = "router_catalog_managed"
+CODEX_MODEL_VIEW_KEY = "codex_model_view"
 # The name the Router dashboard serves; manual installs land on the same file.
 CODEX_COST_HOOK = "codex-cost-hook"
 CODEX_COST_HOOK_MANAGED_KEY = "cost_hook_managed"
@@ -1440,6 +1441,11 @@ def _validate_deployment_url(
     ),
 )
 @click.option(
+    "--codex-models",
+    type=click.Choice(("compact", "all"), case_sensitive=False),
+    help="Models shown by Codex: compact recommendations (default) or all models. Saved across refreshes.",
+)
+@click.option(
     "--claude-models",
     type=click.Choice(("compact", "all"), case_sensitive=False),
     help="Models shown by Claude Code: recommended compact list or all models.",
@@ -1468,6 +1474,7 @@ def router_configure(
     reuse_existing_key: bool,
     confirm_browser: bool,
     claude_models: str | None,
+    codex_models: str | None,
     base_url: str | None,
     ui_url: str | None,
 ) -> None:
@@ -1483,7 +1490,8 @@ def router_configure(
     # workspace's sign-in and key creation may open a browser. Scripted
     # --reuse-existing-key and --confirm-browser (MDM) runs never open it.
     if (
-        not no_browser
+        codex_models is None
+        and not no_browser
         and not reuse_existing_key
         and not confirm_browser
         and (not clients or (api_key is None and setup_file is None))
@@ -1512,6 +1520,7 @@ def router_configure(
         api_key=api_key,
         no_browser=no_browser,
         claude_models=claude_models,
+        codex_models=codex_models,
         api_key_source=ctx.get_parameter_source("api_key"),
         deployment_override=bool(base_url or ui_url),
         reuse_existing_key=reuse_existing_key,
@@ -1613,6 +1622,7 @@ def _run_configure(
     no_browser: bool,
     claude_models: str | None,
     api_key_source: ParameterSource | None,
+    codex_models: str | None = None,
     legacy_cowork_alias: bool = False,
     deployment_override: bool = False,
     reuse_existing_key: bool = False,
@@ -1628,7 +1638,8 @@ def _run_configure(
     # the harnesses it configures then share that one response.
     admin_defaults.clear_cache()
     if (
-        not no_browser
+        codex_models is None
+        and not no_browser
         and not reuse_existing_key
         and (
             not clients
@@ -1659,6 +1670,11 @@ def _run_configure(
             raise click.BadParameter(
                 "cannot be empty", param_hint="'--api-key'"
             ) from None
+    if codex_models is not None and clients != ("codex",):
+        raise click.UsageError(
+            "--codex-models requires exactly one agent: "
+            "'ramp router configure codex --codex-models compact|all'."
+        )
     all_clients = tuple(CLIENT_NAMES)
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     requested_clients = tuple(dict.fromkeys(clients))
@@ -1768,16 +1784,27 @@ def _run_configure(
         picked_from_menu and "codex" in clients
     )
     if asks_model_view and claude_models is None:
-        current_view = (
-            claude_code.model_view(claude_code.read_settings(claude_path), claude_path)
-            if existing_claude
-            else "compact"
-        )
-        claude_models = (
-            _pick_claude_models(current_view, clients)
-            if _can_prompt(ctx, fmt)
-            else current_view
-        )
+        if "claude-code" in clients:
+            current_view = (
+                claude_code.model_view(
+                    claude_code.read_settings(claude_path), claude_path
+                )
+                if existing_claude
+                else "compact"
+            )
+        elif "codex" in clients:
+            current_view = _configured_codex_model_view(_codex_config_path())
+        else:
+            current_view = "compact"
+        if _can_prompt(ctx, fmt):
+            claude_models = _pick_claude_models(current_view, clients)
+            # The question names both profile clients. Apply an answer to
+            # Codex too, but never copy an unprompted Claude default over a
+            # saved Codex preference during unattended multi-client setup.
+            if "codex" in clients and codex_models is None:
+                codex_models = claude_models
+        else:
+            claude_models = current_view
     restore_clients = (
         ""
         if clients == all_clients
@@ -1999,6 +2026,8 @@ def _run_configure(
                 configure_options = {"base_url": base_url}
                 if item == "claude-code":
                     configure_options["claude_model_view"] = claude_models
+                elif item == "codex" and codex_models is not None:
+                    configure_options["codex_model_view"] = codex_models
                 # The same origin this setup is being written to send its
                 # session-usage calls to.
                 pushed = switchyard_push.plan(
@@ -2037,6 +2066,16 @@ def _run_configure(
                 "original_setup_command": _original_setup_command(item, path),
                 "switchyard_model": switchyard_model,
             }
+            if item == "codex":
+                catalog = _read_codex_catalog(
+                    str((path.parent / CODEX_ROUTER_CATALOG).resolve())
+                )
+                result["model_view"] = _configured_codex_model_view(path)
+                if catalog is not None:
+                    result["models_visible"] = sum(
+                        model.get("visibility", "list") == "list"
+                        for model in catalog["models"]
+                    )
             if item == "opencode" and (notes := _opencode_user_model_note(path)):
                 result["note_lines"] = notes
             results.append(result)
@@ -2096,25 +2135,31 @@ def _run_configure(
         print_agent_json(payload, pagination=None)
     elif not failures:
         connected = [result for result in results if result["client"] != CURSOR_CLIENT]
-        model_count = results[0]["models_available"]
-        model_label = "model" if model_count == 1 else "models"
         if connected:
             connected_names = _human_join(
                 [AGENT_NAMES[result["client"]] for result in connected]
             )
             click.echo(f"Connected to: {connected_names}")
-        if all(
-            result["client"] in (COWORK_CLIENT, CURSOR_CLIENT) for result in results
-        ):
-            # Cowork keeps its own model selection and Cursor's list is
-            # chosen by hand, so nothing was "added".
-            click.echo(f"{model_count} {model_label} discovered.")
-        else:
-            click.echo(
-                f"{model_count} {model_label} added. "
-                "Restart any running agents, then pick a model."
-            )
+        added_models = False
         for result in results:
+            model_count = result.get("models_visible", result["models_available"])
+            model_label = "model" if model_count == 1 else "models"
+            # Cowork and Cursor discover choices without adding picker rows.
+            discovered = result["client"] in (COWORK_CLIENT, CURSOR_CLIENT)
+            action = "discovered" if discovered else "added"
+            added_models = added_models or not discovered
+            prefix = f"{AGENT_NAMES[result['client']]}: " if len(results) > 1 else ""
+            message = f"{prefix}{model_count} {model_label} {action}."
+            if len(results) == 1 and not discovered:
+                message += " Restart any running agents, then pick a model."
+            click.echo(message)
+        if len(results) > 1 and added_models:
+            click.echo("Restart any running agents, then pick a model.")
+        for result in results:
+            if result.get("model_view"):
+                click.echo(
+                    f"Codex model picker: {result['model_view']} (saved for future refreshes)."
+                )
             if result.get("switchyard_model"):
                 click.echo(
                     _switchyard_push_notice(
@@ -7670,6 +7715,7 @@ def _configure_client(
     base_url: str | None = None,
     selected_model: str | None = None,
     claude_model_view: str | None = None,
+    codex_model_view: str | None = None,
     preserve_model_view_ownership: bool = False,
     hermes_require_receipt: bool = False,
     hermes_lock_held: bool = False,
@@ -7715,6 +7761,9 @@ def _configure_client(
             models,
             base_url=base_url,
             selected_model=selected_model,
+            **(
+                {"model_view": codex_model_view} if codex_model_view is not None else {}
+            ),
             **({"strict_model": True} if strict_model else {}),
             **({"explicit_model": True} if explicit_model else {}),
             **({} if replace_model is _UNCHECKED else {"replace_model": replace_model}),
@@ -8624,6 +8673,75 @@ def _fetch_codex_catalog(api_key: str, *, base_url: str | None = None) -> dict:
     return catalog
 
 
+def _configured_codex_model_view(path: Path) -> str:
+    """Use compact recommendations unless the user explicitly chose all."""
+    state_path = path.parent / "ramp-router-state.json"
+    if not state_path.exists():
+        return "compact"
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            raise ValueError("expected an object")
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise click.ClickException(
+            f"Could not read Ramp Router setup state from {state_path}: {exc}"
+        ) from None
+    return "all" if state.get(CODEX_MODEL_VIEW_KEY) == "all" else "compact"
+
+
+def _compact_codex_catalog(
+    catalog: dict, recommended: list[RouterModel], selected_model: str
+) -> dict:
+    """Apply Router's curated discovery view to Codex's own metadata.
+
+    Claude's projection carries the canonical request name and display name
+    alongside its Claude-shaped id. Codex promotes unambiguous display names
+    to slugs, retaining canonical names as hidden rows. Match exact slugs, not
+    display labels: two different provider routes can share a label.
+    Keep other entries hidden so existing chats still resolve their metadata.
+    """
+    by_slug = {model["slug"]: model for model in catalog["models"]}
+    names: set[str] = set()
+    for model in recommended:
+        request_name = model.metadata.request_name
+        canonical = by_slug.get(request_name)
+        names.add(request_name)
+        # When the canonical row is visible, Router did not promote its
+        # display name. That name may instead be another model's slug.
+        if canonical is None or canonical.get("visibility", "list") == "hide":
+            names.add(model.metadata.display_name)
+    visible = [
+        model
+        for model in catalog["models"]
+        if model["slug"] in names and model.get("visibility", "list") == "list"
+    ]
+    if not visible:
+        raise click.ClickException(
+            "Router's recommended models did not match its Codex catalog. "
+            "The existing picker was preserved; try refreshing or use --codex-models all."
+        )
+    visible_slugs = {model["slug"] for model in visible}
+    # Keep a current selection that is outside the recommendations reachable
+    # in the picker, without unhiding canonical duplicates of readable rows.
+    selected = next(
+        (model for model in catalog["models"] if model["slug"] == selected_model), None
+    )
+    if (
+        selected
+        and selected.get("visibility", "list") == "list"
+        and selected_model not in visible_slugs
+    ):
+        visible.append(selected)
+        visible_slugs.add(selected_model)
+    hidden = [
+        {**model, "visibility": "hide"}
+        for model in catalog["models"]
+        if model["slug"] not in visible_slugs
+    ]
+    # Visible rows precede hidden rows before Desktop's catalog-size bound.
+    return {**catalog, "models": [*visible, *hidden]}
+
+
 def _render_codex_catalog(catalog: dict, selected_model: str) -> str:
     """Bound a validated catalog while retaining Codex's current selection."""
     models = catalog["models"]
@@ -8690,6 +8808,7 @@ def _configure_codex(
     *,
     base_url: str | None = None,
     selected_model: str | None = None,
+    model_view: str | None = None,
     strict_model: bool = False,
     explicit_model: bool = False,
     replace_model: str | None | object = _UNCHECKED,
@@ -8709,6 +8828,12 @@ def _configure_codex(
             "This model is no longer available. Reload before saving.",
             param_hint="--model",
         )
+    effective_view = model_view or _configured_codex_model_view(path)
+    compact_models = (
+        _fetch_models(api_key, claude_code_view=True, base_url=base_url)
+        if effective_view == "compact"
+        else None
+    )
     # None means nothing to (re)register; existing registrations stay as-is.
     cost_hook_command = (
         None if strict_model else _install_codex_cost_hook(path, base_url)
@@ -8742,6 +8867,8 @@ def _configure_codex(
             explicit_model=strict_model or explicit_model,
             replace_model=replace_model,
             admin_default=admin_default,
+            model_view=model_view,
+            compact_models=compact_models,
         )
 
 
@@ -8758,8 +8885,14 @@ def _configure_codex_in_lock(
     explicit_model: bool = False,
     replace_model: str | None | object = _UNCHECKED,
     admin_default: str | None = None,
+    model_view: str | None = None,
+    compact_models: list[RouterModel] | None = None,
 ) -> tuple[str, bool]:
     existing, existing_data = _read_codex_config(path)
+    if selected_model is None:
+        # A picker preference is not a request to reset the current model.
+        # Read under the lock so a selection made during discovery wins.
+        selected_model = existing_data.get("model")
     if replace_model is not _UNCHECKED:
         # A pushed default, or the fallback from one, replaces the selection
         # refresh planned against. One the user changed meanwhile (say,
@@ -8788,7 +8921,19 @@ def _configure_codex_in_lock(
     admin_default = _codex_admin_default_model(admin_default, models, router_catalog)
     if admin_default is not None and not explicit_model:
         default_model = admin_default
-    router_catalog_body = _render_codex_catalog(router_catalog, default_model)
+    # Resolve the saved preference under the same lock as the write. An
+    # explicit choice wins; refresh and model changes preserve newer choices.
+    effective_view = model_view or _configured_codex_model_view(path)
+    picker_catalog = router_catalog
+    if effective_view == "compact":
+        if compact_models is None:
+            raise click.ClickException(
+                "The Codex model view changed during discovery. Run the command again."
+            )
+        picker_catalog = _compact_codex_catalog(
+            router_catalog, compact_models, default_model
+        )
+    router_catalog_body = _render_codex_catalog(picker_catalog, default_model)
     chunks = _config_chunks(existing)
     repaired = _codex_provider_is_out_of_date(existing_data)
 
@@ -8863,6 +9008,9 @@ def _configure_codex_in_lock(
     # prevents OpenAI's catalog refresh from replacing Router's Desktop picker;
     # configure and refresh both rewrite it from Router's live response.
     router_catalog_path = path.parent / CODEX_ROUTER_CATALOG
+    if receipt.get(CODEX_MODEL_VIEW_KEY) != effective_view:
+        receipt[CODEX_MODEL_VIEW_KEY] = effective_view
+        state_document = receipt
     catalog_digest = _content_digest(router_catalog_body)
     if receipt.get(CODEX_ROUTER_CATALOG_MANAGED_KEY) is not True:
         receipt[CODEX_ROUTER_CATALOG_MANAGED_KEY] = True

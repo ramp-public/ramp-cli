@@ -83,6 +83,32 @@ brew install ramp-public/ramp/ramp-cli
 uv tool install git+https://github.com/ramp-public/ramp-cli.git
 ```
 
+## Codex model picker
+
+Codex CLI and Desktop use Router's recommended model shortlist by default.
+Connect normally, or explicitly select the compact view:
+
+```bash
+ramp router configure codex --codex-models compact --reuse-existing-key
+```
+
+This uses the same recommendations as Claude Code's compact view, with Codex's
+own model capabilities and reasoning settings. Your current model is preserved.
+Other catalog entries remain hidden where space permits so existing chats can
+still resolve their model metadata. Refreshes and model changes preserve the
+saved view. Existing connections without a saved preference switch to compact
+on their next configure or refresh. An explicit `all` preference stays unchanged.
+
+To restore the full model picker:
+
+```bash
+ramp router configure codex --codex-models all --reuse-existing-key
+```
+
+Use the same `--base-url` as your existing connection if it is on another Router
+deployment. The updated catalog applies when Codex reloads it; a running app may
+need to be restarted before its picker reflects the change.
+
 ## Manage Router API keys
 
 Run `ramp router login`, then `ramp router keys` to select a key and inspect

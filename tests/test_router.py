@@ -453,8 +453,16 @@ def test_configure_setup_file_keeps_discovery_and_credits_on_its_router(
         "https://router.example/v1/models",
         "https://router.example/self-service/coding-agent-settings",
         "https://router.example/v1/models",
+        "https://router.example/v1/models",
         "https://router.example/session-usage/usage/balance?include_strategy_settings=true",
     ]
+    model_headers = [headers for url, headers in requests if url.endswith("/models")]
+    assert [headers.get("X-Gateway-Client") for headers in model_headers] == [
+        None,
+        "codex",
+        "claude-code",
+    ]
+    assert "X-Gateway-Model-View" not in model_headers[-1]
 
 
 def test_configure_codex_keeps_the_setup_file_when_configuration_fails(
@@ -6604,7 +6612,10 @@ def test_configure_waits_for_a_browser_created_key_to_reach_the_data_plane(
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     monkeypatch.setattr(router_module.shutil, "which", lambda _name: None)
     sleeps = []
-    responses = [401, 401, 200, 200]
+    # Three attempts to discover callable models, then the Codex catalog and
+    # the Claude Code compact shortlist used by the default Codex view.
+    responses = [401, 401, 200, 200, 200]
+    model_headers = []
 
     def get(url, **kwargs):
         if url.endswith(
@@ -6616,6 +6627,7 @@ def test_configure_waits_for_a_browser_created_key_to_reach_the_data_plane(
             # The credits line and the Switchyard model push are exercised
             # elsewhere; here the endpoints are simply unavailable.
             return httpx.Response(404, request=httpx.Request("GET", url))
+        model_headers.append(kwargs.get("headers", {}))
         status = responses.pop(0)
         payload = (
             {
@@ -6651,6 +6663,14 @@ def test_configure_waits_for_a_browser_created_key_to_reach_the_data_plane(
     assert configured.exit_code == 0, configured.output
     assert sleeps == [0.25, 0.5]
     assert not responses
+    assert [headers.get("X-Gateway-Client") for headers in model_headers] == [
+        None,
+        None,
+        None,
+        "codex",
+        "claude-code",
+    ]
+    assert "X-Gateway-Model-View" not in model_headers[-1]
     assert (codex_home / "ramp-router-key").read_text() == "router-secret"
 
 
@@ -10142,12 +10162,14 @@ def test_configure_and_unconfigure_accept_multiple_clients(tmp_path, monkeypatch
     original_settings = tmp_path / ".claude" / "original.settings.json"
     escape = "claude --settings ~/.claude/original.settings.json --model default"
     assert configure.exit_code == 0, configure.output
-    assert configure.output.splitlines()[:4] == [
+    assert configure.output.splitlines()[:6] == [
         "Connecting Ramp Router to your coding agents",
         "Skipping the Claude Code Router status line: it could not be "
         "downloaded from https://app.router.com/claude-code-statusline.",
         "Connected to: Claude Code and Codex",
-        "1 model added. Restart any running agents, then pick a model.",
+        "Claude Code: 1 model added.",
+        "Codex: 1 model added.",
+        "Restart any running agents, then pick a model.",
     ]
     notice = _notice_lines(configure.output)
     assert notice[0].startswith("Claude Code & Codex only support one model provider")
@@ -10247,14 +10269,18 @@ def test_configure_and_unconfigure_without_client_targets_everything(
     )
 
     assert configure.exit_code == 0
-    assert configure.output.splitlines()[:4] == [
+    assert configure.output.splitlines()[:8] == [
         "Connecting Ramp Router to your coding agents",
         # _mock_models serves no status line asset, so configure says why the
         # extra was skipped without failing anything.
         "Skipping the Claude Code Router status line: it could not be "
         "downloaded from https://app.router.com/claude-code-statusline.",
         "Connected to: Claude Code, Codex, OpenCode, and Pi",
-        "1 model added. Restart any running agents, then pick a model.",
+        "Claude Code: 1 model added.",
+        "Codex: 1 model added.",
+        "OpenCode: 1 model added.",
+        "Pi: 1 model added.",
+        "Restart any running agents, then pick a model.",
     ]
     notice = _notice_lines(configure.output)
     assert "claude --settings ~/claude/original.settings.json --model default" in notice
