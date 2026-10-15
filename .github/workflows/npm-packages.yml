@@ -1,0 +1,79 @@
+name: npm packages
+
+on:
+  pull_request:
+    paths: ["npm/**", ".github/workflows/npm-packages.yml"]
+  push:
+    branches: [main]
+    paths: ["npm/**", ".github/workflows/npm-packages.yml"]
+  workflow_dispatch:
+    inputs:
+      dist_tag:
+        description: "Distribution tag (next for acceptance testing, latest for rollout)"
+        type: choice
+        options: [next, latest]
+        default: next
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: npm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: npm/package-lock.json
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm test
+      - run: npm run check
+
+  publish:
+    needs: test
+    # Never publish from forks, a PR, an arbitrary dispatch ref, or the private
+    # source repo. The variable remains unset until npm bootstrap is complete.
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.repository == 'ramp-public/ramp-cli' &&
+      github.ref == 'refs/heads/main' &&
+      vars.NPM_PUBLISH_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: npm
+    concurrency:
+      group: publish-npm-packages
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: npm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org/
+      - name: Install npm with trusted-publishing support
+        run: npm install -g npm@11.6.2 --ignore-scripts --no-audit --no-fund
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Verify public native assets and publish CLI before Router
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NPM_PUBLISH_ENABLED: "true"
+          NPM_DIST_TAG: ${{ inputs.dist_tag }}
+        run: npm run publish:packages

@@ -1,0 +1,12 @@
+{
+  "name": "ramp-cli-npm-workspace",
+  "private": true,
+  "workspaces": ["cli", "router"],
+  "engines": { "node": ">=22", "npm": ">=10" },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check": "node scripts/check-packages.js",
+    "pack": "node scripts/pack.js",
+    "publish:packages": "node scripts/publish.js"
+  }
+}

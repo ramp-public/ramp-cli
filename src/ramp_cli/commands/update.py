@@ -14,6 +14,11 @@ import click
 
 from ramp_cli import __version__
 from ramp_cli.commands.router import CLIENT_NAMES, configured_router_clients
+from ramp_cli.install_record import (
+    npm_install_record,
+    npm_update_command,
+    npm_update_lines,
+)
 from ramp_cli.output.formatter import resolve_format
 from ramp_cli.skills import managed_skill_targets
 from ramp_cli.version_check import (
@@ -183,11 +188,34 @@ def _is_homebrew_install() -> bool:
 
 
 @click.command("update")
-def update_cmd() -> None:
+@click.option("--_npm-validate", is_flag=True, hidden=True)
+def update_cmd(_npm_validate: bool = False) -> None:
     """Update ramp CLI to the latest version."""
+    # npm entrypoints use the native parser as a side-effect-free preflight.
+    # Click has already rejected invalid flags/arguments before reaching here.
+    if _npm_validate:
+        return
     current = __version__
 
     click.echo(f"Current version: v{current}")
+
+    record = npm_install_record()
+    if record is not None:
+        # Replace this process before npm replaces the native distribution.
+        # The helper preserves npm ownership and never invokes the curl updater.
+        command = npm_update_command()
+        if command is not None:
+            try:
+                os.execv(command[0], [*command, *sys.argv[1:]])
+            except OSError as exc:
+                raise click.ClickException(
+                    f"Could not start the npm updater: {exc}"
+                ) from exc
+            return
+        for line in npm_update_lines(record):
+            click.echo(line)
+        return
+
     click.echo("Checking for updates...")
 
     latest = latest_version()

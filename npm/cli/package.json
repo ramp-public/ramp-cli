@@ -1,0 +1,24 @@
+{
+  "name": "@ramp/cli",
+  "version": "0.0.0",
+  "nativeCliVersion": "0.0.0",
+  "description": "Install and launch the standalone Ramp CLI",
+  "license": "MIT",
+  "engines": { "node": ">=22", "npm": ">=10" },
+  "bin": { "ramp": "bin/ramp.js" },
+  "exports": {
+    "./launcher": "./lib/launch.js",
+    "./postinstall": "./lib/postinstall.js"
+  },
+  "files": ["bin/", "lib/", "README.md", "LICENSE"],
+  "scripts": { "postinstall": "node bin/postinstall.js" },
+  "dependencies": { "proper-lockfile": "^4.1.2", "tar": "^7.5.22" },
+  "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org/" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ramp-public/ramp-cli.git",
+    "directory": "npm/cli"
+  },
+  "homepage": "https://github.com/ramp-public/ramp-cli#readme",
+  "bugs": { "url": "https://github.com/ramp-public/ramp-cli/issues" }
+}

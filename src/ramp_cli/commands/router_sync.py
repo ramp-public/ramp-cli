@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 
 from ramp_cli.config.settings import config_dir
+from ramp_cli.install_record import npm_entrypoint
 from ramp_cli.version_check import get_update_info
 
 try:
@@ -117,8 +118,10 @@ def update_notice() -> str | None:
 def ramp_executable() -> Path | None:
     """The absolute path to the ramp entrypoint this process runs as, or None.
 
-    argv[0] names the exact install being run; PATH lookup is the fallback.
-    Symlinks are kept — an installer-managed link is the stable name.
+    argv[0] names the exact install being run; an npm-managed install's
+    stable entrypoint is next, since npx can put a temporary shim first on
+    PATH; PATH lookup is the fallback. Symlinks are kept — an
+    installer-managed link is the stable name.
     """
     invoked_text = sys.argv[0] or ""
     invoked = Path(invoked_text)
@@ -131,6 +134,9 @@ def ramp_executable() -> Path | None:
         candidate = Path(os.path.abspath(invoked))
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return candidate
+    entrypoint = npm_entrypoint()
+    if entrypoint is not None:
+        return entrypoint
     resolved = shutil.which("ramp")
     return Path(os.path.abspath(resolved)) if resolved else None
 

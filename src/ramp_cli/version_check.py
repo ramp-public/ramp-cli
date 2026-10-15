@@ -17,6 +17,7 @@ import httpx
 
 from ramp_cli import __version__
 from ramp_cli.config.settings import config_dir
+from ramp_cli.install_record import npm_install_record
 
 _PUBLIC_REPO = "ramp-public/ramp-cli"
 _COOLDOWN_SECONDS = 86400  # 24 hours
@@ -183,6 +184,10 @@ def get_update_info() -> dict[str, str] | None:
 
     Returns {"current": "0.1.3", "latest": "0.1.4"} or None.
     """
+    # npm pins the native version, so a public-release nag cannot be fixed by
+    # `npm update`. Suppress every passive update notice for npm installs.
+    if npm_install_record() is not None:
+        return None
     candidates: list[tuple[tuple[int, ...], str]] = []
     for candidate in (_read_cache(), _read_server_recommended()):
         if not candidate:

@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 from click.testing import CliRunner
 
 from ramp_cli.commands.update import _is_homebrew_install
@@ -330,6 +331,148 @@ class TestUpdateAvailable:
         result = _invoke(["update"])
         assert result.exit_code != 0
         assert "Update failed" in result.output
+
+
+class TestUpdateNpm:
+    @patch("ramp_cli.commands.update.subprocess.run")
+    @patch("ramp_cli.commands.update.latest_version")
+    @patch(
+        "ramp_cli.commands.update.npm_install_record",
+        return_value={"owner": "@ramp/cli", "package": "@ramp/router"},
+    )
+    @patch("ramp_cli.commands.update.__version__", "0.1.3")
+    def test_npm_managed_install_prints_npm_command(
+        self, mock_record, mock_latest, mock_run, isolated_config
+    ):
+        result = _invoke(["update"])
+        assert result.exit_code == 0
+        assert "installed by npm (@ramp/router)" in result.output
+        assert "npm update -g @ramp/router" in result.output
+        mock_latest.assert_not_called()
+        mock_run.assert_not_called()
+
+    def test_npm_managed_update_executes_helper_without_curl_or_skills(
+        self, isolated_config
+    ):
+        command = ["/usr/bin/node", "/managed/npm-update.js"]
+        with (
+            patch(
+                "ramp_cli.commands.update.npm_install_record",
+                return_value={"owner": "@ramp/cli", "package": "@ramp/router"},
+            ),
+            patch("ramp_cli.commands.update.npm_update_command", return_value=command),
+            patch("ramp_cli.commands.update.os.execv") as mock_exec,
+            patch("ramp_cli.commands.update.sys.argv", ["ramp", "--quiet", "update"]),
+            patch("ramp_cli.commands.update.subprocess.run") as mock_run,
+            patch("ramp_cli.commands.update.latest_version") as mock_latest,
+            patch(
+                "ramp_cli.commands.update._offer_optional_skills_update"
+            ) as mock_skills,
+        ):
+            result = _invoke(["--quiet", "update"])
+        assert result.exit_code == 0
+        mock_exec.assert_called_once_with(command[0], [*command, "--quiet", "update"])
+        mock_run.assert_not_called()
+        mock_latest.assert_not_called()
+        mock_skills.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["update", "--dry-run"],
+            ["update", "bogus"],
+            ["--env", "bogus", "update"],
+            ["update", "--output", "bogus"],
+            ["--profile", "bogus", "update"],
+            ["--agent", "--human", "update"],
+        ],
+    )
+    def test_native_validation_rejects_bad_arguments_before_updating(
+        self, args, isolated_config
+    ):
+        with (
+            patch("ramp_cli.commands.update.os.execv") as mock_exec,
+            patch("ramp_cli.commands.update.subprocess.run") as mock_run,
+            patch("ramp_cli.commands.update.latest_version") as mock_latest,
+        ):
+            result = _invoke([*args, "--_npm-validate"])
+        assert result.exit_code == 2
+        mock_exec.assert_not_called()
+        mock_run.assert_not_called()
+        mock_latest.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["update"],
+            ["--env=sandbox", "-ojson", "update"],
+            ["-qo", "json", "update"],
+            ["update", "--quiet", "--no-input", "--profile", "human"],
+            ["--", "update"],
+        ],
+    )
+    def test_native_validation_of_valid_flags_is_side_effect_free(
+        self, args, isolated_config
+    ):
+        with (
+            patch("ramp_cli.commands.update.os.execv") as mock_exec,
+            patch("ramp_cli.commands.update.subprocess.run") as mock_run,
+            patch("ramp_cli.commands.update.latest_version") as mock_latest,
+        ):
+            result = _invoke([*args, "--_npm-validate"])
+        assert result.exit_code == 0
+        assert "Current version" not in result.output
+        mock_exec.assert_not_called()
+        mock_run.assert_not_called()
+        mock_latest.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "args, expected_exit",
+        [
+            (["update", "--help"], 0),
+            (["--env=sandbox", "-ojson", "update", "--help"], 0),
+            (["-qo", "json", "update", "--help"], 0),
+            (["--quiet", "--no-input", "update", "--help"], 0),
+            (["--", "update", "--help"], 0),
+            (["--env", "bogus", "update", "--help"], 2),
+            (["--output", "bogus", "update", "--help"], 2),
+            (["--profile", "bogus", "update", "--help"], 2),
+            (["--agent", "--human", "update", "--help"], 2),
+        ],
+    )
+    def test_legacy_help_validation_checks_root_values_without_updating(
+        self, args, expected_exit, isolated_config
+    ):
+        # npm's legacy fallback rejects command-specific arguments first; these
+        # safe help forms must still run real root callbacks, not any updater.
+        with (
+            patch("ramp_cli.commands.update.os.execv") as mock_exec,
+            patch("ramp_cli.commands.update.subprocess.run") as mock_run,
+            patch("ramp_cli.commands.update.latest_version") as mock_latest,
+        ):
+            result = _invoke(args)
+        assert result.exit_code == expected_exit
+        mock_exec.assert_not_called()
+        mock_run.assert_not_called()
+        mock_latest.assert_not_called()
+
+    def test_failed_helper_does_not_fall_back_to_curl(self, isolated_config):
+        with (
+            patch(
+                "ramp_cli.commands.update.npm_install_record",
+                return_value={"owner": "@ramp/cli"},
+            ),
+            patch(
+                "ramp_cli.commands.update.npm_update_command",
+                return_value=["/usr/bin/node", "/managed/npm-update.js"],
+            ),
+            patch("ramp_cli.commands.update.os.execv", side_effect=OSError("missing")),
+            patch("ramp_cli.commands.update.subprocess.run") as mock_run,
+        ):
+            result = _invoke(["update"])
+        assert result.exit_code != 0
+        assert "Could not start the npm updater" in result.output
+        mock_run.assert_not_called()
 
 
 class TestUpdateHomebrew:

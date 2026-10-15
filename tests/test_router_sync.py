@@ -246,8 +246,14 @@ def test_ramp_executable_resolution(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", ["bin/ramp"])
     assert _REAL_RAMP_EXECUTABLE() == fake
 
-    # Otherwise PATH lookup, then None.
+    # An npm-managed install's stable link beats a (possibly npx-cache) PATH hit.
     monkeypatch.setattr(sys, "argv", ["pytest"])
+    monkeypatch.setattr(sync_module.shutil, "which", lambda _name: "/tmp/_npx/ramp")
+    monkeypatch.setattr(sync_module, "npm_entrypoint", lambda: fake)
+    assert _REAL_RAMP_EXECUTABLE() == fake
+    monkeypatch.setattr(sync_module, "npm_entrypoint", lambda: None)
+
+    # Otherwise PATH lookup, then None.
     monkeypatch.setattr(sync_module.shutil, "which", lambda _name: "/usr/bin/ramp")
     assert _REAL_RAMP_EXECUTABLE() == Path("/usr/bin/ramp")
 

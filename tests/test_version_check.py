@@ -207,6 +207,21 @@ class TestGetUpdateWarning:
 
 
 class TestEmitUpdateNotice:
+    @patch(
+        "ramp_cli.version_check.npm_install_record",
+        return_value={"owner": "@ramp/cli"},
+    )
+    @patch("ramp_cli.version_check.__version__", "0.1.3")
+    def test_npm_managed_install_has_no_notice(
+        self, mock_record, cache_file: Path, capsys
+    ):
+        _write_cache("0.2.0")
+        assert get_update_info() is None
+        assert get_update_warning() is None
+        emit_update_notice(agent_mode=False)
+        emit_update_notice(agent_mode=True)
+        assert capsys.readouterr().err == ""
+
     @patch("ramp_cli.version_check.__version__", "0.1.3")
     def test_human_mode(self, cache_file: Path, capsys):
         _write_cache("0.2.0")

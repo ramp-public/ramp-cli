@@ -1,0 +1,19 @@
+{
+  "name": "@ramp/router",
+  "version": "0.0.0",
+  "description": "Install the Ramp CLI and open the Router terminal workspace",
+  "license": "MIT",
+  "engines": { "node": ">=22", "npm": ">=10" },
+  "bin": { "router": "bin/router.js" },
+  "files": ["bin/", "README.md", "LICENSE"],
+  "scripts": { "postinstall": "node bin/postinstall.js" },
+  "dependencies": { "@ramp/cli": "0.0.0" },
+  "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org/" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ramp-public/ramp-cli.git",
+    "directory": "npm/router"
+  },
+  "homepage": "https://github.com/ramp-public/ramp-cli#readme",
+  "bugs": { "url": "https://github.com/ramp-public/ramp-cli/issues" }
+}
