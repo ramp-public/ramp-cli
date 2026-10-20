@@ -239,8 +239,17 @@ class HarnessesPage(CellEditing, RouterPage):
         self.pending_connect = connect
 
     def content(self) -> ComposeResult:
-        yield Static("Connect Router", classes="heading")
+        from ramp_cli.router_ui.tabs.coding import CodingSettings  # noqa: PLC0415
+
+        yield CodingSettings()
+        yield Static("Harnesses", classes="heading")
         yield HarnessTable(id="harnesses", cursor_type="row")
+
+    @property
+    def unsaved(self):
+        from ramp_cli.router_ui.tabs.coding import CodingSettings  # noqa: PLC0415
+
+        return self.is_mounted and self.query_one(CodingSettings).dirty
 
     def actions(self) -> ComposeResult:
         yield Button("Connect", id="connection", disabled=True)
@@ -248,12 +257,18 @@ class HarnessesPage(CellEditing, RouterPage):
 
     def on_mount(self):
         self.query_one("#harnesses", DataTable).add_columns(
-            "Harness", "Router", "Default Model", "Routing Strategy", "API Key"
+            "Harness", "Router", "Default Model", "API Key"
         )
         super().on_mount()
 
     def load(self):
-        self.run("Checking harnesses", self.service.harnesses, self.loaded)
+        def loaded(entries):
+            from ramp_cli.router_ui.tabs.coding import CodingSettings  # noqa: PLC0415
+
+            self.loaded(entries)
+            self.call_after_refresh(self.query_one(CodingSettings).load)
+
+        self.run("Checking harnesses", self.service.harnesses, loaded)
 
     def loaded(self, entries):
         table = self.query_one("#harnesses", DataTable)
@@ -273,7 +288,6 @@ class HarnessesPage(CellEditing, RouterPage):
                 item.get("status")
                 or ("Connected" if item["configured"] else "Not Connected"),
                 safe_text(item.get("default_model") or "—"),
-                safe_text(item.get("routing_strategy") or "—"),
                 safe_text(item.get("api_key") or "—"),
             ]
             if item["configured"]:
@@ -289,7 +303,6 @@ class HarnessesPage(CellEditing, RouterPage):
                     PaletteText(f"  ↳ {tier.title()} subagent", palette, "muted"),
                     "",
                     safe_text(model) if model else "Not set",
-                    "",
                     "",
                     key=f"{SUBAGENT_PREFIX}{tier}",
                 )
@@ -365,9 +378,8 @@ class HarnessesPage(CellEditing, RouterPage):
         editor = {
             1: self.edit_connection,
             2: self.edit_model,
-            3: self.edit_strategy,
             # A harness changes keys by connecting again with another one.
-            4: lambda client, entry, _coordinate: self.connect_harness(client, entry),
+            3: lambda client, entry, _coordinate: self.connect_harness(client, entry),
         }.get(event.coordinate.column)
         if editor:
             editor(client, entry, event.coordinate)
@@ -514,66 +526,6 @@ class HarnessesPage(CellEditing, RouterPage):
             )
 
         self.run("Loading models", self.service.subagents, loaded)
-
-    def edit_strategy(self, client: str, entry: dict, coordinate: Coordinate):
-        name = self.harness_label(client, entry)
-        if not entry["configured"]:
-            self.message(f"Connect {name} to Router first.")
-            return
-        if client == "cursor":
-            self.message(
-                "Cursor uses the strategy of the API key pasted into it. Change it in API keys."
-            )
-            return
-
-        def loaded(data):
-            self.message("")
-            profiles = data["profiles"]
-            if not profiles:
-                self.message("This key's account has no routing strategies yet.")
-                return
-            current = next((p["name"] for p in profiles if p["is_current"]), None)
-            others = ", ".join(
-                router.AGENT_NAMES.get(other, other) for other in data["shared_with"]
-            )
-
-            def chosen(profile: str):
-                shared = (
-                    f" {others} use the same API key and will switch too."
-                    if others
-                    else ""
-                )
-                self.router_app.confirm(
-                    f"Switch {name} to the “{safe_text(profile)}” routing strategy?{shared}",
-                    lambda: self.run_and_reload(
-                        "Saving routing strategy",
-                        lambda: self.service.select_harness_profile(
-                            client, profile, data["connection_token"]
-                        ),
-                        f"{name} now uses {safe_text(profile)}.",
-                    ),
-                    "Switch strategy",
-                )
-
-            self.pick(
-                coordinate,
-                [
-                    (
-                        safe_text(p["name"])
-                        + (" · default" if p.get("is_default") else ""),
-                        p["name"],
-                    )
-                    for p in profiles
-                ],
-                current,
-                chosen,
-            )
-
-        self.run(
-            "Loading routing strategies",
-            lambda: self.service.harness_profiles(client),
-            loaded,
-        )
 
     @on(Button.Pressed, "#connection")
     def change_connection(self):

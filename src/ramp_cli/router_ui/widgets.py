@@ -59,7 +59,7 @@ border.register()
 PAGES = (
     ("home", "Home"),
     ("harnesses", "Harnesses"),
-    ("strategies", "Strategies"),
+    ("strategies", "Routing Profiles"),
     ("keys", "API Keys"),
 )
 REFRESHING = "Refreshing Data"

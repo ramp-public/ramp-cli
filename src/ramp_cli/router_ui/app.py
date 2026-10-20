@@ -161,14 +161,24 @@ class RouterApp(App):
     .heading { text-style: bold; color: $router-accent; }
     #body > Static, #body > Label { margin-left: 1; }
     HarnessesPage #body > .heading { margin: 0 0 1 1; }
+    HarnessesPage #harnesses { min-height: 6; }
     .muted { color: $router-muted; }
     Static { height: auto; }
     Label { margin-top: 1; height: auto; color: $router-muted; }
+    ProfilePage #provider-fields, ProfilePage #switchyard-fields, ProfilePage #auto-fields,
+    ProfilePage #auto-models, ProfilePage #benchmark-fields { height: auto; }
     Input { margin-bottom: 1; background: $router-background; background-tint: transparent; border: solid $router-control-border; padding: 0 1; }
     Input:focus { border: solid $router-accent; background-tint: transparent; }
     Select { height: 3; margin-bottom: 1; background: $router-background; background-tint: transparent; border: none; padding: 0; }
     Select > SelectCurrent { height: 3; background: $router-background; background-tint: transparent; border: solid $router-control-border; padding: 0 1; }
     Select:focus > SelectCurrent, Select.-expanded > SelectCurrent { border: solid $router-accent; background-tint: transparent; }
+    CompactSelect { height: 1; min-height: 1; margin: 0; }
+    CompactSelect > SelectCurrent { height: 1; min-height: 1; border: none; background: $router-surface; color: $router-surface-foreground; }
+    CompactSelect:focus > SelectCurrent, CompactSelect.-expanded > SelectCurrent { border: none; background: $router-active; color: $router-active-accent; }
+    CodingSettings #experimental, ExperimentalModelsPage .compact-action, ExperimentalModelsPage .candidate-action { height: 1; min-height: 1; border: none; padding: 0 1; background: $router-surface; color: $router-surface-foreground; }
+    CodingSettings #experimental:focus, ExperimentalModelsPage .compact-action:focus, ExperimentalModelsPage .candidate-action:focus { background: $router-active; color: $router-active-accent; }
+    ExperimentalModelsPage Input { height: 1; min-height: 1; margin: 0; padding: 0 1; border: none; background: $router-surface; }
+    ExperimentalModelsPage Input:focus { border: none; background: $router-active; }
     SelectOverlay { background: $router-background; background-tint: transparent; border: solid $router-control-border; }
     Button { background: $router-background; color: $router-foreground; border: none; margin-right: 1; height: 3; min-height: 3; padding: 0; content-align: center middle; }
     Button:hover { background: $router-background; }
@@ -205,6 +215,7 @@ class RouterApp(App):
     DataTable > .datatable--cursor { background: $router-active; color: $router-active-accent; }
     DataTable > .datatable--hover { background: $router-hover; color: $router-hover-foreground; }
     Checkbox { background: $router-background; border: none; padding: 0; height: 3; }
+    ProfilePage Checkbox { height: 1; }
     Checkbox > .toggle--button { color: $router-surface; background: $router-surface; }
     Checkbox.-on > .toggle--button { color: $router-surface-accent; background: $router-surface; }
     SelectionList { height: auto; min-height: 3; overflow-y: hidden; background: $router-surface; color: $router-surface-foreground; border: solid $router-button-border; }
@@ -605,11 +616,7 @@ class RouterApp(App):
                 "Leave",
             )
             return
-        if (
-            isinstance(self.screen, FormPage)
-            and self.screen.baseline is not None
-            and self.screen.values() != self.screen.baseline
-        ):
+        if getattr(self.screen, "unsaved", False):
             self.confirm(
                 "Discard unsaved changes and switch screens?",
                 lambda: self.open_confirmed(page),
@@ -641,11 +648,7 @@ class RouterApp(App):
 
     def show_tab(self, name: str):
         leaving = self.screen
-        discarded = (
-            isinstance(leaving, FormPage)
-            and leaving.baseline is not None
-            and leaving.values() != leaving.baseline
-        )
+        discarded = getattr(leaving, "unsaved", False)
         screen, cached = self.tab_page(name)
         self.switch_screen(screen)
         if discarded and leaving is not screen:
@@ -677,12 +680,7 @@ class RouterApp(App):
             else:
                 self.notice_busy()
             return
-        if (
-            not force
-            and isinstance(self.screen, FormPage)
-            and self.screen.baseline is not None
-            and self.screen.values() != self.screen.baseline
-        ):
+        if not force and getattr(self.screen, "unsaved", False):
             self.confirm(
                 "Discard unsaved changes?", lambda: self.back(force=True), "Discard"
             )
@@ -728,11 +726,7 @@ class RouterApp(App):
                 self.cancel_event.set()
             self.notice_busy()
             return
-        if (
-            isinstance(self.screen, FormPage)
-            and self.screen.baseline is not None
-            and self.screen.values() != self.screen.baseline
-        ):
+        if getattr(self.screen, "unsaved", False):
             self.confirm("Discard unsaved changes and quit?", self.exit, "Quit")
         elif isinstance(self.screen, SecretPage):
             self.confirm(

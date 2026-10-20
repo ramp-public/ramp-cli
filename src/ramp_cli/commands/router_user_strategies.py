@@ -1,6 +1,6 @@
 """User-level Router routing profiles over the same endpoints Router web uses.
 
-Profiles are what the web calls strategies: a named set of routing settings
+Profiles are a named set of routing settings
 and the keys that route by it. Every key always belongs to exactly one profile,
 so removing a key from a profile moves it back to the account default.
 """
@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import click
 import httpx
@@ -34,9 +35,7 @@ from ramp_cli.router_ui import launch as router_ui
 if TYPE_CHECKING:
     from ramp_cli.commands.router_user import PickerStyle
 
-# Settings the CLI edits, labelled like the existing strategy toggles. Shadow
-# models and provider preference stay web-only: shadowing needs the content
-# recording consent flow that only the web app presents.
+# The legacy command-line toggles. The TUI also edits V2 profile settings.
 PROFILE_SETTINGS = (
     ("cost_efficient_routing_enabled", "Cost-efficient routing"),
     ("switchyard_routing_enabled", "NVIDIA NeMo Switchyard"),
@@ -65,11 +64,13 @@ class ProfileDraft:
     profile_id: str | None
     is_default: bool
     name: str
-    settings: dict[str, bool | None]
+    settings: dict[str, Any]
     keys: set[str]
     original_name: str = ""
-    original_settings: dict[str, bool | None] = field(default_factory=dict)
+    original_settings: dict[str, Any] = field(default_factory=dict)
     original_keys: set[str] = field(default_factory=set)
+    slug: str | None = None
+    preset_type: str | None = None
 
     @classmethod
     def new(cls) -> "ProfileDraft":
@@ -96,17 +97,29 @@ class ProfileDraft:
             ),
             "auto_routing_enabled": profile.get("auto_routing_enabled"),
         }
+        for name in (
+            "provider_routing_preference",
+            "switchyard_settings",
+            "auto_routing_settings",
+            "benchmark_alias",
+            "shadow_models_enabled",
+            "shadow_settings",
+        ):
+            if name in profile:
+                settings[name] = deepcopy(profile[name])
         keys = set(profile.get("assigned_api_key_ids") or [])
         name = str(profile.get("name") or "")
         return cls(
             profile_id=str(profile["id"]),
             is_default=bool(profile.get("is_default")),
             name=name,
-            settings=dict(settings),
+            settings=deepcopy(settings),
             keys=set(keys),
             original_name=name,
-            original_settings=dict(settings),
+            original_settings=deepcopy(settings),
             original_keys=set(keys),
+            slug=profile.get("slug"),
+            preset_type=profile.get("preset_type"),
         )
 
     def set_setting(self, field_name: str, value: bool | None) -> None:
@@ -118,12 +131,21 @@ class ProfileDraft:
     def rebase(self, profile: dict) -> None:
         """Refresh the saved baseline without discarding the user's desired edits."""
         added, removed = self.added_keys, self.removed_keys
+        settings_edits = {
+            name: deepcopy(value)
+            for name, value in self.settings.items()
+            if value != self.original_settings.get(name)
+        }
+        renamed = self.name != self.original_name
         saved = self.from_profile(profile)
         # Carry only the user's membership edits onto the fresh server state.
         # Untouched keys may have been moved by another command while editing.
         self.keys = (saved.keys | added) - removed
         self.profile_id = saved.profile_id
         self.is_default = saved.is_default
+        if not renamed:
+            self.name = saved.name
+        self.settings = {**deepcopy(saved.settings), **settings_edits}
         self.original_name = saved.name
         self.original_settings = saved.settings
         self.original_keys = saved.keys
@@ -140,16 +162,20 @@ class ProfileDraft:
         body: dict = {}
         if self.profile_id is not None and self.name != self.original_name:
             body["name"] = self.name
-        for field_name, _title in PROFILE_SETTINGS:
-            if self.settings[field_name] != self.original_settings.get(field_name):
-                body[field_name] = self.settings[field_name]
+        for field_name, value in self.settings.items():
+            if value != self.original_settings.get(field_name):
+                body[field_name] = value
         return body
 
     def create_body(self) -> dict:
         body: dict = {"name": self.name}
-        for field_name, _title in PROFILE_SETTINGS:
-            if self.settings[field_name] is not None:
-                body[field_name] = self.settings[field_name]
+        body.update(
+            {name: value for name, value in self.settings.items() if value is not None}
+        )
+        if self.slug is not None:
+            body["slug"] = self.slug
+        if self.preset_type is not None:
+            body["preset_type"] = self.preset_type
         return body
 
     def changes(self) -> list[str]:
@@ -198,7 +224,7 @@ def _profiles(client: RouterUserClient) -> list[dict]:
     except ApiError as error:
         if error.status_code == 403:
             raise RampCLIError(
-                "Strategies aren't available for your Router account yet."
+                "Routing profiles aren't available for your Router account yet."
             ) from None
         raise
 
@@ -233,7 +259,7 @@ def _validate_name(value: str) -> str | bool:
     if len(name) > _NAME_MAX:
         return f"Use {_NAME_MAX} characters or fewer."
     if name.casefold() == "account default":
-        return "That name is reserved for your default strategy."
+        return "That name is reserved for your default routing profile."
     return True
 
 

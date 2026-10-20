@@ -1,6 +1,5 @@
-"""The Strategies tab."""
+"""The Routing Profiles tab."""
 
-import httpx
 from textual import on
 from textual.coordinate import Coordinate
 from textual.widgets import (
@@ -16,14 +15,27 @@ from ramp_cli.commands.router_user_strategies import (
     _validate_name,
     setting_value,
 )
-from ramp_cli.errors import ApiError, RampCLIError
+from ramp_cli.router_ui.dialogs import ChoiceDialog
 from ramp_cli.router_ui.pages import (
     CellEditing,
     CollectionPage,
 )
+from ramp_cli.router_ui.profiles import (
+    AUTO,
+    CODING_PRESETS,
+    EXPERIMENTAL,
+    PRESETS,
+    PROVIDER,
+    PROVIDERS,
+    SWITCHYARD,
+    controls_for,
+    has_switchyard_pair,
+)
 from ramp_cli.router_ui.service import (
     safe_text,
 )
+from ramp_cli.router_ui.tabs.coding import ExperimentalModelsPage
+from ramp_cli.router_ui.tabs.profile import ProfilePage
 from ramp_cli.router_ui.widgets import (
     Button,
     CellChecklist,
@@ -61,8 +73,16 @@ class StrategyTable(CellTable):
 
 
 class StrategiesPage(CellEditing, CollectionPage):
-    page_title = "strategies"
-    columns = ("Name", "Cost-efficient", "Switchyard", "Jev Auto Routing", "API keys")
+    page_title = "routing profiles"
+    columns = (
+        "Name",
+        "Cost-efficient",
+        "Switchyard",
+        "Jev Auto Routing",
+        "API keys",
+        "Provider priority",
+        "Workload",
+    )
     table_class = StrategyTable
     cell_table_id = "table"
     # On/Off cells, by column, and the strategy setting each one changes.
@@ -101,12 +121,20 @@ class StrategiesPage(CellEditing, CollectionPage):
         profile = next((p for p in self.entries if str(p["id"]) == key), None)
         if profile is None or self.router_app.busy:
             return
+        if (
+            profile.get("preset_type") in CODING_PRESETS
+            and event.coordinate.column != 4
+        ):
+            self.edit_profile(profile)
+            return
         editor = {
             0: self.edit_name,
             1: self.edit_setting,
             2: self.edit_setting,
             3: self.edit_setting,
             4: self.edit_keys,
+            5: self.edit_provider,
+            6: lambda profile, _coordinate: self.edit_profile(profile),
         }.get(event.coordinate.column)
         if editor:
             editor(profile, event.coordinate)
@@ -116,50 +144,76 @@ class StrategiesPage(CellEditing, CollectionPage):
 
     def edit_setting(self, profile: dict, coordinate: Coordinate):
         setting = self.CELL_SETTINGS[coordinate.column]
-        value = profile.get(setting)
-        if setting == "auto_routing_enabled":
-            choices = [
-                (inherited_label(self.auto_default), "account"),
-                ("On", "on"),
-                ("Off", "off"),
-            ]
-            current = "account" if value is None else "on" if value else "off"
-        else:
-            choices = [("On", "on"), ("Off", "off")]
-            current = "on" if value else "off"
+        if not self.can_edit(profile, setting):
+            return
+        if setting in (SWITCHYARD, AUTO):
+            self.edit_profile(profile)
+            return
+        choices = [("On", "on"), ("Off", "off")]
+        current = "on" if profile.get(setting) else "off"
 
         def chosen(choice: str):
             draft = ProfileDraft.from_profile(profile)
             draft.set_setting(setting, AUTO_ROUTING_CHOICES[choice])
             label = {"on": "On", "off": "Off", "account": "Default"}[choice]
             title = dict(PROFILE_SETTINGS)[setting]
-            self.confirm_save(
+            self.confirm_draft(
                 profile,
                 draft,
-                setting,
                 f"Set {title} to {label} for {self.strategy_label(profile)}?",
             )
 
         self.pick(coordinate, choices, current, chosen)
 
-    def confirm_save(
-        self, profile: dict, draft: ProfileDraft, setting: str, message: str
-    ):
-        if any(
-            draft.settings[other] != draft.original_settings[other]
-            for other in draft.settings
-            if other != setting
-        ):
-            # Switchyard and Jev Auto Routing can't both be on.
-            message += " This turns off the other one, which can't run alongside it."
-        self.confirm_draft(profile, draft, message)
+    def can_edit(self, profile: dict, setting: str) -> bool:
+        if not profile.get("slug"):
+            self.message(
+                "Legacy profiles are read-only. Create a preset routing profile and move its keys there."
+            )
+            return False
+        if setting not in controls_for(profile):
+            self.message(
+                "This strategy isn't offered by this preset. Switchyard and Auto are offered by Coding agents (Experimental)."
+            )
+            return False
+        return True
+
+    def edit_profile(self, profile: dict):
+        if profile.get("preset_type") == EXPERIMENTAL:
+            self.app.push_screen(
+                ExperimentalModelsPage(),
+                lambda saved: self.app.load_page(self, quiet=True) if saved else None,
+            )
+        elif profile.get("preset_type") in CODING_PRESETS:
+            self.app.open("harnesses")
+        elif profile.get("slug"):
+            self.router_app.push(ProfilePage(self.entries, profile=profile))
+        else:
+            self.can_edit(profile, "")
+
+    def edit_provider(self, profile: dict, coordinate: Coordinate):
+        if not self.can_edit(profile, PROVIDER):
+            return
+
+        def chosen(value: str):
+            draft = ProfileDraft.from_profile(profile)
+            draft.settings[PROVIDER] = value or None
+            label = dict((value, label) for label, value in PROVIDERS)[value]
+            self.confirm_draft(
+                profile,
+                draft,
+                f"Set cross-provider routing to {label} for {self.strategy_label(profile)}?",
+            )
+
+        self.pick(coordinate, list(PROVIDERS), profile.get(PROVIDER) or "", chosen)
 
     def confirm_draft(self, profile: dict, draft: ProfileDraft, message: str):
         name = self.strategy_label(profile)
+        message += f" This affects its {key_count(len(draft.original_keys))} and requests selecting this profile."
         self.router_app.confirm(
             message,
             lambda: self.run_and_reload(
-                "Saving strategy",
+                "Saving routing profile",
                 lambda: self.service.save_profile(draft),
                 f"Saved {name}.",
             ),
@@ -168,6 +222,16 @@ class StrategiesPage(CellEditing, CollectionPage):
         )
 
     def edit_keys(self, profile: dict, coordinate: Coordinate):
+        if profile.get("preset_type") in CODING_PRESETS:
+            self.message(
+                "Coding settings are account-wide and can't receive keys. Move historical assignments to another profile from API Keys."
+            )
+            return
+        if not profile.get("slug"):
+            self.message(
+                "Legacy profiles can't receive keys. Move their keys to a preset profile from API Keys or the destination profile's key list."
+            )
+            return
         if self.keys is None:
             self.message(
                 "Couldn't list your API keys. Refresh to try again.", error=True
@@ -210,7 +274,7 @@ class StrategiesPage(CellEditing, CollectionPage):
                 moves.append(f"move {key_count(len(added))} to {name}")
             if removed:
                 moves.append(
-                    f"return {key_count(len(removed))} to your default strategy"
+                    f"return {key_count(len(removed))} to your default routing profile"
                 )
             message = " and ".join(moves)
             self.confirm_draft(profile, draft, f"{message[0].upper()}{message[1:]}?")
@@ -228,7 +292,9 @@ class StrategiesPage(CellEditing, CollectionPage):
 
     def edit_name(self, profile: dict, coordinate: Coordinate):
         def chosen(value: str):
-            if value == "rename":
+            if value == "edit":
+                self.edit_profile(profile)
+            elif value == "rename":
                 self.rename_strategy(profile, coordinate)
             elif value == "delete":
                 self.delete_strategy(profile)
@@ -236,8 +302,12 @@ class StrategiesPage(CellEditing, CollectionPage):
         self.pick(
             coordinate,
             [
-                ("Rename Strategy?", "rename"),
-                ("Delete Strategy?", "delete"),
+                *(
+                    [("Edit strategies", "edit"), ("Rename Profile?", "rename")]
+                    if profile.get("slug")
+                    else []
+                ),
+                ("Delete Profile?", "delete"),
                 ("Back", "back"),
             ],
             None,
@@ -256,7 +326,7 @@ class StrategiesPage(CellEditing, CollectionPage):
             self.router_app.confirm(
                 f"Rename {name} to “{safe_text(new_name)}”?",
                 lambda: self.run_and_reload(
-                    "Renaming strategy",
+                    "Renaming routing profile",
                     lambda: self.service.save_profile(draft),
                     f"Renamed {name} to {safe_text(new_name)}.",
                 ),
@@ -270,7 +340,7 @@ class StrategiesPage(CellEditing, CollectionPage):
                         current,
                         self.cell_anchor(coordinate),
                         parse_strategy_name,
-                        placeholder="Strategy name",
+                        placeholder="Profile name",
                         submit="Rename",
                     ),
                     lambda result: result and chosen(result[0]),
@@ -284,14 +354,14 @@ class StrategiesPage(CellEditing, CollectionPage):
         moved = len(profile.get("assigned_api_key_ids") or [])
         # Router moves a deleted strategy's keys to the default one.
         note = (
-            f" Its {key_count(moved)} will move to your default strategy."
+            f" Its {key_count(moved)} will move to your default routing profile."
             if moved
             else ""
         )
         self.router_app.confirm(
             f"Delete {name}?{note}",
             lambda: self.run_and_reload(
-                "Deleting strategy",
+                "Deleting routing profile",
                 lambda: self.service.delete_profile(str(profile["id"])),
                 f"Deleted {name}.",
             ),
@@ -312,7 +382,7 @@ class StrategiesPage(CellEditing, CollectionPage):
             self.open_target()
 
         self.run(
-            "Loading strategies",
+            "Loading routing profiles",
             lambda: (
                 self.service.profiles(),
                 self.service.auto_routing_default(),
@@ -354,14 +424,14 @@ class StrategiesPage(CellEditing, CollectionPage):
             ]
             profile = named[0] if len(named) == 1 else None
         if profile is None:
-            self.message(f"No strategy named '{safe_text(target)}'.", error=True)
+            self.message(f"No routing profile named '{safe_text(target)}'.", error=True)
             return
         self.select_row(str(profile["id"]))
         self.query_one("#table", DataTable).focus()
         if intent != "delete":
             return
         if profile.get("is_default"):
-            self.message("Your default strategy can't be deleted.", error=True)
+            self.message("Your default routing profile can't be deleted.", error=True)
         else:
             self.call_after_refresh(lambda: self.delete_strategy(profile))
 
@@ -369,13 +439,38 @@ class StrategiesPage(CellEditing, CollectionPage):
         name = safe_text(item.get("name"))
         auto = item.get("auto_routing_enabled")
         return (
-            f"{name} (default)" if item.get("is_default") else name,
+            f"{name} (default)"
+            if item.get("is_default")
+            else name
+            if item.get("slug")
+            else f"{name} · Legacy",
             "On" if item.get("cost_efficient_routing_enabled") else "Off",
-            "On" if item.get("switchyard_routing_enabled") else "Off",
+            "Model pair"
+            if has_switchyard_pair(item)
+            else "On"
+            if item.get("switchyard_routing_enabled")
+            else "Off",
             inherited_label(self.auto_default)
             if auto is None
             else setting_value("auto_routing_enabled", auto),
-            str(len(item.get("assigned_api_key_ids") or [])),
+            str(len(item.get("assigned_api_key_ids") or []))
+            + (
+                " · historical"
+                if item.get("preset_type") in CODING_PRESETS
+                and item.get("assigned_api_key_ids")
+                else ""
+            ),
+            dict((value, label) for label, value in PROVIDERS).get(
+                item.get(PROVIDER) or "", "Unknown"
+            ),
+            next(
+                (
+                    p.label + (" · account-wide" if p.key in CODING_PRESETS else "")
+                    for p in PRESETS
+                    if p.key == item.get("preset_type")
+                ),
+                "Custom" if item.get("slug") else "Legacy",
+            ),
         )
 
     @on(Button.Pressed, "#create")
@@ -383,40 +478,20 @@ class StrategiesPage(CellEditing, CollectionPage):
         if not self.is_mounted or self.app.screen is not self:
             return
 
-        def chosen(result: tuple | None):
-            if not result:
+        def chosen(key: str | None):
+            if not key:
                 return
-            draft = ProfileDraft.new()
-            draft.name = result[0]
-            self.select_name = draft.name
-            self.run_and_reload(
-                "Creating strategy",
-                lambda: self.create_profile(draft),
-                f"Created {safe_text(draft.name)}. Change its settings in its row.",
-            )
+            preset = next(p for p in PRESETS if p.key == key)
+            self.router_app.push(ProfilePage(self.entries, preset=preset))
 
         self.app.push_screen(
-            CellInput(
-                "",
-                self.query_one("#create", Button).region,
-                parse_strategy_name,
-                placeholder="Strategy name",
-                submit="Create",
+            ChoiceDialog(
+                "New routing profile",
+                "Choose a workload preset. Account-wide coding settings are in Harnesses.",
+                [(p.label, p.key) for p in PRESETS if p.key not in CODING_PRESETS],
             ),
             chosen,
         )
-
-    def create_profile(self, draft: ProfileDraft):
-        try:
-            return self.service.save_profile(draft)
-        except (ApiError, httpx.TransportError) as error:
-            if isinstance(error, ApiError) and error.status_code < 500:
-                raise
-            # It may have been created anyway; a blind retry could make two.
-            raise RampCLIError(
-                "Strategy creation could not be confirmed. Check your strategies "
-                "before creating another; this request may already have saved."
-            ) from error
 
     @on(Button.Pressed, "#legacy")
     def legacy(self):

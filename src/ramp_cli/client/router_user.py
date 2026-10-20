@@ -773,6 +773,9 @@ class RouterUserClient:
     def patch(self, path: str, *, json: dict, timeout: float = 30) -> dict:
         return self._request("PATCH", path, json=json, timeout=timeout)
 
+    def put(self, path: str, *, json: dict, timeout: float = 30) -> dict:
+        return self._request("PUT", path, json=json, timeout=timeout)
+
     def delete(
         self, path: str, *, params: dict | None = None, timeout: float = 30
     ) -> dict:

@@ -96,6 +96,26 @@ test('concurrent installers serialize and reuse the completed download', async t
   assert.equal(downloads, 2); // One checksum plus one archive, despite two installers.
 });
 
+test('waits for a concurrent installer to finish initializing ownership', async t => {
+  const p = sandbox(t);
+  const f = await fixture(p.home);
+  fs.mkdirSync(p.root);
+  const unlock = await require('proper-lockfile').lock(p.root, { lockfilePath: path.join(p.root, '.install-lock') });
+  const owner = path.join(p.root, '.ramp-cli-npm');
+  // Another npm lifecycle hook has opened the marker but not written it yet.
+  const fd = fs.openSync(owner, 'wx');
+  const pending = install({ ...p, download: f.download });
+  const finishOwner = new Promise(resolve => setImmediate(() => {
+    fs.writeFileSync(fd, '@ramp/cli\n');
+    fs.closeSync(fd);
+    resolve(unlock());
+  }));
+  const [result, finished] = await Promise.allSettled([pending, finishOwner]);
+  assert.equal(finished.status, 'fulfilled', finished.reason?.message);
+  assert.equal(result.status, 'fulfilled', result.reason?.message);
+  assert.equal(result.value, p.executable);
+});
+
 test('stale locks left by killed installers are reclaimed', async t => {
   const p = sandbox(t);
   await install({ ...p, download: (await fixture(p.home)).download });
@@ -125,6 +145,9 @@ test('preserves unrelated installation directories and validates version overrid
   fs.writeFileSync(path.join(p.root, 'important'), 'keep');
   await assert.rejects(install(p), /unmanaged installation/);
   assert.equal(fs.readFileSync(path.join(p.root, 'important'), 'utf8'), 'keep');
+  fs.writeFileSync(path.join(p.root, '.ramp-cli-npm'), 'another owner\n');
+  await assert.rejects(install(p), /Unrecognized installation owner/);
+  assert.equal(fs.existsSync(path.join(p.root, '.install-lock')), false);
   await assert.rejects(install({ ...p, env: { ...p.env, RAMP_CLI_VERSION: '../latest' } }), /release tag/);
 });
 

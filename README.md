@@ -11,7 +11,7 @@ curl -fsSL https://agents.ramp.com/install.sh | sh
 This detects your platform, downloads a pre-built binary, and sets up the `ramp` command.
 
 After installation, open the Router workspace to connect coding agents and
-desktop apps, manage API keys, edit routing strategies, and choose subagent
+desktop apps, manage API keys, edit routing profiles, and choose subagent
 models:
 
 ```bash
@@ -113,10 +113,44 @@ need to be restarted before its picker reflects the change.
 
 Run `ramp router login`, then `ramp router keys` to select a key and inspect
 its usage. The selected-key menu lets you rename it, choose an existing routing
-strategy, or lock/unlock it. Locking stops requests without deleting the key;
+profile, or lock/unlock it. Locking stops requests without deleting the key;
 unlocking remains subject to account and administrator restrictions.
-Changing strategy moves only that key, without editing the shared strategy.
-Strategy selection requires routing profiles to be available for your account.
+Changing profiles moves only that key, without editing the shared profile.
+Profile selection requires routing profiles to be available for your account.
+
+In `ramp router ui`, the **Routing Profiles** tab starts new profiles from the
+dashboard's workload presets: General Purpose Agents, Low latency, Automations,
+and Research & analysis. Profiles have
+an immutable routing slug. Select a profile's name → **Edit strategies** to edit
+the controls supported by its preset, and attach keys using the **API keys** cell. Removing
+a key returns it to the account's default profile. You can also assign a profile
+from the **Routing Profile** cell in **API Keys**, or choose one
+when creating a key. Harnesses sharing a key use the same profile; admin-issued
+keys keep the profile selected by their administrator.
+The **Harnesses** tab holds **Global Coding Settings**: cost-efficient routing
+and cross-provider preference, shared across recognized coding-agent traffic for
+the signed-in Router account. **Experimental models → Configure** adds
+`switchyard` and `auto-jev-routing` to the model picker alongside your usual models.
+Switchyard requires both an efficient and a frontier model; sensitivity is under
+**Advanced**. Auto requires 2–6 distinct models, each with a task description;
+the first is the default. Untouched inherited settings are preserved when saving.
+Ordinary and Experimental coding settings are separate, one-per-account profiles.
+Neither accepts API-key assignments. Historical assignments remain visible in
+Routing Profiles and can be moved out from API Keys. Model selection stays per
+harness; saving Experimental settings does not switch an existing session's model.
+Research & analysis lets you choose benchmarks and weights totaling 100%, or
+turn Benchmark routing off. Saving creates or updates the benchmark alias named
+after the profile slug; select that slug in your harness model picker to use it.
+Benchmark edits are saved before the profile, so a partial-save message means
+those edits may already affect requests. Retry to finish; leaving does not undo
+them. Unrelated edits preserve older alias bindings and their stored weight ratios.
+
+Existing profiles retain their previously enabled strategies for editing, even
+when their preset no longer offers those strategies for new profiles. Stored
+Switchyard pairs show **Model pair**; turning Switchyard off clears the pair.
+Unrelated edits preserve inherited and advanced settings. Slugless profiles are
+**Legacy**: create a preset profile and move their keys there to change strategies.
+The Account default profile cannot be renamed or deleted.
 
 For scripts and AI agents:
 
@@ -130,7 +164,7 @@ ramp router keys unlock KEY_ID
 All four commands support `--dry-run` and the standard `--agent` JSON output.
 These changes do not rotate the key's secret or rewrite agent configurations.
 
-For routing strategies, `ramp router strategies` opens the account editor in
+For routing profiles, `ramp router strategies` opens the account editor in
 human-readable mode. Machine-readable listings preserve the configured API key's
 strategy-settings response, even after `ramp router login`. Select account profiles
 explicitly with `ramp --agent router strategies list --account` (or

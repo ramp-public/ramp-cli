@@ -17,7 +17,7 @@ from ramp_cli.router_ui.app import (
     Confirm,
     RouterApp,
 )
-from ramp_cli.router_ui.tabs.harnesses import priced
+from ramp_cli.router_ui.tabs.harnesses import ConnectPage, priced
 from tests.test_router_ui import FakeService, settle
 
 
@@ -41,12 +41,16 @@ async def choose(app, pilot, label):
     await pilot.pause()
 
 
-def test_cell_dropdown_cancel_and_current_value_send_nothing():
+@pytest.mark.parametrize("size", [(120, 32), (80, 24)])
+def test_cell_dropdown_cancel_and_current_value_send_nothing(size):
     async def run():
         service = FakeService()
         app = RouterApp(service, page="harnesses")
-        async with app.run_test(size=(120, 32)) as pilot:
+        async with app.run_test(size=size) as pilot:
             table = await open_cells(app, pilot)
+            await pilot.pause()
+            body = app.screen.query_one("#body")
+            assert table.region.intersection(body.content_region).height >= 3
             await pilot.press("enter")
             await settle(app, pilot)
             assert isinstance(app.screen, CellMenu)
@@ -81,7 +85,7 @@ def test_router_cell_disconnects_after_review():
     asyncio.run(run())
 
 
-def test_strategy_cell_assigns_a_named_strategy_and_warns_about_shared_keys():
+def test_key_cell_reconnects_the_selected_harness():
     async def run():
         service = FakeService()
         app = RouterApp(service, page="harnesses")
@@ -89,15 +93,9 @@ def test_strategy_cell_assigns_a_named_strategy_and_warns_about_shared_keys():
             await open_cells(app, pilot, column=3)
             await pilot.press("enter")
             await settle(app, pilot)
-            menu = app.screen.query_one(OptionList)
-            assert str(menu.get_option_at_index(0).prompt) == "Default · default"
-            await choose(app, pilot, "Fast")
-            assert isinstance(app.screen, Confirm)
-            assert "“Fast”" in app.screen.message
-            assert "Claude Code use the same API key" in app.screen.message
-            app.screen.query_one("#accept").press()
-            await settle(app, pilot)
-            assert service.calls == [("profile", "codex", "Fast", "connection")]
+            assert isinstance(app.screen, ConnectPage)
+            assert app.screen.clients == ("codex",)
+            assert not service.calls
 
     asyncio.run(run())
 

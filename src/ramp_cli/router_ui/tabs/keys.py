@@ -437,7 +437,7 @@ class KeysPage(CellEditing, CollectionPage):
         def loaded(profiles):
             self.message(f"{self.query_one('#table', DataTable).row_count} shown")
             if not profiles:
-                self.message("This account has no routing strategies yet.")
+                self.message("This account has no routing profiles yet.")
                 return
             current = next(
                 (
@@ -451,9 +451,9 @@ class KeysPage(CellEditing, CollectionPage):
 
             def chosen(profile_id: str):
                 self.router_app.confirm(
-                    f"Move {name} to the “{names[profile_id]}” routing strategy?",
+                    f"Move {name} to the “{names[profile_id]}” routing profile?",
                     lambda: self.run_and_reload(
-                        "Saving routing strategy",
+                        "Saving routing profile",
                         lambda: self.service.mutate_key(
                             str(item["id"]), "set-strategy", profile_id
                         ),
@@ -477,7 +477,7 @@ class KeysPage(CellEditing, CollectionPage):
             )
 
         self.run(
-            "Loading routing strategies", self.service.key_profiles, loaded, read=True
+            "Loading routing profiles", self.service.key_profiles, loaded, read=True
         )
 
     def edit_spend_cap(self, item: dict, coordinate: Coordinate):
@@ -620,7 +620,7 @@ class KeysPage(CellEditing, CollectionPage):
             self.message(message, error=True)
 
         self.router_app.confirm(
-            f"Claim {name}? Your admin chose its name, spend cap and routing strategy, "
+            f"Claim {name}? Your admin chose its name, spend cap and routing profile, "
             "and only they can change them. The secret is shown once.",
             lambda: self.run("Claiming API key", attempt, done),
             "Claim",
@@ -759,7 +759,7 @@ class KeyPage(RouterPage):
 
     def actions(self) -> ComposeResult:
         yield Button("Rename", id="rename")
-        yield Button("Change strategy", id="assignment")
+        yield Button("Change profile", id="assignment")
         yield Button("Lock", id="lock")
 
     def on_mount(self):
@@ -783,7 +783,7 @@ class KeyPage(RouterPage):
         self.query_one("#key-summary", Static).update(
             f"{safe_text(self.key.get('name') or '(unnamed)')}\n{safe_text(self.key_id)}\n"
             f"Status: {'Enabled' if self.key.get('enabled') else 'Locked'}\n"
-            f"Strategy: {safe_text(profile.get('name') or 'Account defaults')}"
+            f"Routing profile: {safe_text(profile.get('name') or 'Account defaults')}"
         )
         lock = "lock" if self.key.get("enabled") else "unlock"
         self.query_one("#lock", Button).label = lock.title()
@@ -888,14 +888,14 @@ class CreateKeyPage(FormPage):
     def content(self) -> ComposeResult:
         yield Label("Key name")
         yield Input(self.key_name, id="name", max_length=128)
-        yield Label("Routing strategy")
+        yield Label("Routing profile")
         yield Select([], id="profile", prompt="Account defaults")
 
     def actions(self) -> ComposeResult:
         yield Button("Create key", id="save", variant="primary")
 
     def load(self):
-        self.run("Loading strategies", self.service.key_profiles, self.loaded)
+        self.run("Loading routing profiles", self.service.key_profiles, self.loaded)
 
     def loaded(self, profiles):
         selector = self.query_one("#profile", Select)
@@ -913,7 +913,7 @@ class CreateKeyPage(FormPage):
             except click.BadParameter as error:
                 default = None
                 self.profile_unresolved = True
-                notice = f"{error.format_message()} Choose a strategy."
+                notice = f"{error.format_message()} Choose a routing profile."
         if default:
             selector.value = str(default["id"])
         self.remember()
@@ -925,7 +925,7 @@ class CreateKeyPage(FormPage):
         name = self.query_one("#name", Input).value
         if self.profile_unresolved and profile is Select.NULL:
             self.message(
-                f"No routing strategy matches '{self.routing_profile}'. Choose one.",
+                f"No routing profile matches '{self.routing_profile}'. Choose one.",
                 error=True,
             )
             return
@@ -1038,8 +1038,8 @@ class KeyEditPage(FormPage):
             yield Label("New name")
             yield Input(str(self.key.get("name") or ""), id="name")
         else:
-            yield Label("Routing strategy")
-            yield Select([], id="profile", prompt="Select a strategy")
+            yield Label("Routing profile")
+            yield Select([], id="profile", prompt="Select a profile")
 
     def actions(self) -> ComposeResult:
         yield Button("Save", id="save", variant="primary")
@@ -1048,7 +1048,7 @@ class KeyEditPage(FormPage):
         if self.action == "rename":
             self.remember()
         else:
-            self.run("Loading strategies", self.service.key_profiles, self.loaded)
+            self.run("Loading routing profiles", self.service.key_profiles, self.loaded)
 
     def loaded(self, profiles):
         self.query_one("#profile", Select).set_options(
@@ -1063,7 +1063,7 @@ class KeyEditPage(FormPage):
         else:
             value = self.query_one("#profile", Select).value
             if value is Select.NULL:
-                self.message("Select a strategy.", error=True)
+                self.message("Select a routing profile.", error=True)
                 return
         self.run(
             "Saving API key",

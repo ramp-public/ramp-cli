@@ -48,6 +48,7 @@ from ramp_cli.commands.router_user_strategies import (
 from ramp_cli.errors import EXIT_AUTH_REQUIRED, ApiError, RampCLIError
 from ramp_cli.router_ui import harness
 from ramp_cli.router_ui.cache import CACHE_TTL, ReadCache, cached, mutation
+from ramp_cli.router_ui.profiles import CODING_PRESETS, coding_draft, coding_profile
 
 USAGE_WINDOWS = ((1, "Today"), (3, "3 days"), (7, "7 days"), (30, "1 month"))
 USAGE_DAYS = tuple(days for days, _label in USAGE_WINDOWS)
@@ -712,7 +713,11 @@ class RouterService:
 
     @cached
     def key_profiles(self) -> list[dict]:
-        return _routing_profiles(self.client) or []
+        return [
+            p
+            for p in (_routing_profiles(self.client) or [])
+            if p.get("preset_type") not in CODING_PRESETS
+        ]
 
     @mutation
     def create_key(self, name: str, profile_id: str | None, request_id: str) -> dict:
@@ -724,7 +729,9 @@ class RouterService:
         if profile_id:
             profile = next((p for p in profiles if str(p["id"]) == profile_id), None)
             if profile is None:
-                raise click.BadParameter("The selected strategy no longer exists.")
+                raise click.BadParameter(
+                    "The selected routing profile no longer exists."
+                )
         elif profiles:
             profile = next((p for p in profiles if p.get("is_default")), None)
         return create_named_key(self.client, name, profile, request_id)
@@ -783,6 +790,77 @@ class RouterService:
     def profiles(self) -> list[dict]:
         return _profiles(self.client)
 
+    @mutation
+    def save_coding_profile(
+        self, preset_type: str, changes: dict, profile_id: str | None
+    ) -> dict:
+        if preset_type not in CODING_PRESETS:
+            raise ValueError("Expected an account coding profile.")
+        # A lost create response or another session can have created the singleton.
+        # Recheck before writing; never turn a retry into a second profile.
+        profiles = _profiles(self.client)
+        profile = coding_profile(profiles, preset_type)
+        if (str(profile["id"]) if profile else None) != profile_id:
+            raise RampCLIError(
+                "Coding settings changed. Reopen the editor to reload them."
+            )
+        if profile is not None:
+            if not profile.get("slug"):
+                raise RampCLIError(
+                    "This legacy coding profile is read-only. Manage it in Routing Profiles."
+                )
+            if not changes:
+                return profile
+            return self.client.patch(
+                f"/client/routing-profiles/{profile_id}", json=changes
+            )
+        draft = coding_draft(profiles, preset_type)
+        draft.settings.update(changes)
+        return self.client.post("/client/routing-profiles", json=draft.create_body())
+
+    def profile_options(self, controls: tuple[str, ...]) -> dict:
+        endpoints = {}
+        if {"switchyard_routing_enabled", "auto_routing_enabled"} & set(controls):
+            endpoints["inventory"] = "/admin/models"
+        if "auto_routing_enabled" in controls:
+            endpoints["auto"] = "/admin/me/auto-routing-config"
+        if "benchmark_alias" in controls:
+            endpoints["aliases"] = "/admin/model-aliases"
+            endpoints["benchmarks"] = "/admin/benchmarks"
+        result: dict = {"errors": []}
+        for name, path in endpoints.items():
+            try:
+                # Cache each successful read, not the aggregate's transient errors.
+                result[name] = self.cache.get(
+                    ("profile-option", path),
+                    lambda: public_data(self.client.get(path)),
+                )
+            except (ApiError, RampCLIError, httpx.HTTPError):
+                result["errors"].append(name)
+        return result
+
+    @mutation
+    def save_profile_benchmarks(self, slug: str, benchmarks: list[dict]) -> bool:
+        # Read fresh on each attempt: an earlier request may have saved the alias
+        # even when its response or the subsequent profile write failed.
+        aliases = self.client.get("/admin/model-aliases").get("data") or []
+        alias = next((a for a in aliases if a["name"] == slug), None)
+        if alias is not None:
+            if not alias.get("benchmarks"):
+                raise RampCLIError(
+                    "This slug is already used by a non-benchmark alias. Resolve the alias conflict or choose another profile slug."
+                )
+            if alias["benchmarks"] == benchmarks:
+                return False
+            self.client.put(
+                f"/admin/model-aliases/{alias['id']}", json={"benchmarks": benchmarks}
+            )
+        else:
+            self.client.post(
+                "/admin/model-aliases", json={"name": slug, "benchmarks": benchmarks}
+            )
+        return True
+
     @cached
     def experiment_settings(self) -> dict:
         return self.client.get("/admin/me/experiment-settings")
@@ -798,7 +876,7 @@ class RouterService:
     @mutation
     def save_profile(self, draft: ProfileDraft) -> dict:
         if draft.is_default and draft.name != draft.original_name:
-            raise click.UsageError("The default strategy cannot be renamed.")
+            raise click.UsageError("The default routing profile cannot be renamed.")
         valid = _validate_name(draft.name)
         if valid is not True and not draft.is_default:
             raise click.BadParameter(str(valid), param_hint="name")
@@ -825,7 +903,7 @@ class RouterService:
         profiles = self.profiles()
         target = next((p for p in profiles if str(p["id"]) == profile_id), None)
         if target is None or target.get("is_default"):
-            raise click.BadParameter("The default strategy cannot be deleted.")
+            raise click.BadParameter("The default routing profile cannot be deleted.")
         # Router won't move an admin-issued key to the default strategy, which
         # deleting this one would do.
         assigned = set(map(str, target.get("assigned_api_key_ids") or []))
@@ -837,7 +915,7 @@ class RouterService:
         if managed:
             raise click.BadParameter(
                 f"{key_restriction(managed[0], 'set-strategy')} "
-                "Ask your admin to move it before deleting this strategy."
+                "Ask your admin to move it before deleting this routing profile."
             )
         delete_profile(
             self.client,

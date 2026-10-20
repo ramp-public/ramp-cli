@@ -277,6 +277,35 @@ def test_auto_routing_default_is_cached_but_failures_are_not(clock):
     assert calls == ["/admin/me/experiment-settings"] * 2
 
 
+def test_profile_options_retry_failed_dependencies_without_expiring_successes(clock):
+    calls = []
+    inventory = {"data": [{"id": "model"}]}
+    configuration = {"candidates": [{"model": "model", "description": "Coding"}]}
+
+    def get(path, **kwargs):
+        calls.append(path)
+        if path == "/admin/models":
+            return inventory
+        if calls.count(path) == 1:
+            raise httpx.ReadTimeout("offline")
+        return configuration
+
+    service = service_with(get)
+    controls = ("switchyard_routing_enabled", "auto_routing_enabled")
+    assert service.profile_options(controls) == {
+        "errors": ["auto"],
+        "inventory": inventory,
+    }
+    recovered = {"errors": [], "inventory": inventory, "auto": configuration}
+    assert service.profile_options(controls) == recovered
+    assert service.profile_options(controls) == recovered
+    assert calls == [
+        "/admin/models",
+        "/admin/me/auto-routing-config",
+        "/admin/me/auto-routing-config",
+    ]
+
+
 def test_home_warms_the_other_tabs_only_after_its_own_data():
     test_ui = runpy.run_path(TEST_UI)
     service = test_ui["FakeService"]()

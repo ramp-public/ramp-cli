@@ -59,6 +59,7 @@ if TYPE_CHECKING:
 
 class RouterPage(ArrowNavigation, Screen):
     page_title = "Router"
+    unsaved = False
     BINDINGS = [
         Binding("escape", "back", "Back"),
         Binding("r", "reload", "Reload"),
@@ -208,6 +209,7 @@ class RouterPage(ArrowNavigation, Screen):
             KeysPage,
             SecretPage,
         )
+        from ramp_cli.router_ui.tabs.profile import ProfilePage  # noqa: PLC0415
         from ramp_cli.router_ui.tabs.strategies import StrategiesPage  # noqa: PLC0415
 
         if isinstance(self, (HarnessModelPage, HarnessRoutingPage)):
@@ -216,7 +218,7 @@ class RouterPage(ArrowNavigation, Screen):
             self, (KeysPage, KeyPage, CreateKeyPage, SecretPage, KeyEditPage)
         ):
             return "keys"
-        if isinstance(self, (StrategiesPage, LegacyPage)):
+        if isinstance(self, (StrategiesPage, ProfilePage, LegacyPage)):
             return "strategies"
         if isinstance(self, AccountPage):
             return "home"
@@ -228,7 +230,6 @@ class RouterPage(ArrowNavigation, Screen):
         return list(PAGES)
 
     def compose(self) -> ComposeResult:
-        from ramp_cli.router_ui.tabs.harnesses import HarnessesPage  # noqa: PLC0415
         from ramp_cli.router_ui.tabs.home import HomePage  # noqa: PLC0415
 
         with Horizontal(id="topbar"):
@@ -246,9 +247,7 @@ class RouterPage(ArrowNavigation, Screen):
                 yield Static("", id="status", markup=False)
                 yield KeyHints(self.key_hints(), id="keys", markup=False)
             body_container = (
-                Vertical
-                if isinstance(self, (CollectionPage, HarnessesPage))
-                else VerticalScroll
+                Vertical if isinstance(self, CollectionPage) else VerticalScroll
             )
             with body_container(
                 id="body", classes="table-body" if body_container is Vertical else ""
@@ -595,6 +594,10 @@ class FormPage(RouterPage):
         ) + tuple(
             (widget.id, tuple(widget.selected)) for widget in self.query(SelectionList)
         )
+
+    @property
+    def unsaved(self):
+        return self.baseline is not None and self.values() != self.baseline
 
     def remember(self):
         self.baseline = self.values()

@@ -61,6 +61,8 @@ class FakeService:
             {
                 "id": "cheap",
                 "name": "Cheap",
+                "slug": "cheap",
+                "preset_type": "production-agents",
                 "is_default": False,
                 "assigned_api_key_ids": [],
                 "cost_efficient_routing_enabled": True,
@@ -125,6 +127,9 @@ class FakeService:
 
     def auto_routing_default(self):
         return False
+
+    def profile_options(self, controls):
+        return {"errors": []}
 
     def key_details(self, key_id, days=7):
         return {

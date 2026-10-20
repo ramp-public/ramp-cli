@@ -149,16 +149,6 @@ async function install(options = {}) {
   const force = env.RAMP_CLI_FORCE_UPDATE === '1';
   if (requested !== 'latest' && !/^v\d+\.\d+\.\d+(?:-[\w.]+)?$/.test(requested)) throw new Error('RAMP_CLI_VERSION must be a release tag such as v0.2.55.');
   fs.mkdirSync(p.root, { recursive: true });
-  const owner = path.join(p.root, '.ramp-cli-npm');
-  if (!fs.existsSync(owner)) {
-    // Windows shortcuts live in <root>\bin by default; npx may create them
-    // before any managed install exists, so they never make the root unmanaged.
-    const shortcuts = path.dirname(p.bin) === p.root ? path.basename(p.bin) : null;
-    if (fs.readdirSync(p.root).some(name => name !== '.ramp-cli-npm' && name !== shortcuts)) throw new Error(`Refusing to overwrite an unmanaged installation at ${p.root}. Choose another RAMP_CLI_INSTALL_DIR.`);
-    try { fs.writeFileSync(owner, '@ramp/cli\n', { flag: 'wx' }); }
-    catch (error) { if (error.code !== 'EEXIST') throw error; }
-  }
-  if (fs.readFileSync(owner, 'utf8') !== '@ramp/cli\n') throw new Error(`Unrecognized installation owner at ${p.root}.`);
   const unlock = await lockfile.lock(p.root, {
     lockfilePath: path.join(p.root, '.install-lock'),
     stale: 10_000, update: 2_000,
@@ -166,6 +156,16 @@ async function install(options = {}) {
   }).catch(error => { throw new Error(`Could not acquire the Ramp installation lock at ${p.root}: ${error.message}`); });
   let stage;
   try {
+    // npm can start both package hooks together. Read/create ownership under
+    // the same lock so another hook never sees a newly opened, empty marker.
+    const owner = path.join(p.root, '.ramp-cli-npm');
+    if (!fs.existsSync(owner)) {
+      // Windows shortcuts may exist before the first managed installation.
+      const shortcuts = path.dirname(p.bin) === p.root ? path.basename(p.bin) : null;
+      if (fs.readdirSync(p.root).some(name => name !== '.install-lock' && name !== shortcuts)) throw new Error(`Refusing to overwrite an unmanaged installation at ${p.root}. Choose another RAMP_CLI_INSTALL_DIR.`);
+      fs.writeFileSync(owner, '@ramp/cli\n', { flag: 'wx' });
+    }
+    if (fs.readFileSync(owner, 'utf8') !== '@ramp/cli\n') throw new Error(`Unrecognized installation owner at ${p.root}.`);
     const backup = path.join(p.root, `previous-${p.key}`);
     if (fs.existsSync(backup)) {
       if (!fs.existsSync(p.dist)) fs.renameSync(backup, p.dist);

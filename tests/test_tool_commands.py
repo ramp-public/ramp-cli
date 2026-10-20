@@ -1739,14 +1739,14 @@ class TestBodyBuilding:
             [
                 "get-funds",
                 "--dry_run",
-                "--include_balance",
+                "--include_members",
                 "--rationale",
                 "Testing dry-run body",
             ],
         )
         assert result.exit_code == 0
         body = json.loads(result.output)["data"][0]["body"]
-        assert body["include_balance"] is True
+        assert body["include_members"] is True
 
     def test_bool_flag_included_when_explicitly_false(self):
         runner = CliRunner()
@@ -1755,14 +1755,14 @@ class TestBodyBuilding:
             [
                 "get-funds",
                 "--dry_run",
-                "--no-include_balance",
+                "--no-include_members",
                 "--rationale",
                 "Testing dry-run body",
             ],
         )
         assert result.exit_code == 0
         body = json.loads(result.output)["data"][0]["body"]
-        assert body["include_balance"] is False
+        assert body["include_members"] is False
 
     def test_bool_flag_excluded_when_not_set(self):
         runner = CliRunner()
@@ -1772,7 +1772,7 @@ class TestBodyBuilding:
         )
         assert result.exit_code == 0
         body = json.loads(result.output)["data"][0]["body"]
-        assert "include_balance" not in body
+        assert "include_members" not in body
 
     def test_required_param_missing_errors(self):
         runner = CliRunner()
