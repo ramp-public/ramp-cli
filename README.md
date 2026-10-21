@@ -109,6 +109,47 @@ Use the same `--base-url` as your existing connection if it is on another Router
 deployment. The updated catalog applies when Codex reloads it; a running app may
 need to be restarted before its picker reflects the change.
 
+## Router connectors MCP
+
+Authorize Router account access and connector tools in one browser sign-in:
+
+```bash
+ramp router login --connectors
+ramp router connectors status --output json
+ramp router connectors enable --harness claude-code
+```
+
+The supported harness IDs are `claude-code`, `codex`, and `opencode`. Enable each
+selected harness explicitly; this does not configure Claude Desktop or change
+existing Slack, Google, or other provider connections. To remove only the CLI's
+connector registration, run `ramp router connectors disable --harness claude-code`.
+Unrelated harness settings and MCP servers are preserved; foreign or customized
+`ramp-connectors` entries are not overwritten.
+
+Existing Router logins need the explicit `login --connectors` consent upgrade.
+This uses **Router account authentication**, not `ramp auth login` (Developer API
+authentication). Supported deployments are the public, internal, QA, and internal
+QA Router origins. Capability discovery is available through
+`ramp router connectors capabilities --output json` (`router-connectors-mcp-v1`).
+
+Harness configuration contains only the CLI executable and an opaque binding ID,
+never tokens. Each registration pins the Router deployment, MCP resource, profile,
+user, business, Core identity, and authorizing device session. Signing in again,
+even as the same user, requires explicit re-enable; status reports the old
+registration as `conflict`. Status is local/cached and does not guarantee live
+server authorization. The bridge never opens a browser to recover authentication.
+
+Credentials remain in the private Router CLI store. Processes share its locked,
+durable refresh protocol and a private short-lived MCP token cache. Logging out or
+revoking the authorizing session prevents further issuance; an already-issued MCP
+token can remain valid for at most 300 seconds after issuance plus the existing
+10-second server clock tolerance (310 seconds total), not immediate revocation.
+Other sessions and provider connections are unaffected.
+
+The local stdio bridge forwards newline-delimited JSON-RPC over HTTPS POST without
+following redirects. It accepts JSON or SSE replies; the current Router gateway
+is stateless and does not provide standalone GET/server-push sessions.
+
 ## Manage Router API keys
 
 Run `ramp router login`, then `ramp router keys` to select a key and inspect

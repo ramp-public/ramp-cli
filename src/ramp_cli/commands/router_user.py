@@ -1018,6 +1018,9 @@ def register_router_user_commands(
     copy_to_clipboard: Callable[[str], bool] = lambda _text: False,
 ) -> None:
     from ramp_cli.commands.router import _AgentChoice  # noqa: PLC0415
+    from ramp_cli.commands.router_connectors import register  # noqa: PLC0415
+
+    register(group)
 
     harness_option = click.option(
         "--harness",
@@ -1037,14 +1040,19 @@ def register_router_user_commands(
         "--ui-url", help="Router UI origin; HTTP is allowed only for localhost."
     )
     @click.option("--no-browser", is_flag=True)
+    @click.option(
+        "--connectors",
+        is_flag=True,
+        help="Explicitly authorize connector tools in the same Router browser sign-in.",
+    )
     @click.option("--timeout", type=click.IntRange(1, 900), default=900, hidden=True)
     @click.pass_context
-    def login(ctx, ui_url, no_browser, timeout):
+    def login(ctx, ui_url, no_browser, connectors, timeout):
         if ctx.obj.get("no_input"):
             raise click.UsageError(
                 "User login requires browser interaction; remove --no-input."
             )
-        if router_ui.launch(
+        if not connectors and router_ui.launch(
             ctx,
             "account",
             origin=ui_url,
@@ -1055,7 +1063,11 @@ def register_router_user_commands(
             return
         _output_session(
             ctx,
-            _client(ctx, ui_url).login(no_browser=no_browser, timeout=timeout),
+            _client(ctx, ui_url).login(
+                no_browser=no_browser,
+                timeout=timeout,
+                **({"connectors": True} if connectors else {}),
+            ),
             title="Signed in to Router",
         )
 

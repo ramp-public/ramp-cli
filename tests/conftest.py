@@ -40,7 +40,9 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("ramp_cli.commands.router._session_origin", None)
     # Cloudflare Access tokens come from the developer's own cloudflared and
     # ~/.cloudflared, and detected edges are remembered per process.
-    monkeypatch.setattr("ramp_cli.client.router_user._edge_token", lambda _o: None)
+    monkeypatch.setattr(
+        "ramp_cli.client.router_user._edge_token", lambda _o, **_kw: None
+    )
     monkeypatch.setattr("ramp_cli.client.router_user._edge_origins", set())
     monkeypatch.setattr("ramp_cli.client.router_user._edge_rejected", {})
     # Codex desktop app detection looks for the ChatGPT app's bundled Codex

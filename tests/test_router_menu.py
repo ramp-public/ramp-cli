@@ -25,6 +25,7 @@ def test_main_router_menu_has_short_choices_and_workspace():
     assert visible == {
         "account",
         "configure",
+        "connectors",
         "keys",
         "refresh",
         "strategies",

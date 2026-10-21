@@ -46,7 +46,21 @@ async function json(url, headers = {}) {
   return response.json();
 }
 
-async function publishArtifacts(artifacts, { metadata, publish, tag = 'next' }) {
+// npm can take minutes to make an accepted publish installable. Router pins
+// the exact CLI version, so it must not be published before the CLI resolves.
+async function waitUntilInstallable(artifact, lookup, { attempts = 30, interval = 30_000, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) } = {}) {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      if ((await lookup(artifact.name))?.versions?.[artifact.version]) return;
+    } catch (error) {
+      if (attempt === attempts) throw error;
+    }
+    if (attempt < attempts) await sleep(interval);
+  }
+  throw new Error(`${artifact.name}@${artifact.version} is not installable yet; not publishing packages that depend on it.`);
+}
+
+async function publishArtifacts(artifacts, { metadata, publish, available, tag = 'next' }) {
   // Preflight both packages before writing either. The pack order is CLI first,
   // Router second, so its exact dependency exists before Router is published.
   const current = await Promise.all(artifacts.map(artifact => metadata(artifact.name)));
@@ -60,6 +74,7 @@ async function publishArtifacts(artifacts, { metadata, publish, tag = 'next' }) 
       console.log(`${artifact.name}@${artifact.version} already published with identical contents.`);
       continue;
     }
+    if (index > 0 && available) await available(artifacts[index - 1]);
     try { await publish(artifact, tag); }
     catch (error) {
       // A lost response may follow a successful registry commit. Never blindly
@@ -86,9 +101,10 @@ async function main() {
   await publishArtifacts(artifacts, {
     tag,
     metadata: name => json(`${registry}${encodeURIComponent(name)}`),
+    available: artifact => waitUntilInstallable(artifact, name => json(`${registry}${encodeURIComponent(name)}`, { Accept: 'application/vnd.npm.install-v1+json' })),
     publish: (artifact, distTag) => npm(['publish', artifact.archive, '--ignore-scripts', '--access', 'public', '--registry', registry, '--tag', distTag], { stdio: 'inherit' }),
   });
 }
 
 if (require.main === module) main().catch(error => { console.error(error.message); process.exitCode = 1; });
-module.exports = { platforms, validatePublishEnvironment, validateNativeRelease, validateNativeReceipt, alreadyPublished, publishArtifacts };
+module.exports = { platforms, validatePublishEnvironment, validateNativeRelease, validateNativeReceipt, alreadyPublished, waitUntilInstallable, publishArtifacts };

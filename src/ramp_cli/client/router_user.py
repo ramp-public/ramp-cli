@@ -69,13 +69,32 @@ def _token_expiry(token: str) -> float:
         return time.time() + 300
 
 
-def _edge_token(origin: str) -> str | None:
+def _edge_token(origin: str, *, cached_only: bool = False) -> str | None:
     """A current Access token for ``origin`` from `cloudflared`, if it has one."""
     cached = _edge_tokens.get(origin)
     if cached is not None and time.time() < cached[1]:
         return cached[0]
     binary = shutil.which("cloudflared")
     host = urlsplit(origin).hostname or ""
+    if cached_only:
+        # `cloudflared access token` can initiate login when its cache expires.
+        # A bridge may reuse a cached credential, but must never run that helper.
+        for path in (Path.home() / ".cloudflared").glob(f"{host}-*-token"):
+            try:
+                if path.stat().st_size > 16384:
+                    continue
+                token = path.read_text().strip()
+            except (OSError, UnicodeError):
+                continue
+            if (
+                _single_token(token)
+                and token.count(".") == 2
+                and _token_expiry(token) > time.time() + 60
+                and token not in _edge_rejected.get(origin, ())
+            ):
+                _edge_tokens[origin] = (token, _token_expiry(token) - 60)
+                return token
+        return None
     # Only ask about apps cloudflared already signed in to, or that redirected,
     # so a public Router never pays for a subprocess.
     known = origin in _edge_origins or any(
@@ -263,10 +282,12 @@ class RouterUserClient:
         profile: str | None = None,
         no_input: bool = False,
         interactive: bool = False,
+        passive_edge: bool = False,
     ):
         self.origin = validate_origin(origin)
         self.profile = profile
         self.no_input = no_input
+        self.passive_edge = passive_edge
         # A person at a terminal can approve a browser sign-in, so a missing,
         # expired, or revoked login signs in instead of failing.
         self.interactive = interactive and not no_input
@@ -322,7 +343,11 @@ class RouterUserClient:
                 code=4,
             )
         if origin != self.origin:
-            edge = _edge_token(self.origin)
+            edge = (
+                _edge_token(self.origin, cached_only=True)
+                if self.passive_edge
+                else _edge_token(self.origin)
+            )
             return {"cf-access-token": edge} if edge else {}
         if not _single_token(token):
             raise RampCLIError(
@@ -477,6 +502,7 @@ class RouterUserClient:
         progress: Callable[[str], None] | None = None,
         cancel: Event | None = None,
         on_callback: Callable[[oauth.PkceCallback], None] | None = None,
+        connectors: bool = False,
     ) -> dict:
         """Sign in through the browser.
 
@@ -484,6 +510,19 @@ class RouterUserClient:
         it from a pasted address when the browser can't reach this machine.
         Without one, an interactive terminal is asked for that address.
         """
+        connector_params = {}
+        if connectors:
+            from ramp_cli.router_connectors.auth import (  # noqa: PLC0415
+                CLIENT_ID,
+                resource_for_origin,
+                validate_authorization,
+            )
+
+            connector_params = {
+                "connectors": "1",
+                "resource": resource_for_origin(self.origin),
+                "client_id": CLIENT_ID,
+            }
         self.ensure_edge_access(progress=progress, cancel=cancel, timeout=timeout)
         access_headers = self._access_headers()
         callback = oauth.start_pkce_callback()
@@ -498,6 +537,7 @@ class RouterUserClient:
                     "state": callback.state,
                     "code_challenge": callback.code_challenge,
                     "code_challenge_method": "S256",
+                    **connector_params,
                 }
             )
         )
@@ -534,17 +574,23 @@ class RouterUserClient:
             headers=access_headers,
             event_hooks=self._edge_hooks(),
         ) as http:
-            data = self._token_response(
-                http.post(
-                    self.origin + "/api/auth/cli/token",
-                    json={
-                        "grant_type": "authorization_code",
-                        "code": code,
-                        "code_verifier": callback._verifier,
-                        "redirect_uri": callback.redirect_uri,
-                    },
-                )
+            response = http.post(
+                self.origin + "/api/auth/cli/token",
+                json={
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "code_verifier": callback._verifier,
+                    "redirect_uri": callback.redirect_uri,
+                },
             )
+            if connectors and response.status_code != 200:
+                raise RampCLIError(
+                    "Router connector sign-in failed; retry explicit authorization.",
+                    code=4 if response.status_code in (400, 401, 403) else 1,
+                )
+            data = self._token_response(response)
+            if connectors:
+                validate_authorization(self.origin, data.get("connector_authorization"))
             with _refresh_lock(self.namespace):
                 old = self._load()
                 self._save(data)
@@ -570,6 +616,7 @@ class RouterUserClient:
             "user": state.get("user"),
             "access_token_expired": now
             >= state.get("issued_at", 0) + state.get("expires_in", 0),
+            "connectors_authorized": bool(state.get("connector_authorization")),
         }
 
     def logout(self) -> None:
