@@ -1,68 +1,104 @@
 # @ramp/cli
 
-Install and launch the standalone Ramp CLI. Requires Node.js 22+ and npm 10+;
-Python is not required.
+CLI for Ramp's Developer API. Authenticate with OAuth, manage expenses, approve bills, book travel, and more — from your terminal or AI agent.
 
-```sh
+## Install
+
+```bash
 npm install -g @ramp/cli
-ramp --help
 ```
 
-Or run it without a global npm install:
+Or run directly without a global install:
 
-```sh
+```bash
 npx @ramp/cli --help
 ```
 
-Installation does not sign in, open a browser, or configure Ramp Router. Use
-`ramp auth login` or `ramp router ui` explicitly when needed.
+Requires Node.js 22+ and npm 10+ (Python is not required). Supported platforms: macOS (Apple Silicon & Intel), Linux (glibc x64 & arm64), and Windows (x64).
 
-The shared installer reuses a working native Ramp CLI if available. Otherwise
-it downloads the public release selected by `nativeCliVersion` in this package,
-verifies SHA-256, and installs the entire standalone runtime atomically. Each npm
-version targets the native CLI release of the same version.
+For one-command Ramp Router setup, see [`@ramp/router`](https://www.npmjs.com/package/@ramp/router) (`npx @ramp/router`).
 
-Local CLI reuse does not distinguish public and private builds. An existing
-internal build can be reused, but this package does not preserve an internal
-release channel when updating it. The native `ramp update` command currently
-uses the public installer. Fresh npm-managed downloads always use public assets.
+## Quick Start
 
-An npm-managed CLI is updated only through npm. `ramp update` automatically
-updates supported global installs in their recorded npm prefix, or updates an
-npx-owned runtime through the owning package at `latest` without opening Router.
-Project dependencies and older/unknown receipts receive manual instructions;
-their lockfiles are never changed automatically. The launcher and persistent
-shortcuts turn off native update notices and never run the curl updater. Direct
-native invocation on Windows prints instructions because a running executable
-cannot be replaced. A reused CLI from another installer keeps its own updater.
+```bash
+ramp auth login                              # OAuth via browser
+ramp users me                                # Current user details
+ramp bills search --query "Acme"             # Search bills by vendor name
+ramp cards list                              # List your cards (card_state shows ACTIVE)
+ramp transactions list --transactions_to_retrieve my_transactions
+ramp transactions list --transactions_to_retrieve my_transactions --from_date 2025-01-01
+ramp transactions list --transactions_to_retrieve my_transactions --rationale "Monthly review" --agent  # JSON output for scripting
+ramp router                                  # Open the Router workspace
+ramp update                                  # Update to the latest release
+```
 
-After a native upgrade, existing Router setups are fully refreshed with the new
-CLI, including upgrades initiated directly through npm or deferred with
-`--ignore-scripts`. No agent skills are installed or updated. A failed refresh
-keeps the upgraded CLI and is retried on the next launcher run; it can also be
-retried with `ramp router refresh`.
+## Commands
 
-The npm-managed distribution lives in `~/.local/lib/ramp-cli-npm` on macOS/Linux
-or `%LOCALAPPDATA%\Ramp\CLI\npm` on Windows. It is separate from curl-installed
-distributions. A recoverable installation lock serializes both npm packages.
-Existing unrelated commands and installations are never overwritten.
+| Command        | Description                                         |
+| -------------- | --------------------------------------------------- |
+| `auth`         | Login, logout, check status                         |
+| `config`       | Get/set CLI configuration                           |
+| `env`          | Show or set default environment (sandbox/production)|
+| `profile`      | Show, list, or switch credential profiles           |
+| `router`       | Connect coding agents, manage keys and strategies   |
+| `applications` | Apply for a Ramp account                            |
+| `skills`       | Browse and install agent skill instructions         |
+| `update`       | Update the CLI to the latest release                |
+| `feedback`     | Submit feedback about the CLI                       |
 
-Global npm installs use npm's normal command shims. `npx` can create a persistent
-native `ramp` shortcut in `~/.local/bin`, but does not edit shell startup files.
-The native installation survives npm cache cleanup and npm uninstallation.
+## Resources
 
-Supported targets: macOS and glibc Linux, x64/arm64; Windows x64. Alpine/musl,
-Windows arm64, and other architectures are not supported.
+12 resources, each with their own tools:
 
-Environment overrides shared by both packages:
+| Resource          | Tools                                                        |
+| ----------------- | ------------------------------------------------------------ |
+| `accounting`      | `categories`, `category-options`                             |
+| `bills`           | `search`, `get`, `draft`, `pending`, `approve`, `attachments`|
+| `cards`           | `list`, `activate`, `lock` (aliases also under `funds`)      |
+| `funds`           | `list`, `activate`, `creds`, `lock`                          |
+| `general`         | `comment`, `explain`, `help-center`                          |
+| `purchase-orders` | `search`, `get`                                              |
+| `receipts`        | `upload`, `attach`                                           |
+| `reimbursements`  | `list`, `pending`, `submit`, `approve`, `edit`               |
+| `requests`        | `pending`, `approve`                                         |
+| `transactions`    | `list`, `get`, `approve`, `edit`, `missing`, `flag-missing`, `explain-missing`, `memo-suggestions`, `trips` |
+| `travel`          | `list`, `create`, `bookings`, `locations`                    |
+| `users`           | `list`, `me`, `org-chart`                                    |
 
-- `RAMP_CLI_VERSION`: explicit native tag such as `v0.2.55`, or `latest`.
-- `RAMP_CLI_FORCE_UPDATE=1`: refresh the npm-managed installation.
-- `RAMP_CLI_INSTALL_DIR`: choose the native installation directory.
-- `RAMP_CLI_BIN_DIR`: choose the persistent command directory.
+Usage: `ramp <resource> <tool> [OPTIONS]`
 
-With `--ignore-scripts`, installation is deferred until the first invocation.
-Downloads require HTTPS; do not disable certificate validation to work around
-corporate proxy or certificate errors.
+## Global Flags
 
-Source and issues: https://github.com/ramp-public/ramp-cli
+| Flag               | Description                                       |
+| ------------------ | ------------------------------------------------- |
+| `--env`, `-e`      | `production` (default) or `sandbox`               |
+| `--output`, `-o`   | Output format: `json` or `table`                  |
+| `--agent`          | Machine-readable JSON output (default when piped) |
+| `--human`          | Human-readable table output (default in terminal) |
+| `--wide`           | Show all columns in table output                  |
+| `--quiet`, `-q`    | Suppress progress output                          |
+| `--no-input`       | Disable interactive prompts (for CI/scripts)      |
+
+## Tool Flags
+
+| Flag                   | Description                              |
+| ---------------------- | ---------------------------------------- |
+| `--json TEXT`          | Raw JSON request body (bypasses flags)   |
+| `--dry_run`, `-n`      | Print request without sending            |
+| `--page_size N`        | Results per page                         |
+| `--next_page_cursor`   | Resume pagination from previous response |
+
+Run `ramp <resource> <tool> --help` to see all available flags for a tool.
+
+## Agent Mode
+
+`--agent` outputs JSON for scripting and AI agent consumption. Pipe to `jq` for processing:
+
+```bash
+ramp transactions list --transactions_to_retrieve my_transactions --rationale "Monthly review" --agent | jq '.data[0]'
+ramp users me --rationale "Look up my user ID" --agent | jq '.data[0].user_id'
+```
+
+## License
+
+MIT — see [https://github.com/ramp-public/ramp-cli](https://github.com/ramp-public/ramp-cli) for full documentation and source.

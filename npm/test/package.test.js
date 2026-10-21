@@ -95,8 +95,8 @@ test('packed packages install, coexist, and launch through a real isolated npm r
     const router = fs.readlinkSync(path.join(p.bin, 'router'));
     await invoke('npm', ['install', '-g', '@ramp/cli'], p);
     assert.equal(fs.readlinkSync(path.join(p.bin, 'router')), router);
-    assert.deepEqual(JSON.parse((await invoke(path.join(p.bin, 'router'), [], p)).stdout), ['router', 'ui']);
-    assert.equal(calls(p).filter(args => args[0] === 'router' && args[1] === 'ui').length, 1);
+    assert.deepEqual(JSON.parse((await invoke(path.join(p.bin, 'router'), [], p)).stdout), ['router']);
+    assert.equal(calls(p).filter(args => args.length === 1 && args[0] === 'router').length, 1);
     assert.deepEqual(JSON.parse((await invoke(path.join(p.bin, 'router'), ['status'], p)).stdout), ['router', 'status']);
     assert.deepEqual(JSON.parse((await invoke(path.join(p.bin, 'ramp'), ['auth', 'status'], p)).stdout), ['auth', 'status']);
     assert.equal(fs.existsSync(path.join(p.home, '.bashrc')), false);
@@ -112,11 +112,11 @@ test('packed packages install, coexist, and launch through a real isolated npm r
     assert.ok(fs.existsSync(path.join(p.bin, 'router')));
   });
 
-  await t.test('npx Router opens the native workspace and creates persistent shortcuts', async t => {
+  await t.test('npx Router delegates to native Router and creates persistent shortcuts', async t => {
     const p = isolated(t);
     const result = await invoke('npx', ['--yes', '@ramp/router'], p);
-    assert.deepEqual(JSON.parse(result.stdout), ['router', 'ui']);
-    assert.equal(calls(p).filter(args => args[0] === 'router' && args[1] === 'ui').length, 1);
+    assert.deepEqual(JSON.parse(result.stdout), ['router']);
+    assert.equal(calls(p).filter(args => args.length === 1 && args[0] === 'router').length, 1);
     assert.equal(fs.existsSync(path.join(p.home, '.bashrc')), false);
     assert.ok(fs.existsSync(path.join(p.env.RAMP_CLI_BIN_DIR, 'router')));
   });
@@ -127,7 +127,7 @@ test('packed packages install, coexist, and launch through a real isolated npm r
       await invoke('npm', ['install', '-g', '@ramp/router'], p, { [setting]: '1' });
       assert.equal(calls(p).some(args => args[0] === 'router'), false);
       const result = await invoke('npx', ['--yes', '@ramp/router'], p, { [setting]: '1' });
-      assert.deepEqual(JSON.parse(result.stdout), ['router', 'ui']);
+      assert.deepEqual(JSON.parse(result.stdout), ['router']);
       assert.equal(fs.existsSync(path.join(p.home, '.bashrc')), false);
     });
   }

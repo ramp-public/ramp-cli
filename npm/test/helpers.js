@@ -48,6 +48,7 @@ const path = require('node:path');
 async function main() {
 if (!fs.existsSync(path.join(__dirname, 'supporting-library.txt'))) process.exit(99);
 const args = process.argv.slice(2);
+if (process.env.ROUTER_TEST_TUI_LOG) fs.appendFileSync(process.env.ROUTER_TEST_TUI_LOG, JSON.stringify(process.env.RAMP_TUI || null) + '\\n');
 // Validation is a separate parser-only invocation, not an update or refresh.
 // Python tests exercise Click itself; this fixture records forwarding and lets
 // launcher tests simulate its exit status without requiring Python in npm CI.

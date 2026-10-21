@@ -185,10 +185,10 @@ ramp auth login                              # OAuth via browser
 ramp users me                                # Current user details
 ramp bills search --query "Acme"             # Search bills by vendor name
 ramp cards list                              # List your cards (card_state shows ACTIVE)
-ramp cards list --agent | jq '[.data[0].cards[] | select((.card_state // "" | ascii_downcase) == "active")] | length'  # Count active cards
+ramp cards list --rationale "Count active cards" --agent | jq '[.data[0].cards[] | select((.card_state // "" | ascii_downcase) == "active")] | length'  # Count active cards
 ramp transactions list --transactions_to_retrieve my_transactions
 ramp transactions list --transactions_to_retrieve my_transactions --from_date 2025-01-01
-ramp transactions list --agent               # JSON output for scripting
+ramp transactions list --transactions_to_retrieve my_transactions --rationale "Monthly review" --agent  # JSON output for scripting
 ```
 
 ### Standalone agent authentication
@@ -252,14 +252,14 @@ cannot be overridden by a conflicting `--profile` flag.
 | `bills`           | `search`, `get`, `draft`, `pending`, `approve`, `attachments`|
 | `cards`           | `list`, `activate`, `lock` (aliases also under `funds`)      |
 | `funds`           | `list`, `activate`, `creds`, `lock`                          |
-| `general`         | `comment`, `explain`, `help-center`, `policy`                |
+| `general`         | `comment`, `explain`, `help-center`                          |
 | `purchase-orders` | `search`, `get`                                              |
 | `receipts`        | `upload`, `attach`                                           |
 | `reimbursements`  | `list`, `pending`, `submit`, `approve`, `edit`               |
 | `requests`        | `pending`, `approve`                                         |
 | `transactions`    | `list`, `get`, `approve`, `edit`, `missing`, `flag-missing`, `explain-missing`, `memo-suggestions`, `trips` |
 | `travel`          | `list`, `create`, `bookings`, `locations`                    |
-| `users`           | `me`, `search`, `org-chart`                                  |
+| `users`           | `list`, `me`, `org-chart`                                    |
 
 Usage: `ramp <resource> <tool> [OPTIONS]`
 
@@ -267,7 +267,7 @@ Usage: `ramp <resource> <tool> [OPTIONS]`
 
 | Flag               | Description                                       |
 | ------------------ | ------------------------------------------------- |
-| `--env`, `-e`      | `sandbox` (default) or `production`               |
+| `--env`, `-e`      | `production` (default) or `sandbox`               |
 | `--output`, `-o`   | Output format: `json` or `table`                  |
 | `--agent`          | Machine-readable JSON output (default when piped) |
 | `--human`          | Human-readable table output (default in terminal) |
@@ -293,8 +293,8 @@ Run `ramp <resource> <tool> --help` to see all available flags for a tool.
 `--agent` outputs JSON for scripting and AI agent consumption. Pipe to `jq` for processing:
 
 ```bash
-ramp transactions list --transactions_to_retrieve my_transactions --agent | jq '.data[0]'
-ramp users me --agent | jq '.data.user_id'
+ramp transactions list --transactions_to_retrieve my_transactions --rationale "Monthly review" --agent | jq '.data[0]'
+ramp users me --rationale "Look up my user ID" --agent | jq '.data[0].user_id'
 ```
 
 ## Development

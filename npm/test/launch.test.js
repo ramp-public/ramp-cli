@@ -43,29 +43,36 @@ test('help/version work headlessly without shell changes or onboarding', async t
   }
 });
 
-test('bare router opens the workspace; explicit subcommands still forward in CI', async t => {
+test('bare router delegates terminal handling to native Router; subcommands still forward in CI', async t => {
   const p = sandbox(t);
   await install({ ...p, download: (await fixture(p.home)).download });
   const log = path.join(p.home, 'invocations.jsonl');
-  const env = { ...p.env, npm_command: 'exec', ROUTER_TEST_LOG: log };
+  const tuiLog = path.join(p.home, 'tui.jsonl');
+  const env = { ...p.env, npm_command: 'exec', ROUTER_TEST_LOG: log, ROUTER_TEST_TUI_LOG: tuiLog, RAMP_TUI: '' };
   const result = spawnSync(process.execPath, [bin('router')], { encoding: 'utf8', env, detached: process.platform !== 'win32' });
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(JSON.parse(result.stdout), ['router', 'ui']);
-  assert.deepEqual(JSON.parse(fs.readFileSync(log, 'utf8')), ['router', 'ui']);
+  assert.deepEqual(JSON.parse(result.stdout), ['router']);
+  assert.deepEqual(JSON.parse(fs.readFileSync(log, 'utf8')), ['router']);
+  assert.equal(fs.readFileSync(tuiLog, 'utf8').trim().split('\n').at(-1), '"1"');
   assert.equal(fs.existsSync(path.join(p.home, '.bashrc')), false);
   assert.equal(fs.readlinkSync(path.join(p.bin, 'ramp')), p.entry);
   const explicit = spawnSync(process.execPath, [bin('router'), 'status'], { encoding: 'utf8', env: { ...env, CI: 'true', RAMP_ROUTER_SKIP_ONBOARDING: '1' } });
   assert.equal(explicit.status, 0, explicit.stderr);
   assert.deepEqual(JSON.parse(explicit.stdout), ['router', 'status']);
+  assert.equal(fs.readFileSync(tuiLog, 'utf8').trim().split('\n').at(-1), 'null');
+  const ramp = spawnSync(process.execPath, [bin('ramp'), 'router'], { encoding: 'utf8', env });
+  assert.equal(ramp.status, 0, ramp.stderr);
+  assert.equal(fs.readFileSync(tuiLog, 'utf8').trim().split('\n').at(-1), 'null');
 });
 
-test('bare router invokes the workspace without injecting configuration arguments', async t => {
+test('bare headless router preserves native help exit code without a workspace retry warning', async t => {
   const p = sandbox(t);
   await install({ ...p, download: (await fixture(p.home)).download });
-  const env = { ...p.env, npm_command: 'exec', CI: 'true', RAMP_ROUTER_SKIP_ONBOARDING: '1' };
+  const env = { ...p.env, npm_command: 'exec', CI: 'true', RAMP_ROUTER_SKIP_ONBOARDING: '1', ROUTER_TEST_EXIT: '2' };
   const result = spawnSync(process.execPath, [bin('router')], { encoding: 'utf8', env, input: 'not configuration input', detached: process.platform !== 'win32' });
-  assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(JSON.parse(result.stdout), ['router', 'ui']);
+  assert.equal(result.status, 2, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), ['router']);
+  assert.equal(result.stderr, '');
   assert.equal(fs.existsSync(path.join(p.home, '.bashrc')), false);
 });
 

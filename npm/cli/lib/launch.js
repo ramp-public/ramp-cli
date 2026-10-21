@@ -50,8 +50,10 @@ function stableRampDir(executable, env = process.env) {
 
 const managed = executable => path.resolve(executable).startsWith(`${paths().root}${path.sep}`);
 
-async function launch(executable, args, stdio = 'inherit') {
+async function launch(executable, args, stdio = 'inherit', workspace = false) {
   const env = { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' };
+  // Let native Router choose the workspace or help using its terminal checks.
+  if (workspace) env.RAMP_TUI = '1';
   delete env.RAMP_CLI_FORCE_UPDATE;
   delete env.RAMP_VERSION;
   if (managed(executable)) {
@@ -107,13 +109,10 @@ async function main(mode, args) {
     }
     const nativeArgs = mode !== 'router' ? args
       : args.some(arg => ['--version', '-V'].includes(arg)) ? ['--version']
-        : workspace ? ['router', 'ui'] : ['router', ...args];
-    // Explicit `router` opens the native TUI; it reports a usage error if no
-    // interactive terminal is available. CI/skip flags affect only the npm
-    // install hook and optional wrapper prompts, not an explicit command.
-    result = await launch(executable, nativeArgs, session?.stdio || 'inherit');
+        : ['router', ...args];
+    result = await launch(executable, nativeArgs, session?.stdio || 'inherit', workspace);
   } finally { session?.close(); }
-  if (workspace && (result.code !== 0 || result.signal)) console.error('Ramp CLI remains installed. Retry `router` from an interactive terminal.');
+  if (workspace && (result.signal || (result.code !== 0 && result.code !== 2))) console.error('Ramp CLI remains installed. Retry `router` from an interactive terminal.');
   process.exitCode = result.code ?? (128 + (constants.signals[result.signal] || 1));
   if (result.signal && process.platform !== 'win32') {
     // The lock library also registers signal listeners. Restore the default

@@ -71,7 +71,7 @@ test('Windows writes a cache-independent cmd launcher and handles an empty user 
   assert.equal(fs.existsSync(path.join(p.bin, 'ramp.ps1')), false);
   assert.equal(cmd.includes('_npx'), false);
   const router = fs.readFileSync(path.join(p.bin, 'router.cmd'), 'utf8');
-  assert.match(router, /router ui/);
+  assert.match(router, /if "%~1"=="" set RAMP_TUI=1/);
   assert.match(router, /router %\*/);
   assert.equal(router.includes('_npx'), false);
   let script;
@@ -121,9 +121,11 @@ test('persistent router forwards subcommands and survives without npm wrapper fi
   const body = fs.readFileSync(router, 'utf8');
   assert.equal(body.includes('_npx'), false);
   for (const args of [[], ['status'], ['refresh', '--no-browser'], ['ui'], ['strategies', 'list', '$literal', '; untouched', 'one two']]) {
-    const result = spawnSync(router, args, { encoding: 'utf8', env: p.env });
+    const tuiLog = path.join(p.home, 'shortcut-tui.jsonl');
+    const result = spawnSync(router, args, { encoding: 'utf8', env: { ...p.env, RAMP_TUI: '', ROUTER_TEST_TUI_LOG: tuiLog } });
     assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(JSON.parse(result.stdout), ['router', ...(args.length ? args : ['ui'])]);
+    assert.deepEqual(JSON.parse(result.stdout), ['router', ...args]);
+    assert.equal(fs.readFileSync(tuiLog, 'utf8').trim().split('\n').at(-1), args.length ? 'null' : '"1"');
   }
   assert.equal(spawnSync(router, ['--version'], { env: p.env }).status, 0);
 });

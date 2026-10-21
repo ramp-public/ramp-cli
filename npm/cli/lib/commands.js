@@ -60,8 +60,8 @@ function exposeCommand(options = {}) {
   if (windows && ['router.exe', 'router.ps1', 'router.bat'].some(name => fs.existsSync(path.join(p.bin, name)))) throw new Error(`An existing router command in ${p.bin} was preserved. Choose RAMP_CLI_BIN_DIR for the Router shortcut.`);
   const marker = windows ? '@echo off\r\nrem @ramp/router native launcher\r\n' : '#!/bin/sh\n# @ramp/router native launcher\n';
   const body = windows
-    ? `${marker}setlocal DisableDelayedExpansion\r\n${managed ? 'set RAMP_NO_UPDATE_CHECK=1\r\n' : ''}if "%~1"=="--version" goto version\r\nif "%~1"=="-V" goto version\r\nif "%~1"=="" (\r\n  "${executable.replace(/%/g, '%%')}" router ui\r\n) else (\r\n  "${executable.replace(/%/g, '%%')}" router %*\r\n)\r\nexit /b %ERRORLEVEL%\r\n:version\r\n"${executable.replace(/%/g, '%%')}" --version\r\nexit /b %ERRORLEVEL%\r\n`
-    : `${marker}case "\${1-}" in --version|-V) exec ${shellQuote(target)} --version ;; esac\nif [ "$#" -eq 0 ]; then set -- ui; fi\nexec ${shellQuote(target)} router "$@"\n`;
+    ? `${marker}setlocal DisableDelayedExpansion\r\n${managed ? 'set RAMP_NO_UPDATE_CHECK=1\r\n' : ''}if "%~1"=="--version" goto version\r\nif "%~1"=="-V" goto version\r\nif "%~1"=="" set RAMP_TUI=1\r\n"${executable.replace(/%/g, '%%')}" router %*\r\nexit /b %ERRORLEVEL%\r\n:version\r\n"${executable.replace(/%/g, '%%')}" --version\r\nexit /b %ERRORLEVEL%\r\n`
+    : `${marker}case "\${1-}" in --version|-V) exec ${shellQuote(target)} --version ;; esac\nif [ "$#" -eq 0 ]; then export RAMP_TUI=1; fi\nexec ${shellQuote(target)} router "$@"\n`;
   try { fs.writeFileSync(router, body, { flag: 'wx', mode: 0o755 }); }
   catch (error) {
     if (error.code !== 'EEXIST') throw error;
