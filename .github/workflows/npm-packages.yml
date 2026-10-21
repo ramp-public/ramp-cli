@@ -43,12 +43,11 @@ jobs:
   publish:
     needs: test
     # Never publish from forks, a PR, an arbitrary dispatch ref, or the private
-    # source repo. The variable remains unset until npm bootstrap is complete.
+    # source repo.
     if: >-
       github.event_name == 'workflow_dispatch' &&
       github.repository == 'ramp-public/ramp-cli' &&
-      github.ref == 'refs/heads/main' &&
-      vars.NPM_PUBLISH_ENABLED == 'true'
+      github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: npm
     concurrency:

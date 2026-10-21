@@ -116,10 +116,11 @@ placeholder changes. An npm-only fix ships with the next native release
 4. For **each** package, configure npm trusted publishing for organization
    `ramp-public`, repository `ramp-cli`, workflow filename `npm-packages.yml`,
    environment `npm`. Allow direct `npm publish` where the npm UI requires it.
-5. Configure the public repository's `npm` GitHub environment with required
-   reviewers and main-branch-only deployment rules. Set repository variable
-   `NPM_PUBLISH_ENABLED=true` only after bootstrap and trusted publishing work.
-   No npm write token belongs in GitHub secrets, `.npmrc`, or either tarball.
+5. Create the public repository's `npm` GitHub environment and restrict its
+   deployments to `main`. npm trusted publishing does not check the branch, so
+   this rule is what keeps other branches from publishing. Do not require
+   reviewers, or the daily job times out waiting. No npm write token belongs in
+   GitHub secrets, `.npmrc`, or either tarball.
 6. Verify the OIDC release, then require 2FA and disallow traditional publishing
    tokens in npm package settings. Public repo + public package OIDC releases
    receive npm provenance. A manual bootstrap publish does not establish that.
@@ -134,13 +135,10 @@ workflow on main with `latest` and succeeds only once npmjs.org lists both
 packages at that version. The npm tests also run in internal CI, so a failing
 npm test blocks the daily release. A run that finds the current version already
 published does nothing, and a later run publishes a version an earlier one
-missed. Set internal repository variable `NPM_RELEASE_ENABLED=true` after the
-bootstrap below; the `npm` environment must not need a manual approval, or the
-daily job times out waiting for it.
+missed.
 
 The workflow can still be dispatched manually with `next` for acceptance
-testing. Merely merging this implementation publishes nothing. The workflow
-uses Node 22 and npm 11.6.2 with GitHub OIDC.
+testing. The workflow uses Node 22 and npm 11.6.2 with GitHub OIDC.
 
 The release script validates package relationships, public release status, all
 five platform archives/checksums, and tarball contents. It preflights immutable
