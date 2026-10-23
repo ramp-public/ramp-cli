@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, urlparse
 import click
 import httpx
 
+from ramp_cli.auth.access import read_only_scopes
 from ramp_cli.auth.constants import INVALID_GRANT
 from ramp_cli.auth.environment import extra_auth_headers
 from ramp_cli.config.constants import (
@@ -64,8 +65,8 @@ class TokenResponse:
 @dataclass
 class LoginOptions:
     no_browser: bool = False
-    scopes: tuple[str, ...] = ()
     auth_level: str = "auto"
+    read_only: bool = False
 
 
 @dataclass
@@ -229,7 +230,9 @@ def login(env: str, opts: LoginOptions | None = None) -> TokenResponse:
 
     callback = start_pkce_callback()
 
-    scopes = _resolve_login_scopes(env, opts.scopes)
+    scopes = _resolve_scopes(env)
+    if opts.read_only:
+        scopes = read_only_scopes(scopes)
     auth = _build_auth_url(
         env,
         callback.redirect_uri,
@@ -598,14 +601,17 @@ def _classify_token_error(status_code: int, grant_type: str) -> str:
 def _resolve_scopes(env: str) -> str:
     """Build the OAuth scope string for login.
 
-    Uses custom scopes if configured, otherwise extracts scopes from the
-    agent-tool OpenAPI spec. A freshly synced env cache is authoritative for
-    that environment; stale or untracked caches are merged with the bundled
-    spec so they cannot hide scopes that the installed CLI already knows about.
+    Extracts scopes from the agent-tool OpenAPI spec. A freshly synced env
+    cache is authoritative for that environment; stale or untracked caches are
+    merged with the bundled spec so they cannot hide scopes that the installed
+    CLI already knows about. The legacy `scopes` config setting is ignored.
     """
-    custom = configured_scopes()
-    if custom:
-        return custom
+    if configured_scopes():
+        click.echo(
+            "Warning: the `scopes` config setting is no longer supported and was "
+            "ignored. Use `ramp auth login --read-only` for read-only access.",
+            err=True,
+        )
 
     all_scopes: set[str] = set()
     for spec_path in _resolve_scope_spec_paths(env):
@@ -619,13 +625,6 @@ def _resolve_scopes(env: str) -> str:
                 err=True,
             )
     return " ".join(sorted(all_scopes))
-
-
-def _resolve_login_scopes(env: str, requested_scopes: tuple[str, ...]) -> str:
-    """Use an explicit least-privilege scope set or discover all tool scopes."""
-    if requested_scopes:
-        return " ".join(dict.fromkeys(requested_scopes))
-    return _resolve_scopes(env)
 
 
 def _resolve_scope_spec_paths(env: str):

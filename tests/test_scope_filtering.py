@@ -363,36 +363,6 @@ class TestServerScopeErrors:
         assert "insufficient OAuth scope" in message
         assert "tasks:read" not in message
 
-    def test_custom_scope_override_is_called_out(self, isolated_config, monkeypatch):
-        cfg = settings.load()
-        cfg.scopes = "users:read"
-        settings.save(cfg)
-        client = MagicMock()
-        client.post.side_effect = self._scope_error()
-        tool = self._tool()
-        monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
-        monkeypatch.setattr("ramp_cli.tools.commands.maybe_sync", lambda env: None)
-        monkeypatch.setattr(
-            "ramp_cli.main.list_categories", lambda env: {"tasks": [tool]}
-        )
-        monkeypatch.setattr("ramp_cli.tools.commands.RampClient", lambda env: client)
-
-        result = CliRunner().invoke(cli, ["--env", "sandbox", "tasks", "list"])
-
-        assert result.exit_code != 0
-        message = str(result.exception)
-        assert "top-level custom `scopes` override" in message
-        assert "cached tool definition: tasks:read" in message
-
-    def test_custom_scope_override_superset_is_not_blamed(self, isolated_config):
-        cfg = settings.load()
-        cfg.scopes = "tasks:read users:read"
-        settings.save(cfg)
-
-        message = _scope_error_hint(self._tool(), "sandbox")
-
-        assert "custom `scopes` override" not in message
-
     def test_external_token_gets_external_token_recovery(
         self, isolated_config, monkeypatch
     ):
@@ -503,6 +473,7 @@ class TestAuthStatusScopes:
         prod_data = data["data"][0]["production"]
         assert "scopes" in prod_data
         assert sorted(prod_data["scopes"]) == ["a:read", "b:write"]
+        assert prod_data["access"] == "read/write"
 
     def test_status_warns_on_no_scopes(self, isolated_config, monkeypatch):
         monkeypatch.setattr(store.time, "time", lambda: 100)

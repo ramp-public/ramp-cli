@@ -315,6 +315,7 @@ user or business stops a pending write so you can review the account and rerun i
 
 ```bash
 ramp auth login                              # OAuth via browser
+ramp auth login --read-only                  # Read-only access for this login
 ramp users me                                # Current user details
 ramp bills search --query "Acme"             # Search bills by vendor name
 ramp cards list                              # List your cards (card_state shows ACTIVE)

@@ -958,19 +958,11 @@ class TestResolveScopes:
         assert "incorporation:read" not in scopes
         assert "incorporation:write" not in scopes
 
-    def test_explicit_login_scopes_override_discovery(self, monkeypatch):
-        monkeypatch.setattr(
-            oauth_module,
-            "_resolve_scopes",
-            lambda env: pytest.fail("scope discovery should not run"),
-        )
 
-        scopes = oauth_module._resolve_login_scopes(
-            "production",
-            ("applications:read", "applications:write", "applications:read"),
-        )
-
-        assert scopes == "applications:read applications:write"
+class _FakeCallback:
+    redirect_uri = "http://127.0.0.1/callback"
+    state = "state"
+    code_challenge = "challenge"
 
 
 class TestAuthLoginSpecRefresh:
@@ -1040,68 +1032,86 @@ class TestAuthLoginSpecRefresh:
         assert "Could not refresh tool definitions before login" in result.output
         assert store.get_granted_scopes("sandbox", profile="human") == {"users:read"}
 
-    def test_login_passes_explicit_oauth_options(self, isolated_config, monkeypatch):
-        self._patch_success_ui(monkeypatch)
-        requested_scopes = (
-            "applications:read",
-            "applications:write",
-            "bank_accounts:read",
+    def test_login_rejects_removed_scope_option(self, isolated_config, monkeypatch):
+        monkeypatch.setattr(
+            auth_command_module,
+            "do_login",
+            lambda env, opts: pytest.fail("login must not start"),
         )
 
+        result = CliRunner().invoke(
+            cli,
+            ["--human", "--env", "sandbox", "auth", "login", "--scope", "users:read"],
+        )
+
+        assert result.exit_code == 1
+        assert "Error: --scope is no longer supported." in result.output
+        assert "ramp auth login --read-only" in result.output
+        assert not store.has_tokens("sandbox", profile="human")
+
+    @pytest.mark.parametrize(
+        ("read_only", "granted", "expected"),
+        [
+            (True, "users:read", "Logged in with read-only access"),
+            (False, "users:read users:write", "Logged in with read/write access"),
+        ],
+    )
+    def test_login_read_only_and_access_message(
+        self, isolated_config, monkeypatch, read_only, granted, expected
+    ):
+        self._patch_success_ui(monkeypatch)
         monkeypatch.setattr(auth_command_module, "fetch_spec", lambda env: 1)
 
         def fake_login(env: str, opts: oauth_module.LoginOptions) -> TokenResponse:
-            assert env == "sandbox"
-            assert opts.scopes == requested_scopes
-            assert opts.auth_level == "business"
+            assert opts.read_only is read_only
             return TokenResponse(
-                access_token="access",
-                refresh_token="refresh",
-                scope=" ".join(requested_scopes),
+                access_token="access", refresh_token="refresh", scope=granted
             )
 
         monkeypatch.setattr(auth_command_module, "do_login", fake_login)
 
-        result = CliRunner().invoke(
-            cli,
-            [
-                "--human",
-                "--env",
-                "sandbox",
-                "auth",
-                "login",
-                "--scope",
-                "applications:read",
-                "--scope",
-                "applications:write",
-                "--scope",
-                "bank_accounts:read",
-                "--auth-level",
-                "business",
-            ],
-            catch_exceptions=False,
-        )
+        args = ["--human", "--env", "sandbox", "auth", "login"]
+        if read_only:
+            args.append("--read-only")
+        result = CliRunner().invoke(cli, args, catch_exceptions=False)
 
         assert result.exit_code == 0
-        assert store.get_granted_scopes("sandbox", profile="human") == set(
-            requested_scopes
-        )
+        assert expected in result.output
 
-    def test_refresh_skips_when_custom_scopes_configured(
-        self, isolated_config, monkeypatch
+    def test_read_only_requests_only_read_scopes(self, monkeypatch):
+        monkeypatch.setattr(
+            oauth_module, "_resolve_scopes", lambda env: "a:read a:write b:read"
+        )
+        captured: dict[str, str] = {}
+
+        def fake_build_auth_url(env, redirect_uri, state, challenge, scopes, **kw):
+            captured["scopes"] = scopes
+            raise RuntimeError("stop")
+
+        monkeypatch.setattr(oauth_module, "start_pkce_callback", lambda: _FakeCallback)
+        monkeypatch.setattr(oauth_module, "_build_auth_url", fake_build_auth_url)
+
+        with pytest.raises(RuntimeError, match="stop"):
+            oauth_module.login("sandbox", oauth_module.LoginOptions(read_only=True))
+
+        assert captured["scopes"] == "a:read b:read"
+
+    def test_scope_option_hidden_from_help(self):
+        result = CliRunner().invoke(cli, ["auth", "login", "--help"])
+
+        assert result.exit_code == 0
+        assert "--scope" not in result.output
+
+    def test_configured_scopes_are_ignored_with_warning(
+        self, isolated_config, monkeypatch, capsys
     ):
-        monkeypatch.setattr(
-            auth_command_module.settings,
-            "configured_scopes",
-            lambda: "users:read",
-        )
-        monkeypatch.setattr(
-            auth_command_module,
-            "fetch_spec",
-            lambda env: pytest.fail("fetch_spec should not be called"),
-        )
+        monkeypatch.setattr(oauth_module, "configured_scopes", lambda: "users:read")
+        monkeypatch.setattr(oauth_module, "_resolve_scope_spec_paths", lambda env: ())
 
-        auth_command_module._refresh_tool_spec_before_login("sandbox")
+        assert oauth_module._resolve_scopes("sandbox") == ""
+        captured = capsys.readouterr()
+        assert "`scopes` config setting is no longer supported" in captured.err
+        assert captured.out == ""
 
 
 class TestStandaloneAgentLogin:
@@ -1459,8 +1469,7 @@ class TestPostLoginEnvHint:
                 "auth",
                 "login",
                 "--token_stdin",
-                "--scope",
-                "applications:read",
+                "--read-only",
                 "--auth-level",
                 "business",
             ],
@@ -1468,7 +1477,7 @@ class TestPostLoginEnvHint:
         )
 
         assert result.exit_code == 2
-        assert "--scope and --auth-level cannot be used with --token_stdin" in (
+        assert "--read-only and --auth-level cannot be used with --token_stdin" in (
             result.output
         )
 

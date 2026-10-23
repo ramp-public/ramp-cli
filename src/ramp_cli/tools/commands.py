@@ -26,7 +26,7 @@ from ramp_cli.client.session import get_session_id
 from ramp_cli.client.vault import vault_proxy_headers, vault_proxy_target
 from ramp_cli.config.constants import api_url, append_query_params
 from ramp_cli.config.profiles import AGENT_PROFILE
-from ramp_cli.config.settings import configured_scopes, resolve_environment
+from ramp_cli.config.settings import resolve_environment
 from ramp_cli.errors import ApiError
 from ramp_cli.onboarding import maybe_show_category_tip
 from ramp_cli.output.formatter import (
@@ -729,25 +729,12 @@ def _scope_error_hint(tool: ToolDef, env: str, profile: str | None = None) -> st
             f"    ramp --env {env} auth login"
         )
 
-    required = set(tool.required_scopes)
-    override_guidance = ""
-    configured = set(configured_scopes().split())
-    missing_from_override = sorted(required - configured) if configured else []
-    if missing_from_override:
-        override_guidance = (
-            "\n  Your top-level custom `scopes` override omits scopes declared by "
-            "the cached tool definition: "
-            f"{', '.join(missing_from_override)}. Update or remove the override "
-            "before logging in.\n"
-        )
-
     login_command = f"ramp --env {env} auth login"
     if profile == AGENT_PROFILE:
         login_command = f"ramp --env {env} agent login --client-id <agent-client-id>"
     return (
         f"The `{tool.name}` command was rejected by Core because the active "
-        "credential has insufficient OAuth scope.\n"
-        f"{override_guidance}\n"
+        "credential has insufficient OAuth scope.\n\n"
         f"  Refresh the tool definitions and re-authorize for {env}:\n\n"
         f"    ramp --env {env} tools refresh\n"
         f"    {login_command}"

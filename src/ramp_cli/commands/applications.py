@@ -34,13 +34,6 @@ APPLICATION_CREATED_MESSAGE = (
 )
 
 _APPLICATIONS_API_PATH = "/developer/v1/applications"
-_APPLICATION_AUTH_FALLBACK_SCOPES = (
-    "applications:read",
-    "applications:write",
-    "bank_accounts:read",
-    "incorporation:read",
-    "incorporation:write",
-)
 _APPLICATION_INVITE_LINK_KEYS = (
     "invite_link",
     "invite_url",
@@ -154,10 +147,7 @@ def _render_success_message(format_flag: str | None, config_format: str) -> None
 
 
 def _manual_auth_fallback_command(env: str) -> str:
-    scope_flags = " ".join(
-        f"--scope {scope}" for scope in _APPLICATION_AUTH_FALLBACK_SCOPES
-    )
-    return f"ramp --env {env} auth login --auth-level business {scope_flags}"
+    return f"ramp --env {env} auth login --auth-level business"
 
 
 def _agent_handoff_envelope(payload: dict[str, Any]) -> dict[str, Any]:
@@ -237,7 +227,7 @@ def _render_handoff_result(
 
     if auth_error:
         click.echo(f"CLI authentication was not completed: {auth_error}", err=True)
-    click.echo("Manual scoped auth fallback:", err=True)
+    click.echo("Manual auth fallback:", err=True)
     click.echo(f"  {fallback_command}", err=True)
 
 

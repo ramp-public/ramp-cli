@@ -553,10 +553,7 @@ def test_applications_create__wait_for_auth_timeout_returns_fallback(
     assert data["authenticated"] is False
     assert data["auth_error"] == "OAuth redirect timed out after 1 seconds"
     assert data["fallback_command"] == (
-        "ramp --env sandbox auth login --auth-level business "
-        "--scope applications:read --scope applications:write "
-        "--scope bank_accounts:read "
-        "--scope incorporation:read --scope incorporation:write"
+        "ramp --env sandbox auth login --auth-level business"
     )
 
 

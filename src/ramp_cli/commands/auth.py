@@ -10,6 +10,7 @@ import httpx
 
 from ramp_cli.animations.nyc import show_nyc
 from ramp_cli.auth import store
+from ramp_cli.auth.access import access_level
 from ramp_cli.auth.client_credentials import login as do_client_credentials_login
 from ramp_cli.auth.environment import (
     environment_auth_required_message,
@@ -26,6 +27,17 @@ from ramp_cli.output.style import SUCCESS_GREEN, env_label, show_status_box
 from ramp_cli.specs.sync import fetch_spec
 
 CLIENT_SECRET_ENV_VAR = "RAMP_CLIENT_SECRET"
+
+SCOPE_REMOVED_MESSAGE = """--scope is no longer supported.
+
+Ramp now limits what an agent can do using your role's permissions, not
+individual OAuth scopes, so picking specific scopes had no effect.
+
+To give an agent read-only access, run:
+  ramp auth login --read-only
+
+Without it, the agent can read and write anything your role allows.
+Run `ramp auth status` to see the current access level."""
 
 
 @click.group("auth", help="Manage authentication")
@@ -92,9 +104,6 @@ def _with_profile(data: dict, profile: str | None) -> dict:
 
 def _refresh_tool_spec_before_login(env: str) -> None:
     """Best-effort sync so newly deployed tool scopes are requested at login."""
-    if settings.configured_scopes():
-        return
-
     try:
         fetch_spec(env)
     except Exception:
@@ -120,10 +129,19 @@ def _refresh_tool_spec_before_login(env: str) -> None:
     help="Print login URL instead of opening browser",
 )
 @click.option(
+    "--read-only",
+    "read_only",
+    is_flag=True,
+    default=False,
+    help="Request read-only access for this login. Without it, the agent can "
+    "read and write anything your role allows.",
+)
+@click.option(
     "--scope",
     "scopes",
     multiple=True,
-    help="Request only this OAuth scope. Repeat for additional scopes.",
+    hidden=True,
+    help="No longer supported. Use --read-only.",
 )
 @click.option(
     "--auth-level",
@@ -145,6 +163,7 @@ def login(
     ctx: click.Context,
     token_stdin: bool,
     no_browser: bool,
+    read_only: bool,
     scopes: tuple[str, ...],
     auth_level: str,
     client_id: str | None,
@@ -155,14 +174,17 @@ def login(
     profile = profiles.HUMAN_PROFILE
     label = env_label(env)
 
+    if scopes and not client_id:
+        raise click.ClickException(SCOPE_REMOVED_MESSAGE)
+
     if token_stdin:
         if client_id or client_secret is not None:
             raise click.UsageError(
                 "--token_stdin cannot be used with --client-id or --client-secret."
             )
-        if scopes or auth_level != "auto":
+        if read_only or auth_level != "auto":
             raise click.UsageError(
-                "--scope and --auth-level cannot be used with --token_stdin."
+                "--read-only and --auth-level cannot be used with --token_stdin."
             )
         token = sys.stdin.readline().strip()
         if not token:
@@ -197,6 +219,10 @@ def login(
         raise click.UsageError("--client-secret requires --client-id.")
 
     if client_id:
+        if read_only:
+            raise click.UsageError(
+                "--read-only cannot be used with --client-id or --client-secret."
+            )
         login_standalone_agent(
             ctx,
             env=env,
@@ -216,8 +242,8 @@ def login(
 
     opts = LoginOptions(
         no_browser=no_browser,
-        scopes=scopes,
         auth_level=auth_level,
+        read_only=read_only,
     )
     try:
         token_resp = do_login(env, opts)
@@ -259,6 +285,11 @@ def login(
         for env in iter_environments()
     ]
     show_status_box(envs)
+
+    access = access_level(token_resp.scope.split())
+    if access:
+        click.echo(f"  Logged in with {access} access")
+        click.echo()
 
     if first_time:
         show_welcome(env)
@@ -349,19 +380,21 @@ def status(ctx: click.Context) -> None:
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     cfg = settings.load()
     profile = ctx.obj["profile"]
+    is_human = profile != profiles.AGENT_PROFILE
 
     if fmt == "json":
-        data = {
-            env.name: _with_profile(
-                {
-                    "authenticated": _is_authenticated(cfg, env.name, profile),
-                    "base_url": base_url(env.name),
-                    "scopes": sorted(_granted_scopes(cfg, env.name, profile)),
-                },
-                profile,
-            )
-            for env in iter_environments()
-        }
+        data = {}
+        for env in iter_environments():
+            authenticated = _is_authenticated(cfg, env.name, profile)
+            scopes = _granted_scopes(cfg, env.name, profile)
+            entry: dict = {
+                "authenticated": authenticated,
+                "base_url": base_url(env.name),
+                "scopes": sorted(scopes),
+            }
+            if is_human:
+                entry["access"] = access_level(scopes) if authenticated else None
+            data[env.name] = _with_profile(entry, profile)
         print_agent_json(data, pagination=None)
     else:
         if profile:
@@ -382,6 +415,8 @@ def status(ctx: click.Context) -> None:
                     "\n     Tools will fail. Log in again:  ramp auth login",
                     err=True,
                 )
+            elif is_human:
+                click.echo(f"  Access: {access_level(scopes)}", err=True)
             else:
                 click.echo(f"  Scopes: {len(scopes)} granted", err=True)
 
