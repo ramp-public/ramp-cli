@@ -8,7 +8,7 @@ import {
   usageOriginFromBaseURL,
 } from "../src/usage.ts"
 import { sidebarUsageView } from "../src/sidebar-view.ts"
-import { resolveAPIKey, resolveUsageOrigin } from "../src/options.ts"
+import { resolveAPIKey, resolveUsageAPIKey, resolveUsageOrigin } from "../src/options.ts"
 
 function usagePayload(overrides = {}) {
   return {
@@ -100,6 +100,13 @@ describe("resolveUsageOrigin", () => {
 })
 
 describe("resolveAPIKey", () => {
+  it("keeps the direct usage credential separate from the local data-plane token", () => {
+    const options = { apiKey: "ramp-local-token", usageApiKey: "real-key" }
+    assert.equal(resolveAPIKey(options), "ramp-local-token")
+    assert.equal(resolveUsageAPIKey(options), "real-key")
+    assert.equal(resolveUsageAPIKey({ apiKey: "direct-key" }), "direct-key")
+    assert.equal(resolveUsageAPIKey({ apiKey: "rotated-key", usageApiKey: "old-key" }), "rotated-key")
+  })
   it("prefers the inline key and falls back through the environments", () => {
     process.env.RAMP_ROUTER_API_KEY = "env-key"
     assert.equal(resolveAPIKey({ apiKey: "inline-key" }), "inline-key")

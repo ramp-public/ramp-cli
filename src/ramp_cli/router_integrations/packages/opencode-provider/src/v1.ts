@@ -19,6 +19,7 @@ import {
   resolveRampCliVersion,
   routerPluginOptions,
 } from "./options.ts"
+import { applyTurnHeader } from "./turn-id.ts"
 
 type MutableProviderConfig = {
   npm?: string
@@ -99,6 +100,12 @@ export const RouterProviderV1: Plugin = async (_input, rawOptions) => {
   const rampCliVersion = resolveRampCliVersion(options)
 
   return {
+    // OpenCode passes the current user message to every chat request; its ID
+    // groups the model calls caused by that message into one Router turn.
+    "chat.headers": async (input, output) => {
+      if (input.model?.providerID !== providerID) return
+      applyTurnHeader(output.headers, input.message?.id)
+    },
     config: async (config) => {
       const baseURL = resolveBaseURL(options)
       const apiKey = resolveAPIKey(options)

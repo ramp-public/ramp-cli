@@ -329,7 +329,7 @@ def test_concurrent_session_starts_yield_exactly_one_syncer():
 
 def test_claim_sync_slot_loses_while_another_process_holds_the_lock():
     _write_cooldown(age_seconds=sync_module.SYNC_COOLDOWN_SECONDS + 1)
-    lock_path = config_dir() / "router-sync.lock"
+    lock_path = sync_module.job_lock_dir() / "router-sync.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as holder:
         fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
@@ -436,7 +436,7 @@ def test_a_lock_losing_invocation_still_emits_the_notice(monkeypatch):
     _write_cooldown(age_seconds=sync_module.SYNC_COOLDOWN_SECONDS + 1)
     _cache_update()
     spawned = _record_spawns(monkeypatch)
-    lock_path = config_dir() / "router-sync.lock"
+    lock_path = sync_module.job_lock_dir() / "router-sync.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as holder:
         fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
@@ -498,3 +498,30 @@ def test_an_unwritable_state_dir_fails_closed(monkeypatch, tmp_path):
     assert result.output == ""
     assert result.stderr == ""
     assert spawned == []
+
+
+def test_sync_lock_does_not_follow_xdg_config_home(monkeypatch, tmp_path):
+    """The job's lock stays the same lock under another XDG_CONFIG_HOME."""
+    with sync_module.sync_lock() as held:
+        assert held
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "elsewhere"))
+        with sync_module.sync_lock() as second:
+            assert not second
+
+
+def test_sync_lock_waits_for_a_holder_to_finish():
+    released = threading.Event()
+
+    def hold():
+        with sync_module.sync_lock() as held:
+            assert held
+            released.wait(5)
+            time.sleep(0.3)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    time.sleep(0.1)
+    released.set()
+    with sync_module.sync_lock(wait=5) as acquired:
+        assert acquired
+    holder.join(5)

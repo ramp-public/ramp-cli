@@ -1,6 +1,6 @@
 import { createSignal } from "solid-js"
 
-import { resolveAPIKey, resolveRampCliVersion, resolveUsageOrigin } from "./options.ts"
+import { resolveUsageAPIKey, resolveRampCliVersion, resolveUsageOrigin } from "./options.ts"
 import type { RouterPluginOptions } from "./options.ts"
 import { sidebarUsageView } from "./sidebar-view.ts"
 import type { SidebarUsageView } from "./sidebar-view.ts"
@@ -89,7 +89,7 @@ export function createUsageTracker(host: UsageHost, deps: TrackerDeps = {}) {
       if (!afterIdle && last !== undefined && now() - last < USAGE_REFRESH_MIN_INTERVAL_MS) {
         return "retry"
       }
-      const apiKey = resolveAPIKey(options)
+      const apiKey = resolveUsageAPIKey(options)
       if (!apiKey) {
         if (!activeRetries.has(sessionID)) clearUsage(sessionID)
         return "retry"

@@ -1,11 +1,14 @@
 """Rate-limited session-start sync for installed Router artifacts.
 
 Configure/refresh register a session-start sync in Claude Code, Codex, and
-OpenCode that runs `ramp router sync --hook`, keeping the locally installed
-artifacts (Codex catalog snapshot and instructions, Claude statusline, default
-model ids, plugin paths) from going stale. The invocation is cheap and
-fail-open: the common case is one stat() with zero network I/O, and an expired
-cooldown spawns `ramp router refresh` detached so session start never waits.
+OpenCode that runs `ramp router sync --hook`, keeping each setup's model list
+and default model current. The invocation is cheap and fail-open: the common
+case is one stat() with zero network I/O, and an expired cooldown spawns a
+models-only refresh detached so session start never waits. That refresh also
+repairs missing CLI-owned OpenCode/Pi plugin paths after upgrades, without
+resetting plugin options. Other settings are the user's between configures;
+`ramp router refresh` (which
+`ramp update` runs) is what repairs the rest of a setup.
 """
 
 from __future__ import annotations
@@ -16,6 +19,8 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from ramp_cli.config.settings import config_dir
@@ -47,6 +52,18 @@ def log_path() -> Path:
     return config_dir() / "router-sync.log"
 
 
+def job_lock_dir() -> Path:
+    """Where the per-user sync and schedule locks and the opt-out marker live.
+
+    Not config_dir(): that follows XDG_CONFIG_HOME, and the scheduled job runs
+    with the value it was installed with. An interactive run under another
+    XDG_CONFIG_HOME would otherwise take a lock the running job is not holding
+    and reload or remove the job mid-write, or leave an opt-out marker the job
+    never reads.
+    """
+    return Path.home() / ".config" / "ramp"
+
+
 def sync_is_due() -> bool:
     """Report whether the cooldown has elapsed: one stat(), no network."""
     try:
@@ -54,6 +71,14 @@ def sync_is_due() -> bool:
     except OSError:
         return True
     return age >= SYNC_COOLDOWN_SECONDS
+
+
+def cooldown_due_at() -> float:
+    """When the cooldown ends (now if it already has)."""
+    try:
+        return _cooldown_path().stat().st_mtime + SYNC_COOLDOWN_SECONDS
+    except OSError:
+        return time.time()
 
 
 def touch_cooldown() -> bool:
@@ -76,7 +101,7 @@ def claim_sync_slot() -> bool:
     the hooks that call this.
     """
     try:
-        lock_path = config_dir() / "router-sync.lock"
+        lock_path = job_lock_dir() / "router-sync.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with lock_path.open("a+b") as lock_file:
             if fcntl is not None:
@@ -99,6 +124,42 @@ def claim_sync_slot() -> bool:
         # session start, forever.
         log_failure(f"could not claim the sync cooldown: {exc!r}")
         return False
+
+
+@contextmanager
+def sync_lock(wait: float = 0) -> Iterator[bool]:
+    """Hold the sync lock for the whole block; yield False if another run has it.
+
+    Lock-only counterpart of claim_sync_slot (same file, no cooldown check),
+    for the scheduled job, whose refresh must not overlap another sync.
+    ``wait`` seconds are spent retrying before giving up, for callers that
+    must not act while a refresh is writing.
+    """
+    try:
+        lock_path = job_lock_dir() / "router-sync.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = lock_path.open("a+b")
+    except OSError as exc:
+        log_failure(f"could not open the sync lock: {exc!r}")
+        yield False
+        return
+    with lock_file:
+        if fcntl is not None:
+            deadline = time.monotonic() + wait
+            while True:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        yield False
+                        return
+                    time.sleep(0.25)
+        try:
+            yield True
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def update_notice() -> str | None:

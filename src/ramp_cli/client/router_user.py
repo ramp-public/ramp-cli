@@ -7,6 +7,7 @@ Credentials use the Core CLI baseline: private plaintext files and atomic writes
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -19,11 +20,13 @@ import time
 from collections.abc import Callable
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 from pathlib import Path
-from threading import Event, Lock, Thread
+from threading import Event, Lock
 from urllib.parse import urlencode, urlsplit
 
 import click
 import httpx
+from prompt_toolkit import PromptSession
+from prompt_toolkit.output import DummyOutput
 
 from ramp_cli.auth import oauth
 from ramp_cli.auth.refresh import _refresh_lock
@@ -244,34 +247,63 @@ def _stdin_is_terminal() -> bool:
         return False
 
 
-def _read_pasted_callback(callback: oauth.PkceCallback) -> None:
+def _read_pasted_callback(
+    callback: oauth.PkceCallback, *, timeout: float, cancel: Event | None = None
+) -> None:
     """Also accept the callback address typed into the terminal.
 
-    Read on a daemon thread so the browser's own callback can still win; the
-    prompt is left behind unanswered if it does.
+    Race a cancellable terminal prompt against browser completion. Await its
+    teardown before returning so no reader can steal the next picker's input.
+    Hide the pasted address: it contains an authorization code.
     """
 
-    def read() -> None:
-        while not callback._event.is_set():
-            # On stderr, like the sign-in URL: stdout may carry JSON output.
-            click.echo(
-                "If the browser can't reach this machine, paste the address "
-                "it was sent to: ",
-                err=True,
-                nl=False,
-            )
-            try:
-                url = input()
-            except (EOFError, OSError, ValueError):
-                return
-            if not url.strip():
-                continue
-            try:
-                callback.submit_url(url)
-            except click.ClickException as error:
-                click.echo(error.format_message(), err=True)
+    async def read() -> None:
+        session: PromptSession[str] = PromptSession(output=DummyOutput())
+        deadline = time.monotonic() + timeout
 
-    Thread(target=read, daemon=True).start()
+        async def completed() -> None:
+            while not callback._event.is_set():
+                if cancel is not None and cancel.is_set():
+                    raise click.ClickException("Router sign-in cancelled.")
+                if time.monotonic() >= deadline:
+                    raise click.ClickException("Router user login timed out.")
+                await asyncio.sleep(0.05)
+
+        completion = asyncio.create_task(completed())
+        prompt = None
+        try:
+            while not callback._event.is_set():
+                click.echo(
+                    "If the browser can't reach this machine, paste its callback "
+                    "address here (input hidden): ",
+                    err=True,
+                    nl=False,
+                )
+                prompt = asyncio.create_task(session.prompt_async("", is_password=True))
+                done, _ = await asyncio.wait(
+                    {prompt, completion}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if completion in done:
+                    await completion
+                    return
+                try:
+                    url = await prompt
+                except EOFError:
+                    return  # the browser can still complete the sign-in
+                if not url.strip():
+                    continue
+                try:
+                    callback.submit_url(url)
+                except click.ClickException as error:
+                    click.echo(error.format_message(), err=True)
+        finally:
+            tasks = [completion, *([prompt] if prompt is not None else [])]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            click.echo(err=True)
+
+    asyncio.run(read())
 
 
 class RouterUserClient:
@@ -541,6 +573,7 @@ class RouterUserClient:
                 }
             )
         )
+        deadline = time.monotonic() + timeout
         try:
             message = "Approve the sign-in in your browser to continue..."
             if no_browser or not oauth._open_browser(url):
@@ -552,9 +585,12 @@ class RouterUserClient:
             else:
                 click.echo(message, err=True)
                 if on_callback is None and _stdin_is_terminal():
-                    _read_pasted_callback(callback)
+                    _read_pasted_callback(
+                        callback,
+                        timeout=max(0, deadline - time.monotonic()),
+                        cancel=cancel,
+                    )
             if cancel is not None:
-                deadline = time.monotonic() + timeout
                 while not callback._event.wait(timeout=0.1):
                     if cancel.is_set():
                         raise click.ClickException("Router sign-in cancelled.")
@@ -563,7 +599,8 @@ class RouterUserClient:
                 if cancel.is_set():
                     raise click.ClickException("Router sign-in cancelled.")
             code = callback.wait_for_code(
-                timeout, timeout_message="Router user login timed out."
+                max(0, deadline - time.monotonic()),
+                timeout_message="Router user login timed out.",
             )
         finally:
             callback.shutdown()

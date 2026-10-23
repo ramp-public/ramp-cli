@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import hashlib
 import hmac
@@ -19,7 +20,7 @@ import tempfile
 import time
 import tomllib
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, redirect_stderr
 from copy import copy
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -27,6 +28,7 @@ from functools import lru_cache
 from pathlib import Path, PurePath
 from typing import Literal
 from urllib.parse import urlsplit
+from urllib.request import url2pathname
 
 import click
 import httpx
@@ -35,9 +37,26 @@ import questionary
 import zstandard
 from click.core import ParameterSource
 
-from ramp_cli import __version__, admin_defaults, claude_cowork, hermes_agent
-from ramp_cli.commands import claude_code, conductor, cursor
+from ramp_cli import (
+    __version__,
+    admin_defaults,
+    claude_cowork,
+    codex_desktop,
+    hermes_agent,
+    json5_edit,
+)
+from ramp_cli.commands import (
+    claude_code,
+    conductor,
+    cursor,
+    router_credentials,
+    router_repo,
+    router_schedule,
+)
 from ramp_cli.commands import router_sync as router_sync_module
+from ramp_cli.commands.router_connectors import (
+    configure_harnesses as configure_connector_harnesses,
+)
 from ramp_cli.commands.router_sync import (
     SYNC_HOOK_STOP_EVENT,
     SYNC_HOOK_USER_MANAGED,
@@ -48,6 +67,8 @@ from ramp_cli.commands.router_sync import (
     session_sync_hook_command,
     spawn_detached_refresh,
     sync_is_due,
+    sync_lock,
+    touch_cooldown,
     update_notice,
 )
 from ramp_cli.commands.router_user import RouterMenuGroup, register_router_user_commands
@@ -58,6 +79,7 @@ from ramp_cli.commands.router_user_strategies import (
     use_account_strategies,
 )
 from ramp_cli.config.settings import config_dir
+from ramp_cli.errors import RampCLIError
 from ramp_cli.output.formatter import (
     print_agent_json,
     print_json,
@@ -65,6 +87,7 @@ from ramp_cli.output.formatter import (
     resolve_format,
 )
 from ramp_cli.output.style import show_notice, start_spinner
+from ramp_cli.router_connectors import harnesses as connector_harnesses
 from ramp_cli.router_integrations import integration_package_path
 from ramp_cli.router_setup import (
     ROUTER_SETUP_DEFERRED_EXIT_CODE,
@@ -115,7 +138,7 @@ HERMES_ROUTER_PROVIDER = "router"
 # Read instead of --api-key so the secret stays out of shell history and out
 # of the process list.
 CONFIGURE_KEY_ENV = "RAMP_ROUTER_CONFIGURE_API_KEY"
-# Browser-created keys reach the control-plane database before the data plane's
+# Newly created keys reach the control-plane database before the data plane's
 # request-time projection. Retry only that known-new key long enough for its
 # materialized record to arrive.
 NEW_KEY_RETRY_DELAYS = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
@@ -526,7 +549,13 @@ def _codex_key_command(key_path: Path) -> tuple[str, list[str]]:
     return "/bin/cat", [str(key_path)]
 
 
-def _codex_provider(key_path: Path, base_url: str | None = None) -> str:
+def _codex_provider(
+    key_path: Path,
+    base_url: str | None = None,
+    *,
+    repository_attribution: bool = False,
+    api_key: str | None = None,
+) -> str:
     """Describe the Router provider to Codex.
 
     The credential is read by a command rather than written inline, because
@@ -540,7 +569,6 @@ def _codex_provider(key_path: Path, base_url: str | None = None) -> str:
     already sends, because that shape carries no harness prompt and is only
     safe alongside the model_instructions_file this same setup writes.
     """
-    command, args = _codex_key_command(key_path)
     http_headers = ", ".join(
         f"{json.dumps(name)} = {json.dumps(value)}"
         for name, value in (
@@ -548,9 +576,18 @@ def _codex_provider(key_path: Path, base_url: str | None = None) -> str:
             (claude_code.RAMP_CLI_VERSION_HEADER, __version__),
         )
     )
+    setup_base_url = base_url
+    if repository_attribution:
+        setup_base_url, local_key = router_repo.client_credentials(
+            base_url or router_base_url(),
+            api_key if api_key is not None else key_path.read_text().strip(),
+        )
+        if router_repo.is_wrapped(setup_base_url):
+            key_path = router_repo.local_token_path(local_key)
+    command, args = _codex_key_command(key_path)
     return f'''[model_providers.ramp-router]
 name = "Ramp Router"
-base_url = "{(base_url or router_base_url()).rstrip("/")}"
+base_url = "{(setup_base_url or router_base_url()).rstrip("/")}"
 wire_api = "responses"
 supports_websockets = false
 http_headers = {{ {http_headers} }}
@@ -1425,6 +1462,19 @@ def _validate_deployment_url(
     help="Print the Router setup URL instead of opening a browser.",
 )
 @click.option(
+    "--connectors",
+    is_flag=True,
+    help=(
+        "Sign in with connector access on every run, enable MCP, and configure Claude Code, "
+        "Codex, or OpenCode. Create a key if none is saved; otherwise offer reuse."
+    ),
+)
+@click.option(
+    "--enable-agent",
+    is_flag=True,
+    help="Sign in, configure selected harnesses, and enable background refresh and repository tagging.",
+)
+@click.option(
     "--reuse-existing-key",
     is_flag=True,
     help=(
@@ -1471,6 +1521,8 @@ def router_configure(
     setup_file: Path | None,
     api_key: str | None,
     no_browser: bool,
+    connectors: bool,
+    enable_agent: bool,
     reuse_existing_key: bool,
     confirm_browser: bool,
     claude_models: str | None,
@@ -1482,6 +1534,50 @@ def router_configure(
         raise click.UsageError(
             "--confirm-browser cannot be combined with --no-browser."
         )
+    if connectors and confirm_browser:
+        raise click.UsageError(
+            "--connectors cannot be combined with --confirm-browser."
+        )
+    if enable_agent:
+        if confirm_browser or setup_file is not None or reuse_existing_key:
+            raise click.UsageError(
+                "--enable-agent cannot be combined with --confirm-browser, --setup-file, or --reuse-existing-key."
+            )
+        fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
+        if (
+            fmt == "json"
+            or ctx.obj.get("no_input")
+            or ctx.obj.get("agent_mode")
+            or not _can_prompt(ctx, fmt)
+        ):
+            raise click.UsageError(
+                "--enable-agent requires an interactive human terminal."
+            )
+        if os.environ.get(SYNC_OPT_OUT_ENV):
+            raise click.UsageError(
+                f"Unset {SYNC_OPT_OUT_ENV} before enabling the agent."
+            )
+        if (
+            sys.platform != "darwin" and not sys.platform.startswith("linux")
+        ) or not router_repo.service_supported():
+            raise click.UsageError(
+                "--enable-agent requires the native Router agent and a supported service manager."
+            )
+        base = base_url or router_base_url()
+        origin = ui_url or _statusline_origin(base)
+        _validate_deployment_url(ctx, click.Option(["--base-url"]), base)
+        _validate_deployment_url(ctx, click.Option(["--ui-url"]), origin)
+        if origin != _router_key_origin(base):
+            raise click.UsageError("Router API and sign-in deployments must match.")
+        supported = (
+            connector_harnesses.HARNESSES
+            if connectors
+            else router_credentials.HARNESSES
+        )
+        if any(client not in supported for client in clients):
+            raise click.UsageError(
+                "--enable-agent supports only " + ", ".join(supported) + "."
+            )
     # Click has already copied any configured key into api_key. Drop it from
     # the environment before the workspace starts, whose detection probes
     # (Claude Desktop's among them) run as child processes.
@@ -1494,6 +1590,8 @@ def router_configure(
         and not no_browser
         and not reuse_existing_key
         and not confirm_browser
+        and not connectors
+        and not enable_agent
         and (not clients or (api_key is None and setup_file is None))
         and router_ui.launch(
             ctx,
@@ -1525,11 +1623,24 @@ def router_configure(
         deployment_override=bool(base_url or ui_url),
         reuse_existing_key=reuse_existing_key,
         confirm_browser=confirm_browser,
+        connectors=connectors,
+        enable_agent=enable_agent,
     )
     if confirm_browser:
         _run_mdm_configure(run)
     else:
         run()
+    if enable_agent:
+        ctx.invoke(router_agent_enable, helper_port=None)
+        tagging = router_repo.status()
+        if (
+            router_schedule.background_status()["state"] != "running"
+            or not tagging["healthy"]
+            or tagging.get("refresh_failures")
+        ):
+            raise click.ClickException(
+                "Router is configured, but the agent is not running or a harness could not be migrated. Check 'router agent status' and rerun configure --enable-agent."
+            )
 
 
 def _run_mdm_configure(run: Callable[[], None]) -> None:
@@ -1627,6 +1738,8 @@ def _run_configure(
     deployment_override: bool = False,
     reuse_existing_key: bool = False,
     confirm_browser: bool = False,
+    connectors: bool = False,
+    enable_agent: bool = False,
 ) -> None:
     # Click has already copied any configured value into api_key. Drop the
     # secret from the environment before anything here spawns a child: the
@@ -1641,6 +1754,8 @@ def _run_configure(
         codex_models is None
         and not no_browser
         and not reuse_existing_key
+        and not connectors
+        and not enable_agent
         and (
             not clients
             or api_key is None
@@ -1675,20 +1790,58 @@ def _run_configure(
             "--codex-models requires exactly one agent: "
             "'ramp router configure codex --codex-models compact|all'."
         )
-    all_clients = tuple(CLIENT_NAMES)
+    all_clients = (
+        connector_harnesses.HARNESSES
+        if connectors
+        else router_credentials.HARNESSES
+        if enable_agent
+        else tuple(CLIENT_NAMES)
+    )
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     requested_clients = tuple(dict.fromkeys(clients))
+    if connectors and any(item not in all_clients for item in requested_clients):
+        raise click.UsageError(
+            "--connectors supports only " + ", ".join(all_clients) + "."
+        )
     picked_from_menu = False
     if not requested_clients:
         if _can_prompt(ctx, fmt):
-            requested_clients = _pick_installed_clients()
+            if connectors or enable_agent:
+                installed = set(_installed_clients())
+                if _codex_app_installed():
+                    installed.add("codex")
+                candidates = tuple(item for item in all_clients if item in installed)
+                requested_clients = _pick_clients(
+                    "Choose the agents you want to configure with Ramp Router",
+                    candidates or all_clients,
+                )
+                if not requested_clients:
+                    raise click.Abort()
+            else:
+                requested_clients = _pick_installed_clients()
             picked_from_menu = True
         else:
             # Cowork uses a desktop profile rather than agent config files,
             # but belongs in unattended setup too.
-            if claude_cowork.is_available():
+            if not connectors and claude_cowork.is_available():
                 all_clients = (*all_clients, COWORK_CLIENT)
     clients = requested_clients or all_clients
+    if enable_agent:
+        for client in clients:
+            try:
+                path = (
+                    connector_harnesses.config_path(client)
+                    if client == "opencode"
+                    else _client_config_path(client)
+                )
+            except RampCLIError as exc:
+                raise click.ClickException(str(exc)) from None
+            if client == "codex":
+                _read_codex_config(path)
+            elif client == "claude-code":
+                claude_code.read_settings(path)
+            elif path.exists():
+                _read_json_text(client, path)
     if (
         claude_models is not None
         and clients != ("claude-code",)
@@ -1700,7 +1853,8 @@ def _run_configure(
             "--claude-models requires exactly one agent: "
             "'ramp router configure claude-code --claude-models compact|all'."
         )
-    clients = _with_claude_desktop(ctx, fmt, clients, requested_clients)
+    if not connectors and not enable_agent:
+        clients = _with_claude_desktop(ctx, fmt, clients, requested_clients)
 
     claude_path = _client_config_path("claude-code")
     existing_claude = claude_code.state_path(claude_path).is_file()
@@ -1710,6 +1864,8 @@ def _run_configure(
         and setup_file is None
         and api_key is None
         and not deployment_override
+        and not connectors
+        and not enable_agent
         and _same_router(
             _configured_claude_code_router_url(claude_path), router_base_url()
         )
@@ -1728,6 +1884,9 @@ def _run_configure(
         # preference configures, so the repeat-configure shortcut clears it
         # like a full configure would.
         _scrub_stale_fable_verdict()
+        # Like every other configure, so RAMP_NO_SESSION_SYNC=1 removes the
+        # job here too.
+        router_schedule.install()
         if fmt == "json":
             settings = claude_code.read_settings(claude_path)
             print_agent_json(
@@ -1752,7 +1911,7 @@ def _run_configure(
             click.echo(f"Claude Code model list: {view}")
         return
 
-    if reuse_existing_key and setup_file is None and api_key is None:
+    if reuse_existing_key and not connectors and setup_file is None and api_key is None:
         credentials = _stored_router_api_key_choices()
         if len(credentials) > 1:
             if confirm_browser:
@@ -1774,7 +1933,12 @@ def _run_configure(
                 saved_by=",".join(credentials[0][1]) if credentials else None,
             )
 
-    if ctx.obj["no_input"] and setup_file is None and api_key is None:
+    if (
+        ctx.obj["no_input"]
+        and not connectors
+        and setup_file is None
+        and api_key is None
+    ):
         raise click.UsageError(
             "Pass --setup-file or --api-key when using non-interactive mode, or set "
             f"{CONFIGURE_KEY_ENV} to keep the key out of shell history "
@@ -1796,7 +1960,7 @@ def _run_configure(
             current_view = _configured_codex_model_view(_codex_config_path())
         else:
             current_view = "compact"
-        if _can_prompt(ctx, fmt):
+        if not enable_agent and _can_prompt(ctx, fmt):
             claude_models = _pick_claude_models(current_view, clients)
             # The question names both profile clients. Apply an answer to
             # Codex too, but never copy an unprompted Claude default over a
@@ -1820,7 +1984,7 @@ def _run_configure(
     if fmt != "json":
         click.echo(f"Connecting Ramp Router to {target_phrase}")
     base_url = router_base_url()
-    browser_acquired_key = False
+    newly_created_key = False
     if setup_file is not None:
         # Parsed before the host check so a malformed file is classified as
         # the invalid input even where Cowork setup cannot run at all.
@@ -1837,6 +2001,22 @@ def _run_configure(
         # Named on a host that cannot run Conductor: fail before a browser
         # opens or a key is created for a setup that cannot be written.
         raise click.ClickException("Conductor is only available on macOS.")
+    if connectors:
+        api_key, newly_created_key = configure_connector_harnesses(
+            ctx,
+            clients,
+            base_url=base_url,
+            api_key=api_key,
+            no_browser=no_browser,
+            reuse_existing_key=reuse_existing_key,
+            can_prompt=_can_prompt(ctx, fmt),
+        )
+    elif enable_agent and api_key is None:
+        api_key, newly_created_key = router_credentials.acquire_key(
+            _statusline_origin(base_url),
+            profile=ctx.obj.get("profile"),
+            no_browser=no_browser,
+        )
     if (
         setup_file is None
         and api_key is None
@@ -1868,7 +2048,7 @@ def _run_configure(
             api_key = acquire_router_api_key(router_ui_url(), mdm=True)
         else:
             api_key = acquire_router_api_key(router_ui_url(), no_browser=no_browser)
-        browser_acquired_key = True
+        newly_created_key = True
     api_key = api_key.strip()
     if not api_key:
         # A user-supplied key was validated above, so what is empty here came
@@ -1877,6 +2057,7 @@ def _run_configure(
     results = []
     failures = []
     cowork_note = None
+    setup_messages = io.StringIO() if connectors and fmt != "json" else None
     # A push started here is owed to every harness on this machine, not
     # only the ones this run connects.
     switchyard_push = _SwitchyardPush((*clients, *configured_router_clients()))
@@ -1884,9 +2065,11 @@ def _run_configure(
     # and each agent's files, so it is the stretch that needs to look alive.
     stop_spinner = (
         start_spinner(f"Setting up {target_phrase}")
-        if fmt != "json" and not ctx.obj["quiet"]
+        if fmt != "json" and not ctx.obj["quiet"] and not connectors
         else (lambda: None)
     )
+    if setup_messages is not None and not ctx.obj["quiet"]:
+        click.echo("\nSetting up agents...")
     try:
         models_by_client: dict[str, list[RouterModel]] = {}
         standard_clients = tuple(
@@ -1896,7 +2079,7 @@ def _run_configure(
             models = _fetch_models(
                 api_key,
                 base_url=base_url,
-                wait_for_key=setup_file is not None or browser_acquired_key,
+                wait_for_key=setup_file is not None or newly_created_key,
             )
             models_by_client.update(dict.fromkeys(standard_clients, models))
         if COWORK_CLIENT in clients:
@@ -1906,7 +2089,7 @@ def _run_configure(
                 api_key,
                 gateway_client=claude_cowork.GATEWAY_CLIENT,
                 base_url=base_url,
-                wait_for_key=setup_file is not None or browser_acquired_key,
+                wait_for_key=setup_file is not None or newly_created_key,
             )
         if "claude-code" in clients:
             # The --claude-models choice is a presentation preference for
@@ -1923,7 +2106,7 @@ def _run_configure(
                 claude_code_view=True,
                 model_view_all=True,
                 base_url=base_url,
-                wait_for_key=setup_file is not None or browser_acquired_key,
+                wait_for_key=setup_file is not None or newly_created_key,
             )
         for item in clients:
             models = models_by_client[item]
@@ -2041,12 +2224,19 @@ def _run_configure(
                     configure_options["selected_model"] = pushed
                     if item == "codex":
                         configure_options["explicit_model"] = True
-                path, default_model, repaired = _configure_client(
-                    item,
-                    api_key,
-                    models,
-                    **configure_options,
-                )
+                # Keep optional setup diagnostics inside the final Notice.
+                # Exceptions still reach the command's normal error handling.
+                with (
+                    redirect_stderr(setup_messages)
+                    if setup_messages is not None
+                    else nullcontext()
+                ):
+                    path, default_model, repaired = _configure_client(
+                        item,
+                        api_key,
+                        models,
+                        **configure_options,
+                    )
             except click.ClickException as exc:
                 switchyard_push.settle(written=False)
                 failures.append(f"{AGENT_NAMES[item]}: {exc.message}")
@@ -2066,6 +2256,8 @@ def _run_configure(
                 "original_setup_command": _original_setup_command(item, path),
                 "switchyard_model": switchyard_model,
             }
+            if connectors:
+                result["connectors_enabled"] = True
             if item == "codex":
                 catalog = _read_codex_catalog(
                     str((path.parent / CODEX_ROUTER_CATALOG).resolve())
@@ -2082,7 +2274,7 @@ def _run_configure(
         if confirm_browser:
             record_mdm_event(
                 "router_mdm_clients_configured",
-                key_source="browser" if browser_acquired_key else "reused",
+                key_source="browser" if newly_created_key else "reused",
                 configured=",".join(result["client"] for result in results) or None,
                 failed="; ".join(failures) or None,
             )
@@ -2119,9 +2311,56 @@ def _run_configure(
         # terminal spinning with the cursor hidden.
         stop_spinner()
 
+    # MDM owns its restart, gated on the connection fingerprint. Keep this at
+    # the command boundary so background catalog refreshes never close apps.
+    if not failures and not confirm_browser and not enable_agent:
+        for result in results:
+            if result["client"] == "codex":
+                result["restarted_apps"] = codex_desktop.restart_running()
+
+    connector_undo = (
+        "\nTo disable connector tools, run:\n"
+        + "\n".join(
+            f"  ramp router connectors disable --harness {client}" for client in clients
+        )
+        if connectors
+        else ""
+    )
     notice = _profile_notice(results, restore_clients) if fmt != "json" else []
+    if setup_messages is not None:
+        diagnostics = setup_messages.getvalue()
+        if not failures:
+            if not notice:
+                notice = [
+                    "Ramp Router and connectors are configured for "
+                    + _human_join([AGENT_NAMES[result["client"]] for result in results])
+                    + ".",
+                    "",
+                    "To restore your previous settings:",
+                    f"  ramp router unconfigure{restore_clients}",
+                ]
+            for result in results:
+                if result.get("note_lines"):
+                    notice.extend(["", *result["note_lines"]])
+                if result["client"] == CODEX_CLIENT_NAME:
+                    trust_lines = _codex_hook_trust_note_lines(_codex_config_path())
+                    if trust_lines:
+                        notice.extend(["", *trust_lines])
+            notice.extend(connector_undo.splitlines())
+            if diagnostics:
+                notice.extend(["", *diagnostics.rstrip().splitlines()])
+            if not ctx.obj["quiet"]:
+                click.echo("Configured agents.")
+            click.echo()
+            show_notice("NOTICE", notice)
+            suppress_next_update_notice()
+            return
+        if diagnostics:
+            click.echo(diagnostics, err=True, nl=False)
     if failures and fmt == "json":
-        raise click.ClickException("Could not configure " + "; ".join(failures))
+        raise click.ClickException(
+            "Could not configure " + "; ".join(failures) + connector_undo
+        )
     if fmt == "json":
         payload = (
             results[0]
@@ -2151,11 +2390,17 @@ def _run_configure(
             prefix = f"{AGENT_NAMES[result['client']]}: " if len(results) > 1 else ""
             message = f"{prefix}{model_count} {model_label} {action}."
             if len(results) == 1 and not discovered:
-                message += " Restart any running agents, then pick a model."
+                message += (
+                    " Restart any running Codex CLI sessions, then pick a model."
+                    if result.get("restarted_apps")
+                    else " Restart any running agents, then pick a model."
+                )
             click.echo(message)
         if len(results) > 1 and added_models:
             click.echo("Restart any running agents, then pick a model.")
         for result in results:
+            if result.get("restarted_apps"):
+                click.echo("Reopened: " + _human_join(result["restarted_apps"]) + ".")
             if result.get("model_view"):
                 click.echo(
                     f"Codex model picker: {result['model_view']} (saved for future refreshes)."
@@ -2175,7 +2420,7 @@ def _run_configure(
             click.echo()
             if cursor_result["api_key_on_clipboard"]:
                 click.echo("Cursor: your Router API key is on the clipboard.")
-            elif browser_acquired_key and all(
+            elif newly_created_key and all(
                 result["client"] == CURSOR_CLIENT for result in results
             ):
                 # No agent config file took the key either, so this browser
@@ -2222,8 +2467,11 @@ def _run_configure(
             "Could not configure "
             + "; ".join(failures)
             + f". Run 'ramp router unconfigure{restore_clients}' to restore your "
-            "previous settings."
+            f"previous settings.{connector_undo}"
         )
+    router_schedule.install()
+    if fmt != "json" and not enable_agent:
+        _warn_if_agent_off()
     if fmt != "json" and not notice:
         # The notice carries this line itself, alongside the profiles it is
         # restoring, so repeating it here would only be noise.
@@ -2251,16 +2499,21 @@ def _run_configure(
                 )
 
 
-def _refresh_cowork_model_selections() -> dict | None:
+def _refresh_cowork_model_selections(
+    *,
+    models_only: bool = False,
+    skip: frozenset[tuple[str, str]] = frozenset(),
+) -> dict | None:
     """Migrate Cowork's persisted model selections during a refresh.
 
     Cowork also moves a CLI-owned profile from the legacy production host
-    while Desktop is closed. It must not quit an active Cowork session merely
-    because a session-start hook ran. A selection that predates a Router model
-    rename keeps an id Claude no longer recognizes, which it sizes at its
-    200k unknown-model fallback instead of the model's real window. Refresh
-    heals those whenever Claude Desktop is closed; configure covers the
-    deterministic case because it stops the app first.
+    while Desktop is closed, except in a ``models_only`` (background) refresh,
+    which leaves the profile's endpoint alone. It must not quit an active
+    Cowork session merely because a session-start hook ran. A selection that
+    predates a Router model rename keeps an id Claude no longer recognizes,
+    which it sizes at its 200k unknown-model fallback instead of the model's
+    real window. Refresh heals those whenever Claude Desktop is closed;
+    configure covers the deterministic case because it stops the app first.
 
     Strictly best-effort: this leg reports what it did (or why it could
     not run) but never joins the refresh failures. A stale Cowork receipt,
@@ -2279,9 +2532,13 @@ def _refresh_cowork_model_selections() -> dict | None:
     try:
         api_key, gateway_origin = claude_cowork.configured_router_connection()
         base_url = f"{gateway_origin}/v1"
+        if (base_url.rstrip("/"), api_key) in skip:
+            return None
         migrated_gateway = False
-        if base_url == LEGACY_ROUTER_BASE_URL and not any(
-            os.environ.get(name, "").strip() for name in BASE_URL_ENVS
+        if (
+            not models_only
+            and base_url == LEGACY_ROUTER_BASE_URL
+            and not any(os.environ.get(name, "").strip() for name in BASE_URL_ENVS)
         ):
             migrated_gateway = claude_cowork.migrate_gateway_base_url(
                 _router_host(LEGACY_ROUTER_BASE_URL),
@@ -2352,12 +2609,141 @@ def _cowork_refresh_message(result: dict) -> str:
     return message
 
 
+@router_group.group(
+    "agent",
+    help="Manage background refresh and local repository tagging (off by default).",
+)
+def router_agent() -> None:
+    pass
+
+
+def _print_background_status(ctx: click.Context) -> None:
+    status = router_schedule.background_status()
+    tagging = router_repo.status()
+    status["repository_tagging"] = tagging
+    if resolve_format(ctx.obj["format"], ctx.obj["config_format"]) == "json":
+        print_agent_json(status, pagination=None)
+        return
+    click.echo(f"Background sync: {'enabled' if status['enabled'] else 'disabled'}.")
+    click.echo(f"Service: {status['service']} ({status['state']}).")
+    for failure in tagging.get("refresh_failures", []):
+        click.echo(
+            f"Client refresh failed ({failure['client']}): {failure['error']}. "
+            "Repair the client, then run 'ramp router agent enable' again."
+        )
+    if tagging["enabled"]:
+        running = "running" if tagging["healthy"] else "not running"
+        click.echo(
+            f"Repository tagging: enabled ({running} on port {tagging['port']})."
+        )
+    elif not tagging["service_supported"]:
+        click.echo(
+            "Repository tagging: unavailable (requires the native Router agent)."
+        )
+    else:
+        click.echo("Repository tagging: disabled.")
+    if not tagging["enabled"] and tagging["clients"]:
+        click.echo(
+            "Some clients still use the local listener, so it remains in passthrough mode. "
+            "Run 'ramp router refresh' and then 'ramp router agent disable' again."
+        )
+    if status["environment_opt_out"]:
+        click.echo(f"{SYNC_OPT_OUT_ENV} is set; background sync is blocked.")
+    if status["state"] == router_schedule.AGENT_DISABLED:
+        click.echo(f"To allow the service, {router_schedule.LOGIN_ITEMS_HINT}.")
+    elif status["enabled"] and status["state"] not in ("running", "scheduled"):
+        click.echo(
+            "The preference is saved, but the service is not running. "
+            "Run 'ramp router agent enable' again from a logged-in desktop session."
+        )
+
+
+@router_agent.command(
+    "enable", help="Enable background refresh and repository tagging at each login."
+)
+@click.option(
+    "--port",
+    "helper_port",
+    type=click.IntRange(1024, 65535),
+    default=None,
+    help=f"Local repository-tagging port (default {router_repo.DEFAULT_PORT}).",
+)
+@click.pass_context
+def router_agent_enable(ctx: click.Context, helper_port: int | None) -> None:
+    if sys.platform != "darwin" and not sys.platform.startswith("linux"):
+        raise click.UsageError("Background sync requires macOS or Linux.")
+    if os.environ.get(SYNC_OPT_OUT_ENV):
+        raise click.UsageError(
+            f"Unset {SYNC_OPT_OUT_ENV} before enabling background sync."
+        )
+    if not _scheduled_sync_connections():
+        raise click.UsageError("Configure Router first with 'ramp router configure'.")
+    tagging_supported = router_repo.service_supported()
+    if helper_port is not None and not tagging_supported:
+        raise click.UsageError("--port requires the native Router agent.")
+    if tagging_supported:
+        # Establish a healthy listener before clients can depend on it. A failed
+        # start preserves the old settings and does not opt into background sync.
+        router_repo.enable(ctx, helper_port)
+    router_schedule.enable_background()
+    _print_background_status(ctx)
+    if (
+        tagging_supported
+        and resolve_format(ctx.obj["format"], ctx.obj["config_format"]) != "json"
+    ):
+        click.echo("Restart open coding-agent sessions to pick up the local endpoint.")
+
+
+@router_agent.command(
+    "disable", help="Disable refresh and tagging; restore direct Router endpoints."
+)
+@click.pass_context
+def router_agent_disable(ctx: click.Context) -> None:
+    # Stop sync first, retaining the listener until endpoint migration finishes.
+    router_schedule.disable_background()
+    tagging = router_repo.enabled() or router_repo.listener_port() is not None
+    if tagging or clients_using_repo_helper():
+        router_repo.disable(ctx)
+    _print_background_status(ctx)
+    if (
+        tagging
+        and resolve_format(ctx.obj["format"], ctx.obj["config_format"]) != "json"
+    ):
+        click.echo("Restart open coding-agent sessions to pick up the direct endpoint.")
+
+
+@router_agent.command(
+    "status", help="Show refresh, repository tagging, and actual service state."
+)
+@click.pass_context
+def router_agent_status(ctx: click.Context) -> None:
+    _print_background_status(ctx)
+
+
 @router_group.command(
     "refresh",
     help="Reapply current Router setup to agents already configured with it",
 )
 @click.pass_context
-def router_refresh(ctx: click.Context) -> None:
+def router_refresh(ctx: click.Context) -> list[dict]:
+    return _refresh_clients(ctx)
+
+
+def _refresh_clients(
+    ctx: click.Context,
+    *,
+    models_only: bool = False,
+    skip: frozenset[tuple[str, str]] = frozenset(),
+    preserve_sync_opt_out: bool = False,
+    failures_out: list[dict] | None = None,
+) -> list[dict]:
+    """Refresh every configured setup; return one result per refreshed setup.
+
+    ``models_only`` is the background mode (the scheduled job and the session
+    hook): it updates model lists/defaults and repairs missing CLI-owned plugin
+    paths after upgrades. Other settings stay as the user has them. ``skip`` holds (base URL, key)
+    pairs a background run already knows are revoked or unreachable.
+    """
     admin_defaults.clear_cache()
     clients = configured_router_clients()
     results = []
@@ -2367,8 +2753,12 @@ def router_refresh(ctx: click.Context) -> None:
     # However the command ends, a push an interrupt left in flight is settled.
     ctx.call_on_close(switchyard_push.finish)
     for client in clients:
-        path = _client_config_path(client)
         try:
+            path = _client_config_path(client)
+            if models_only and client in {"opencode", "pi"}:
+                # Local upgrade repair must work even if discovery is offline.
+                # Do not reconfigure options, credentials, or user registrations.
+                _repair_moved_plugin(client, path)
             # For Hermes, the credential read, endpoint read, model
             # discovery, and reconfiguration form one transaction under its
             # config lock. With the reads outside the lock, an unconfigure
@@ -2413,6 +2803,8 @@ def router_refresh(ctx: click.Context) -> None:
                 # legacy production URL unless this run explicitly selects
                 # a deployment through the environment.
                 base_url = _refresh_router_base_url(client, path)
+                if (base_url.rstrip("/"), api_key) in skip:
+                    continue
                 # The dashboard origin belongs to the same snapshot as the
                 # credential and endpoint: read it now, not after discovery,
                 # so a configure that reconnects to another deployment in
@@ -2486,12 +2878,27 @@ def router_refresh(ctx: click.Context) -> None:
                     configure_options["conductor_require_receipt"] = True
                     configure_options["conductor_lock_held"] = True
                 with _pinned_usage_origin(usage_origin, keep_override=True):
-                    _, default_model, _ = _configure_client(
-                        client, api_key, models, **configure_options
-                    )
+                    if models_only:
+                        default_model = _refresh_client_models(
+                            client,
+                            path,
+                            api_key,
+                            models,
+                            base_url=base_url,
+                            selected_model=configure_options["selected_model"],
+                            replace_model=configure_options.get(
+                                "replace_model", _UNCHECKED
+                            ),
+                        )
+                    else:
+                        _, default_model, _ = _configure_client(
+                            client, api_key, models, **configure_options
+                        )
         except click.ClickException as exc:
             switchyard_push.settle(written=False)
             failures.append(f"{CLIENT_NAMES[client]}: {exc.message}")
+            if failures_out is not None:
+                failures_out.append({"client": client, "error": exc.message})
             continue
         # Also when Codex kept a model the user chose during discovery: that
         # choice is their answer, not something to push over later.
@@ -2514,13 +2921,26 @@ def router_refresh(ctx: click.Context) -> None:
             result["note_lines"] = notes
         results.append(result)
 
-    cowork_result = _refresh_cowork_model_selections()
+    cowork_result = _refresh_cowork_model_selections(models_only=models_only, skip=skip)
     if cowork_result is not None:
         results.append(cowork_result)
+        if failures_out is not None and cowork_result.get("error"):
+            failures_out.append(
+                {"client": COWORK_CLIENT, "error": cowork_result["error"]}
+            )
+    if results:
+        # Before the failure check, so one broken setup cannot keep the job
+        # from the healthy ones.
+        if preserve_sync_opt_out:
+            router_schedule.install(preserve_opt_out=True)
+        else:
+            router_schedule.install()
 
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
-    if failures and fmt == "json":
+    if failures and failures_out is None and fmt == "json":
         raise click.ClickException("Could not refresh " + "; ".join(failures))
+    if fmt != "json" and results and not os.environ.get(router_schedule.SCHEDULED_ENV):
+        _warn_if_agent_off()
     if fmt == "json":
         print_agent_json({"clients": results}, pagination=None)
     elif not clients and cowork_result is None:
@@ -2545,8 +2965,10 @@ def router_refresh(ctx: click.Context) -> None:
             if trust_lines:
                 show_notice("NOTE", trust_lines)
 
-    if failures:
+    if failures and failures_out is None:
         raise click.ClickException("Could not refresh " + "; ".join(failures))
+    # The scheduled sync reads this to tell a skipped Cowork pass from a done one.
+    return results
 
 
 def _cursor_suggested_model(models: list[RouterModel]) -> str | None:
@@ -3040,6 +3462,20 @@ def _copy_to_clipboard(text: str) -> bool:
     help="Internal: the spawned background half of --hook.",
 )
 @click.option(
+    "--scheduled",
+    "scheduled_mode",
+    is_flag=True,
+    hidden=True,
+    help="Internal: the OS scheduled job; refreshes only when Router's setup changed.",
+)
+@click.option(
+    "--env-file",
+    "env_file",
+    default=None,
+    hidden=True,
+    help="Internal: the environment the scheduled job was installed with.",
+)
+@click.option(
     "--event",
     type=click.Choice((SYNC_HOOK_STOP_EVENT,)),
     default=None,
@@ -3052,25 +3488,540 @@ def router_sync(
     hook_mode: bool,
     client: str | None,
     detached_mode: bool,
+    scheduled_mode: bool,
+    env_file: str | None,
     event: str | None,
 ) -> None:
     """Keep locally installed Router artifacts fresh.
 
     --hook is the session-start mode: cooldown-gated, detached, and fail-open.
     """
+    if scheduled_mode:
+        if env_file:
+            router_schedule.load_job_environment(env_file)
+        _run_scheduled_sync(ctx)
+        return
     if detached_mode:
         # The background half of --hook, off the session-start path, so
         # blocking on the network is fine here. The synchronous cache fetch
         # is what keeps "latest" fresh — and the update notice able to fire —
         # on machines where ramp only ever runs through hooks; the passive
         # daemon-thread check dies with short-lived processes.
-        refresh_version_cache()
-        ctx.invoke(router_refresh)
+        # Under the same lock as the scheduled job, so a session-hook refresh
+        # and a scheduled tick never write the agent configs at once.
+        # A background run: its refresh never reloads the job or undoes an
+        # opt-out. It updates models and repairs missing managed plugin paths.
+        os.environ[router_schedule.SCHEDULED_ENV] = "1"
+        with sync_lock() as locked:
+            if locked:
+                refresh_version_cache()
+                _refresh_clients(ctx, models_only=True)
         return
     if hook_mode:
         _run_hook_sync(client, event)
         return
     raise click.UsageError("Use --hook for session-start sync or 'router refresh'.")
+
+
+@dataclass(frozen=True)
+class _SyncConnection:
+    """One Router endpoint and key that configured setups use."""
+
+    base_url: str
+    api_key: str
+    # Control-plane origins whose coding-agent defaults this key's setups
+    # apply; empty when none of them reads those defaults.
+    settings_origins: frozenset[str] = frozenset()
+
+    @property
+    def digest(self) -> str:
+        return hashlib.sha256(f"{self.base_url}\n{self.api_key}".encode()).hexdigest()
+
+
+def _scheduled_sync_connections() -> list[_SyncConnection]:
+    """Distinct (base_url, api_key) connections across every configured setup."""
+    origins: dict[tuple[str, str], set[str]] = {}
+    for client in configured_router_clients():
+        path = _client_config_path(client)
+        receipt = path.parent / "ramp-router-state.json"
+        # The same locks and enrollment rechecks as router_refresh: read
+        # unlocked, a concurrent unconfigure could pair a restored
+        # pre-Router credential with the Router endpoint it is sent to.
+        if client == "hermes":
+            transaction = _hermes_config_lock()
+        elif client == "conductor":
+            transaction = _conductor_settings_lock(path)
+        elif client == "claude-code":
+            transaction = claude_code.settings_lock(path)
+        elif client == "codex":
+            # Codex's writer replaces the endpoint and key separately.
+            transaction = codex_config_lock(path)
+        else:
+            transaction = nullcontext()
+        try:
+            with transaction:
+                if client == "hermes" and not (
+                    receipt.exists() and _hermes_receipt_enrolls(receipt)
+                ):
+                    continue
+                if client == "claude-code" and not receipt.exists():
+                    continue
+                if client == "conductor" and not _conductor_receipt_enrolls(receipt):
+                    continue
+                base_url = _refresh_router_base_url(client, path)
+                connection = origins.setdefault(
+                    (base_url.rstrip("/"), _stored_router_api_key(client, path)),
+                    set(),
+                )
+                if client in CODING_AGENT_SETTINGS_HARNESSES:
+                    # The origin refresh reads this setup's defaults from.
+                    connection.add(_settings_origin(client, path, base_url))
+        except click.ClickException:
+            continue
+    if claude_cowork.state_path().exists():
+        try:
+            api_key, origin = claude_cowork.configured_router_connection()
+            origins.setdefault((f"{origin}/v1".rstrip("/"), api_key), set())
+        except click.ClickException:
+            pass
+    return [
+        _SyncConnection(url, key, frozenset(found))
+        for (url, key), found in origins.items()
+    ]
+
+
+# Outcomes of one background check of a connection.
+_SYNC_OK = "ok"
+_SYNC_REVOKED = "revoked"  # 401/403: the key is revoked or no longer active
+_SYNC_UNAVAILABLE = "unavailable"  # an outage, timeout, or unreadable answer
+_SYNC_UNSUPPORTED = "unsupported"  # an older Router without the endpoint
+
+
+def _sync_check(
+    url: str, api_key: str, read: Callable[[dict], object]
+) -> tuple[str, str | None]:
+    """One authenticated GET, classified; the value only for _SYNC_OK."""
+    try:
+        response = httpx.get(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                **_router_telemetry_headers(),
+            },
+            timeout=5,
+        )
+    except httpx.HTTPError:
+        return _SYNC_UNAVAILABLE, None
+    if response.status_code in (401, 403):
+        return _SYNC_REVOKED, None
+    if response.status_code in (404, 405, 501):
+        return _SYNC_UNSUPPORTED, None
+    if response.status_code != 200:
+        return _SYNC_UNAVAILABLE, None
+    try:
+        value = read(response.json())
+    except (ValueError, AttributeError, KeyError, TypeError):
+        return _SYNC_UNAVAILABLE, None
+    if not isinstance(value, str) or not value:
+        return _SYNC_UNAVAILABLE, None
+    return _SYNC_OK, value
+
+
+def _fetch_sync_version(base_url: str, api_key: str) -> tuple[str, str | None, bool]:
+    """Router's opaque version and whether it covers coding-agent settings."""
+    includes_settings = False
+
+    def read(body: dict) -> object:
+        nonlocal includes_settings
+        includes_settings = body.get("includes_coding_agent_settings") is True
+        return body.get("version")
+
+    outcome, version = _sync_check(f"{base_url}/client/sync-version", api_key, read)
+    return outcome, version, includes_settings
+
+
+def _fetch_defaults_version(origin: str, api_key: str) -> tuple[str, str | None]:
+    """A digest of the coding-agent defaults refresh would apply for this key.
+
+    Older Routers' versions cover model lists only. The effective default for each
+    harness also follows workspace settings, workspace model policy, and the
+    key's Switchyard configuration, all of which this one response reflects;
+    ``switchyard_offered`` starts the one-time Switchyard push.
+
+    The body read here is pinned in ``admin_defaults``, so a refresh in this
+    run applies exactly what this digest describes; a failed read pins none.
+    """
+
+    def digest(body: object) -> str:
+        pinned = admin_defaults.pin(api_key, origin, body)
+        if pinned is None:
+            raise ValueError("no usable coding-agent settings")
+        covered: object = pinned["harnesses"]
+        if body.get("switchyard_offered") is True:
+            # Only when set, so digests recorded before the field still match.
+            covered = {"harnesses": covered, "switchyard_offered": True}
+        return hashlib.sha256(json.dumps(covered, sort_keys=True).encode()).hexdigest()[
+            :16
+        ]
+
+    outcome, value = _sync_check(
+        f"{origin}/self-service/coding-agent-settings", api_key, digest
+    )
+    if outcome != _SYNC_OK:
+        admin_defaults.pin(api_key, origin, None)
+    if outcome == _SYNC_UNSUPPORTED:
+        return _SYNC_OK, "none"  # no defaults to apply on this control plane
+    return outcome, value
+
+
+def _connection_version(
+    connection: _SyncConnection, stored: str | None = None
+) -> tuple[str, str | None]:
+    """The connection's combined version: Router's, then each defaults digest.
+
+    Router's answer alone classifies the connection. A defaults check that
+    fails (an outage, a redirect, a 401/403 from the control plane) keeps that
+    origin's digest from ``stored``, the version last recorded for this
+    connection, so the model lists still sync and a defaults change is caught
+    once the control plane answers again. With combined-version coverage, a
+    failed read records "?" so the agent keeps checking defaults until recovery.
+    Refresh reads those defaults fail-open as well.
+    """
+    outcome, version, includes_settings = _fetch_sync_version(
+        connection.base_url, connection.api_key
+    )
+    if outcome != _SYNC_OK:
+        return outcome, None
+    origins = sorted(connection.settings_origins)
+    previous = stored.split("|") if stored else []
+    if len(previous) != len(origins) + 1:
+        # Nothing comparable to keep: "?" makes the next real answer count
+        # as a change.
+        previous = []
+    parts = [version]
+    for index, origin in enumerate(origins, start=1):
+        outcome, defaults = _fetch_defaults_version(origin, connection.api_key)
+        if outcome != _SYNC_OK:
+            # The agent may skip defaults polling when Router covers settings.
+            # Keep polling after a failed read, even with an unchanged version.
+            defaults = previous[index] if previous and not includes_settings else "?"
+        parts.append(defaults)
+    return _SYNC_OK, "|".join(parts)
+
+
+def _warn_if_agent_off() -> None:
+    """Tell the user when they turned the background agent off; never raises."""
+    try:
+        if router_schedule.agent_state() == router_schedule.AGENT_DISABLED:
+            click.echo(
+                "Router setups are not kept fresh in the background: "
+                f"{router_schedule.LOGIN_ITEMS_HINT}.",
+                err=True,
+            )
+    except Exception:
+        pass
+
+
+def _write_agent_manifest(connections: list[_SyncConnection]) -> None:
+    """Tell the Ramp Router agent what to check until the next scheduled sync.
+
+    The agent repeats each connection's version requests and compares them
+    with the parts recorded here, then runs this sync only on a difference,
+    a rejected key, once ``due_at`` (the daily refresh or a due retry) has
+    passed, or once Claude Desktop exits with a Cowork pass pending. Never
+    raises.
+    """
+    try:
+        if router_schedule.agent_executable() is None:
+            return  # the plain scheduled job runs this sync on its own timer
+        state = router_schedule.load_state()
+        now = time.time()
+        full_seconds = router_schedule.FULL_REFRESH_SECONDS
+        last = state.get("last_full_refresh")
+        retry_after = state.get("retry_after")
+        # A Cowork pass waits for Claude Desktop to close. The agent watches
+        # these processes and runs this sync once they are gone, rather than
+        # polling with a full sync while Desktop stays open for hours. With
+        # Desktop closed the pass already ran (and failed) at the start of
+        # this sync: it waits for the next one rather than every agent tick.
+        cowork_wait_pids = (
+            claude_cowork.claude_pids() if state.get("cowork_pending") else []
+        )
+        if not connections:
+            # Cursor-only setups have no refreshable receipts. Stay idle until
+            # a configure clears the manifest, with a daily safety recheck.
+            due_at = now + full_seconds
+        elif isinstance(retry_after, int | float):
+            due_at = retry_after
+        elif isinstance(last, int | float):
+            due_at = last + full_seconds
+        else:
+            due_at = now
+        stored = (
+            state.get("versions") if isinstance(state.get("versions"), dict) else {}
+        )
+        revoked = state.get("revoked") if isinstance(state.get("revoked"), dict) else {}
+        entries = []
+        for connection in connections:
+            origins = sorted(connection.settings_origins)
+            previous = stored.get(connection.digest)
+            parts = previous.split("|") if isinstance(previous, str) else None
+            if parts is not None and len(parts) != len(origins) + 1:
+                parts = None  # nothing comparable: any answer counts as a change
+            since = revoked.get(connection.digest)
+            entries.append(
+                {
+                    "checks": [
+                        {
+                            "kind": "sync",
+                            "url": f"{connection.base_url}/client/sync-version",
+                        },
+                        *(
+                            {
+                                "kind": "defaults",
+                                "url": f"{origin}/self-service/coding-agent-settings",
+                            }
+                            for origin in origins
+                        ),
+                    ],
+                    "headers": {
+                        "Authorization": f"Bearer {connection.api_key}",
+                        **_router_telemetry_headers(),
+                    },
+                    "expected": parts,
+                    "skip_until": (
+                        since + full_seconds if isinstance(since, int | float) else None
+                    ),
+                }
+            )
+        if entries and all(
+            entry["skip_until"] is not None and entry["skip_until"] > now
+            for entry in entries
+        ):
+            # No connection can be refreshed before its revocation cooldown
+            # ends. An overdue daily refresh must not bypass those cooldowns.
+            due_at = max(due_at, min(entry["skip_until"] for entry in entries))
+        unsupported_due_at = router_sync_module.cooldown_due_at()
+        if isinstance(retry_after, int | float):
+            # Rust checks this deadline independently of due_at. An expired
+            # legacy cooldown must not bypass Python's failed-refresh backoff.
+            unsupported_due_at = max(unsupported_due_at, retry_after)
+        router_schedule.write_manifest(
+            {
+                "version": 1,
+                "written_at": now,
+                "due_at": due_at,
+                "unsupported_due_at": unsupported_due_at,
+                "cowork_wait_pids": cowork_wait_pids,
+                "connections": entries,
+            }
+        )
+    except Exception as exc:  # the agent falls back to running this sync
+        log_failure(f"could not write the Ramp Router agent manifest: {exc!r}")
+
+
+def _run_scheduled_sync(ctx: click.Context) -> None:
+    """The OS-scheduled job: refresh only when Router says the setup changed.
+
+    Cheap in the common case (a small GET or two per Router key, no writes).
+    Never raises; failures go to the state-dir log.
+    """
+    suppress_next_update_notice()
+    os.environ[router_schedule.SCHEDULED_ENV] = "1"
+    try:
+        if os.environ.get(SYNC_OPT_OUT_ENV):
+            return
+        if not router_schedule.background_enabled():
+            # Nothing is written yet, so removing the job from its own tick
+            # interrupts nothing.
+            router_schedule.remove_after_opt_out()
+            return
+        with sync_lock() as locked:
+            if not locked:
+                return
+            connections = _scheduled_sync_connections()
+            if not connections:
+                _write_agent_manifest(connections)
+                return
+            state = router_schedule.load_state()
+            if state.get("cowork_pending"):
+                state = _retry_pending_cowork(state)
+            _scheduled_tick(ctx, connections, state)
+            _write_agent_manifest(connections)
+    except Exception as exc:  # fail-open is this mode's contract
+        log_failure(f"scheduled sync failed: {exc!r}")
+    finally:
+        os.environ.pop(router_schedule.SCHEDULED_ENV, None)
+
+
+def _scheduled_tick(
+    ctx: click.Context, connections: list[_SyncConnection], state: dict
+) -> None:
+    """Check each connection, then refresh at most once.
+
+    - ok: refresh when its version moved since the last refresh.
+    - revoked: its setups are left as they are, and the key is not checked
+      again for a day, so a dead key never drives hourly retries.
+    - unavailable: nothing is decided for it; the next tick checks again,
+      so an outage recovers on its own.
+    - unsupported (an older Router): the session-hook cooldown paces a refresh.
+
+    The versions seen are stored whether or not the refresh succeeds, so one
+    broken setup cannot hold back healthy ones or make every tick refresh
+    again. A failed refresh is retried on its own backoff instead (an hour,
+    doubling to a day while it keeps failing); a new version still refreshes
+    at once. The session-hook cooldown starts only on success.
+    """
+    now = time.time()
+    stored = state.get("versions") if isinstance(state.get("versions"), dict) else {}
+    revoked_since = (
+        state.get("revoked") if isinstance(state.get("revoked"), dict) else {}
+    )
+    revoked: dict[str, float] = {}
+    versions: dict[str, str] = {}
+    skip: set[tuple[str, str]] = set()
+    unavailable: set[str] = set()
+    retry_connections = state.get("retry_connections")
+    # Older state used a global retry; treat it as pending for every connection.
+    if isinstance(retry_connections, list):
+        pending = {digest for digest in retry_connections if isinstance(digest, str)}
+    elif isinstance(state.get("retry_after"), int | float):
+        pending = {connection.digest for connection in connections}
+    else:
+        pending = set()
+    reachable_connections: set[str] = set()
+    changed = unsupported = reachable = False
+    for connection in connections:
+        digest = connection.digest
+        since = revoked_since.get(digest)
+        recent = (
+            isinstance(since, int | float)
+            and now - since < router_schedule.FULL_REFRESH_SECONDS
+        )
+        if recent:
+            outcome, version = _SYNC_REVOKED, None
+        else:
+            outcome, version = _connection_version(connection, stored.get(digest))
+        if outcome == _SYNC_REVOKED:
+            if digest not in revoked_since:
+                log_failure(
+                    "Router rejected a configured key as revoked or inactive; "
+                    "its setups are left as they are until it is replaced"
+                )
+            revoked[digest] = since if recent else now
+            skip.add((connection.base_url, connection.api_key))
+        elif outcome == _SYNC_UNAVAILABLE:
+            skip.add((connection.base_url, connection.api_key))
+            unavailable.add(digest)
+        elif outcome == _SYNC_UNSUPPORTED:
+            unsupported = reachable = True
+            reachable_connections.add(digest)
+        else:
+            reachable = True
+            reachable_connections.add(digest)
+            versions[digest] = version
+            changed = changed or stored.get(digest) != version
+    # Revoked or removed connections cannot be retried. Their revocation
+    # cooldown (or a later configure), not the refresh backoff, owns recovery.
+    pending &= reachable_connections | unavailable
+    updated = dict(state)
+    if revoked != revoked_since:
+        updated["revoked"] = revoked
+    if pending:
+        updated["retry_connections"] = sorted(pending)
+    else:
+        for key in ("retry_connections", "retry_after", "retry_delay"):
+            updated.pop(key, None)
+    backing_off = router_schedule.retry_pending(updated)
+    due = reachable and (
+        changed
+        or (
+            router_schedule.retry_due(updated) and bool(pending & reachable_connections)
+        )
+        or (
+            not backing_off
+            and (
+                router_schedule.full_refresh_due(state)
+                or (unsupported and sync_is_due())
+            )
+        )
+    )
+    if not due:
+        retry_blocked = router_schedule.retry_due(updated) and bool(
+            pending & unavailable
+        )
+        daily_blocked = (
+            bool(unavailable)
+            and not backing_off
+            and router_schedule.full_refresh_due(updated)
+        )
+        if retry_blocked or daily_blocked:
+            # Neither a due retry nor an overdue daily refresh could run. Keep
+            # both on a backoff instead of publishing an expired manifest deadline.
+            updated["retry_connections"] = sorted(pending | unavailable)
+            updated.update(router_schedule.retry_after_failure(updated, now))
+        if updated != state:
+            router_schedule.save_state(updated)
+        return
+    # Keep versions for connections whose check failed this run.
+    refreshed: dict = {
+        "versions": {**stored, **versions},
+        "last_full_refresh": now,
+    }
+    if revoked:
+        refreshed["revoked"] = revoked
+    # Unavailable connections missed this refresh even if their version has not
+    # changed. Retain their retries independently of success on reachable ones.
+    skipped_retries = unavailable
+    if skipped_retries:
+        refreshed["retry_connections"] = sorted(skipped_retries)
+        refreshed.update(
+            {
+                key: updated[key]
+                for key in ("retry_after", "retry_delay")
+                if key in updated
+            }
+            if backing_off
+            else router_schedule.retry_after_failure(updated, now)
+        )
+    try:
+        refresh_version_cache()
+        with contextlib.redirect_stdout(io.StringIO()):
+            results = _refresh_clients(ctx, models_only=True, skip=frozenset(skip))
+    except Exception as exc:
+        log_failure(f"scheduled refresh failed: {getattr(exc, 'message', exc)!s}")
+        refreshed.update(router_schedule.retry_after_failure(updated, now))
+        refreshed["retry_connections"] = sorted(skipped_retries | reachable_connections)
+        if state.get("cowork_pending"):
+            refreshed["cowork_pending"] = True  # the retry runs the Cowork pass
+        router_schedule.save_state(refreshed)
+        return
+    if not _cowork_refreshed(results):
+        # Cowork waits for Claude Desktop to close; acknowledging the
+        # version now would leave it stale until the daily refresh.
+        refreshed["cowork_pending"] = True
+    router_schedule.save_state(refreshed)
+    touch_cooldown()
+
+
+def _cowork_refreshed(results: list[dict]) -> bool:
+    cowork = next((r for r in results if r.get("client") == COWORK_CLIENT), None)
+    return cowork is None or not (
+        cowork.get("skipped_while_running") or cowork.get("error")
+    )
+
+
+def _retry_pending_cowork(state: dict) -> dict:
+    """Finish a Cowork pass a scheduled refresh skipped, once Desktop is closed."""
+    if claude_cowork.claude_is_running():
+        return state
+    if not _cowork_refreshed(
+        [_refresh_cowork_model_selections(models_only=True) or {}]
+    ):
+        return state
+    state = {key: value for key, value in state.items() if key != "cowork_pending"}
+    router_schedule.save_state(state)
+    return state
 
 
 def _run_hook_sync(client: str | None, event: str | None = None) -> None:
@@ -4636,6 +5587,9 @@ def _run_unconfigure(
         claude_cowork.state_path().exists()
     )
     if results and not setup_remains:
+        # Removes the agent too; the tagging setting stays, so a later
+        # configure starts its listener again.
+        router_schedule.uninstall()
         # Ramp-owned version-nudge state leaves with the last Router setup; a
         # failed removal keeps its receipt, so its state stays.
         for stale in (installed_version_path(), server_recommended_version_path()):
@@ -6669,13 +7623,17 @@ def _configure_claude_code(
         settings = claude_code.read_settings(path)
         state_path = claude_code.state_path(path)
         previous_state = claude_code.read_state(path) if state_path.exists() else None
+        endpoint, client_key = router_repo.client_credentials(
+            base_url or router_base_url(), api_key
+        )
         updated, state = claude_code.plan_configuration(
             settings,
             path,
-            _router_host(base_url),
-            api_key,
+            _router_host(endpoint),
+            client_key,
             model,
             usage_base_url=_statusline_origin(base_url),
+            usage_api_key=api_key,
             statusline=statusline,
             model_view_all=model_view == "all",
             shell_environment=os.environ,
@@ -6889,7 +7847,7 @@ def _configured_claude_code_router_url(path: Path) -> str:
     )
     if isinstance(base_url, str) and base_url.strip():
         host = base_url.strip().rstrip("/").removesuffix("/v1")
-        return f"{host}/v1"
+        return router_repo.unwrap_url(f"{host}/v1")
     return router_base_url()
 
 
@@ -6902,13 +7860,9 @@ def _configured_claude_model_view_all(path: Path) -> bool:
 
 def _json_config_path(client: str) -> Path:
     if client == "opencode":
-        configured = os.environ.get("OPENCODE_CONFIG")
-        if configured:
-            return Path(configured).expanduser()
-        config_home = Path(
-            os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
-        ).expanduser()
-        return config_home / "opencode" / "opencode.json"
+        # Keep legacy provider discovery working when both files exist; only
+        # connector registration requires an unambiguous MCP destination.
+        return connector_harnesses.config_path(client, require_unambiguous=False)
     pi_home = Path(os.environ.get("PI_CODING_AGENT_DIR", Path.home() / ".pi" / "agent"))
     return pi_home.expanduser() / "settings.json"
 
@@ -7249,8 +8203,61 @@ def _stored_router_base_url(client: str, path: Path) -> str | None:
             )
 
     if isinstance(base_url, str) and base_url.strip():
-        return base_url.strip().rstrip("/")
+        # Agent configs may point at the local repository helper. The rest of
+        # the CLI must still reason about the real Router deployment behind it.
+        return router_repo.unwrap_url(base_url.strip().rstrip("/"))
     return None
+
+
+def clients_using_repo_helper() -> list[str]:
+    """Return configured local clients whose endpoint is the helper."""
+    clients: list[str] = []
+    try:
+        claude_path = _client_config_path("claude-code")
+        settings = claude_code.read_settings(claude_path)
+        environment = settings.get("env")
+        if isinstance(environment, dict) and router_repo.is_wrapped(
+            environment.get("ANTHROPIC_BASE_URL")
+        ):
+            clients.append("claude-code")
+    except Exception:
+        pass
+    try:
+        _, config = _read_codex_config(_codex_config_path())
+        providers = config.get("model_providers")
+        provider = (
+            providers.get(ROUTER_PROVIDER) if isinstance(providers, dict) else None
+        )
+        if isinstance(provider, dict) and router_repo.is_wrapped(
+            provider.get("base_url")
+        ):
+            clients.append("codex")
+    except Exception:
+        pass
+    for client in ("opencode", "pi"):
+        try:
+            if client == "opencode":
+                path = _client_config_path(client)
+                config = _read_json_config(client, path)
+                entries = []
+                for key in ("plugin", "plugins"):
+                    value = config.get(key)
+                    if isinstance(value, list):
+                        entries.extend(value)
+                if any(
+                    isinstance(options := _opencode_plugin_options(entry), dict)
+                    and router_repo.is_wrapped(options.get("baseURL"))
+                    for entry in entries
+                ):
+                    clients.append(client)
+            else:
+                path = _client_config_path(client).parent / PI_PLUGIN_CONFIG_FILE
+                config = _read_json_config(client, path)
+                if router_repo.is_wrapped(config.get("baseUrl")):
+                    clients.append(client)
+        except Exception:
+            pass
+    return clients
 
 
 def _refresh_router_base_url(client: str, path: Path) -> str:
@@ -7401,7 +8408,12 @@ def _stored_router_api_key(client: str, path: Path) -> str:
         api_key = None
 
     if isinstance(api_key, str) and api_key.strip():
-        return api_key.strip()
+        api_key = api_key.strip()
+        if api_key.startswith("ramp-local-"):
+            return router_repo.upstream_api_key(
+                api_key, _stored_router_base_url(client, path) or ""
+            )
+        return api_key
     raise click.ClickException(
         f"Could not read the existing Ramp Router API key for {CLIENT_NAMES[client]}. "
         f"Run 'ramp router configure {client}' to repair it."
@@ -7815,6 +8827,458 @@ def _configure_client(
     return path, default_model, False
 
 
+def _refresh_client_models(
+    client: str,
+    path: Path,
+    api_key: str,
+    models: list[RouterModel],
+    *,
+    base_url: str | None,
+    selected_model: str | None,
+    replace_model: str | None | object = _UNCHECKED,
+) -> str:
+    """Write only one setup's model list and default model; return the default.
+
+    The background refresh mode. Every other setting (endpoint, key, headers,
+    hooks, status line, auto-compact window, plugin entries) stays as the user
+    has it; configure and `ramp router refresh` are what rewrite those. Only a
+    selection Router made is moved, never one the user chose outside Router.
+    Refresh already holds the Hermes and Conductor locks around this call.
+    """
+    if client == "claude-code":
+        return _refresh_claude_code_model(path, models, selected_model)
+    if client == "codex":
+        return _refresh_codex_models(
+            path,
+            api_key,
+            models,
+            base_url=base_url,
+            selected_model=selected_model,
+            replace_model=replace_model,
+        )
+    default_model = _preferred_model(models, selected_model)
+    if client == "hermes":
+        return _refresh_hermes_model(path, default_model)
+    if client == "conductor":
+        _refresh_conductor_models(path, api_key, default_model, base_url=base_url)
+        return default_model
+    return _refresh_plugin_model(client, _json_config_path(client), default_model)
+
+
+def _not_configured(client: str) -> click.ClickException:
+    return click.ClickException(
+        f"Ramp Router is no longer configured in {CLIENT_NAMES[client]}."
+    )
+
+
+def _refresh_claude_code_model(
+    path: Path, models: list[RouterModel], selected_model: str | None
+) -> str:
+    model = _claude_code_default_model(models, selected_model=selected_model)
+    with claude_code.settings_lock(path):
+        if not claude_code.state_path(path).is_file():
+            raise _not_configured("claude-code")
+        state = claude_code.read_state(path)
+        settings = claude_code.read_settings(path)
+        current = settings.get("model")
+        if not (
+            current is None
+            or current == state["written"]["top_level"].get("model")
+            or claude_code._is_router_model(current)
+        ):
+            # A model the user picked outside Router's list is theirs.
+            return current
+        updated, new_state = claude_code.plan_model_update(settings, state, model)
+        updated, new_state = claude_code.plan_automatic_subagent_cleanup(
+            updated, path, new_state
+        )
+        if updated == settings and new_state == state:
+            return model
+        state_path = claude_code.state_path(path)
+        # State first, so a successful settings write is always paired with
+        # the managed values needed to undo it.
+        try:
+            _write_private_file(state_path, json.dumps(new_state, indent=2) + "\n")
+        except OSError as exc:
+            raise click.ClickException(
+                f"Could not save Claude Code setup state to {state_path}: {exc}"
+            ) from None
+        try:
+            _write_private_file(path, json.dumps(updated, indent=2) + "\n")
+        except OSError as exc:
+            _restore_private_file(state_path, json.dumps(state, indent=2) + "\n")
+            raise click.ClickException(
+                f"Could not update Claude Code settings {path}: {exc}"
+            ) from None
+    return model
+
+
+def _with_root_model(path: Path, config: str, data: dict, model: str) -> str:
+    """The Codex config with only its root ``model`` set to ``model``.
+
+    Quoted keys are matched too, and the result is parsed before it is
+    returned, so a config this cannot rewrite is reported, not corrupted.
+    """
+    updated = _rewrite_codex_root_model(config, data, model)
+    if updated is None:
+        raise click.ClickException(f"Could not update the model in {path}.")
+    return updated
+
+
+def _write_model_files(writes: list[tuple[Path, str]], client: str) -> None:
+    """Write each changed file in order, putting every one back if any fails."""
+    previous = [
+        (path, path.read_text(encoding="utf-8") if path.exists() else None)
+        for path, _ in writes
+    ]
+    try:
+        for path, content in writes:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _write_private_file(path, content)
+    except OSError as exc:
+        for path, content in previous:
+            _restore_private_file(path, content)
+        raise click.ClickException(
+            f"Could not update the {CLIENT_NAMES[client]} model list: {exc}"
+        ) from None
+
+
+def _changed(path: Path, content: str) -> bool:
+    try:
+        return path.read_text(encoding="utf-8") != content
+    except (OSError, UnicodeError):
+        return True
+
+
+def _refresh_codex_models(
+    path: Path,
+    api_key: str,
+    models: list[RouterModel],
+    *,
+    base_url: str | None,
+    selected_model: str | None,
+    replace_model: str | None | object = _UNCHECKED,
+) -> str:
+    """Rewrite Codex's Router catalog and root ``model``; nothing else.
+
+    The harness prompt file follows the model it was read for, so it moves
+    with a changed model when this setup already points Codex at it. The
+    admin default wins as it does in configure, and its cached copy in the
+    receipt follows, so the Codex hooks put back the current default.
+    """
+    # Discovery before the lock, as in _configure_codex.
+    router_catalog = _fetch_codex_catalog(api_key, base_url=base_url)
+    compact_models = (
+        _fetch_models(api_key, claude_code_view=True, base_url=base_url)
+        if _configured_codex_model_view(path) == "compact"
+        else None
+    )
+    # None when Router did not answer: a background run then keeps the
+    # recorded default instead of dropping it for a transient failure.
+    harnesses = admin_defaults.coding_agent_settings(
+        api_key, _statusline_origin(base_url)
+    )
+    with codex_config_lock(path):
+        existing, existing_data = _read_codex_config(path)
+        state_path = path.parent / "ramp-router-state.json"
+        if (
+            not state_path.exists()
+            or existing_data.get("model_provider") != ROUTER_PROVIDER
+        ):
+            raise _not_configured("codex")
+        if replace_model is not _UNCHECKED:
+            if existing_data.get("model") != replace_model:
+                selected_model = existing_data.get("model")
+        elif selected_model is not None:
+            # Read again after discovery, as _configure_codex_in_lock does.
+            selected_model = existing_data.get("model")
+        default_model = _preferred_codex_model(models, router_catalog, selected_model)
+        try:
+            receipt = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise click.ClickException(
+                f"Could not read Ramp Router setup state from {state_path}: {exc}"
+            ) from None
+        if not isinstance(receipt, dict):
+            raise click.ClickException(
+                f"Could not read Ramp Router setup state from {state_path}."
+            )
+        recorded_default = receipt.get(CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY)
+        admin_default = (
+            _codex_admin_default_model(
+                admin_defaults.effective_model(harnesses, CODEX_CLIENT_NAME),
+                models,
+                router_catalog,
+            )
+            if harnesses is not None
+            else _codex_admin_default_model(
+                recorded_default if isinstance(recorded_default, str) else None,
+                models,
+                router_catalog,
+            )
+        )
+        if admin_default is not None:
+            default_model = admin_default
+        picker_catalog = router_catalog
+        if receipt.get(CODEX_MODEL_VIEW_KEY) != "all":
+            if compact_models is None:
+                raise click.ClickException(
+                    "The Codex model view changed during discovery. Run the command again."
+                )
+            picker_catalog = _compact_codex_catalog(
+                router_catalog, compact_models, default_model
+            )
+        catalog_body = _render_codex_catalog(picker_catalog, default_model)
+        writes: list[tuple[Path, str]] = []
+        original_receipt = dict(receipt)
+        receipt[CODEX_ROUTER_CATALOG_DIGEST_KEY] = _content_digest(catalog_body)
+        if admin_default is not None:
+            receipt[CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY] = admin_default
+        else:
+            receipt.pop(CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY, None)
+        if receipt != original_receipt:
+            # The receipt first: unconfigure recognizes the catalog by it.
+            writes.append((state_path, json.dumps(receipt, indent=2) + "\n"))
+        catalog_path = path.parent / CODEX_ROUTER_CATALOG
+        if _changed(catalog_path, catalog_body):
+            writes.append((catalog_path, catalog_body))
+        if existing_data.get("model") != default_model:
+            writes.append(
+                (path, _with_root_model(path, existing, existing_data, default_model))
+            )
+            instructions_path = path.parent / "ramp-router-instructions.md"
+            if existing_data.get("model_instructions_file") == str(
+                instructions_path.resolve()
+            ):
+                prompt = _codex_harness_prompt(default_model)
+                if prompt:
+                    writes.append((instructions_path, prompt))
+        _write_model_files(writes, "codex")
+    return default_model
+
+
+def _refresh_conductor_models(
+    path: Path, api_key: str, default_model: str, *, base_url: str | None
+) -> None:
+    """Rewrite the isolated Codex home's catalog and ``model``; nothing else."""
+    router_catalog = _render_codex_catalog(
+        _fetch_codex_catalog(api_key, base_url=base_url), default_model
+    )
+    if not _conductor_receipt_enrolls(_conductor_state_path(path)):
+        raise _not_configured("conductor")
+    codex_home = path.parent / "ramp-router" / CONDUCTOR_CODEX_HOME
+    config_path = codex_home / "config.toml"
+    existing, data = _read_codex_config(config_path)
+    if data.get("model_provider") != ROUTER_PROVIDER:
+        raise _not_configured("conductor")
+    writes: list[tuple[Path, str]] = []
+    catalog_path = codex_home / CODEX_ROUTER_CATALOG
+    if _changed(catalog_path, router_catalog):
+        writes.append((catalog_path, router_catalog))
+    if data.get("model") != default_model:
+        writes.append(
+            (config_path, _with_root_model(config_path, existing, data, default_model))
+        )
+        if data.get("model_instructions_file"):
+            vendored_codex = conductor.vendored_binary("codex")
+            prompt = _codex_harness_prompt_from(
+                vendored_codex if vendored_codex.is_file() else None,
+                default_model,
+                bundled=True,
+            )
+            if prompt:
+                writes.append((codex_home / "ramp-router-instructions.md", prompt))
+    _write_model_files(writes, "conductor")
+
+
+def _refresh_hermes_model(path: Path, default_model: str) -> str:
+    """Move Hermes's ``model.default`` off a model Router no longer serves.
+
+    Returns the model in effect afterwards.
+    """
+    state_path = path.parent / "ramp-router-state.json"
+    if not state_path.exists() or not _hermes_receipt_enrolls(state_path):
+        raise _not_configured("hermes")
+    live = hermes_agent.read_config_json("model")
+    if not (isinstance(live, dict) and live.get("provider") == HERMES_ROUTER_PROVIDER):
+        # The user moved Hermes to another provider.
+        current = live.get("default") if isinstance(live, dict) else None
+        return current if isinstance(current, str) else ""
+    if live.get("default") == default_model:
+        return default_model
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            raise ValueError
+    except (OSError, UnicodeError, ValueError):
+        raise click.ClickException(
+            f"Could not read Ramp Router setup state from {state_path}."
+        ) from None
+    # A default this CLI chose, so unconfigure may restore over it.
+    state["written_model_default"] = default_model
+    try:
+        _write_private_file(state_path, json.dumps(state, indent=2) + "\n")
+    except OSError as exc:
+        raise click.ClickException(f"Could not write {state_path}: {exc}") from None
+    hermes_agent.set_config_value("model.default", default_model)
+    return default_model
+
+
+def _refresh_plugin_model(client: str, path: Path, default_model: str) -> str:
+    """Move OpenCode's or Pi's Router default model; return the one in effect."""
+    if not (path.parent / "ramp-router-state.json").exists():
+        raise _not_configured(client)
+    text, config = _read_json_text(client, path)
+    prefix = f"{ROUTER_PROVIDER}/"
+    if client == "opencode" and _opencode_default_model_paths(config):
+        return _refresh_opencode_plugin_model(path, text, config, default_model)
+    if client == "opencode":
+        key, value = "model", f"{prefix}{default_model}"
+        current = config.get(key)
+        ours = isinstance(current, str) and current.startswith(prefix)
+    else:
+        key, value = "defaultModel", default_model
+        current = config.get(key)
+        ours = config.get("defaultProvider") == ROUTER_PROVIDER
+    if not ours:
+        # The user moved this agent off Router's provider.
+        return current.removeprefix(prefix) if isinstance(current, str) else ""
+    if current == value:
+        return default_model
+    updated = _edit_json_values(text, [((key,), value)])
+    if updated is None:
+        raise _unedited(path)
+    _write_model_files([(path, updated)], client)
+    return default_model
+
+
+def _read_json_text(client: str, path: Path) -> tuple[str, dict]:
+    """A JSON config's text and its parsed value, read once."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise click.ClickException(
+            f"Could not read {CLIENT_NAMES[client]} config {path}: {exc}"
+        ) from None
+    try:
+        config = json5.loads(text)
+        if not isinstance(config, dict):
+            raise ValueError("the top-level value must be an object")
+    except ValueError as exc:
+        raise click.ClickException(
+            f"Could not read {CLIENT_NAMES[client]} config {path}: {exc}"
+        ) from None
+    return text, config
+
+
+def _edit_json_values(
+    text: str, edits: list[tuple[tuple[str | int, ...], object]]
+) -> str | None:
+    """``text`` with each value replaced in place, or None if that is unsafe.
+
+    Comments, trailing commas, and layout stay as the user wrote them. The
+    result must parse to the original with only those values changed. When
+    the text cannot be edited that way, strict JSON is rewritten (it has no
+    comments to lose); a JSON5 file is never reformatted, and None is returned.
+    """
+    expected = json5.loads(text)
+    updated: str | None = text
+    for keys, value in edits:
+        target = expected
+        for key in keys[:-1]:
+            target = target[key]
+        target[keys[-1]] = value
+        if updated is not None:
+            updated = json5_edit.replace_value(updated, keys, value)
+    if updated is not None and json5.loads(updated) == expected:
+        return updated
+    try:
+        json.loads(text)
+    except ValueError:
+        return None
+    return json.dumps(expected, indent=2) + "\n"
+
+
+def _unedited(path: Path) -> click.ClickException:
+    """The failure for a model change that would reformat a JSON5 file.
+
+    Raised, not just logged, so the refresh counts as failed and the
+    scheduled job retries it on its backoff instead of acknowledging it.
+    """
+    return click.ClickException(
+        f"Left the model in {path} as it is: it could not be changed without "
+        "reformatting the file. Run 'ramp router refresh' to update it."
+    )
+
+
+def _opencode_default_model_paths(config: dict) -> list[tuple[str | int, ...]]:
+    """Where the Router plugin options in one OpenCode config hold ``defaultModel``.
+
+    Only a v2 setup writes that option; there it, not the config's ``model``,
+    is the Router default.
+    """
+    package_path = _bundled_plugin_path("opencode")
+    paths: list[tuple[str | int, ...]] = []
+    for key in ("plugin", "plugins"):
+        entries = config.get(key)
+        if not isinstance(entries, list):
+            continue
+        for index, entry in enumerate(entries):
+            if not _is_router_plugin_entry("opencode", entry, package_path):
+                continue
+            if isinstance(entry, list) and len(entry) > 1:
+                options_key: str | int = 1
+            elif isinstance(entry, dict):
+                options_key = "options"
+            else:
+                continue
+            options = _opencode_plugin_options(entry)
+            if options is not None and "defaultModel" in options:
+                paths.append((key, index, options_key, "defaultModel"))
+    return paths
+
+
+def _json_value_at(document: dict, keys: tuple[str | int, ...]) -> object:
+    value: object = document
+    for key in keys:
+        if isinstance(value, dict):
+            value = value.get(key)
+        elif isinstance(value, list) and isinstance(key, int) and key < len(value):
+            value = value[key]
+        else:
+            return None
+    return value
+
+
+def _refresh_opencode_plugin_model(
+    path: Path, text: str, config: dict, default_model: str
+) -> str:
+    """Move the v2 plugin's ``defaultModel`` in opencode.json and cli.json.
+
+    The config's own ``model`` is left as it is: a user's model there is
+    theirs, and moving an earlier Router model into the option is the
+    receipt-tracked change that configure and `ramp router refresh` make.
+    """
+    writes: list[tuple[Path, str]] = []
+    cli_path = _opencode_cli_config_path()
+    documents = [(path, text, config)]
+    if cli_path.exists():
+        documents.append((cli_path, *_read_json_text("opencode", cli_path)))
+    for document_path, document_text, document in documents:
+        paths = _opencode_default_model_paths(document)
+        if all(_json_value_at(document, keys) == default_model for keys in paths):
+            continue
+        updated = _edit_json_values(
+            document_text, [(keys, default_model) for keys in paths]
+        )
+        if updated is None:
+            # Before any write, so the two files never disagree.
+            raise _unedited(document_path)
+        writes.append((document_path, updated))
+    _write_model_files(writes, "opencode")
+    return default_model
+
+
 def _plugin_source(entry: object) -> str | None:
     if isinstance(entry, str):
         return entry
@@ -7826,6 +9290,115 @@ def _plugin_source(entry: object) -> str | None:
             if isinstance(entry.get(key), str):
                 return entry[key]
     return None
+
+
+def _local_plugin_path(source: str | None) -> Path | None:
+    if source is None:
+        return None
+    try:
+        path = Path(source)
+        if path.is_absolute():
+            return path.resolve()
+        url = urlsplit(source)
+        if (
+            url.scheme == "file"
+            and url.netloc in {"", "localhost"}
+            and not (url.query or url.fragment)
+        ):
+            path = Path(url2pathname(url.path))
+            if path.is_absolute():
+                return path.resolve()
+    except (OSError, ValueError, RuntimeError):
+        pass
+    return None
+
+
+def _read_plugin_state(state_path: Path) -> dict:
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            raise ValueError("expected an object")
+        return state
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(
+            f"Could not read Ramp Router setup state from {state_path}: {exc}"
+        ) from None
+
+
+def _repair_moved_plugin(client: str, path: Path) -> None:
+    """Relocate missing CLI-owned plugin sources, without full reconfiguration.
+
+    New receipts record the installed directory. Legacy receipts can only be
+    recovered conservatively: a missing path must have our exact bundled layout
+    and must not be one of the registrations saved for restoration.
+    """
+    state_path = path.parent / "ramp-router-state.json"
+    if not state_path.is_file():
+        return
+    state = _read_plugin_state(state_path)
+    package = _bundled_plugin_path(client)
+    recorded = (
+        _local_plugin_path(state.get("installed_plugin_path"))
+        if isinstance(state.get("installed_plugin_path"), str)
+        else None
+    )
+    previous = {
+        _local_plugin_path(_plugin_source(entry))
+        for key in (
+            "plugin_entries",
+            "plugins_entries",
+            "tui_plugin_entries",
+            "package_entries",
+        )
+        for entry in (state.get(key) if isinstance(state.get(key), list) else [])
+    }
+    documents = [path]
+    if client == "opencode":
+        documents.extend([_opencode_tui_config_path(), _opencode_cli_config_path()])
+    writes = []
+    for document in dict.fromkeys(documents):
+        if not document.is_file():
+            continue
+        text, config = _read_json_text(client, document)
+        edits = []
+        for key in ("plugin", "plugins") if client == "opencode" else ("packages",):
+            entries = config.get(key, [])
+            if not isinstance(entries, list):
+                continue
+            for index, entry in enumerate(entries):
+                source = _plugin_source(entry)
+                old = _local_plugin_path(source)
+                if old is None or old == package or old.exists():
+                    continue
+                if recorded is not None:
+                    if old != recorded:
+                        continue  # the user replaced the registration
+                elif (
+                    "installed_plugin_path" in state
+                    or old.parts[-4:]
+                    != ("ramp_cli", "router_integrations", "packages", package.name)
+                    or old in previous
+                ):
+                    continue
+                keys: tuple[str | int, ...] = (key, index)
+                if isinstance(entry, list):
+                    keys += (0,)
+                elif isinstance(entry, dict):
+                    keys += ("package" if entry.get("package") == source else "source",)
+                replacement = (
+                    package.as_uri() if source.startswith("file:") else str(package)
+                )
+                edits.append((keys, replacement))
+        if edits:
+            updated = _edit_json_values(text, edits)
+            if updated is None:
+                raise click.ClickException(
+                    f"Could not repair Router plugin paths in {document} without reformatting it. Run 'ramp router refresh'."
+                )
+            writes.append((document, updated))
+    if writes:
+        state["installed_plugin_path"] = str(package)
+        _write_model_files([*writes, (state_path, _dump_state(state))], client)
 
 
 def _is_router_plugin_entry(client: str, entry: object, package_path: Path) -> bool:
@@ -7902,6 +9475,8 @@ def _configure_opencode(
     default_model: str,
     *,
     base_url: str | None,
+    usage_base_url: str | None = None,
+    usage_api_key: str | None = None,
     replace_model: bool = False,
 ) -> tuple[str | None, list[tuple[Path, dict]]]:
     """Register the bundled plugin for whichever OpenCode generation is installed.
@@ -8005,8 +9580,13 @@ def _configure_opencode(
         # Claude Code gets ROUTER_BASE_URL: the plugin cannot know a
         # split-origin deployment's dashboard host from the data-plane URL
         # alone.
-        "usageBaseURL": _statusline_origin(base_url),
+        "usageBaseURL": usage_base_url or _statusline_origin(base_url),
         "apiKey": api_key,
+        **(
+            {"usageApiKey": usage_api_key}
+            if usage_api_key != api_key and usage_api_key
+            else {}
+        ),
         "rampCliVersion": __version__,
         **(
             {"rampExecutable": str(executable)}
@@ -8063,6 +9643,11 @@ def _configure_plugin_client(
     package_path = _bundled_plugin_path(client)
     state_path = path.parent / "ramp-router-state.json"
     state = None
+    actual_base_url = base_url
+    real_api_key = api_key
+    base_url, api_key = router_repo.client_credentials(
+        base_url or router_base_url(), api_key
+    )
 
     if client == "opencode":
         state, writes = _configure_opencode(
@@ -8072,6 +9657,8 @@ def _configure_plugin_client(
             api_key,
             default_model,
             base_url=base_url,
+            usage_base_url=_statusline_origin(actual_base_url),
+            usage_api_key=real_api_key,
             replace_model=replace_model,
         )
     else:
@@ -8152,8 +9739,13 @@ def _configure_plugin_client(
             (
                 path.parent / PI_PLUGIN_CONFIG_FILE,
                 {
-                    "baseUrl": base_url or router_base_url(),
-                    "usageBaseUrl": _statusline_origin(base_url),
+                    "baseUrl": base_url,
+                    "usageBaseUrl": _statusline_origin(actual_base_url),
+                    **(
+                        {"usageApiKey": real_api_key, "localApiKey": api_key}
+                        if real_api_key != api_key
+                        else {}
+                    ),
                     "rampCliVersion": __version__,
                 },
             ),
@@ -8161,14 +9753,33 @@ def _configure_plugin_client(
         if models_path.exists():
             writes.append((models_path, models_config))
 
+    # Record exactly which bundled path this configure owns. Future background
+    # refreshes may relocate it if an upgrade removes that directory.
+    installed_state = (
+        json.loads(state) if state is not None else _read_plugin_state(state_path)
+    )
+    plugin_path_changed = installed_state.get("installed_plugin_path") != str(
+        package_path
+    )
+    if state is not None or plugin_path_changed:
+        installed_state["installed_plugin_path"] = str(package_path)
+        state = _dump_state(installed_state)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if state is not None:
-            _write_private_file(state_path, state)
-        for output_path, payload in writes:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            _write_private_file(output_path, json.dumps(payload, indent=2) + "\n")
-    except OSError as exc:
+        # A path change and its receipt must roll back together. Otherwise keep
+        # the existing partial-write behavior: Switchyard records a model push
+        # that landed even if another setup file subsequently failed.
+        serialized = [(state_path, state)] if state is not None else []
+        serialized.extend(
+            (output_path, json.dumps(payload, indent=2) + "\n")
+            for output_path, payload in writes
+        )
+        if plugin_path_changed:
+            _write_model_files(serialized, client)
+        else:
+            for output_path, content in serialized:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                _write_private_file(output_path, content)
+    except (OSError, click.ClickException) as exc:
         raise click.ClickException(
             f"Could not write {CLIENT_NAMES[client]} config {path}: {exc}"
         ) from None
@@ -9179,7 +10790,9 @@ def _configure_codex_in_lock(
             or (cost_hook_command is not None and _is_owned_cost_hook_chunk(chunk))
         )
     ).rstrip()
-    provider = _codex_provider(key_path, base_url)
+    provider = _codex_provider(
+        key_path, base_url, repository_attribution=True, api_key=api_key
+    )
     updated = f"{preserved}\n\n{provider}" if preserved else provider
     if cost_hook_command is not None:
         updated = _register_codex_cost_hook(path, updated, cost_hook_command)
@@ -10183,7 +11796,8 @@ def _organize_router_menu() -> None:
         invoke_without_command=True,
         no_args_is_help=False,
         help="Connect or disconnect coding harnesses.",
-        epilog="Existing shortcuts still work: configure CLIENTS [OPTIONS]. "
+        epilog="Use 'ramp router configure --connectors' for connector and harness setup. "
+        "Existing shortcuts still work: configure CLIENTS [OPTIONS]. "
         "For connection options, use 'configure connect --help'. "
         "For guided Cursor setup, use 'ramp router cursor'.",
     )
@@ -10239,6 +11853,7 @@ def _organize_router_menu() -> None:
 
     for name, description in {
         "account": "Manage your Router login.",
+        "agent": "Manage the Router agent.",
         "configure": "Connect or disconnect harnesses.",
         "keys": "View and manage API keys.",
         "refresh": "Update connected harnesses.",

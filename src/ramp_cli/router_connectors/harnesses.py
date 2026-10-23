@@ -28,7 +28,7 @@ EXECUTABLE_NAMES = (
 )
 
 
-def config_path(harness: str) -> Path:
+def config_path(harness: str, *, require_unambiguous: bool = True) -> Path:
     if harness == "claude-code":
         configured = os.environ.get("CLAUDE_CONFIG_DIR")
         return (
@@ -45,12 +45,14 @@ def config_path(harness: str) -> Path:
     if configured:
         return Path(configured).expanduser()
     root = (
-        Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+        Path(
+            os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+        ).expanduser()
         / "opencode"
     )
     paths = [root / "opencode.json", root / "opencode.jsonc"]
     existing = [p for p in paths if p.exists()]
-    if len(existing) > 1:
+    if require_unambiguous and len(existing) > 1:
         raise RampCLIError(
             "Multiple OpenCode configurations found; resolve them before connector setup."
         )

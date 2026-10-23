@@ -371,6 +371,118 @@ describe("discoverRouterModels", () => {
 })
 
 describe("Pi provider extension", () => {
+  for (const scenario of ["login", "direct-override", "legacy-env-override"]) {
+    it(`pairs credentials and endpoints for discovery and inference after ${scenario}`, async () => {
+      const home = process.env.PI_CODING_AGENT_DIR
+      const token = `ramp-local-${"a".repeat(64)}`
+      const local = "http://127.0.0.1:47317/u/api.router.com/v1"
+      const authPath = join(home, "auth.json")
+      writeFileSync(authPath, JSON.stringify({ "ramp-router": { type: "api_key", key: token } }))
+      writeFileSync(join(home, "ramp-router-config.json"), JSON.stringify({
+        baseUrl: local, localApiKey: token, usageApiKey: "saved-real-key",
+      }))
+      if (scenario === "direct-override") process.env.RAMP_ROUTER_BASE_URL = "https://api.router.com/v1"
+      if (scenario === "legacy-env-override") process.env.LLM_GATEWAY_BASE_URL = "https://api.router.com/v1"
+      const discovery = mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ data: [
+        { id: "gpt-5.4", owned_by: "openai", router: routerMetadata("gpt-5.4") },
+        { id: "claude-sonnet-4-6", owned_by: "anthropic", router: { ...routerMetadata("claude-sonnet-4-6"), surfaces: ["messages"] } },
+      ] })))
+      const registerProvider = mock.fn()
+      await registerRouterProvider({ registerProvider })
+      const provider = registerProvider.mock.calls[0].arguments[0]
+      let credential = token
+      if (scenario === "login") {
+        assert.equal(String(discovery.mock.calls[0].arguments[0]), `${local}/models`)
+        assert.equal(discovery.mock.calls[0].arguments[1].headers.authorization, `Bearer ${token}`)
+        credential = "rotated-real-key"
+        writeFileSync(authPath, JSON.stringify({ "ramp-router": { type: "api_key", key: credential } }))
+        const refresh = {
+          credential: { type: "api_key", key: credential },
+          signal: new AbortController().signal,
+          publish: async ({ update }) => { update?.(); return true },
+        }
+        await provider.refreshModels({ ...refresh, allowNetwork: false })
+        assert.deepEqual(provider.getModels(), [])
+        await provider.refreshModels({ ...refresh, allowNetwork: true })
+      }
+      const expected = scenario === "login" ? credential : "saved-real-key"
+      const lastDiscovery = discovery.mock.calls.at(-1).arguments
+      assert.equal(String(lastDiscovery[0]), "https://api.router.com/v1/models")
+      assert.equal(lastDiscovery[1].headers.authorization, `Bearer ${expected}`)
+      const requests = []
+      const capture = async (url, init) => {
+        requests.push({ url: String(url), headers: new Headers(init.headers) })
+        return new Response(JSON.stringify({ error: { message: "fixture stop" } }), {
+          status: 400, headers: { "content-type": "application/json" },
+        })
+      }
+      for (const model of provider.getModels()) {
+        await provider.streamSimple(model, { messages: [{ role: "user", content: "hello", timestamp: Date.now() }] }, {
+          apiKey: credential, fetch: capture, maxRetries: 0,
+        }).result()
+      }
+      assert.equal(requests.length, 2)
+      for (const request of requests) {
+        assert.equal(new URL(request.url).origin, "https://api.router.com")
+        assert.equal(request.headers.get("authorization"), `Bearer ${expected}`)
+        assert.equal(request.headers.has("x-api-key"), false)
+      }
+    })
+  }
+
+  it("uses the same credential pairing for a cached background discovery", { timeout: 5000 }, async () => {
+    const home = process.env.PI_CODING_AGENT_DIR
+    const token = `ramp-local-${"a".repeat(64)}`
+    process.env.RAMP_ROUTER_BASE_URL = "https://api.router.com/v1"
+    writeFileSync(join(home, "auth.json"), JSON.stringify({ "ramp-router": { type: "api_key", key: token } }))
+    writeFileSync(join(home, "ramp-router-config.json"), JSON.stringify({
+      baseUrl: "http://127.0.0.1:47317/u/api.router.com/v1", localApiKey: token, usageApiKey: "real-key",
+    }))
+    const background = Promise.withResolvers()
+    let discoveryCount = 0
+    const discovery = mock.method(globalThis, "fetch", async (url, init) => {
+      assert.equal(String(url), "https://api.router.com/v1/models")
+      assert.equal(init.headers.authorization, "Bearer real-key")
+      if (++discoveryCount === 2) background.resolve()
+      return new Response(JSON.stringify({ data: [{ id: "gpt-5.4", owned_by: "openai", router: routerMetadata("gpt-5.4") }] }))
+    })
+    await registerRouterProvider({ registerProvider() {} })
+    await registerRouterProvider({ registerProvider() {} })
+    await background.promise
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(discovery.mock.callCount(), 2)
+  })
+
+  it("uses a local token for discovery and the real key for dashboard calls", { timeout: 5000 }, async () => {
+    const home = process.env.PI_CODING_AGENT_DIR
+    const localKey = `ramp-local-${"a".repeat(64)}`
+    writeFileSync(join(home, "auth.json"), JSON.stringify({
+      "ramp-router": { type: "api_key", key: localKey },
+    }))
+    writeFileSync(join(home, "ramp-router-config.json"), JSON.stringify({
+      baseUrl: "http://127.0.0.1:47317/u/api.router.com/v1",
+      usageBaseUrl: "https://app.router.com",
+      usageApiKey: "real-key",
+      localApiKey: localKey,
+    }))
+    const dashboardSeen = Promise.withResolvers()
+    const fetcher = mock.method(globalThis, "fetch", async (url, init) => {
+      if (String(url).startsWith("http://127.0.0.1:")) {
+        assert.equal(init.headers.authorization, `Bearer ${localKey}`)
+        return new Response(JSON.stringify({ data: [{
+          id: "gpt-5.4", owned_by: "openai", router: routerMetadata("gpt-5.4"),
+        }] }))
+      }
+      assert.equal(String(url), "https://app.router.com/self-service/coding-agent-settings")
+      assert.equal(init.headers.authorization, "Bearer real-key")
+      dashboardSeen.resolve()
+      return new Response(JSON.stringify({ harnesses: {} }))
+    })
+    await registerRouterProvider({ registerProvider() {}, on() {}, setModel() {} })
+    await dashboardSeen.promise
+    assert.equal(fetcher.mock.callCount(), 2)
+  })
+
   beforeEach(() => {
     // Most tests use synthetic Router IDs to exercise cache and credential
     // behavior. Make those IDs known to the mocked Pi host without weakening
@@ -2678,6 +2790,27 @@ const QUESTION = {
 }
 
 describe("Router classifiers", () => {
+  for (const scenario of ["login", "direct-override"]) {
+    it(`reconciles classifier credentials after ${scenario}`, async () => {
+      const home = process.env.PI_CODING_AGENT_DIR
+      const token = `ramp-local-${"a".repeat(64)}`
+      const credential = scenario === "login" ? "rotated-key" : token
+      writeFileSync(join(home, "auth.json"), JSON.stringify({ "ramp-router": { type: "api_key", key: credential } }))
+      writeFileSync(join(home, "ramp-router-config.json"), JSON.stringify({
+        baseUrl: "http://127.0.0.1:47317/u/api.router.com/v1", localApiKey: token, usageApiKey: "real-key",
+      }))
+      if (scenario === "direct-override") process.env.RAMP_ROUTER_BASE_URL = "https://api.router.com/v1"
+      const { provider } = await register()
+      if (!(await hostClassifies())) return assert.equal(provider.classify, undefined)
+      const classifier = provider.getAllModels().find((model) => model.type === "classifier")
+      const result = await provider.classify(classifier, QUESTION, { apiKey: credential, maxRetries: 0 })
+      assert.equal(result.stopReason, "stop", result.errorMessage)
+      assert.equal(systemOneRequests.length, 1)
+      assert.equal(new URL(systemOneRequests[0].url).origin, "https://api.router.com")
+      assert.equal(systemOneRequests[0].headers.authorization, `Bearer ${scenario === "login" ? credential : "real-key"}`)
+    })
+  }
+
   // Serves discovery and records System One calls; anything else fails.
   let systemOneRequests
   beforeEach(() => {
@@ -3081,6 +3214,8 @@ async function lineageHeaders({
   provider = "ramp-router",
   sessionID = "019ff2af-7ce1-7000-8000-000000000001",
   parentSession,
+  leafEntry,
+  entries = [],
   initialHeaders = { "Existing-Header": "preserved" },
 } = {}) {
   let handler
@@ -3099,6 +3234,8 @@ async function lineageHeaders({
       model: { provider },
       sessionManager: {
         getSessionId: () => sessionID,
+        getLeafEntry: () => leafEntry,
+        getEntry: (id) => entries.find((entry) => entry.id === id),
         getHeader: () => ({
           type: "session",
           id: sessionID,
@@ -3119,6 +3256,26 @@ describe("Pi session lineage headers", () => {
     })
     assert.deepEqual(await lineageHeaders({ provider: "openai" }), {
       "Existing-Header": "preserved",
+    })
+  })
+
+  it("emits the nearest user message entry as the turn ID", async () => {
+    const user = { type: "message", id: "user-entry-1", parentId: null, message: { role: "user" } }
+    const tool = { type: "message", id: "tool-entry-1", parentId: user.id, message: { role: "toolResult" } }
+    assert.deepEqual(await lineageHeaders({ leafEntry: tool, entries: [user] }), {
+      "Existing-Header": "preserved",
+      "X-Gateway-Client": "pi",
+      "X-Session-Id": "019ff2af-7ce1-7000-8000-000000000001",
+      "X-Turn-Id": user.id,
+    })
+  })
+
+  it("keeps requests untagged when no user entry is available", async () => {
+    const tool = { type: "message", id: "tool-entry-1", parentId: null, message: { role: "toolResult" } }
+    assert.deepEqual(await lineageHeaders({ leafEntry: tool }), {
+      "Existing-Header": "preserved",
+      "X-Gateway-Client": "pi",
+      "X-Session-Id": "019ff2af-7ce1-7000-8000-000000000001",
     })
   })
 

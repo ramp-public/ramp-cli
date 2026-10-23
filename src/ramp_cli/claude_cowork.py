@@ -316,8 +316,24 @@ def _run_quiet(command: list[str], *, timeout: float = 15) -> int:
         return -1
 
 
+def claude_pids() -> list[int]:
+    """Claude Desktop's process ids (empty when it is not running)."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-x", "Claude"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [int(line) for line in result.stdout.split() if line.isdigit()]
+
+
 def _claude_is_running() -> bool:
-    return _run_quiet(["pgrep", "-x", "Claude"], timeout=2) == 0
+    return bool(claude_pids())
 
 
 def _ensure_claude_installed() -> None:

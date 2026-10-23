@@ -12,6 +12,7 @@ import {
   DEFAULT_API_KEY_ENV,
   nonEmpty,
   resolveAPIKey,
+  resolveUsageAPIKey,
   resolveBaseURL,
   resolveDefaultModel,
   resolveProviderID,
@@ -25,6 +26,7 @@ import {
   workspaceDefaultApplier,
   workspaceDefaultCache,
 } from "./workspace-default.ts"
+import { applyTurnHeader, turnTracker } from "./turn-id.ts"
 
 /**
  * Router speaks the OpenAI Responses API for every model it serves, so the
@@ -171,6 +173,22 @@ export function toV2Provider(input: {
   }
 }
 
+type TurnRegistration = { dispose(): Promise<void> }
+type TurnSessionLike = {
+  hook(
+    name: "prompt",
+    callback: (event: { sessionID?: unknown; messageID?: unknown }) => void,
+  ): Promise<TurnRegistration>
+  hook(
+    name: "model.request",
+    callback: (event: {
+      sessionID?: unknown
+      model?: { providerID?: unknown }
+      headers: Record<string, string>
+    }) => void,
+  ): Promise<TurnRegistration>
+}
+
 /**
  * The OpenCode v2 plugin body. Discovery runs once before the synchronous
  * provider transform, as v2 requires, and the result is captured for replay.
@@ -195,7 +213,7 @@ export async function setupRouterProviderV2(
   // provider registers; its own short timeout bounds any wait below.
   const defaults = workspaceDefaultCache({
     usageOrigin: resolveUsageOrigin(options),
-    apiKey,
+    apiKey: resolveUsageAPIKey(options) ?? apiKey,
     ...(rampCliVersion ? { rampCliVersion } : {}),
   })
   defaults.prefetch()
@@ -245,5 +263,31 @@ export async function setupRouterProviderV2(
   void applier.watch(ctx.event.subscribe({ signal: subscription.signal })).catch(() => {
     // An ended event stream only stops later refreshes.
   })
-  return () => subscription.abort()
+  const turnRegistrations: TurnRegistration[] = []
+  const session = ctx.session as unknown as Partial<TurnSessionLike> | undefined
+  if (typeof session?.hook === "function") {
+    const turns = turnTracker()
+    try {
+      // Push each registration as soon as it exists so a later failure can dispose it.
+      turnRegistrations.push(
+        await session.hook("prompt", (event) => {
+          turns.record(event.sessionID, event.messageID)
+        }),
+      )
+      turnRegistrations.push(
+        await session.hook("model.request", (event) => {
+          if (event.model?.providerID !== providerID) return
+          applyTurnHeader(event.headers, turns.current(event.sessionID))
+        }),
+      )
+    } catch {
+      // Turn IDs are attribution metadata. A host without these hooks keeps working untagged.
+      await Promise.allSettled(turnRegistrations.map((registration) => registration.dispose()))
+      turnRegistrations.length = 0
+    }
+  }
+  return () => {
+    subscription.abort()
+    void Promise.allSettled(turnRegistrations.map((registration) => registration.dispose()))
+  }
 }

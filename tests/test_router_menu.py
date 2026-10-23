@@ -24,6 +24,7 @@ def test_main_router_menu_has_short_choices_and_workspace():
     visible = {name for name, command in group.commands.items() if not command.hidden}
     assert visible == {
         "account",
+        "agent",
         "configure",
         "connectors",
         "keys",
@@ -39,6 +40,7 @@ def test_main_router_menu_has_short_choices_and_workspace():
     assert result.exit_code == 0, result.output
     assert "Connect or disconnect harnesses." in result.output
     assert "Choose subagent models." in result.output
+    assert "Manage the Router agent." in result.output
 
 
 def test_configure_help_contains_cursor_and_disconnect():

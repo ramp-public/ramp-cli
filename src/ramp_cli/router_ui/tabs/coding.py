@@ -433,7 +433,9 @@ class ExperimentalModelsPage(InlineModal):
         self.call_after_refresh(self.fit_body)
 
     def fit_body(self):
-        if self.is_mounted:
+        # Deferred refreshes can run during removal, when is_mounted is still true
+        # but the dialog's children are gone. display also excludes closing nodes.
+        if self.is_mounted and self.display:
             dialog = self.query_one("#experimental-dialog")
             chrome = dialog.styles.gutter.height + sum(
                 w.outer_size.height + w.styles.margin.height

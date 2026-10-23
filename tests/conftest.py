@@ -51,6 +51,8 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         "ramp_cli.commands.router._CODEX_APP_LOCATIONS",
         (tmp_path / "ChatGPT.app",),
     )
+    # Configuring a fixture must not quit the developer's desktop apps.
+    monkeypatch.setattr("ramp_cli.codex_desktop.restart_running", lambda: [])
     # Hermes is configured through its own `hermes config` executable rather
     # than direct file writes, so a developer with Hermes installed would
     # otherwise have tests drive the real binary against their real setup.
@@ -79,6 +81,22 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     ):
         monkeypatch.delenv(leaked, raising=False)
     monkeypatch.setenv("RAMP_NO_TOOL_AVAILABILITY", "1")
+    # Configure/refresh/unconfigure manage an OS scheduled job (launchd or
+    # systemd); tests must never install one on the developer's machine.
+    monkeypatch.setattr(
+        "ramp_cli.commands.router_schedule.install", lambda **_kwargs: None
+    )
+    monkeypatch.setattr("ramp_cli.commands.router_schedule.uninstall", lambda: None)
+    # Repository tagging rewrites the same always-on agent service.
+    monkeypatch.setattr("ramp_cli.commands.router_repo.install_service", lambda: None)
+    monkeypatch.setattr("ramp_cli.commands.router_repo.uninstall_service", lambda: None)
+    monkeypatch.setattr("ramp_cli.commands.router_schedule.update_agent", lambda: None)
+    # A development agent build in the developer's shell must not be picked up.
+    monkeypatch.delenv("RAMP_ROUTER_AGENT", raising=False)
+    # The job's locks live under the real home, not XDG_CONFIG_HOME.
+    monkeypatch.setattr(
+        "ramp_cli.commands.router_sync.job_lock_dir", lambda: tmp_path / "job-locks"
+    )
     # Pin the resolved ramp entrypoint so hook commands in fixtures are
     # deterministic regardless of how the tests were launched.
     monkeypatch.setattr(
@@ -91,5 +109,6 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     # Router's coding-agent settings are cached per process; one test's
     # Router must not answer the next one's configure.
     monkeypatch.setattr("ramp_cli.admin_defaults._cache", {})
+    monkeypatch.setattr("ramp_cli.admin_defaults._pinned", {})
     monkeypatch.setattr("ramp_cli.config.settings.default_environment", lambda: "")
     yield tmp_path

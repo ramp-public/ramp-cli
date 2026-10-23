@@ -48,6 +48,10 @@ LEGACY_SWITCHYARD_SOURCE = "switchyard"
 # are cached too: within one run the Switchyard read and the admin default
 # read must agree, and neither should wait on a Router that just timed out.
 _cache: dict[tuple[str, str], tuple[float, dict | None]] = {}
+# (api_key, origin) -> the body a background check read (None: no usable body).
+# Pinned for the rest of the process and never expired or cleared, so the
+# refresh that check starts applies exactly what it saw (see pin()).
+_pinned: dict[tuple[str, str], dict | None] = {}
 
 
 def clear_cache() -> None:
@@ -65,6 +69,8 @@ def _settings_payload(api_key: str, origin: str, timeout: float) -> dict | None:
         return None
     origin = origin.rstrip("/")
     cache_key = (api_key, origin)
+    if cache_key in _pinned:
+        return _pinned[cache_key]
     now = time.monotonic()
     cached = _cache.get(cache_key)
     if cached is not None and now - cached[0] < CACHE_TTL_SECONDS:
@@ -101,6 +107,26 @@ def switchyard_offered(
     return payload is not None and payload.get("switchyard_offered") is True
 
 
+def pin(api_key: str, origin: str, payload: object) -> dict | None:
+    """Make every later read in this process return ``payload``; return it if usable.
+
+    The scheduled sync reads the settings once to decide whether anything
+    changed. Pinning that body makes the refresh apply the same one, rather
+    than a second read that could time out or answer differently and leave a
+    recorded change unapplied. An unusable body, or None for a failed read,
+    pins "no settings": the refresh applies nothing the check did not see.
+    """
+    usable = _usable(payload)
+    _pinned[(api_key, origin.rstrip("/"))] = usable
+    return usable
+
+
+def _usable(payload: object) -> dict | None:
+    if not isinstance(payload, dict) or not isinstance(payload.get("harnesses"), dict):
+        return None
+    return payload
+
+
 def _fetch_coding_agent_settings(
     api_key: str, origin: str, timeout: float
 ) -> dict | None:
@@ -119,9 +145,7 @@ def _fetch_coding_agent_settings(
         payload = response.json()
     except (httpx.HTTPError, ValueError):
         return None
-    if not isinstance(payload, dict) or not isinstance(payload.get("harnesses"), dict):
-        return None
-    return payload
+    return _usable(payload)
 
 
 def effective_model(harnesses: dict | None, client: str) -> str | None:

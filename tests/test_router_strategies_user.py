@@ -24,7 +24,7 @@ from ramp_cli.errors import ApiError, RampCLIError
 from ramp_cli.main import cli
 from ramp_cli.router_ui.app import RouterApp
 from ramp_cli.router_ui.service import RouterService
-from ramp_cli.router_ui.tabs.coding import CodingSettings
+from ramp_cli.router_ui.tabs.coding import CodingSettings, ExperimentalModelsPage
 from tests.test_router_harness_cells import choose
 from tests.test_router_ui import settle
 
@@ -559,6 +559,41 @@ def test_experimental_preset_saves_model_pair_and_auto_without_legacy_toggle(rou
     asyncio.run(run())
 
 
+def test_experimental_resize_callback_ignores_dialog_teardown(router, monkeypatch):
+    resized_during_teardown = []
+
+    def on_unmount(self):
+        # Textual keeps is_mounted true after removing the screen's children.
+        # A queued refresh callback can run in exactly this teardown state.
+        assert self.is_mounted
+        assert not self.query("#experimental-dialog")
+        self.fit_body()
+        resized_during_teardown.append(self)
+
+    monkeypatch.setattr(ExperimentalModelsPage, "on_unmount", on_unmount, raising=False)
+
+    async def run():
+        service = RouterService({}, origin="http://localhost:3080")
+        service.harnesses = lambda: []
+        app = RouterApp(service, page="harnesses")
+        try:
+            async with app.run_test(size=(120, 40)) as pilot:
+                await settle(app, pilot)
+                app.screen.query_one("#experimental").press()
+                await settle(app, pilot)
+                form = app.screen
+                form.fit_body()
+                form.dismiss(None)
+                await settle(app, pilot)
+                assert resized_during_teardown == [form]
+                assert app.screen is not form
+                form.fit_body()
+        finally:
+            service.close()
+
+    asyncio.run(run())
+
+
 def test_research_preset_requires_benchmark_choice_or_explicit_opt_out(router):
     async def run():
         service = RouterService({}, origin="http://localhost:3080")
@@ -719,8 +754,9 @@ def test_retry_collects_reverted_auto_toggle_after_failed_profile_save(
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("failure", ["profile", "alias_before", "alias_after"])
 def test_retry_restores_reverted_benchmark_weights_after_partial_save(
-    router, monkeypatch
+    router, monkeypatch, failure
 ):
     original = [
         {"benchmark_id": "mmlu_pro", "weight": 30},
@@ -745,11 +781,23 @@ def test_retry_restores_reverted_benchmark_weights_after_partial_save(
 
     def fail_once(client, path, *, json, **kwargs):
         attempts.append(copy.deepcopy(json))
-        if len(attempts) == 1:
+        if len(attempts) == 1 and failure == "profile":
             raise ApiError(422, '{"error":{"message":"Profile unavailable"}}')
         return patch(client, path, json=json, **kwargs)
 
     monkeypatch.setattr(RouterUserClient, "patch", fail_once)
+    put = RouterUserClient.put
+    alias_attempts = []
+
+    def fail_alias_once(client, path, **kwargs):
+        alias_attempts.append(copy.deepcopy(kwargs["json"]))
+        if len(alias_attempts) == 1 and failure.startswith("alias_"):
+            if failure == "alias_after":
+                put(client, path, **kwargs)
+            raise httpx.ReadError("Alias response lost")
+        return put(client, path, **kwargs)
+
+    monkeypatch.setattr(RouterUserClient, "put", fail_alias_once)
 
     async def run():
         service = RouterService({}, origin="http://localhost:3080")
@@ -766,10 +814,14 @@ def test_retry_restores_reverted_benchmark_weights_after_partial_save(
             await settle(app, pilot)
             app.screen.query_one("#accept").press()
             await settle(app, pilot)
-            assert router["aliases"][0]["benchmarks"] == [
-                {"benchmark_id": "mmlu_pro", "weight": 60},
-                {"benchmark_id": "coding_index", "weight": 40},
-            ]
+            assert router["aliases"][0]["benchmarks"] == (
+                original
+                if failure == "alias_before"
+                else [
+                    {"benchmark_id": "mmlu_pro", "weight": 60},
+                    {"benchmark_id": "coding_index", "weight": 40},
+                ]
+            )
             assert form.query_one("#benchmark-save-status").display
             form.query_one("#weight-0", Input).value = "30"
             await pilot.pause()
@@ -779,11 +831,10 @@ def test_retry_restores_reverted_benchmark_weights_after_partial_save(
             await settle(app, pilot)
             assert router["aliases"][0]["benchmarks"] == original
             assert profile["name"] == "Renamed research"
-            assert [method for method, _, _ in writes(router)] == [
-                "PUT",
-                "PUT",
-                "PATCH",
-            ]
+            assert not form.benchmark_uncertain
+            assert [method for method, _, _ in writes(router)] == (
+                ["PATCH"] if failure == "alias_before" else ["PUT", "PUT", "PATCH"]
+            )
         service.close()
 
     asyncio.run(run())

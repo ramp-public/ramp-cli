@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import io
+import itertools
 import json
 import os
 import sqlite3
@@ -13,9 +14,11 @@ import subprocess
 import tomllib
 from contextlib import contextmanager
 from decimal import Decimal
+from types import SimpleNamespace
 
 import click
 import httpx
+import json5
 import pytest
 import zstandard
 from click.testing import CliRunner
@@ -24,11 +27,16 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
 import ramp_cli.commands.router as router_module
-from ramp_cli import __version__, claude_cowork
+from ramp_cli import __version__, claude_cowork, codex_desktop
+from ramp_cli.client.router_user import RouterUserClient
+from ramp_cli.codex_desktop import restart_running
 from ramp_cli.commands import claude_code, cursor
 from ramp_cli.commands.router import DEFAULT_ROUTER_BASE_URL as ROUTER_BASE_URL
 from ramp_cli.config.settings import config_dir
+from ramp_cli.errors import RampCLIError
 from ramp_cli.main import cli
+from ramp_cli.router_connectors import auth as connector_auth
+from ramp_cli.router_connectors import harnesses as connector_harnesses
 
 
 @pytest.fixture(autouse=True)
@@ -208,6 +216,700 @@ def _router_model(identifier, *, request_name=None, display_name=None):
     return router_module.RouterModel(
         id=identifier,
         metadata=router_module._model_metadata(metadata, identifier),
+    )
+
+
+@pytest.fixture
+def connector_setup(monkeypatch):
+    _mock_models(monkeypatch)
+    _mock_codex_catalog(monkeypatch)
+    monkeypatch.setattr(connector_harnesses, "_executable", lambda: "/usr/bin/ramp")
+    monkeypatch.setattr(connector_auth, "issue", lambda *a, **kw: "mcp-secret")
+    monkeypatch.setattr(router_module, "_can_prompt", lambda *a: True)
+    monkeypatch.setattr(router_module, "_pick_claude_models", lambda *a: "compact")
+    monkeypatch.setattr(
+        router_module.router_ui,
+        "launch",
+        lambda *a, **kw: pytest.fail("Connector setup must not open the workspace"),
+    )
+    monkeypatch.setattr(
+        router_module,
+        "acquire_router_api_key",
+        lambda *a, **kw: pytest.fail("Create keys through the Router user API"),
+    )
+    calls = []
+    sessions = itertools.count()
+
+    def login(client, **options):
+        calls.append(("login", options))
+        client._save(
+            {
+                "refresh_token": "cli-refresh-secret",
+                "issued_at": 0,
+                "refresh_token_expires_in": 10**12,
+                "connector_authorization": {
+                    "resource": connector_auth.resource_for_origin(client.origin),
+                    "client_id": connector_auth.CLIENT_ID,
+                    "scope": "connectors:execute",
+                    "user_id": "user",
+                    "business_uuid": "business",
+                    "core_user_uuid": "core-user",
+                    "session_id": f"session-{next(sessions)}",
+                },
+            }
+        )
+        return client.status()
+
+    def get(client, path, **kwargs):
+        assert path == "/client/routing-profiles"
+        return {"data": [{"id": "default-profile", "is_default": True}]}
+
+    def post(client, path, **kwargs):
+        assert path == "/client/api-keys"
+        assert kwargs["json"]["routing_profile_id"] == "default-profile"
+        assert kwargs["idempotency_key"]
+        assert any(
+            connector_harnesses.status(h)["state"] == "enabled"
+            for h in connector_harnesses.HARNESSES
+        )
+        calls.append(("create", kwargs["json"]))
+        return {"id": "created-key", "secret": "router-secret"}
+
+    monkeypatch.setattr(RouterUserClient, "login", login)
+    monkeypatch.setattr(RouterUserClient, "get", get)
+    monkeypatch.setattr(RouterUserClient, "post", post)
+    return calls
+
+
+@pytest.mark.parametrize("connectors", [False, True])
+def test_configure_agent_composes_with_optional_connectors(
+    monkeypatch, connector_setup, connectors
+):
+    monkeypatch.setattr(router_module.router_repo, "service_supported", lambda: True)
+    monkeypatch.setattr(router_module.router_repo, "status", lambda: {"healthy": True})
+    monkeypatch.setattr(
+        router_module.router_schedule, "background_status", lambda: {"state": "running"}
+    )
+    monkeypatch.setattr(
+        router_module,
+        "_pick_claude_models",
+        lambda *_: pytest.fail("Agent configuration must not add a model-view prompt"),
+    )
+
+    @click.command()
+    @click.option("--port", "helper_port", default=None)
+    def enable(helper_port):
+        assert (
+            router_module._stored_router_api_key(
+                "claude-code", router_module._client_config_path("claude-code")
+            )
+            == "router-secret"
+        )
+        connector_setup.append(("agent",))
+
+    monkeypatch.setattr(router_module, "router_agent_enable", enable)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure",
+            "claude-code",
+            "--enable-agent",
+            "--api-key",
+            "router-secret",
+            *(["--connectors"] if connectors else []),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert connector_setup[-1] == ("agent",)
+    assert any(call[0] == "login" for call in connector_setup) == connectors
+    assert connector_harnesses.status("claude-code")["state"] == (
+        "enabled" if connectors else "disabled"
+    )
+
+
+@pytest.mark.parametrize(
+    "clients",
+    [("claude-code",), ("codex",), ("opencode",), connector_harnesses.HARNESSES],
+)
+@pytest.mark.parametrize("quiet", [False, True])
+def test_configure_connectors_shows_setup_progress_then_notice(
+    monkeypatch, connector_setup, clients, quiet
+):
+    if "opencode" in clients:
+        monkeypatch.setenv("RAMP_OPENCODE_MAJOR", "2")
+        opencode_config = router_module._client_config_path("opencode")
+        opencode_config.parent.mkdir(parents=True)
+        opencode_config.write_text(json.dumps({"model": "anthropic/claude-opus-4"}))
+    login = RouterUserClient.login
+
+    def complete_login(client, **options):
+        session = login(client, **options)
+        click.echo("OAuth complete")
+        return session
+
+    monkeypatch.setattr(RouterUserClient, "login", complete_login)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure",
+            *clients,
+            "--connectors",
+            *(["--quiet"] if quiet else []),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    after_login = result.output.split("OAuth complete\n", 1)[1]
+    lines = after_login.splitlines()
+    if not quiet:
+        assert lines[:3] == ["", "Setting up agents...", "Configured agents."]
+        lines = lines[3:]
+    separator, *lines = lines
+    assert separator == ""
+    assert lines[0].startswith("┌─── NOTICE")
+    assert lines[-1].startswith("└")
+    assert all(line.startswith("│") and line.endswith("│") for line in lines[1:-1])
+    notice = _notice_lines(after_login)
+    for client in clients:
+        assert f"ramp router connectors disable --harness {client}" in notice
+        assert connector_harnesses.status(client)["state"] == "enabled"
+    expected_notes = []
+    if "opencode" in clients:
+        assert (
+            json.loads(opencode_config.read_text())["model"]
+            == "anthropic/claude-opus-4"
+        )
+        model_notes = router_module._opencode_user_model_note(opencode_config)
+        assert model_notes
+        expected_notes.extend(model_notes)
+    if "codex" in clients:
+        trust_notes = router_module._codex_hook_trust_note_lines(
+            router_module._client_config_path("codex")
+        )
+        assert trust_notes
+        expected_notes.extend(trust_notes)
+    text = " ".join(" ".join(notice).split())
+    for note in expected_notes:
+        assert " ".join(note.split()) in text
+
+
+@pytest.mark.parametrize("prior_login", ["none", "ordinary", "connectors"])
+def test_configure_connectors_creates_key_without_reuse_prompt(
+    monkeypatch, connector_setup, prior_login
+):
+    client = RouterUserClient(router_module.ROUTER_UI_URL)
+    if prior_login != "none":
+        client.login(connectors=True)
+        if prior_login == "ordinary":
+            saved = client._load()
+            saved.pop("connector_authorization")
+            client._save(saved)
+        connector_setup.clear()
+    monkeypatch.setattr(router_module, "_installed_clients", lambda: ("codex", "pi"))
+
+    def choose_clients(message, candidates):
+        assert candidates == ("codex",)
+        return candidates
+
+    monkeypatch.setattr(router_module, "_pick_clients", choose_clients)
+    monkeypatch.setattr(
+        router_module.questionary,
+        "select",
+        lambda *a, **kw: pytest.fail("There is no old key to ask about reusing"),
+    )
+    fetch_models = router_module._fetch_models
+    waits = []
+
+    def fetch(api_key, **kwargs):
+        waits.append(kwargs.get("wait_for_key"))
+        return fetch_models(api_key, **kwargs)
+
+    monkeypatch.setattr(router_module, "_fetch_models", fetch)
+    result = CliRunner().invoke(cli, ["--human", "router", "configure", "--connectors"])
+
+    assert result.exit_code == 0, result.output
+    assert [call[0] for call in connector_setup] == ["login", "create"]
+    assert connector_setup[0][1] == {"connectors": True, "no_browser": False}
+    assert waits[0] is True
+    assert connector_harnesses.status("codex")["state"] == "enabled"
+    path = router_module._client_config_path("codex")
+    assert router_module._stored_router_api_key("codex", path) == "router-secret"
+    assert "router-secret" not in result.output
+
+
+@pytest.mark.parametrize("reuse", [True, False])
+@pytest.mark.parametrize("harness", ["claude-code", "codex", "opencode"])
+def test_configure_connectors_offers_saved_key_before_creating_another(
+    monkeypatch, connector_setup, reuse, harness
+):
+    runner = CliRunner()
+    args = ["--human", "router", "configure", harness, "--connectors"]
+    assert runner.invoke(cli, args).exit_code == 0
+    connector_setup.clear()
+    prompts = []
+
+    def select(message, *, choices, **kwargs):
+        prompts.append(message)
+        assert choices[0].value == 0
+        assert choices[-1].value == "new"
+        return SimpleNamespace(ask=lambda: 0 if reuse else "new")
+
+    monkeypatch.setattr(router_module.questionary, "select", select)
+    if not reuse:
+        _mock_models(monkeypatch, key="replacement-secret")
+
+        def create(client, path, **kwargs):
+            connector_setup.append(("create", kwargs["json"]))
+            return {"id": "replacement", "secret": "replacement-secret"}
+
+        monkeypatch.setattr(RouterUserClient, "post", create)
+    result = runner.invoke(cli, args)
+
+    assert result.exit_code == 0, result.output
+    assert len(prompts) == 1
+    assert [call[0] for call in connector_setup] == (
+        ["login"] if reuse else ["login", "create"]
+    )
+    path = router_module._client_config_path(harness)
+    assert router_module._stored_router_api_key(harness, path) == (
+        "router-secret" if reuse else "replacement-secret"
+    )
+    assert connector_harnesses.status(harness)["state"] == "enabled"
+    assert "router-secret" not in result.output
+    assert "replacement-secret" not in result.output
+
+
+def test_configure_connectors_machine_output_reauthenticates_and_reuses_key(
+    monkeypatch, connector_setup
+):
+    client = RouterUserClient(router_module.ROUTER_UI_URL)
+    client.login(connectors=True)
+    connector_setup.clear()
+    monkeypatch.setattr(router_module, "_can_prompt", lambda *a: False)
+    runner = CliRunner()
+    args = ["--output", "json", "router", "configure", "--connectors"]
+    first = runner.invoke(cli, args)
+    assert first.exit_code == 0, first.output
+    previous_bindings = {
+        h: connector_harnesses.status(h)["binding_id"]
+        for h in connector_harnesses.HARNESSES
+    }
+    connector_setup.clear()
+
+    result = runner.invoke(cli, [*args, "--reuse-existing-key"])
+
+    assert result.exit_code == 0, result.output
+    assert connector_setup == [("login", {"connectors": True, "no_browser": False})]
+    data = json.loads(result.stdout)["data"][0]
+    assert {row["client"] for row in data["clients"]} == set(
+        connector_harnesses.HARNESSES
+    )
+    assert all(row["connectors_enabled"] for row in data["clients"])
+    for harness, previous in previous_bindings.items():
+        current = connector_harnesses.status(harness)["binding_id"]
+        assert current != previous
+        assert connector_auth.load_binding(current)["authorization"] == (
+            connector_auth.authorization(client)
+        )
+    assert "router-secret" not in result.output
+
+    connector_setup.clear()
+    paths = [
+        client.path,
+        *(connector_harnesses.config_path(h) for h in previous_bindings),
+    ]
+    before = [path.read_bytes() for path in paths]
+    rejected = runner.invoke(cli, [*args, "--reuse-existing-key", "--no-input"])
+    assert rejected.exit_code == 2, rejected.output
+    assert connector_setup == []
+    assert [path.read_bytes() for path in paths] == before
+
+
+@pytest.mark.parametrize("selected", connector_harnesses.HARNESSES)
+def test_configure_connectors_renews_previously_enabled_harnesses(
+    connector_setup, selected
+):
+    runner = CliRunner()
+    previous = tuple(h for h in connector_harnesses.HARNESSES if h != selected)
+    first = runner.invoke(
+        cli, ["--human", "router", "configure", *previous, "--connectors"]
+    )
+    assert first.exit_code == 0, first.output
+    old_binding = connector_harnesses.status(previous[0])["binding_id"]
+    before = {h: connector_harnesses.config_path(h).read_text() for h in previous}
+    connector_setup.clear()
+
+    result = runner.invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure",
+            selected,
+            "--connectors",
+            "--reuse-existing-key",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert connector_setup == [("login", {"connectors": True, "no_browser": False})]
+    client = RouterUserClient(router_module.ROUTER_UI_URL)
+    try:
+        current = connector_harnesses.status(selected)["binding_id"]
+        assert current != old_binding
+        assert all(
+            row["state"] == "enabled"
+            for row in connector_auth.status(client)["harnesses"]
+        )
+        for harness in previous:
+            assert connector_harnesses.status(harness)["binding_id"] == current
+            parse = tomllib.loads if harness == "codex" else json.loads
+            assert parse(connector_harnesses.config_path(harness).read_text()) == (
+                parse(before[harness].replace(old_binding, current))
+            )
+        # The old binding remains pinned; existing bridges cannot silently
+        # switch authorization without reloading their harness registration.
+        assert connector_auth.load_binding(old_binding)["authorization"] != (
+            connector_auth.authorization(client)
+        )
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize(
+    "difference",
+    [
+        "origin",
+        "profile",
+        "user_id",
+        "business_uuid",
+        "core_user_uuid",
+        "client_id",
+        "missing",
+        "custom",
+        "disabled",
+    ],
+)
+def test_configure_connectors_does_not_retarget_unselected_harnesses(
+    connector_setup, difference
+):
+    runner = CliRunner()
+    first = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--connectors"]
+    )
+    assert first.exit_code == 0, first.output
+    binding = connector_harnesses.status("codex")["binding_id"]
+    path = connector_auth._binding_path(binding)
+    saved = json.loads(path.read_text())
+    if difference == "missing":
+        path.unlink()
+    elif difference == "custom":
+        config = connector_harnesses.config_path("codex")
+        config.write_text(config.read_text().replace("/usr/bin/ramp", "/custom/mcp"))
+    elif difference == "disabled":
+        connector_harnesses.disable("codex")
+    else:
+        if difference == "origin":
+            saved["origin"] = "https://internal.router.com"
+            saved["authorization"]["resource"] = connector_auth.resource_for_origin(
+                saved["origin"]
+            )
+        elif difference == "profile":
+            saved["profile"] = "agent"
+        else:
+            saved["authorization"][difference] = "another-identity"
+        path.write_text(json.dumps(saved))
+    config = connector_harnesses.config_path("codex")
+    before = config.read_bytes()
+
+    result = runner.invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure",
+            "opencode",
+            "--connectors",
+            "--reuse-existing-key",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert config.read_bytes() == before
+    assert connector_harnesses.status("opencode")["state"] == "enabled"
+
+
+def test_configure_connectors_reports_failed_renewal(connector_setup, monkeypatch):
+    runner = CliRunner()
+    first = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--connectors"]
+    )
+    assert first.exit_code == 0, first.output
+    enable = connector_harnesses.enable
+
+    def fail_renewal(harness, binding):
+        if harness == "codex":
+            raise RampCLIError("Cannot renew Codex connector registration")
+        return enable(harness, binding)
+
+    monkeypatch.setattr(connector_harnesses, "enable", fail_renewal)
+    result = runner.invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure",
+            "opencode",
+            "--connectors",
+            "--reuse-existing-key",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "Cannot renew Codex" in str(result.exception)
+
+
+@pytest.mark.parametrize("selection", ["reuse-required", "conflict", "cancel"])
+def test_configure_connectors_rejected_key_choice_preserves_registrations(
+    monkeypatch, connector_setup, selection
+):
+    runner = CliRunner()
+    args = ["--human", "router", "configure", "codex", "--connectors"]
+    first = runner.invoke(cli, [*args, "--api-key", "router-secret"])
+    assert first.exit_code == 0, first.output
+    if selection == "conflict":
+        _mock_models(monkeypatch, key="another-secret")
+        other = runner.invoke(
+            cli,
+            [
+                "--human",
+                "router",
+                "configure",
+                "opencode",
+                "--connectors",
+                "--api-key",
+                "another-secret",
+            ],
+        )
+        assert other.exit_code == 0, other.output
+    client = RouterUserClient(router_module.ROUTER_UI_URL)
+    if selection == "cancel":
+        saved = client._load()
+        saved.pop("connector_authorization")
+        client._save(saved)
+        monkeypatch.setattr(
+            router_module.questionary,
+            "select",
+            lambda *a, **kw: SimpleNamespace(ask=lambda: None),
+        )
+    else:
+        monkeypatch.setattr(router_module, "_can_prompt", lambda *a: False)
+        args.append("--no-input")
+        if selection == "conflict":
+            args.append("--reuse-existing-key")
+    connector_harnesses.enable("codex", "a" * 32)
+    path = connector_harnesses.config_path("codex")
+    before = path.read_bytes(), client.path.read_bytes()
+    connector_setup.clear()
+    monkeypatch.setattr(
+        connector_auth,
+        "issue",
+        lambda *a, **kw: pytest.fail(
+            "Rejected key selection must not issue MCP tokens"
+        ),
+    )
+
+    result = runner.invoke(cli, args)
+
+    assert result.exit_code == (1 if selection == "cancel" else 2), result.output
+    assert (path.read_bytes(), client.path.read_bytes()) == before
+    assert connector_harnesses.status("codex")["binding_id"] == "a" * 32
+    assert connector_setup == []
+
+
+@pytest.mark.parametrize("custom_path", [False, True])
+def test_configure_connectors_opencode_uses_existing_jsonc_through_teardown(
+    monkeypatch, tmp_path, connector_setup, custom_path
+):
+    default_path = tmp_path / "opencode" / "opencode.json"
+    path = (
+        tmp_path / "custom" / "settings.jsonc"
+        if custom_path
+        else default_path.with_suffix(".jsonc")
+    )
+    if custom_path:
+        monkeypatch.setenv("OPENCODE_CONFIG", str(path))
+    else:
+        monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+    path.parent.mkdir(parents=True)
+    original = {
+        "model": "openai/custom",
+        "mcp": {"other": {"type": "local", "command": ["other-mcp"]}},
+    }
+    path.write_text("// Existing OpenCode settings\n" + json.dumps(original))
+    runner = CliRunner()
+    args = ["--human", "router", "configure", "opencode", "--connectors"]
+
+    first = runner.invoke(cli, args)
+    assert first.exit_code == 0, first.output
+    assert router_module._client_config_path("opencode") == path
+    assert router_module._stored_router_api_key("opencode", path) == "router-secret"
+    assert connector_harnesses.status("opencode")["state"] == "enabled"
+    assert not default_path.exists()
+    repeated = runner.invoke(cli, [*args, "--reuse-existing-key"])
+    assert repeated.exit_code == 0, repeated.output
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "opencode"])
+    assert removed.exit_code == 0, removed.output
+    undo = [
+        line.strip().split()[1:]
+        for line in _notice_lines(repeated.output)
+        if line.strip().startswith("ramp router connectors disable ")
+    ]
+    assert len(undo) == 1
+    disabled = runner.invoke(cli, undo[0])
+    assert disabled.exit_code == 0, disabled.output
+    assert connector_harnesses.status("opencode")["state"] == "disabled"
+    assert json.loads(path.read_text()) == original
+    assert not default_path.exists()
+
+
+@pytest.mark.parametrize("provider_fails", [False, True])
+def test_configure_connectors_undo_instructions_disable_every_selected_harness(
+    monkeypatch, connector_setup, provider_fails
+):
+    configure = router_module._configure_client
+
+    def configure_client(client, *args, **kwargs):
+        if provider_fails and client == "opencode":
+            click.echo("Provider setup diagnostic", err=True)
+            raise click.ClickException("Could not write provider settings")
+        return configure(client, *args, **kwargs)
+
+    monkeypatch.setattr(router_module, "_configure_client", configure_client)
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["--human", "router", "configure", "codex", "opencode", "--connectors"],
+    )
+
+    assert result.exit_code == (1 if provider_fails else 0), result.output
+    if provider_fails:
+        assert "Provider setup diagnostic" in result.output
+        assert "Could not write provider settings" in result.output
+        assert "Configured agents." not in result.output
+    undo = [
+        line.strip().split()[1:]
+        for line in (
+            result.output.splitlines()
+            if provider_fails
+            else _notice_lines(result.output)
+        )
+        if line.strip().startswith("ramp router connectors disable ")
+    ]
+    assert len(undo) == 2
+    for command in undo:
+        removed = runner.invoke(cli, command)
+        assert removed.exit_code == 0, removed.output
+    assert all(
+        connector_harnesses.status(harness)["state"] == "disabled"
+        for harness in ("codex", "opencode")
+    )
+
+
+@pytest.mark.parametrize("harness", ["codex", "opencode"])
+def test_configure_connectors_ambiguous_opencode_config_only_blocks_opencode(
+    monkeypatch, tmp_path, connector_setup, harness
+):
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+    directory = tmp_path / "opencode"
+    directory.mkdir()
+    paths = [directory / "opencode.json", directory / "opencode.jsonc"]
+    for path in paths:
+        path.write_text("{}\n")
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", harness, "--connectors"]
+    )
+
+    if harness == "codex":
+        assert result.exit_code == 0, result.output
+        assert connector_harnesses.status("codex")["state"] == "enabled"
+    else:
+        assert isinstance(result.exception, RampCLIError)
+        assert "Multiple OpenCode configurations found" in str(result.exception)
+        assert all(call[0] != "create" for call in connector_setup)
+    assert all(path.read_text() == "{}\n" for path in paths)
+
+
+def test_configure_connectors_uses_supplied_key_and_honors_no_browser(connector_setup):
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure",
+            "codex",
+            "--connectors",
+            "--api-key",
+            "router-secret",
+            "--no-browser",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert connector_setup == [("login", {"connectors": True, "no_browser": True})]
+    assert connector_harnesses.status("codex")["state"] == "enabled"
+    assert (
+        router_module._stored_router_api_key(
+            "codex", router_module._client_config_path("codex")
+        )
+        == "router-secret"
+    )
+
+
+def test_configure_connectors_preserves_foreign_mcp_and_does_not_create_key(
+    connector_setup,
+):
+    path = connector_harnesses.config_path("codex")
+    path.parent.mkdir(parents=True)
+    original = '[mcp_servers.ramp-connectors]\ncommand = "custom-server"\n'
+    path.write_text(original)
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "codex", "--connectors"]
+    )
+
+    assert result.exit_code != 0
+    assert path.read_text() == original
+    assert [call[0] for call in connector_setup] == ["login"]
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["pi"],
+        ["codex", "--no-input"],
+        ["codex", "--confirm-browser"],
+        ["codex", "--ui-url", "https://internal.router.com"],
+    ],
+)
+def test_configure_connectors_rejects_invalid_setup_before_side_effects(
+    connector_setup, args
+):
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "--connectors", *args]
+    )
+
+    assert result.exit_code == 2, result.output
+    assert connector_setup == []
+    assert all(
+        connector_harnesses.status(h)["state"] == "disabled"
+        for h in connector_harnesses.HARNESSES
     )
 
 
@@ -4304,10 +5006,12 @@ def test_refresh_agent_mode_does_not_emit_success_before_partial_failure(
     assert '"clients"' not in result.output
 
 
-def test_configure_codex_writes_router_provider(tmp_path, monkeypatch):
+@pytest.mark.parametrize("restarted_apps", [[], ["Codex"]])
+def test_configure_codex_writes_router_provider(tmp_path, monkeypatch, restarted_apps):
     codex_home = tmp_path / "codex"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     _mock_models(monkeypatch, [{"id": "a"}, {"id": "b"}])
+    monkeypatch.setattr(codex_desktop, "restart_running", lambda: restarted_apps)
 
     result = CliRunner().invoke(
         cli,
@@ -4355,15 +5059,150 @@ def test_configure_codex_writes_router_provider(tmp_path, monkeypatch):
     assert key_path.read_text() == "router-secret"
     assert "Connecting Ramp Router to your coding agent" in result.output
     assert "Connected to: Codex" in result.output
-    assert (
-        "2 models added. Restart any running agents, then pick a model."
-        in result.output
+    restart_advice = (
+        "Restart any running Codex CLI sessions, then pick a model."
+        if restarted_apps
+        else "Restart any running agents, then pick a model."
     )
+    assert f"2 models added. {restart_advice}" in result.output
+    if restarted_apps:
+        assert "Reopened: Codex." in result.output
     assert "Create or copy an API key" not in result.output
     assert "router-secret" not in result.output
     assert config_path.stat().st_mode & 0o777 == 0o600
     assert key_path.stat().st_mode & 0o777 == 0o600
     assert catalog_path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize(
+    ("platform", "app", "state"),
+    [
+        ("darwin", "Codex", "running"),
+        ("darwin", "ChatGPT", "running"),
+        ("darwin", "Codex", "stopped"),
+        ("darwin", "Codex", "quit-failed"),
+        ("darwin", "Codex", "quit-pending"),
+        ("darwin", "Codex", "open-failed"),
+        ("darwin", "Codex", "probe-failed"),
+        ("darwin", "Codex", "quit-timeout"),
+        ("darwin", "Codex", "missing-helper"),
+        ("linux", "Codex", "running"),
+        ("win32", "Codex", "running"),
+    ],
+)
+def test_configure_reopens_codex_after_saving(
+    tmp_path, monkeypatch, platform, app, state
+):
+    _mock_models(monkeypatch)
+    monkeypatch.setattr(router_module, "_codex_harness_prompt", lambda _model: None)
+    monkeypatch.setattr(codex_desktop, "restart_running", restart_running)
+    monkeypatch.setattr(codex_desktop, "sys", SimpleNamespace(platform=platform))
+    clock = itertools.count(step=5)
+    monkeypatch.setattr(
+        codex_desktop,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(clock), sleep=lambda _delay: None),
+    )
+    calls = []
+    probes_after_quit = 0
+    quit_command = ["osascript", "-e", f'tell application "{app}" to quit']
+    open_command = ["open", "-a", app]
+    config_path = tmp_path / "codex/config.toml"
+
+    def run(command, **kwargs):
+        nonlocal probes_after_quit
+        assert tomllib.loads(config_path.read_text())["model_provider"] == "ramp-router"
+        assert router_module.CONFIGURE_KEY_ENV not in os.environ
+        assert kwargs["stdout"] == kwargs["stderr"] == subprocess.DEVNULL
+        assert kwargs["stdin"] == subprocess.DEVNULL
+        assert kwargs["timeout"] > 0
+        calls.append(command)
+        if command[0] == "pgrep":
+            assert command[1:4] == ["-u", str(os.getuid()), "-x"]
+            if command[-1] != app or state == "stopped":
+                status = 1
+            elif state == "probe-failed":
+                status = 2
+            elif quit_command in calls:
+                probes_after_quit += 1
+                status = 0 if state == "quit-pending" or probes_after_quit == 1 else 1
+            else:
+                status = 0
+        elif command == quit_command:
+            if state == "quit-timeout":
+                raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+            if state == "missing-helper":
+                raise FileNotFoundError(command[0])
+            status = 1 if state == "quit-failed" else 0
+        else:
+            assert command == open_command
+            assert probes_after_quit == 2
+            status = 1 if state == "open-failed" else 0
+        return subprocess.CompletedProcess(command, status)
+
+    # Scope the fake to desktop restarts; Router also probes the background
+    # service through subprocess during refresh.
+    monkeypatch.setattr(
+        codex_desktop, "subprocess", SimpleNamespace(**{**vars(subprocess), "run": run})
+    )
+    # The workspace uses this same connect alias in a noninteractive child.
+    result = CliRunner().invoke(
+        cli,
+        ["--agent", "--no-input", "router", "configure", "connect", "codex"],
+        env={router_module.CONFIGURE_KEY_ENV: "router-secret"},
+    )
+
+    failed = platform == "darwin" and state not in {"running", "stopped"}
+    assert (result.exit_code != 0) == failed, result.output
+    assert config_path.exists()
+    if platform != "darwin":
+        assert not calls
+    else:
+        assert (quit_command in calls) == (state not in {"stopped", "probe-failed"})
+        assert (open_command in calls) == (state in {"running", "open-failed"})
+    if failed:
+        assert "Ramp Router was configured, but" in result.output
+        assert "manually" in result.output
+    else:
+        assert json.loads(result.output)["data"][0]["restarted_apps"] == (
+            [app] if platform == "darwin" and state == "running" else []
+        )
+
+    # Session-start refreshes share the writer, but must not restart their host.
+    calls.clear()
+    refreshed = CliRunner().invoke(cli, ["--agent", "router", "refresh"])
+    assert refreshed.exit_code == 0, refreshed.output
+    assert not calls
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_mdm_and_failed_codex_configure_leave_restart_to_the_caller(
+    monkeypatch, failure
+):
+    _mock_models(monkeypatch)
+
+    def unexpected_restart():
+        pytest.fail("Apps must not restart during MDM setup or after a failed write")
+
+    monkeypatch.setattr(codex_desktop, "restart_running", unexpected_restart)
+    arguments = [
+        "--agent",
+        "router",
+        "configure",
+        "codex",
+        "--api-key",
+        "router-secret",
+    ]
+    if failure:
+
+        def failed_write(*args, **kwargs):
+            raise click.ClickException("Could not save Codex configuration")
+
+        monkeypatch.setattr(router_module, "_configure_codex", failed_write)
+    else:
+        arguments.append("--confirm-browser")
+    result = CliRunner().invoke(cli, arguments)
+    assert (result.exit_code != 0) == failure, result.output
 
 
 def test_listing_order_does_not_choose_the_default_model():
@@ -12131,3 +12970,514 @@ def test_cursor_pointed_elsewhere_or_unreadable_is_not_routed():
     assert not router_module._cursor_routes_to_router()
     (cursor.user_dir() / "globalStorage" / "state.vscdb").write_text("not sqlite")
     assert cursor.override_base_url() is None
+
+
+# Background refreshes update model data and relocate missing managed plugin
+# paths; other settings stay as the user has them.
+
+
+def _background_refresh(monkeypatch):
+    monkeypatch.setattr(router_module, "refresh_version_cache", lambda: None)
+    result = CliRunner().invoke(cli, ["--human", "router", "sync", "--detached"])
+    assert result.exit_code == 0, result.output
+    return result
+
+
+def _plugin_upgrade_fixture(tmp_path, monkeypatch, variant, *, remove_old=True):
+    client = "pi" if variant == "pi" else "opencode"
+    current = router_module.integration_package_path(client).resolve()
+    old = (
+        tmp_path
+        / "old install"
+        / "ramp_cli"
+        / "router_integrations"
+        / "packages"
+        / current.name
+    )
+    (old / "src").mkdir(parents=True)
+    (old / "package.json").write_text("{}")
+    (old / "src/index.ts").write_text("// old installation\n")
+    monkeypatch.setattr(router_module, "integration_package_path", lambda _client: old)
+    if client == "pi":
+        monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "pi"))
+        _mock_models(monkeypatch, [{"id": "stable"}])
+        _configure_agent("pi")
+        paths = [tmp_path / "pi/settings.json"]
+    else:
+        monkeypatch.setenv(
+            "RAMP_OPENCODE_MAJOR", "2" if variant == "opencode2" else "1"
+        )
+        _connect_opencode(tmp_path, monkeypatch, models=[{"id": "stable"}])
+        paths = [
+            tmp_path / "opencode/opencode.json",
+            router_module._opencode_cli_config_path()
+            if variant == "opencode2"
+            else router_module._opencode_tui_config_path(),
+        ]
+    state_path = paths[0].parent / "ramp-router-state.json"
+    assert json.loads(state_path.read_text())["installed_plugin_path"] == str(old)
+    if remove_old:
+        old.rename(old.with_name("retired-package"))
+    monkeypatch.setattr(
+        router_module, "integration_package_path", lambda _client: current
+    )
+    return client, old, current, paths, state_path
+
+
+@pytest.mark.parametrize("variant", ["opencode1", "opencode2", "pi"])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_session_sync_repairs_moved_plugins_with_service_disabled(
+    tmp_path, monkeypatch, variant, legacy
+):
+    client, old, current, paths, state_path = _plugin_upgrade_fixture(
+        tmp_path, monkeypatch, variant
+    )
+    state = json.loads(state_path.read_text())
+    if legacy:
+        state.pop("installed_plugin_path")
+        state_path.write_text(json.dumps(state))
+    before = {path: _with_comment(path) for path in paths}
+    auxiliary = {
+        p: p.read_bytes()
+        for p in paths[0].parent.glob("*.json")
+        if p not in {*paths, state_path}
+    }
+    assert not router_module.router_schedule.background_enabled()
+
+    _background_refresh(monkeypatch)
+    assert not router_module.router_schedule.background_enabled()
+
+    old_source = str(old) if client == "pi" else old.as_uri()
+    new_source = str(current) if client == "pi" else current.as_uri()
+    for path, text in before.items():
+        assert path.read_text() == text.replace(
+            json.dumps(old_source), json.dumps(new_source)
+        )
+    assert json.loads(state_path.read_text()) == {
+        **state,
+        "installed_plugin_path": str(current),
+    }
+    assert all(p.read_bytes() == contents for p, contents in auxiliary.items())
+    stamps = {p: p.stat().st_mtime_ns for p in [*paths, state_path]}
+    _background_refresh(monkeypatch)
+    assert all(p.stat().st_mtime_ns == stamp for p, stamp in stamps.items())
+
+
+@pytest.mark.parametrize("variant", ["opencode1", "opencode2", "pi"])
+@pytest.mark.parametrize(
+    "replacement",
+    [None, "/custom/missing/provider", "../relative/provider", "npm:custom-provider"],
+)
+def test_session_sync_preserves_existing_or_user_changed_plugin_sources(
+    tmp_path, monkeypatch, variant, replacement
+):
+    client, old, _, paths, state_path = _plugin_upgrade_fixture(
+        tmp_path, monkeypatch, variant, remove_old=replacement is not None
+    )
+    original_source = str(old) if client == "pi" else old.as_uri()
+    for path in paths:
+        if replacement is not None:
+            path.write_text(
+                path.read_text().replace(
+                    json.dumps(original_source), json.dumps(replacement)
+                )
+            )
+    before = {p: p.read_bytes() for p in [*paths, state_path]}
+    # Exercise only relocation: other model changes have their own coverage.
+    router_module._repair_moved_plugin(client, paths[0])
+    assert all(p.read_bytes() == contents for p, contents in before.items())
+
+
+def test_legacy_plugin_repair_preserves_preexisting_registration(tmp_path, monkeypatch):
+    client, old, _, paths, state_path = _plugin_upgrade_fixture(
+        tmp_path, monkeypatch, "pi"
+    )
+    state = json.loads(state_path.read_text())
+    state.pop("installed_plugin_path")
+    state["package_entries"] = [str(old)]
+    state_path.write_text(json.dumps(state))
+    before = paths[0].read_bytes()
+    router_module._repair_moved_plugin(client, paths[0])
+    assert paths[0].read_bytes() == before
+
+
+def test_plugin_repair_rolls_back_all_files_when_a_write_fails(tmp_path, monkeypatch):
+    client, _, _, paths, state_path = _plugin_upgrade_fixture(
+        tmp_path, monkeypatch, "opencode2"
+    )
+    before = {p: p.read_bytes() for p in [*paths, state_path]}
+    write = router_module._write_private_file
+    failed = False
+
+    def fail_once(path, content):
+        nonlocal failed
+        if path == paths[1] and not failed:
+            failed = True
+            raise OSError("test write failure")
+        return write(path, content)
+
+    monkeypatch.setattr(router_module, "_write_private_file", fail_once)
+    with pytest.raises(click.ClickException):
+        router_module._repair_moved_plugin(client, paths[0])
+    assert all(p.read_bytes() == contents for p, contents in before.items())
+
+
+def test_detached_sync_repairs_plugin_before_network_discovery(tmp_path, monkeypatch):
+    client, old, current, paths, _ = _plugin_upgrade_fixture(
+        tmp_path, monkeypatch, "pi"
+    )
+
+    def offline(*_args, **_kwargs):
+        raise click.ClickException("offline")
+
+    monkeypatch.setattr(router_module, "_fetch_models", offline)
+    monkeypatch.setattr(router_module, "refresh_version_cache", lambda: None)
+    result = CliRunner().invoke(cli, ["--human", "router", "sync", "--detached"])
+    assert result.exit_code != 0
+    assert "offline" in result.output
+    assert json.loads(paths[0].read_text())["packages"] == [str(current)]
+
+
+def test_failed_full_refresh_keeps_plugin_ownership_in_sync(tmp_path, monkeypatch):
+    _, _, current, paths, state_path = _plugin_upgrade_fixture(
+        tmp_path, monkeypatch, "opencode2"
+    )
+    before = {p: p.read_bytes() for p in [*paths, state_path]}
+    write = router_module._write_private_file
+    failed = False
+
+    def fail_once(path, content):
+        nonlocal failed
+        if path == paths[1] and not failed:
+            failed = True
+            raise OSError("test write failure")
+        return write(path, content)
+
+    monkeypatch.setattr(router_module, "_write_private_file", fail_once)
+    result = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+    assert result.exit_code != 0
+    assert all(p.read_bytes() == contents for p, contents in before.items())
+    _background_refresh(monkeypatch)
+    assert json.loads(state_path.read_text())["installed_plugin_path"] == str(current)
+    assert all(
+        json.loads(p.read_text())["plugins"][0]["package"] == current.as_uri()
+        for p in paths
+    )
+
+
+def test_background_refresh_moves_only_the_claude_code_model(tmp_path, monkeypatch):
+    settings_path = _configure_claude_for_subagents(
+        monkeypatch, tmp_path, [{"id": "retired"}, {"id": "gpt-5.4"}]
+    )
+    settings = json.loads(settings_path.read_text())
+    assert settings["model"] == "retired"
+    # The user's own edits since configure, which a full refresh rewrites.
+    settings["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = "950000"
+    settings["env"]["ROUTER_BASE_URL"] = "https://user-edit.test"
+    settings["statusLine"] = {"type": "command", "command": "my-line"}
+    settings_path.write_text(json.dumps(settings))
+    _mock_models(monkeypatch, [{"id": "gpt-5.4"}])
+
+    _background_refresh(monkeypatch)
+
+    assert json.loads(settings_path.read_text()) == {**settings, "model": "gpt-5.4"}
+    # Recorded as Router's write, so unconfigure still restores the original.
+    state = claude_code.read_state(settings_path)
+    assert state["written"]["top_level"]["model"] == "gpt-5.4"
+
+
+def test_background_refresh_keeps_a_claude_code_model_the_user_chose(
+    tmp_path, monkeypatch
+):
+    settings_path = _configure_claude_for_subagents(
+        monkeypatch, tmp_path, [{"id": "retired"}, {"id": "gpt-5.4"}]
+    )
+    settings = json.loads(settings_path.read_text())
+    settings["model"] = "opus"  # outside Router's list: the user's own pick
+    settings_path.write_text(json.dumps(settings))
+    _mock_models(monkeypatch, [{"id": "gpt-5.4"}])
+
+    _background_refresh(monkeypatch)
+
+    assert json.loads(settings_path.read_text()) == settings
+
+
+def test_background_refresh_moves_only_the_codex_model_and_catalog(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_codex_catalog(monkeypatch, slugs=("retired", "gpt-5.4"))
+    _mock_models(monkeypatch, [{"id": "retired"}, {"id": "gpt-5.4"}])
+    _configure_agent("codex")
+    config_path = codex_home / "config.toml"
+    config = config_path.read_text()
+    assert tomllib.loads(config)["model"] == "retired"
+    # The user's own edit since configure, in the Router provider block.
+    edited = config.replace(
+        "[model_providers.ramp-router]",
+        "[model_providers.ramp-router]\nstream_idle_timeout_ms = 1",
+    )
+    assert edited != config
+    config_path.write_text(edited)
+    key = (codex_home / "ramp-router-key").read_text()
+    _mock_models(monkeypatch, [{"id": "gpt-5.4"}])
+
+    _background_refresh(monkeypatch)
+
+    assert config_path.read_text() == edited.replace(
+        'model = "retired"', 'model = "gpt-5.4"'
+    )
+    catalog = json.loads((codex_home / router_module.CODEX_ROUTER_CATALOG).read_text())
+    assert [model["slug"] for model in catalog["models"]] == ["gpt-5.4"]
+    receipt = json.loads((codex_home / "ramp-router-state.json").read_text())
+    assert receipt[router_module.CODEX_ROUTER_CATALOG_DIGEST_KEY] == (
+        router_module._content_digest(
+            (codex_home / router_module.CODEX_ROUTER_CATALOG).read_text()
+        )
+    )
+    # The harness prompt follows the model it was read for.
+    instructions = codex_home / "ramp-router-instructions.md"
+    assert instructions.read_text() == "NATIVE PROMPT FOR gpt-5.4"
+    assert (codex_home / "ramp-router-key").read_text() == key
+
+
+def test_background_refresh_moves_only_the_opencode_model(tmp_path, monkeypatch):
+    _connect_opencode(tmp_path, monkeypatch)
+    config_path = tmp_path / "opencode" / "opencode.json"
+    config = json.loads(config_path.read_text())
+    config["model"] = "ramp-router/switchyard"
+    config["plugin"][0][1]["apiKey"] = "user-rotated"
+    config_path.write_text(json.dumps(config))
+    _mock_models(monkeypatch, [{"id": "gpt-5.6-sol"}], key="user-rotated")
+
+    _background_refresh(monkeypatch)
+
+    assert json.loads(config_path.read_text()) == {
+        **config,
+        "model": "ramp-router/gpt-5.6-sol",
+    }
+
+
+def _configure_codex_with_admin_default(tmp_path, monkeypatch, model):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(
+        monkeypatch,
+        [{"id": "a"}, {"id": "b"}, {"id": "c"}],
+        coding_agent_settings=_admin_default(model),
+    )
+    _configure_agent("codex")
+    return codex_home
+
+
+def test_background_refresh_applies_and_caches_a_new_codex_admin_default(
+    tmp_path, monkeypatch
+):
+    codex_home = _configure_codex_with_admin_default(tmp_path, monkeypatch, "b")
+    config_path = codex_home / "config.toml"
+    assert tomllib.loads(config_path.read_text())["model"] == "b"
+    _mock_models(
+        monkeypatch,
+        [{"id": "a"}, {"id": "b"}, {"id": "c"}],
+        coding_agent_settings=_admin_default("c"),
+    )
+
+    _background_refresh(monkeypatch)
+
+    assert tomllib.loads(config_path.read_text())["model"] == "c"
+    # The hooks put back the cached copy, so it must follow.
+    receipt = _codex_router_state(codex_home)
+    assert receipt[router_module.CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY] == "c"
+
+
+def test_background_refresh_keeps_the_codex_admin_default_when_router_is_silent(
+    tmp_path, monkeypatch
+):
+    codex_home = _configure_codex_with_admin_default(tmp_path, monkeypatch, "b")
+    # The settings endpoint fails: no answer, not "no default".
+    _mock_models(monkeypatch, [{"id": "a"}, {"id": "b"}, {"id": "c"}])
+
+    _background_refresh(monkeypatch)
+
+    assert tomllib.loads((codex_home / "config.toml").read_text())["model"] == "b"
+    receipt = _codex_router_state(codex_home)
+    assert receipt[router_module.CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY] == "b"
+
+
+def test_background_refresh_moves_the_opencode_v2_plugin_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("RAMP_OPENCODE_MAJOR", "2")
+    _connect_opencode(tmp_path, monkeypatch)
+    config_path = tmp_path / "opencode" / "opencode.json"
+    cli_path = router_module._opencode_cli_config_path()
+    config = json.loads(config_path.read_text())
+    cli_config = json.loads(cli_path.read_text())
+    assert "model" not in config
+    assert config["plugins"][0]["options"]["defaultModel"] != "gpt-5.7"
+    _mock_models(monkeypatch, [{"id": "gpt-5.7"}])
+
+    _background_refresh(monkeypatch)
+
+    for path, before in ((config_path, config), (cli_path, cli_config)):
+        after = json.loads(path.read_text())
+        assert after["plugins"][0]["options"].pop("defaultModel") == "gpt-5.7"
+        before["plugins"][0]["options"].pop("defaultModel")
+        # No top-level model appears, and nothing else moves.
+        assert after == before
+
+
+_COMMENT = "// kept by the background refresh\n"
+
+
+def _with_comment(path):
+    """Put a comment and a trailing comma into a config the CLI wrote."""
+    text = path.read_text().rstrip()
+    assert text.endswith("}")
+    text = _COMMENT + text[:-1].rstrip() + ",\n}\n"
+    path.write_text(text)
+    return text
+
+
+def test_background_refresh_keeps_comments_in_an_opencode_config(tmp_path, monkeypatch):
+    _connect_opencode(tmp_path, monkeypatch)
+    config_path = tmp_path / "opencode" / "opencode.json"
+    text = _with_comment(config_path)
+    old = json5.loads(text)["model"]
+    _mock_models(monkeypatch, [{"id": "gpt-5.7"}])
+
+    _background_refresh(monkeypatch)
+
+    assert config_path.read_text() == text.replace(
+        json.dumps(old), '"ramp-router/gpt-5.7"'
+    )
+
+
+def test_background_refresh_keeps_comments_in_opencode_v2_configs(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("RAMP_OPENCODE_MAJOR", "2")
+    _connect_opencode(tmp_path, monkeypatch)
+    paths = [
+        tmp_path / "opencode" / "opencode.json",
+        router_module._opencode_cli_config_path(),
+    ]
+    texts = [_with_comment(path) for path in paths]
+    _mock_models(monkeypatch, [{"id": "gpt-5.7"}])
+
+    _background_refresh(monkeypatch)
+
+    for path, text in zip(paths, texts, strict=True):
+        old = json5.loads(text)["plugins"][0]["options"]["defaultModel"]
+        assert path.read_text() == text.replace(
+            f'"defaultModel": {json.dumps(old)}', '"defaultModel": "gpt-5.7"'
+        )
+
+
+def test_background_refresh_keeps_comments_in_a_pi_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "pi"))
+    _mock_models(monkeypatch, [{"id": "retired"}, {"id": "gpt-5.7"}])
+    _configure_agent("pi")
+    settings_path = tmp_path / "pi" / "settings.json"
+    text = _with_comment(settings_path)
+    assert json5.loads(text)["defaultModel"] == "retired"
+    _mock_models(monkeypatch, [{"id": "gpt-5.7"}])
+
+    _background_refresh(monkeypatch)
+
+    assert settings_path.read_text() == text.replace('"retired"', '"gpt-5.7"')
+
+
+def test_background_refresh_never_reformats_a_commented_config(tmp_path, monkeypatch):
+    _connect_opencode(tmp_path, monkeypatch)
+    config_path = tmp_path / "opencode" / "opencode.json"
+    text = _with_comment(config_path)
+    monkeypatch.setattr(router_module.json5_edit, "replace_value", lambda *_args: None)
+    _mock_models(monkeypatch, [{"id": "gpt-5.7"}])
+    monkeypatch.setattr(router_module, "refresh_version_cache", lambda: None)
+
+    result = CliRunner().invoke(cli, ["--human", "router", "sync", "--detached"])
+
+    assert config_path.read_text() == text
+    # A failure, so the scheduled job retries instead of acknowledging it.
+    assert result.exit_code != 0
+    assert "could not be changed without reformatting" in result.output
+
+
+def test_background_refresh_pushes_switchyard_once(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _connect_opencode(tmp_path, monkeypatch)
+    _configure_agent("codex")
+    _mock_models(monkeypatch, SWITCHYARD_MODELS, switchyard_offered=True)
+    config_path = codex_home / "config.toml"
+
+    _background_refresh(monkeypatch)
+
+    assert _opencode_model(tmp_path) == "ramp-router/switchyard"
+    assert tomllib.loads(config_path.read_text())["model"] == "switchyard"
+
+    # A model chosen after the push stays through later background runs.
+    _choose("opencode", "gpt-5.6-sol")
+    _choose("codex", "gpt-5.6-sol")
+    _background_refresh(monkeypatch)
+    assert _opencode_model(tmp_path) == "ramp-router/gpt-5.6-sol"
+    assert tomllib.loads(config_path.read_text())["model"] == "gpt-5.6-sol"
+
+
+def test_full_refresh_still_repairs_the_whole_setup(tmp_path, monkeypatch):
+    settings_path = _configure_claude_for_subagents(
+        monkeypatch, tmp_path, [{"id": "gpt-5.4"}]
+    )
+    settings = json.loads(settings_path.read_text())
+    settings["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = "950000"
+    settings_path.write_text(json.dumps(settings))
+
+    _refresh_agents()
+
+    after = json.loads(settings_path.read_text())
+    assert after["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "900000"
+
+
+def test_with_root_model_changes_only_the_root_model_line():
+    config = (
+        'approval_policy = "never"\nmodel = "a"\nmodel_provider = "ramp-router"\n\n'
+        '[profiles.x]\nmodel = "keep"\n'
+    )
+    path = router_module.Path("config.toml")
+
+    def rewrite(text):
+        return router_module._with_root_model(path, text, tomllib.loads(text), "b")
+
+    assert rewrite(config) == config.replace('model = "a"', 'model = "b"')
+    assert rewrite("[t]\nmodel = 1\n") == 'model = "b"\n[t]\nmodel = 1\n'
+    # A quoted key is the same key: rewritten, never duplicated.
+    assert rewrite('"model" = "a"\n') == 'model = "b"\n'
+
+
+def test_repeat_claude_code_configure_manages_the_scheduled_job(tmp_path, monkeypatch):
+    """The keyless shortcut honors RAMP_NO_SESSION_SYNC like every configure."""
+    _configure_claude_for_subagents(monkeypatch, tmp_path, [{"id": "gpt-5.4"}])
+    installs: list[bool] = []
+    monkeypatch.setattr(
+        router_module.router_schedule, "install", lambda: installs.append(True)
+    )
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "claude-code", "--claude-models", "all"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Claude Code model list: all" in result.output
+    assert installs == [True]
+
+
+def test_background_refresh_keeps_an_opencode_model_off_router(tmp_path, monkeypatch):
+    _connect_opencode(tmp_path, monkeypatch)
+    config_path = tmp_path / "opencode" / "opencode.json"
+    config = json.loads(config_path.read_text())
+    config["model"] = "anthropic/claude-sonnet"  # the user's own provider
+    config_path.write_text(json.dumps(config))
+
+    _background_refresh(monkeypatch)
+
+    assert json.loads(config_path.read_text()) == config

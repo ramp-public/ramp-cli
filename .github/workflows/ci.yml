@@ -6,6 +6,23 @@ on:
   pull_request:
 
 jobs:
+  router-agent:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: router-agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: router-agent
+      - run: cargo test --release --locked
+
   lint:
     runs-on: ubuntu-latest
     steps:

@@ -6,14 +6,20 @@ import json
 import os
 import sys
 import time
+from threading import Event, Timer
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import click
 import httpx
 import pytest
 from click.testing import CliRunner
+from prompt_toolkit.application import create_app_session
+from prompt_toolkit.input import create_pipe_input
+from prompt_toolkit.output import DummyOutput
 
 from ramp_cli.auth import oauth
+from ramp_cli.client import router_user as auth_client
 from ramp_cli.client.router_user import (
     RouterUserClient,
     _atomic_write,
@@ -22,6 +28,7 @@ from ramp_cli.client.router_user import (
     validate_origin,
 )
 from ramp_cli.commands import router_user
+from ramp_cli.commands.router import _pick_clients
 from ramp_cli.commands.router_user import _menu_footer
 from ramp_cli.errors import EXIT_AUTH_REQUIRED, ApiError, RampCLIError
 from ramp_cli.main import cli
@@ -67,6 +74,98 @@ def jwt_token(user="owner", business=None, nonce="initial"):
         .decode()
     )
     return f"e30.{payload}.signature"
+
+
+@pytest.mark.parametrize("no_input", [True, False])
+def test_explicit_login_finishes_paste_fallback_before_picker(monkeypatch, no_input):
+    callback = SimpleNamespace(
+        redirect_uri="http://localhost:43123/callback",
+        state="state",
+        code_challenge="challenge",
+        _verifier="verifier",
+        wait_for_code=lambda *args, **kwargs: "code",
+        shutdown=lambda: None,
+    )
+    monkeypatch.setattr(oauth, "start_pkce_callback", lambda: callback)
+    monkeypatch.setattr(oauth, "_open_browser", lambda _: True)
+    monkeypatch.setattr(auth_client, "_stdin_is_terminal", lambda: True)
+    reader = Mock()
+    monkeypatch.setattr(auth_client, "_read_pasted_callback", reader)
+    monkeypatch.setattr(RouterUserClient, "ensure_edge_access", lambda *_a, **_k: None)
+    monkeypatch.setattr(httpx.Client, "post", lambda *_a, **_k: token_response())
+    client = RouterUserClient("http://localhost:3080", no_input=no_input)
+    try:
+        client.login()
+        assert reader.call_count == 1
+        assert reader.call_args.args == (callback,)
+        assert 0 < reader.call_args.kwargs["timeout"] <= 900
+        if no_input:
+            # Setup's next step owns stdin exclusively, including arrow-key
+            # sequences and cursor-position replies after browser login.
+            with create_pipe_input() as pipe:
+                with create_app_session(input=pipe, output=DummyOutput()):
+                    pipe.send_text("\x1b[B \x1b[B\x1b[A\x1b[B\r")
+                    assert _pick_clients(
+                        "Choose harnesses", ("claude-code", "codex")
+                    ) == ("codex",)
+    finally:
+        client.close()
+
+
+def test_callback_can_be_pasted_without_browser_reaching_loopback(capsys):
+    callback = oauth.start_pkce_callback()
+    url = f"{callback.redirect_uri}?state={callback.state}&code=private-code"
+    try:
+        with create_pipe_input() as pipe:
+            with create_app_session(input=pipe, output=DummyOutput()):
+                pipe.send_text(url + "\r")
+                auth_client._read_pasted_callback(callback, timeout=2)
+        assert (
+            callback.wait_for_code(0, timeout_message="not completed") == "private-code"
+        )
+        output = capsys.readouterr()
+        assert "private-code" not in output.out + output.err
+    finally:
+        callback.shutdown()
+
+
+@pytest.mark.parametrize("finish", ["browser", "cancel", "timeout"])
+def test_paste_reader_is_stopped_before_arrow_picker(finish):
+    callback = oauth.start_pkce_callback()
+    cancel = Event()
+    timer = None
+    try:
+        with create_pipe_input() as pipe:
+            with create_app_session(input=pipe, output=DummyOutput()):
+                if finish == "browser":
+                    timer = Timer(
+                        0.1,
+                        lambda: callback.submit_url(
+                            f"{callback.redirect_uri}?state={callback.state}&code=browser-code"
+                        ),
+                    )
+                elif finish == "cancel":
+                    timer = Timer(0.1, cancel.set)
+                if timer:
+                    timer.start()
+                if finish == "browser":
+                    auth_client._read_pasted_callback(callback, timeout=2)
+                else:
+                    with pytest.raises(
+                        click.ClickException,
+                        match="cancelled" if finish == "cancel" else "timed out",
+                    ):
+                        auth_client._read_pasted_callback(
+                            callback, timeout=0.3, cancel=cancel
+                        )
+                pipe.send_text("\x1b[B \x1b[B\x1b[A\x1b[B\r")
+                assert _pick_clients("Choose harnesses", ("claude-code", "codex")) == (
+                    "codex",
+                )
+    finally:
+        if timer:
+            timer.join()
+        callback.shutdown()
 
 
 @pytest.mark.parametrize("configured_origin", [None, "matching", "other"])

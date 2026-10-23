@@ -20,6 +20,7 @@ ramp router ui --inline --height 18  # beneath your prompt (macOS/Linux)
 ramp router ui --theme light         # dark, light, terminal, or auto (default)
 ```
 
+Run `npx @ramp/router@latest configure --enable-agent` to sign in, choose harnesses, and enable the Router agent.
 `RAMP_ROUTER_THEME` sets a default theme and `RAMP_ROUTER_REDUCED_MOTION=1`
 turns off animation. Interactive `router configure`, `keys`, `strategies`,
 `account`, and `subagents` open their workspace screens.
@@ -106,12 +107,95 @@ ramp router configure codex --codex-models all --reuse-existing-key
 ```
 
 Use the same `--base-url` as your existing connection if it is on another Router
-deployment. The updated catalog applies when Codex reloads it; a running app may
-need to be restarted before its picker reflects the change.
+deployment. On macOS, configure quits and reopens running Codex and ChatGPT desktop
+apps after saving the settings. Restart any running Codex CLI sessions manually.
+Background refreshes leave running apps alone; their updated catalogs apply when
+Codex next reloads them.
+
+## Router agent: background refresh and repository tagging
+
+One optional agent keeps configured Router model lists and defaults current and
+tags supported local coding-agent requests with their Git repository. It is
+**disabled by default**:
+`ramp update`, configure, and refresh do not opt you in.
+
+After configuring Router on macOS or Linux:
+
+```bash
+ramp router agent enable
+ramp router agent status
+ramp router agent disable
+```
+
+`enable` starts the native agent's local listener, checks its health, and refreshes
+existing Claude Code, Codex, OpenCode, and Pi setups to use it. The same process
+handles background refresh; there is no separate repository-helper command.
+Use `ramp router agent enable --port 47999` to select a different local port.
+Restart open coding-agent sessions after enabling or disabling so they reload
+their saved endpoints. Cursor's cloud-hosted requests are not tagged.
+
+Clients use a per-user local token for requests to the agent. The agent checks
+the caller's OS user, then replaces that token with the Router key stored in a
+private file. Each token is limited to one Router host. Direct account and usage
+calls continue to use the Router key. After an upgrade from an older tagging
+preview, run `ramp router agent enable` and restart open coding-agent sessions
+to replace their saved credentials and endpoints.
+In Pi, a new key entered through `/login` uses the direct Router endpoint until
+`ramp router configure pi` pairs it with the agent again. A direct endpoint
+override for the same deployment uses the saved Router key, not the local token.
+An override for a different deployment needs that deployment's key.
+
+The choice is saved per user and survives shell restarts, logins, CLI updates, and
+refreshes. Enabling installs a launchd or systemd user service that starts at login
+and restarts after a crash. `ramp router refresh` reapplies the opted-in setup but
+never opts an unenabled or disabled user in. Disabling stops background refresh
+and tagging and restores direct Router endpoints, without disconnecting Router
+or changing session-start hooks. If a client cannot be restored, an untagged
+passthrough listener stays until repair succeeds; run refresh and disable again.
+`status` reports refresh, tagging, listener health, and service state;
+`--agent` returns one JSON envelope with tagging diagnostics under
+`repository_tagging`.
+If a client refresh fails during enable, the background preference remains on.
+The command and `status` report the failed clients under `refresh_failures` in
+the tagging diagnostics. Repair those clients, then run enable again.
+
+Binary releases include the Rust agent, which checks about every five minutes.
+Installs without it use a 15-minute scheduled job when enabled, without repository
+tagging. Existing sync-only opt-ins remain unchanged until `agent enable` is run
+again. Linux needs a
+working systemd user session. On macOS, a disabled Login Items entry must also be
+allowed in System Settings. `RAMP_NO_SESSION_SYNC` still blocks automatic sync;
+unset it before explicitly enabling the background service.
+
+Session-hook and scheduled refreshes also repair missing CLI-owned OpenCode/Pi
+plugin paths after an upgrade moves the bundled plugins, even when the OS service
+is disabled and only session hooks are in use. They preserve plugin options,
+credentials, custom registrations, and config comments. An existing plugin path
+is left alone; use `ramp router refresh` for full setup repair.
 
 ## Router connectors MCP
 
-Authorize Router account access and connector tools in one browser sign-in:
+Set up Router login, connector tools, and your coding harnesses in one command:
+
+```bash
+ramp router configure --connectors
+```
+
+Choose from Claude Code, Codex, and OpenCode, or name them explicitly, for example
+`ramp router configure codex --connectors`. Setup signs in with connector consent
+on every run, enables connectors for the selected harnesses, and configures them
+with a Router API key. If no compatible key is saved locally, it creates a
+`Ramp CLI` key through the Router key API and uses it immediately, without a reuse
+prompt. If a saved key exists, setup asks whether to reuse it or create a new one.
+Use `--reuse-existing-key` to reuse a saved key without the key-selection prompt;
+OAuth sign-in still runs. `--no-input` and `--agent` are incompatible with this
+flow. Use `--no-browser` to print the sign-in URL and open it yourself.
+Previously enabled connector registrations for the same Router account,
+business, deployment, and credential profile are renewed for the new sign-in
+too, even when their harness is not selected. Their provider settings are left
+unchanged; disabled, custom, and other-account registrations are not retargeted.
+
+To authorize and enable connectors separately:
 
 ```bash
 ramp router login --connectors
@@ -126,10 +210,9 @@ connector registration, run `ramp router connectors disable --harness claude-cod
 Unrelated harness settings and MCP servers are preserved; foreign or customized
 `ramp-connectors` entries are not overwritten.
 
-Existing Router logins need the explicit `login --connectors` consent upgrade.
-This uses **Router account authentication**, not `ramp auth login` (Developer API
-authentication). Supported deployments are the public, internal, QA, and internal
-QA Router origins. Capability discovery is available through
+Connector setup uses **Router account authentication**, not `ramp auth login`
+(Developer API authentication). Supported deployments are the public, internal,
+QA, and internal QA Router origins. Capability discovery is available through
 `ramp router connectors capabilities --output json` (`router-connectors-mcp-v1`).
 
 Harness configuration contains only the CLI executable and an opaque binding ID,

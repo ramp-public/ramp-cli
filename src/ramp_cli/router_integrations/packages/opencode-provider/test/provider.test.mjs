@@ -256,6 +256,39 @@ describe("OpenCode provider plugin", () => {
       "X-Gateway-Ramp-Cli-Version": "0.2.38",
     })
   })
+
+  it("sends the current user message ID as Router's turn ID", async () => {
+    const hooks = await plugin.server({}, { apiKey: "inline-secret" })
+    const output = { headers: { "X-Mine": "keep" } }
+
+    await hooks["chat.headers"](
+      { model: { providerID: "ramp-router" }, message: { id: "msg_turn_1" } },
+      output,
+    )
+
+    assert.deepEqual(output.headers, { "X-Mine": "keep", "X-Turn-Id": "msg_turn_1" })
+  })
+
+  it("leaves other providers and missing message IDs untouched", async () => {
+    const hooks = await plugin.server({}, { apiKey: "inline-secret" })
+    const otherProvider = { headers: {} }
+    const missingID = { headers: {} }
+    const oversizedID = { headers: {} }
+
+    await hooks["chat.headers"](
+      { model: { providerID: "openai" }, message: { id: "msg_turn_1" } },
+      otherProvider,
+    )
+    await hooks["chat.headers"]({ model: { providerID: "ramp-router" }, message: {} }, missingID)
+    await hooks["chat.headers"](
+      { model: { providerID: "ramp-router" }, message: { id: "x".repeat(257) } },
+      oversizedID,
+    )
+
+    assert.deepEqual(otherProvider.headers, {})
+    assert.deepEqual(missingID.headers, {})
+    assert.deepEqual(oversizedID.headers, {})
+  })
 })
 
 describe("reasoning variants", () => {

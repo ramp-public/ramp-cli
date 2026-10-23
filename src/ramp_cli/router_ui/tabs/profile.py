@@ -63,6 +63,7 @@ class ProfilePage(FormPage):
         self.uncertain = False
         self.custom_candidates: list[dict] | None = None
         self.benchmark_saved = False
+        self.benchmark_uncertain = False
 
     def content(self):
         settings = self.draft.settings
@@ -320,7 +321,12 @@ class ProfilePage(FormPage):
         if not self.query_one("#benchmark", Checkbox).value:
             draft.settings[BENCHMARK] = None
             return None
-        if self.profile and self.draft.settings.get(BENCHMARK) and not fields.edited:
+        if (
+            self.profile
+            and self.draft.settings.get(BENCHMARK)
+            and not fields.edited
+            and not self.benchmark_uncertain
+        ):
             return None
         if {"aliases", "benchmarks"} & set(self.options.get("errors", [])):
             raise ValueError(
@@ -369,9 +375,11 @@ class ProfilePage(FormPage):
                 f"Select {safe_text(slug) or 'the profile slug'} in your harness model picker to use benchmark routing."
             )
             status = self.query_one("#benchmark-save-status", Static)
-            status.display = self.benchmark_saved
+            status.display = self.benchmark_saved or self.benchmark_uncertain
             status.update(
-                "Benchmark changes are already saved and may affect live requests. Leaving does not undo them; retry to finish saving the profile."
+                "Benchmark changes may already be saved and affect live requests. Retry to confirm the weights and finish saving the profile."
+                if self.benchmark_uncertain
+                else "Benchmark changes are already saved and may affect live requests. Leaving does not undo them; retry to finish saving the profile."
             )
         if AUTO in self.controls:
             self.query_one("#auto-fields").display = self.selected("#auto") != "off"
@@ -515,8 +523,15 @@ class ProfilePage(FormPage):
         submitted_values = dict(self.values())
 
         def alias_saved(changed: bool):
+            self.benchmark_uncertain = False
             self.benchmark_saved |= changed
             self.query_one(BenchmarkFields).remember_saved(benchmarks)
+            self.update_visibility()
+
+        def alias_failed():
+            # A lost response does not mean the server rejected the write. Even a
+            # revert to the opening weights must be checked against the live alias.
+            self.benchmark_uncertain = True
             self.update_visibility()
 
         def retain_failed_draft():
@@ -527,7 +542,13 @@ class ProfilePage(FormPage):
 
         def persist():
             if benchmarks is not None:
-                changed = self.service.save_profile_benchmarks(draft.slug, benchmarks)
+                try:
+                    changed = self.service.save_profile_benchmarks(
+                        draft.slug, benchmarks
+                    )
+                except Exception:
+                    self.app.call_from_thread(alias_failed)
+                    raise
                 self.app.call_from_thread(alias_saved, changed)
             try:
                 return self.service.save_profile(draft)

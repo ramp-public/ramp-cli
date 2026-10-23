@@ -17,6 +17,8 @@ export type RouterPluginOptions = PluginOptions & {
   baseURL?: string
   usageBaseURL?: string
   apiKey?: string
+  /** Direct dashboard credential when apiKey is a local agent token. */
+  usageApiKey?: string
   apiKeyEnv?: string
   rampExecutable?: string
   rampCliVersion?: string
@@ -63,6 +65,13 @@ export function resolveAPIKey(options: RouterPluginOptions): string | undefined 
     process.env[LEGACY_API_KEY_ENV] ||
     undefined
   )
+}
+
+export function resolveUsageAPIKey(options: RouterPluginOptions): string | undefined {
+  const key = resolveAPIKey(options)
+  return key?.startsWith("ramp-local-")
+    ? nonEmpty(options.usageApiKey, "") || key
+    : key
 }
 
 /** The CLI version recorded at configure time, absent for a hand-written entry. */

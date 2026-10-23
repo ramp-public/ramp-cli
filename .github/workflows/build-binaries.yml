@@ -110,6 +110,24 @@ jobs:
             --assume-yes-for-downloads \
             src/ramp_cli/main.py
 
+      # The Ramp Router background agent ships beside ramp in main.dist/, so every
+      # install channel (install.sh, Homebrew, npm) carries it. It is built here,
+      # before the architecture check, which inspects every native file.
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: router-agent
+
+      - name: Build the Ramp Router agent
+        shell: bash
+        run: |
+          cargo build --release --locked --manifest-path router-agent/Cargo.toml
+          cp router-agent/target/release/ramp-router-agent build/main.dist/ramp-router-agent
+          build/main.dist/ramp-router-agent --version
+
       - name: Validate release architecture
         shell: bash
         run: |

@@ -54,6 +54,7 @@ import type {
   RouterModel as DiscoveredModel,
 } from "./discovery.ts"
 import { registerUsageWidget, usageOriginFromBaseURL } from "./usage.ts"
+import { directRouterURL, resolveRouterConnection, type RouterConnection } from "./connection.ts"
 import {
   applyWorkspaceDefaultOnSessionStart,
   workspaceDefaultCache,
@@ -68,11 +69,16 @@ const DEFAULT_BASE_URL = "https://api.router.com/v1"
 const STARTUP_DISCOVERY_TIMEOUT_MS = 2_000
 const MAX_SESSION_ID_BYTES = 128
 const MAX_SESSION_HEADER_BYTES = 4096
+const MAX_TURN_ID_BYTES = 128
+// Bound the backward walk for malformed session trees. A normal turn has far
+// fewer entries than this between the current leaf and its user message.
+const MAX_TURN_LOOKBACK_ENTRIES = 10_000
 const SESSION_ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/
 const LINEAGE_HEADERS = [
   "X-Gateway-Client",
   RAMP_CLI_VERSION_HEADER,
   "X-Session-Id",
+  "X-Turn-Id",
   "X-Parent-Session-Id",
   "X-Forked-From-Session-Id",
 ] as const
@@ -328,6 +334,37 @@ function boundedSessionID(value: unknown): string | undefined {
   return value
 }
 
+function boundedTurnID(value: unknown): string | undefined {
+  if (
+    typeof value !== "string" ||
+    Buffer.byteLength(value, "utf8") > MAX_TURN_ID_BYTES ||
+    !SESSION_ID_PATTERN.test(value)
+  ) {
+    return undefined
+  }
+  return value
+}
+
+/**
+ * Pi persists each user message before it calls the model. The nearest user
+ * entry on the active branch therefore identifies the turn every model call
+ * in that run belongs to, including tool loops and branched sessions.
+ */
+function currentTurnID(sessionManager: SessionManager | undefined): string | undefined {
+  try {
+    let entry = sessionManager?.getLeafEntry?.()
+    for (let step = 0; entry && step < MAX_TURN_LOOKBACK_ENTRIES; step += 1) {
+      if (entry.type === "message" && entry.message.role === "user") {
+        return boundedTurnID(entry.id)
+      }
+      entry = entry.parentId ? sessionManager?.getEntry?.(entry.parentId) : undefined
+    }
+  } catch {
+    // Turn IDs are attribution metadata and never block an inference request.
+  }
+  return undefined
+}
+
 /**
  * Resolve Pi's fork source without reading any conversation entries.
  *
@@ -402,6 +439,8 @@ function sessionAttributionHeaders(
   if (!sessionID) return headers
   headers["X-Gateway-Client"] = "pi"
   headers["X-Session-Id"] = sessionID
+  const turnID = currentTurnID(sessionManager)
+  if (turnID) headers["X-Turn-Id"] = turnID
   const forkedFromSessionID = parentSessionID(sessionManager?.getHeader()?.parentSession)
   if (forkedFromSessionID && forkedFromSessionID !== sessionID) {
     // Keep the compatibility parent field during rollout while giving Router
@@ -582,6 +621,8 @@ function piHome(): string {
 function configuredRouter(): {
   baseUrl?: string
   usageBaseUrl?: string
+  usageApiKey?: string
+  localApiKey?: string
   rampCliVersion?: string
 } {
   const home = piHome()
@@ -591,9 +632,14 @@ function configuredRouter(): {
       const record = parsed as {
         baseUrl?: unknown
         usageBaseUrl?: unknown
+        usageApiKey?: unknown
+        localApiKey?: unknown
         rampCliVersion?: unknown
       }
       return {
+        ...(typeof record.usageApiKey === "string" && typeof record.localApiKey === "string"
+          ? { usageApiKey: record.usageApiKey, localApiKey: record.localApiKey }
+          : {}),
         ...(typeof record.baseUrl === "string" && record.baseUrl.trim()
           ? { baseUrl: record.baseUrl.trim() }
           : {}),
@@ -634,6 +680,7 @@ function routerProvider(
   catalogGeneration: CatalogGeneration,
   host: HostSupport,
   activeSession: () => SessionManager | undefined,
+  connectionFor: (key: string) => RouterConnection,
   initialCredentialIdentity?: string,
   rampCliVersion?: string,
 ) {
@@ -862,10 +909,11 @@ function routerProvider(
         const canonical = requestModel(model as RouterModel, requestOptions)
         const expectedModelID = canonical.id
         if (canonical.api !== api) throw new Error("Ramp Router model does not match this provider")
+        const connection = connectionFor(requestOptions!.apiKey!)
         return (await getApi(api)).stream(
-          canonical,
+          { ...canonical, baseUrl: modelBaseURL(api, connection.baseUrl) },
           context,
-          guardedRequestOptions(expectedModelID, api, requestOptions),
+          guardedRequestOptions(expectedModelID, api, { ...requestOptions, apiKey: connection.apiKey }),
         )
       }),
     streamSimple: (model, context, options) =>
@@ -874,10 +922,11 @@ function routerProvider(
         const canonical = requestModel(model as RouterModel, requestOptions)
         const expectedModelID = canonical.id
         if (canonical.api !== api) throw new Error("Ramp Router model does not match this provider")
+        const connection = connectionFor(requestOptions!.apiKey!)
         return (await getApi(api)).streamSimple(
-          canonical,
+          { ...canonical, baseUrl: modelBaseURL(api, connection.baseUrl) },
           context,
-          guardedRequestOptions(expectedModelID, api, requestOptions),
+          guardedRequestOptions(expectedModelID, api, { ...requestOptions, apiKey: connection.apiKey }),
         )
       }),
   })
@@ -970,10 +1019,11 @@ function routerProvider(
       if (!hostClassifier) {
         throw new Error("Update Pi to use classifier models through Ramp Router")
       }
+      const connection = connectionFor(requestOptions!.apiKey!)
       return await hostClassifier.classify(
-        canonical,
+        { ...canonical, baseUrl: connection.baseUrl },
         context,
-        guardedClassifierOptions(canonical.id, requestOptions),
+        guardedClassifierOptions(canonical.id, { ...requestOptions, apiKey: connection.apiKey }),
       )
     } catch (error) {
       // Pi's contract: classify reports failures in its result, never rejects.
@@ -1072,9 +1122,10 @@ function routerProvider(
         )
       }
       const refreshGeneration = ++catalogGeneration.current
+      const connection = connectionFor(apiKey)
       const discovered = await discoverRouterModels({
-        baseURL: baseUrl,
-        apiKey,
+        baseURL: connection.baseUrl,
+        apiKey: connection.apiKey,
         ...(rampCliVersion ? { rampCliVersion } : {}),
         ...(signal ? { signal } : {}),
       })
@@ -1687,11 +1738,13 @@ async function discoverModels(
   apiKey: string,
   rampCliVersion: string | undefined,
   host: HostSupport,
+  connectionFor: (key: string) => RouterConnection,
   signal?: AbortSignal,
 ): Promise<RouterCatalog> {
+  const connection = connectionFor(apiKey)
   const discovered = await discoverRouterModels({
-    baseURL: baseUrl,
-    apiKey,
+    baseURL: connection.baseUrl,
+    apiKey: connection.apiKey,
     ...(rampCliVersion ? { rampCliVersion } : {}),
     ...(signal ? { signal } : {}),
   })
@@ -1710,6 +1763,18 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
   // environment override aimed at another stack.
   const usageOrigin = environmentBaseUrl ? undefined : configured.usageBaseUrl
   const rampCliVersion = configured.rampCliVersion
+  const connectionFor = (key: string) => resolveRouterConnection(baseUrl, key, configured)
+  let usageBaseUrl = baseUrl
+  try {
+    usageBaseUrl = directRouterURL(baseUrl)
+  } catch {
+    // Keep Pi usable with other providers. The credential resolver still
+    // rejects this endpoint before any discovery, inference, or usage call.
+  }
+  const usageApiKey = async () => {
+    const key = await routerApiKey()
+    return key ? connectionFor(key).usageApiKey : undefined
+  }
 
   // Resolve Router's credential through Pi's own auth machinery without
   // refreshing any provider. The private cache is scoped to both endpoint and
@@ -1741,6 +1806,7 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
         apiKey,
         rampCliVersion,
         host,
+        connectionFor,
         AbortSignal.timeout(STARTUP_DISCOVERY_TIMEOUT_MS),
       )
       if (!(await routerCredentialIsCurrent(apiKey))) {
@@ -1775,15 +1841,16 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
     catalogGeneration,
     host,
     () => activeSession,
+    connectionFor,
     startupCredentialIdentity,
     rampCliVersion,
   )
   pi.registerProvider(registeredProvider)
   registerUsageWidget(pi, {
-    baseURL: baseUrl,
+    baseURL: usageBaseUrl,
     ...(usageOrigin ? { usageOrigin } : {}),
     ...(rampCliVersion ? { rampCliVersion } : {}),
-    resolveAPIKey: routerApiKey,
+    resolveAPIKey: usageApiKey,
   })
 
   // Extension factories run before session_start, which is the first point at
@@ -1826,8 +1893,8 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
   // qualify, and a switch the user makes afterwards stands. Fetched in the
   // background from here on, so a slow Router never holds up a session start.
   const workspaceDefaults = workspaceDefaultCache({
-    usageOrigin: usageOrigin ?? usageOriginFromBaseURL(baseUrl),
-    resolveAPIKey: routerApiKey,
+    usageOrigin: usageOrigin ?? usageOriginFromBaseURL(usageBaseUrl),
+    resolveAPIKey: usageApiKey,
     ...(rampCliVersion ? { rampCliVersion } : {}),
   })
   const appliesWorkspaceDefault =
@@ -1857,7 +1924,7 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
   // private cache is an optional next-launch optimization, not a prerequisite
   // for using the newer catalog in this process.
   if (apiKey && backgroundGeneration !== undefined) {
-    void discoverModels(baseUrl, apiKey, rampCliVersion, host)
+    void discoverModels(baseUrl, apiKey, rampCliVersion, host, connectionFor)
       .then(async (refreshed) => {
         if (refreshed.models.length > 0) {
           // Pi resolves auth again for inference. If /login or a concurrent

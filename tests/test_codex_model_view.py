@@ -310,6 +310,61 @@ def test_failed_compact_discovery_preserves_existing_configuration(
     assert {path: path.read_bytes() for path in paths} == before
 
 
+@pytest.mark.parametrize("view", [None, "compact", "all"])
+def test_background_refresh_preserves_the_saved_codex_view(
+    tmp_path, model_server, view
+):
+    _, server_catalog, _ = model_server
+    _configure(CliRunner(), view)
+    home = tmp_path / "codex"
+    catalog_path = home / router.CODEX_ROUTER_CATALOG
+    state_path = home / "ramp-router-state.json"
+    # Change catalog metadata so both the catalog and its receipt digest move.
+    server_catalog["models"][0]["description"] = "Updated recommendation"
+    models = router._fetch_models("test-key")
+
+    router._refresh_codex_models(
+        home / "config.toml", "test-key", models, base_url=None, selected_model=None
+    )
+
+    catalog = json.loads(catalog_path.read_text())
+    assert _visible(catalog) == (
+        ["recommended", "other"] if view == "all" else ["recommended"]
+    )
+    assert catalog["models"][0]["description"] == "Updated recommendation"
+    receipt = json.loads(state_path.read_text())
+    assert receipt[router.CODEX_MODEL_VIEW_KEY] == (view or "compact")
+    assert receipt[router.CODEX_ROUTER_CATALOG_DIGEST_KEY] == router._content_digest(
+        catalog_path.read_text()
+    )
+
+
+def test_background_compact_discovery_failure_preserves_all_files(
+    tmp_path, model_server
+):
+    _, _, server_state = model_server
+    _configure(CliRunner(), "compact")
+    home = tmp_path / "codex"
+    paths = [
+        home / name
+        for name in (
+            "config.toml",
+            router.CODEX_ROUTER_CATALOG,
+            "ramp-router-state.json",
+        )
+    ]
+    before = {path: path.read_bytes() for path in paths}
+    models = router._fetch_models("test-key")
+    server_state["fail_compact"] = True
+
+    with pytest.raises(click.ClickException):
+        router._refresh_codex_models(
+            home / "config.toml", "test-key", models, base_url=None, selected_model=None
+        )
+
+    assert {path: path.read_bytes() for path in paths} == before
+
+
 @pytest.mark.parametrize("clients", [[], ["claude-code"], ["codex", "claude-code"]])
 def test_codex_models_flag_requires_codex_only(clients):
     result = CliRunner().invoke(

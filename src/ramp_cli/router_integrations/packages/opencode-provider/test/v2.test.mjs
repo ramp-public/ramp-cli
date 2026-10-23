@@ -426,3 +426,82 @@ describe("OpenCode v2 setup", () => {
     assert.equal(added[0].info.settings.baseURL, "https://api.router.com/v1")
   })
 })
+
+/** Records OpenCode v2 session hooks so a test can fire them in order. */
+function fakeSessionHooks() {
+  const callbacks = {}
+  const disposed = []
+  return {
+    callbacks,
+    disposed,
+    session: {
+      hook: async (name, callback) => {
+        callbacks[name] = callback
+        return { dispose: async () => disposed.push(name) }
+      },
+    },
+  }
+}
+
+describe("OpenCode v2 turn IDs", () => {
+  it("tags each Router model request with the session's current user message", async () => {
+    mock.method(globalThis, "fetch", async () => modelList({ id: "m", router: routerMetadata("m") }))
+    const { ctx } = fakeContext({ apiKey: "k", baseURL: "https://router.example/v1" })
+    const hooks = fakeSessionHooks()
+    ctx.session = hooks.session
+
+    const cleanup = await plugin.setup(ctx)
+    hooks.callbacks.prompt({ sessionID: "ses_a", messageID: "msg_1" })
+    hooks.callbacks.prompt({ sessionID: "ses_b", messageID: "msg_9" })
+    const first = { sessionID: "ses_a", model: { providerID: "ramp-router" }, headers: {} }
+    hooks.callbacks["model.request"](first)
+    hooks.callbacks.prompt({ sessionID: "ses_a", messageID: "msg_2" })
+    const second = { sessionID: "ses_a", model: { providerID: "ramp-router" }, headers: {} }
+    hooks.callbacks["model.request"](second)
+    const otherSession = { sessionID: "ses_b", model: { providerID: "ramp-router" }, headers: {} }
+    hooks.callbacks["model.request"](otherSession)
+
+    assert.deepEqual(first.headers, { "X-Turn-Id": "msg_1" })
+    assert.deepEqual(second.headers, { "X-Turn-Id": "msg_2" })
+    assert.deepEqual(otherSession.headers, { "X-Turn-Id": "msg_9" })
+
+    cleanup()
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.deepEqual(hooks.disposed.sort(), ["model.request", "prompt"])
+  })
+
+  it("does not tag other providers or sessions without a recorded prompt", async () => {
+    mock.method(globalThis, "fetch", async () => modelList({ id: "m", router: routerMetadata("m") }))
+    const { ctx } = fakeContext({ apiKey: "k", baseURL: "https://router.example/v1" })
+    const hooks = fakeSessionHooks()
+    ctx.session = hooks.session
+
+    await plugin.setup(ctx)
+    hooks.callbacks.prompt({ sessionID: "ses_a", messageID: "msg_1" })
+    const otherProvider = { sessionID: "ses_a", model: { providerID: "openai" }, headers: {} }
+    const unknownSession = { sessionID: "ses_z", model: { providerID: "ramp-router" }, headers: {} }
+    hooks.callbacks["model.request"](otherProvider)
+    hooks.callbacks["model.request"](unknownSession)
+
+    assert.deepEqual(otherProvider.headers, {})
+    assert.deepEqual(unknownSession.headers, {})
+  })
+
+  it("keeps working untagged when the host cannot register the hooks", async () => {
+    mock.method(globalThis, "fetch", async () => modelList({ id: "m", router: routerMetadata("m") }))
+    const { ctx, added } = fakeContext({ apiKey: "k", baseURL: "https://router.example/v1" })
+    const disposed = []
+    ctx.session = {
+      hook: async (name) => {
+        if (name === "model.request") throw new Error("unknown hook")
+        return { dispose: async () => disposed.push(name) }
+      },
+    }
+
+    const cleanup = await plugin.setup(ctx)
+
+    assert.equal(added.length, 1)
+    assert.deepEqual(disposed, ["prompt"])
+    cleanup()
+  })
+})

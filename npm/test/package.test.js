@@ -121,6 +121,15 @@ test('packed packages install, coexist, and launch through a real isolated npm r
     assert.ok(fs.existsSync(path.join(p.env.RAMP_CLI_BIN_DIR, 'router')));
   });
 
+  await t.test('npx configure forwards the background opt-in and keeps a persistent router command', async t => {
+    const p = isolated(t);
+    const result = await invoke('npx', ['--yes', '@ramp/router', 'configure', '--enable-agent'], p);
+    assert.deepEqual(JSON.parse(result.stdout), ['router', 'configure', '--enable-agent']);
+    const shortcut = path.join(p.env.RAMP_CLI_BIN_DIR, 'router');
+    assert.ok(fs.existsSync(shortcut));
+    assert.deepEqual(JSON.parse((await invoke(shortcut, ['configure', '--enable-agent'], p)).stdout), ['router', 'configure', '--enable-agent']);
+  });
+
   for (const setting of ['CI', 'RAMP_ROUTER_SKIP_ONBOARDING']) {
     await t.test(`${setting} suppresses install-time UI but not an explicit npx invocation`, async t => {
       const p = isolated(t);

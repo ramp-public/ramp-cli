@@ -17,6 +17,7 @@ npm install -g @ramp/router
 router
 ```
 
+Run `npx @ramp/router@latest configure --enable-agent` to sign in, choose harnesses, and enable the Router agent.
 Requires Node.js 22+ and npm 10+ (Python is not required). Supported platforms: macOS (Apple Silicon & Intel), Linux (glibc x64 & arm64), and Windows (x64).
 
 ## Router Workspace & Setup

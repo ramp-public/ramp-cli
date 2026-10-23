@@ -1,0 +1,47 @@
+[package]
+name = "ramp-router-agent"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Ramp Router background agent: keeps Router setups fresh and tags coding-agent requests with their Git repository"
+publish = false
+
+[[bin]]
+name = "ramp-router-agent"
+path = "src/main.rs"
+
+[lib]
+name = "rrh"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "sync"] }
+hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1", "http2"] }
+http-body-util = "0.1"
+http-body = "1"
+bytes = "1"
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-platform-verifier = "0.7"
+webpki-root-certs = "1"
+rustls-pki-types = { version = "1", features = ["std"] }
+regex = "1"
+aho-corasick = "1"
+memchr = "2"
+libc = "0.2"
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc = "0.14"
+
+[dev-dependencies]
+proptest = "1"
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

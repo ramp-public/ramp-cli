@@ -609,18 +609,20 @@ def _emit_error(code: int, message: str) -> None:
 
 
 def _is_session_sync_invocation() -> bool:
-    """Report whether this run is `ramp router sync --hook` or `--detached`.
+    """Report whether this run is a background `ramp router sync` invocation.
 
     The hook's fast path must be zero-network, and the passive version check
     would otherwise start a GitHub request before dispatch; the detached
     background half fetches the version cache itself, synchronously, so the
-    racy daemon-thread check is redundant there. Token containment because
-    root flags may appear anywhere; these flags exist only on `router sync`.
+    racy daemon-thread check is redundant there. Scheduled runs also check
+    synchronously, after loading the saved update-check preference from their
+    env file. Token containment allows root flags anywhere; these flags exist
+    only on `router sync`.
     """
     arguments = set(sys.argv[1:])
     if not {"router", "sync"} <= arguments:
         return False
-    return "--hook" in arguments or "--detached" in arguments
+    return bool({"--hook", "--detached", "--scheduled"} & arguments)
 
 
 def main() -> None:

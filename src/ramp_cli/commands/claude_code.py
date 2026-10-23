@@ -119,6 +119,7 @@ _OWNED_ENV_KEYS = (
     # base because that points at the data plane, which does not answer the
     # session-usage endpoint the script calls.
     "ROUTER_BASE_URL",
+    "ROUTER_API_KEY",
     # Owned so the cap Router needs can be put back to whatever the user had,
     # and so it does not outlive the Router models it protects.
     AUTO_COMPACT_WINDOW_ENV,
@@ -135,6 +136,7 @@ _OWNED_ENV_KEYS = (
 _ENV_KEYS_OWNED_LATER = (
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
     "ROUTER_BASE_URL",
+    "ROUTER_API_KEY",
     _CLAUDE_AI_CONNECTORS_ENV,
     AUTO_COMPACT_WINDOW_ENV,
     *SUBAGENT_ENV_KEYS,
@@ -657,6 +659,7 @@ def plan_configuration(
     model: str,
     *,
     usage_base_url: str | None = None,
+    usage_api_key: str | None = None,
     statusline: str | None = None,
     model_view_all: bool = False,
     shell_environment: Mapping[str, str] | None = None,
@@ -727,6 +730,8 @@ def plan_configuration(
     updated["env"].pop("ANTHROPIC_API_KEY", None)
     if usage_base_url is not None:
         updated["env"]["ROUTER_BASE_URL"] = usage_base_url
+    if usage_api_key is not None:
+        updated["env"]["ROUTER_API_KEY"] = usage_api_key
     inherited = (shell_environment or {}).get(AUTO_COMPACT_WINDOW_ENV)
     cap_claimed = _apply_auto_compact_cap(
         settings, environment, updated["env"], inherited
@@ -933,6 +938,22 @@ def plan_automatic_subagent_cleanup(
             # so unconfigure can still restore the pre-Router value.
             written[key] = None
     return {**settings, "env": environment}, updated_state
+
+
+def plan_model_update(settings: dict, state: dict, model: str) -> tuple[dict, dict]:
+    """Set only the default model and record it as this CLI's write.
+
+    The whole Claude Code edit of a background refresh. The pre-Router
+    snapshot in ``state["top_level"]`` is kept, so unconfigure still restores
+    the user's own model.
+    """
+    written = state["written"]
+    if settings.get("model") == model and written["top_level"].get("model") == model:
+        return settings, state
+    return {**settings, "model": model}, {
+        **state,
+        "written": {**written, "top_level": {**written["top_level"], "model": model}},
+    }
 
 
 def plan_model_view_update(

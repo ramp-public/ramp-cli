@@ -1,5 +1,6 @@
 """The Harnesses tab and its connection pages."""
 
+import sys
 from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING
@@ -147,7 +148,9 @@ _APPLIES_WITHOUT_RESTART = ("cowork", "cursor")
 def restart_notice(clients, *, connected: bool) -> Notice | None:
     """Tell the user which harnesses to restart, or None when none need it."""
     names = [
-        safe_text(router.AGENT_NAMES.get(client, client))
+        "Codex CLI"
+        if client == "codex" and connected and sys.platform == "darwin"
+        else safe_text(router.AGENT_NAMES.get(client, client))
         for client in clients
         if client not in _APPLIES_WITHOUT_RESTART
     ]
