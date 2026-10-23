@@ -81,7 +81,7 @@ def flow(monkeypatch, isolated_config):
 
     monkeypatch.setattr(router.httpx, "get", get)
     monkeypatch.setattr(router, "_fetch_configure_summary", lambda *_a, **_k: None)
-    monkeypatch.setattr(router, "_codex_harness_prompt", lambda *_: None)
+    monkeypatch.setattr(router, "_codex_harness_prompt", lambda *_a, **_k: None)
     monkeypatch.setattr(
         router.codex_desktop,
         "restart_running",
@@ -391,7 +391,7 @@ def test_actual_writers_keep_notes_jsonc_and_one_prompt(
     flow, monkeypatch, isolated_config, ambiguous_opencode
 ):
 
-    monkeypatch.setattr(router, "_codex_harness_prompt", lambda *_: None)
+    monkeypatch.setattr(router, "_codex_harness_prompt", lambda *_a, **_k: None)
     monkeypatch.setattr(router, "_fetch_configure_summary", lambda *_a, **_k: None)
     monkeypatch.setattr(
         router,

@@ -86,7 +86,7 @@ def test_explicit_login_finishes_paste_fallback_before_picker(monkeypatch, no_in
         wait_for_code=lambda *args, **kwargs: "code",
         shutdown=lambda: None,
     )
-    monkeypatch.setattr(oauth, "start_pkce_callback", lambda: callback)
+    monkeypatch.setattr(oauth, "start_pkce_callback", lambda **kw: callback)
     monkeypatch.setattr(oauth, "_open_browser", lambda _: True)
     monkeypatch.setattr(auth_client, "_stdin_is_terminal", lambda: True)
     reader = Mock()
@@ -190,7 +190,7 @@ def test_access_token_is_origin_bound_across_native_lifecycle(
         wait_for_code=lambda *args, **kwargs: "code",
         shutdown=lambda: None,
     )
-    monkeypatch.setattr(oauth, "start_pkce_callback", lambda: callback)
+    monkeypatch.setattr(oauth, "start_pkce_callback", lambda **kw: callback)
     requests = []
 
     def handle(request):
@@ -250,7 +250,7 @@ def test_invalid_access_configuration_fails_before_browser_without_disclosing_to
     monkeypatch.setenv("RAMP_ROUTER_ACCESS_ORIGIN", origin)
     monkeypatch.setenv("RAMP_ROUTER_ACCESS_TOKEN", token)
     monkeypatch.setattr(
-        oauth, "start_pkce_callback", lambda: pytest.fail("Opened callback")
+        oauth, "start_pkce_callback", lambda **kw: pytest.fail("Opened callback")
     )
     with pytest.raises(RampCLIError, match="RAMP_ROUTER_ACCESS") as error:
         RouterUserClient("https://internal.router.com").login(no_browser=True)

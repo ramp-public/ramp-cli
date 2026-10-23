@@ -91,6 +91,12 @@ def _mock_models(monkeypatch, models=None, base_url=ROUTER_BASE_URL):
                             "slug": model["id"],
                             "display_name": model["router"]["display_name"],
                             "base_instructions": "",
+                            "context_window": model["router"]["limits"][
+                                "context_window"
+                            ],
+                            "max_context_window": model["router"]["limits"][
+                                "context_window"
+                            ],
                         }
                         for model in models
                     ]
@@ -843,10 +849,89 @@ def test_refresh_will_not_resurrect_an_unconfigured_setup(monkeypatch):
             "router-secret",
             "gpt-5.4",
             require_receipt=True,
+            models=router_module._fetch_models("router-secret"),
         )
 
     assert "no longer configured" in str(excinfo.value)
     assert not (home / "ramp-router").exists()
+
+
+@pytest.mark.parametrize("native_ceiling", [None, 765_432])
+def test_conductors_codex_catalog_caps_context_on_configure_and_refresh(
+    monkeypatch, native_ceiling
+):
+    metadata = _router_metadata("test-model")
+    metadata["provider_model"] = "gpt-6.1-sol"
+    metadata["limits"]["context_window"] = 1_050_000
+    metadata["limits"]["max_output_tokens"] = 128_000
+    if native_ceiling is not None:
+        vendored = conductor.vendored_binary("codex")
+        vendored.parent.mkdir(parents=True)
+        vendored.write_text("test binary")
+
+        def catalog_from(executable, *, bundled=False):
+            assert executable == str(vendored)
+            assert bundled
+            return {
+                "models": [
+                    {"slug": "gpt-6.1-sol", "max_context_window": native_ceiling}
+                ]
+            }
+
+        monkeypatch.setattr(router_module, "_codex_catalog_from", catalog_from)
+    metadata["pricing"] = {
+        "long_context_token_threshold": 272_000,
+        "long_context": {"input": "4", "output": "15"},
+    }
+    _mock_models(monkeypatch, [{"id": "test-model", "router": metadata}])
+    runner = CliRunner()
+    result = _configure(runner)
+    assert result.exit_code == 0, result.output
+    path = (
+        conductor.conductor_home()
+        / "ramp-router"
+        / router_module.CONDUCTOR_CODEX_HOME
+        / router_module.CODEX_ROUTER_CATALOG
+    )
+    row = json.loads(path.read_text())["models"][0]
+    assert row["context_window"] == 272_000
+    assert row["max_context_window"] == (native_ceiling or 872_000)
+
+    metadata["pricing"]["long_context_token_threshold"] = 200_000
+    result = runner.invoke(cli, ["--agent", "router", "refresh"])
+    assert result.exit_code == 0, result.output
+    row = json.loads(path.read_text())["models"][0]
+    assert row["context_window"] == 200_000
+    assert row["max_context_window"] == (native_ceiling or 872_000)
+
+
+@pytest.mark.parametrize(
+    "provider_model,window,default",
+    [("grok-4.7", 500_000, 400_000), ("claude-haiku-5-5", 1_000_000, 800_000)],
+)
+def test_conductor_non_gpt_defaults_keep_the_full_override_window(
+    monkeypatch, provider_model, window, default
+):
+    metadata = _router_metadata("test-model")
+    metadata["provider_model"] = provider_model
+    metadata["limits"]["context_window"] = window
+    _mock_models(monkeypatch, [{"id": "test-model", "router": metadata}])
+    runner = CliRunner()
+    result = _configure(runner)
+    assert result.exit_code == 0, result.output
+    path = (
+        conductor.conductor_home()
+        / "ramp-router"
+        / router_module.CONDUCTOR_CODEX_HOME
+        / router_module.CODEX_ROUTER_CATALOG
+    )
+    for refresh in (False, True):
+        if refresh:
+            result = runner.invoke(cli, ["--agent", "router", "refresh"])
+            assert result.exit_code == 0, result.output
+        row = json.loads(path.read_text())["models"][0]
+        assert row["context_window"] == default
+        assert row["max_context_window"] == window
 
 
 def test_configure_conductor_writes_the_vendored_harness_prompt(monkeypatch):
@@ -855,8 +940,9 @@ def test_configure_conductor_writes_the_vendored_harness_prompt(monkeypatch):
     home.mkdir(parents=True)
     captured = {}
 
-    def harness_prompt(executable, default_model, *, bundled=False):
+    def harness_prompt(executable, default_model, *, bundled=False, router_models=None):
         captured["request"] = (executable, default_model, bundled)
+        captured["models"] = [model.id for model in router_models]
         return "VENDORED HARNESS PROMPT"
 
     monkeypatch.setattr(router_module, "_codex_harness_prompt_from", harness_prompt)
@@ -876,3 +962,4 @@ def test_configure_conductor_writes_the_vendored_harness_prompt(monkeypatch):
     # its bundled catalog: a Router-configured binary reports empty
     # instructions from the ordinary read.
     assert captured["request"] == (conductor.vendored_binary("codex"), "gpt-5.4", True)
+    assert captured["models"] == ["gpt-5.4"]

@@ -5094,7 +5094,9 @@ def test_configure_reopens_codex_after_saving(
     tmp_path, monkeypatch, platform, app, state
 ):
     _mock_models(monkeypatch)
-    monkeypatch.setattr(router_module, "_codex_harness_prompt", lambda _model: None)
+    monkeypatch.setattr(
+        router_module, "_codex_harness_prompt", lambda _model, **_k: None
+    )
     monkeypatch.setattr(codex_desktop, "restart_running", restart_running)
     monkeypatch.setattr(codex_desktop, "sys", SimpleNamespace(platform=platform))
     clock = itertools.count(step=5)
@@ -5332,7 +5334,7 @@ def test_codex_catalog_respects_the_desktop_limit_and_keeps_the_selected_model(
 
     catalog = json.loads(
         router_module._render_codex_catalog(
-            router_module._fetch_codex_catalog("router-secret"), "model-100"
+            router_module._fetch_codex_catalog("router-secret"), "model-100", []
         )
     )
 
@@ -5355,7 +5357,7 @@ def test_codex_catalog_refuses_a_selected_model_missing_from_its_projection(
 
     with pytest.raises(click.ClickException, match="generic-only"):
         router_module._render_codex_catalog(
-            router_module._fetch_codex_catalog("router-secret"), "generic-only"
+            router_module._fetch_codex_catalog("router-secret"), "generic-only", []
         )
 
 
@@ -11350,6 +11352,57 @@ def test_codex_keeps_its_own_harness_prompt(tmp_path, monkeypatch):
     assert config["model_instructions_file"] == str(instructions.resolve())
 
 
+@pytest.mark.parametrize("already_on_router", [False, True])
+def test_configure_and_refresh_use_the_promoted_models_native_prompt(
+    tmp_path, monkeypatch, already_on_router
+):
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model = "GPT-6.1 Sol"\n')
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(
+        monkeypatch,
+        [
+            {
+                "id": "gpt-6.1-sol",
+                "codex_slug": "GPT-6.1 Sol",
+                "router": _router_metadata(
+                    "gpt-6.1-sol",
+                    provider_model="gpt-6.1-sol",
+                    display_name="GPT-6.1 Sol",
+                ),
+            }
+        ],
+    )
+    native = _mock_codex_catalog(
+        monkeypatch, ("gpt-6.1-sol", "gpt-5.6-sol", "gpt-5.6-luna")
+    )
+    for row in native["models"][1:]:
+        row["base_instructions"] = "SHARED 5.6 PROMPT"
+
+    def run(command, **_kwargs):
+        catalog = native
+        if already_on_router and "--bundled" not in command:
+            catalog = {"models": [{"slug": "GPT-6.1 Sol", "base_instructions": ""}]}
+        return subprocess.CompletedProcess(command, 0, json.dumps(catalog), "")
+
+    monkeypatch.setattr(router_module.subprocess, "run", run)
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert result.exit_code == 0, result.output
+    instructions = codex_home / "ramp-router-instructions.md"
+    assert instructions.read_text() == "NATIVE PROMPT FOR gpt-6.1-sol"
+    instructions.write_text("SHARED 5.6 PROMPT")
+
+    result = runner.invoke(cli, ["--human", "router", "refresh"])
+    assert result.exit_code == 0, result.output
+    assert instructions.read_text() == "NATIVE PROMPT FOR gpt-6.1-sol"
+    config = tomllib.loads((codex_home / "config.toml").read_text())
+    assert config["model"] == "GPT-6.1 Sol"
+
+
 def test_codex_is_configured_without_a_prompt_when_it_is_not_installed(
     tmp_path, monkeypatch
 ):
@@ -11421,7 +11474,7 @@ def test_a_codex_on_path_is_preferred_over_the_app_for_the_prompt(
     monkeypatch.setattr(router_module, "_codex_harness_prompt_from", read)
 
     assert router_module._codex_harness_prompt("gpt-5.4") == "PATH CODEX PROMPT"
-    assert calls == [("/usr/bin/codex", {})]
+    assert calls == [("/usr/bin/codex", {"router_models": None})]
 
 
 def test_a_codex_on_path_already_pointed_at_router_reads_its_bundled_prompt(

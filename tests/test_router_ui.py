@@ -681,7 +681,7 @@ def test_login_progress_can_cancel_without_stdout_or_token_exchange(
         _event=Event(),
         shutdown=lambda: calls.append("shutdown"),
     )
-    monkeypatch.setattr(oauth, "start_pkce_callback", lambda: callback)
+    monkeypatch.setattr(oauth, "start_pkce_callback", lambda **kw: callback)
     monkeypatch.setattr(oauth, "_open_browser", lambda _url: True)
     monkeypatch.setattr(RouterUserClient, "_edge_protected", lambda _self: False)
     monkeypatch.setattr(

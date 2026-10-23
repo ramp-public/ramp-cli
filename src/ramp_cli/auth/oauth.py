@@ -280,7 +280,12 @@ def login(env: str, opts: LoginOptions | None = None) -> TokenResponse:
     return exchange_pkce_callback_code(env, callback, code)
 
 
-def start_pkce_callback() -> PkceCallback:
+def start_pkce_callback(*, success_redirect: str | None = None) -> PkceCallback:
+    """Listen for the loopback callback.
+
+    ``success_redirect`` sends the browser on to that address once a code
+    has been received, instead of showing the "Authenticated" page.
+    """
     verifier = _generate_verifier()
     challenge = _generate_challenge(verifier)
     state = _generate_state()
@@ -350,6 +355,12 @@ def start_pkce_callback() -> PkceCallback:
                 return
 
             result["code"] = code
+            if success_redirect:
+                self.send_response(303)
+                self.send_header("Location", success_redirect)
+                self.end_headers()
+                event.set()
+                return
             page = _callback_html(
                 success=True,
                 title="Authenticated",

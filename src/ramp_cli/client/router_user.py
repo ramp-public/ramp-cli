@@ -557,7 +557,11 @@ class RouterUserClient:
             }
         self.ensure_edge_access(progress=progress, cancel=cancel, timeout=timeout)
         access_headers = self._access_headers()
-        callback = oauth.start_pkce_callback()
+        # Connectors still need their "Connected" switches turned on in the
+        # Router UI, so the browser lands there instead of on a static page.
+        callback = oauth.start_pkce_callback(
+            success_redirect=self.origin + "/connectors" if connectors else None
+        )
         if on_callback is not None:
             on_callback(callback)
         url = (

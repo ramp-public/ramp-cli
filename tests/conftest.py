@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from ramp_cli.commands import router
+
 
 @pytest.fixture(autouse=True)
 def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -17,6 +19,7 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     home, so a test that configured every agent wrote its fixture credential
     into the developer's own Codex and Pi setup.
     """
+    router._bundled_codex_catalog_from.cache_clear()
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
     monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "pi"))

@@ -118,7 +118,7 @@ def test_compact_retains_selected_hidden_metadata_after_desktop_cap():
         + [_row("recommended"), _row("saved-hidden", "hide", context_window=999999)]
     }
     compact = router._compact_codex_catalog(catalog, [_recommended()], "saved-hidden")
-    bounded = json.loads(router._render_codex_catalog(compact, "saved-hidden"))
+    bounded = json.loads(router._render_codex_catalog(compact, "saved-hidden", []))
     assert len(bounded["models"]) == router.CODEX_CATALOG_MODEL_LIMIT
     assert _visible(bounded) == ["recommended"]
     assert bounded["models"][-1]["slug"] == "saved-hidden"
@@ -198,10 +198,13 @@ def model_server(monkeypatch):
                             "schema_version": 1,
                             "request_name": name,
                             "display_name": name,
-                            "provider_model": name,
+                            "provider_model": state.get(
+                                "provider_model", f"gpt-{name}"
+                            ),
+                            "pricing": state.get("pricing"),
                             "listing": {"order": 0},
                             "limits": {
-                                "context_window": 200000,
+                                "context_window": state.get("context_window", 200000),
                                 "max_output_tokens": 32000,
                             },
                             "capabilities": {
@@ -217,7 +220,7 @@ def model_server(monkeypatch):
 
     monkeypatch.setattr(router.httpx, "get", get)
     monkeypatch.setattr(router.shutil, "which", lambda _name: None)
-    monkeypatch.setattr(router, "_codex_harness_prompt", lambda _model: None)
+    monkeypatch.setattr(router, "_codex_harness_prompt", lambda _model, **_kwargs: None)
     monkeypatch.setattr(router, "_install_codex_cost_hook", lambda *_a, **_k: None)
     monkeypatch.setattr(router, "session_sync_hook_command", lambda *_a, **_k: None)
     monkeypatch.setattr(router.claude_cowork, "is_available", lambda: False)
@@ -276,6 +279,104 @@ def test_configure_compact_refresh_then_all_restores_server_visibility(
     assert refreshed.exit_code == 0, refreshed.output
     assert json.loads(catalog_path.read_text()) == server_catalog
     assert requests.count("claude-code") == 2
+
+
+@pytest.mark.parametrize("view", ["compact", "all"])
+@pytest.mark.parametrize(
+    "provider_model,window,default,ceiling,refreshed_default",
+    [
+        ("gpt-6.1-sol", 1_050_000, 160_000, 968_000, 120_000),
+        ("grok-4.7", 500_000, 400_000, 500_000, 400_000),
+        ("claude-haiku-5-5", 1_000_000, 800_000, 1_000_000, 800_000),
+    ],
+)
+def test_configure_and_refresh_cap_context_without_extra_discovery(
+    tmp_path,
+    model_server,
+    view,
+    provider_model,
+    window,
+    default,
+    ceiling,
+    refreshed_default,
+):
+    requests, catalog, state = model_server
+    state.update(provider_model=provider_model, context_window=window)
+    state["pricing"] = {
+        "long_context_token_threshold": 160_000,
+        "long_context": {"input": "4", "output": "15"},
+    }
+    for row in catalog["models"]:
+        row.update(context_window=window, max_context_window=window)
+    original = copy.deepcopy(catalog)
+    runner = CliRunner()
+    _configure(runner, view)
+    path = tmp_path / "codex" / router.CODEX_ROUTER_CATALOG
+    configured = json.loads(path.read_text())
+    assert {row["context_window"] for row in configured["models"]} == {default, window}
+    for row in configured["models"]:
+        # The generic list does not describe legacy; do not guess its policy.
+        expected = window if row["slug"] == "legacy" else default
+        assert row["context_window"] == expected
+        assert row["max_context_window"] == (
+            window if row["slug"] == "legacy" else ceiling
+        )
+    assert requests.count(None) == requests.count("codex") == 1
+    assert requests.count("claude-code") == (1 if view == "compact" else 0)
+
+    state["pricing"]["long_context_token_threshold"] = 120_000
+    result = runner.invoke(cli, ["--agent", "router", "refresh"])
+    assert result.exit_code == 0, result.output
+    refreshed = json.loads(path.read_text())
+    for row in refreshed["models"]:
+        expected = window if row["slug"] == "legacy" else refreshed_default
+        assert row["context_window"] == expected
+        assert row["max_context_window"] == (
+            window if row["slug"] == "legacy" else ceiling
+        )
+    assert requests.count(None) == requests.count("codex") == 2
+    assert requests.count("claude-code") == (2 if view == "compact" else 0)
+    assert catalog == original
+
+
+@pytest.mark.parametrize("view", ["compact", "all"])
+def test_configure_and_refresh_use_the_installed_bundled_ceiling(
+    tmp_path, model_server, monkeypatch, view
+):
+    _, catalog, state = model_server
+    state.update(provider_model="gpt-future-model", context_window=1_050_000)
+    state["pricing"] = {
+        "long_context_token_threshold": 272_000,
+        "long_context": {"input": "4", "output": "15"},
+    }
+    for row in catalog["models"]:
+        row.update(context_window=1_050_000, max_context_window=1_050_000)
+    monkeypatch.setattr(
+        router.shutil,
+        "which",
+        lambda name: "/installed/codex" if name == "codex" else None,
+    )
+    calls = []
+
+    def catalog_from(executable, *, bundled=False):
+        calls.append((executable, bundled))
+        return {
+            "version": "native",
+            "models": [{"slug": "gpt-future-model", "max_context_window": 765_432}],
+        }
+
+    monkeypatch.setattr(router, "_codex_catalog_from", catalog_from)
+    runner = CliRunner()
+    _configure(runner, view)
+    path = tmp_path / "codex" / router.CODEX_ROUTER_CATALOG
+    for row in json.loads(path.read_text())["models"]:
+        if row["slug"] != "legacy":
+            assert row["context_window"] == 272_000
+            assert row["max_context_window"] == 765_432
+    result = runner.invoke(cli, ["--agent", "router", "refresh"])
+    assert result.exit_code == 0, result.output
+    assert calls == [("/installed/codex", True)]
+    assert json.loads(path.read_text())["models"][0]["max_context_window"] == 765_432
 
 
 def test_failed_compact_discovery_preserves_existing_configuration(

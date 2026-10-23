@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import os
 import re
 import shlex
@@ -24,6 +25,7 @@ from contextlib import contextmanager, nullcontext, redirect_stderr
 from copy import copy
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from functools import lru_cache
 from pathlib import Path, PurePath
 from typing import Literal
@@ -172,6 +174,7 @@ CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY = "admin_default_model"
 # SessionStart group's CODEX_SYNC_HOOK_STATE_KEY.
 CODEX_STOP_SYNC_HOOK_STATE_KEY = "stop_sync_hook"
 CODEX_CATALOG_MODEL_LIMIT = 100
+_GPT_MODEL_ID = re.compile(r"(?:^|[/:.])gpt-")
 CLIENT_NAMES = {
     "claude-code": "Claude Code",
     "codex": "Codex",
@@ -292,6 +295,7 @@ class RouterModelMetadata:
     context_window: int
     max_output_tokens: int
     tool_calls: bool | None
+    long_context_token_threshold: int | None = None
 
 
 def _model_metadata(raw: object, identifier: str) -> RouterModelMetadata:
@@ -347,7 +351,33 @@ def _model_metadata(raw: object, identifier: str) -> RouterModelMetadata:
         tool_calls=tools.get("supported")
         if isinstance(tools.get("supported"), bool)
         else None,
+        long_context_token_threshold=_long_context_threshold(raw.get("pricing")),
     )
+
+
+def _long_context_threshold(pricing: object) -> int | None:
+    """Match the plugins: require a valid threshold and a complete price band."""
+    if not isinstance(pricing, dict):
+        return None
+    threshold = pricing.get("long_context_token_threshold")
+    band = pricing.get("long_context")
+    if (
+        isinstance(threshold, bool)
+        or not isinstance(threshold, int)
+        or not 0 < threshold <= 2**53 - 1
+        or not isinstance(band, dict)
+    ):
+        return None
+    for key in ("input", "output"):
+        rate = band.get(key)
+        if not isinstance(rate, str):
+            return None
+        try:
+            if not math.isfinite(float(Fraction(rate))):
+                return None
+        except (OverflowError, ValueError, ZeroDivisionError):
+            return None
+    return threshold
 
 
 def _token_limit(value: object, field: str, identifier: str) -> int:
@@ -384,25 +414,36 @@ def _human_join(values: list[str]) -> str:
     return ", ".join(values[:-1]) + f", and {values[-1]}"
 
 
-def _codex_harness_prompt(default_model: str) -> str | None:
+def _codex_harness_prompt(
+    default_model: str, *, router_models: list[RouterModel] | None = None
+) -> str | None:
     executable = shutil.which("codex")
     if executable:
         # Once the config points at Router, the ordinary read reports Router's
         # catalog, which carries no instructions; the bundled read recovers the
         # prompt, so a CLI installed after an earlier configure still gets it.
         return _codex_harness_prompt_from(
-            executable, default_model
-        ) or _codex_harness_prompt_from(executable, default_model, bundled=True)
+            executable, default_model, router_models=router_models
+        ) or _codex_harness_prompt_from(
+            executable, default_model, bundled=True, router_models=router_models
+        )
     # Without a Codex on PATH, the desktop app's bundled CLI is the binary the
     # app actually runs, so its prompt matches the app. Only the bundled read
     # works there, since the app shares a config that may already select Router.
     return _codex_harness_prompt_from(
-        _codex_app_bundled_cli(), default_model, bundled=True
+        _codex_app_bundled_cli(),
+        default_model,
+        bundled=True,
+        router_models=router_models,
     )
 
 
 def _codex_harness_prompt_from(
-    executable: str | Path | None, default_model: str, *, bundled: bool = False
+    executable: str | Path | None,
+    default_model: str,
+    *,
+    bundled: bool = False,
+    router_models: list[RouterModel] | None = None,
 ) -> str | None:
     """Read Codex's own harness prompt out of the installed binary.
 
@@ -418,6 +459,72 @@ def _codex_harness_prompt_from(
     catalog — whose base_instructions are empty — from the ordinary command,
     which is exactly the contamination the bundled read escapes.
     """
+    catalog = (
+        _bundled_codex_catalog_from(str(executable))
+        if bundled and executable
+        else _codex_catalog_from(executable)
+    )
+    if catalog is None:
+        return None
+    prompts = {
+        model["slug"]: model["base_instructions"]
+        for model in catalog["models"]
+        if isinstance(model, dict)
+        and isinstance(model.get("slug"), str)
+        and isinstance(model.get("base_instructions"), str)
+        and model["base_instructions"]
+    }
+    if not prompts:
+        return None
+    if default_model in prompts:
+        return prompts[default_model]
+    # Router promotes readable picker slugs that differ from Codex's native
+    # names. Resolve their stated identity before choosing a shared prompt.
+    model = next(
+        (
+            model
+            for model in router_models or ()
+            if default_model in (model.id, model.metadata.request_name)
+        ),
+        None,
+    )
+    if model is None:
+        matches = [
+            model
+            for model in router_models or ()
+            if model.metadata.display_name == default_model
+        ]
+        if len(matches) == 1:
+            model = matches[0]
+    if model is not None:
+        for name in (
+            model.metadata.provider_model,
+            model.metadata.request_name,
+            model.id,
+        ):
+            if name in prompts:
+                return prompts[name]
+    # Codex ships a different prompt per model family, but instructions are a
+    # single global setting. With no prompt for the model being configured,
+    # take the one the most families share: that is Codex's general harness
+    # text rather than a specialization. Ties break on the slug so two runs
+    # against the same install agree.
+    prompt_stats: dict[str, tuple[int, str]] = {}
+    for slug, prompt in prompts.items():
+        count, minimum_slug = prompt_stats.get(prompt, (0, slug))
+        prompt_stats[prompt] = (count + 1, min(minimum_slug, slug))
+    return max(prompt_stats, key=prompt_stats.__getitem__)
+
+
+@lru_cache(maxsize=4)
+def _bundled_codex_catalog_from(executable: str) -> dict | None:
+    """Share one offline bundled read across setup during this CLI process."""
+    return _codex_catalog_from(executable, bundled=True)
+
+
+def _codex_catalog_from(
+    executable: str | Path | None, *, bundled: bool = False
+) -> dict | None:
     if not executable:
         return None
     command = [str(executable), "debug", "models"]
@@ -443,34 +550,30 @@ def _codex_harness_prompt_from(
     if result.returncode != 0:
         return None
     try:
-        models = json.loads(result.stdout).get("models")
+        catalog = json.loads(result.stdout)
     except (json.JSONDecodeError, AttributeError):
         return None
-    if not isinstance(models, list):
-        return None
+    return (
+        catalog
+        if isinstance(catalog, dict) and isinstance(catalog.get("models"), list)
+        else None
+    )
 
-    prompts = {
-        model["slug"]: model["base_instructions"]
-        for model in models
+
+def _codex_bundled_context_windows(executable: str | Path | None) -> dict[str, int]:
+    if not executable:
+        return {}
+    return {
+        model["slug"]: model["max_context_window"]
+        for model in (_bundled_codex_catalog_from(str(executable)) or {}).get(
+            "models", []
+        )
         if isinstance(model, dict)
         and isinstance(model.get("slug"), str)
-        and isinstance(model.get("base_instructions"), str)
-        and model["base_instructions"]
+        and isinstance(model.get("max_context_window"), int)
+        and not isinstance(model["max_context_window"], bool)
+        and model["max_context_window"] > 0
     }
-    if not prompts:
-        return None
-    if default_model in prompts:
-        return prompts[default_model]
-    # Codex ships a different prompt per model family, but instructions are a
-    # single global setting. With no prompt for the model being configured,
-    # take the one the most families share: that is Codex's general harness
-    # text rather than a specialization. Ties break on the slug so two runs
-    # against the same install agree.
-    prompt_stats: dict[str, tuple[int, str]] = {}
-    for slug, prompt in prompts.items():
-        count, minimum_slug = prompt_stats.get(prompt, (0, slug))
-        prompt_stats[prompt] = (count + 1, min(minimum_slug, slug))
-    return max(prompt_stats, key=prompt_stats.__getitem__)
 
 
 def _codex_original_catalog(root_values: dict) -> str | None:
@@ -482,7 +585,8 @@ def _codex_original_catalog(root_values: dict) -> str | None:
     authoritative, so a profile-local snapshot keeps its picker isolated until
     Codex starts partitioning the shared cache by provider.
     """
-    if root_values.get("model_catalog_json") or not shutil.which("codex"):
+    executable = shutil.which("codex")
+    if root_values.get("model_catalog_json") or not executable:
         return None
 
     provider = _codex_restored_provider(root_values)
@@ -491,16 +595,10 @@ def _codex_original_catalog(root_values: dict) -> str | None:
         # the provider-agnostic cache we are escaping, so a fresh Router entry
         # there would make us snapshot the exact contamination this file is
         # meant to prevent. The bundled catalog cannot read that cache.
-        commands = [
-            [
-                "codex",
-                "-c",
-                f"model_provider={json.dumps(provider)}",
-                "debug",
-                "models",
-                "--bundled",
-            ]
-        ]
+        catalog = _bundled_codex_catalog_from(executable)
+        if catalog is not None and catalog["models"]:
+            return json.dumps(catalog, indent=2) + "\n"
+        return None
     else:
         commands = [
             [
@@ -6802,6 +6900,8 @@ def _configure_conductor(
     base_url: str | None = None,
     require_receipt: bool = False,
     lock_held: bool = False,
+    *,
+    models: list[RouterModel],
 ) -> None:
     """Point Conductor's vendored agents at Ramp Router.
 
@@ -6818,10 +6918,15 @@ def _configure_conductor(
     # Everything slow happens before the settings lock is taken: a bad key or
     # unreachable Router leaves no partial setup behind, and the lock never
     # waits on the network.
-    router_catalog = _render_codex_catalog(
-        _fetch_codex_catalog(api_key, base_url=base_url), default_model
-    )
     vendored_codex = conductor.vendored_binary("codex")
+    router_catalog = _render_codex_catalog(
+        _fetch_codex_catalog(api_key, base_url=base_url),
+        default_model,
+        models,
+        native_windows=_codex_bundled_context_windows(
+            vendored_codex if vendored_codex.is_file() else None
+        ),
+    )
     harness_prompt = _codex_harness_prompt_from(
         # Only the binary Conductor actually spawns: a standalone Codex on
         # PATH may be another version, and its prompt would then outlive the
@@ -6832,6 +6937,7 @@ def _configure_conductor(
         # right one — and the binary consulted may itself already be pointed
         # at Router, whose catalog carries no instructions at all.
         bundled=True,
+        router_models=models,
     )
     artifacts = path.parent / "ramp-router"
     codex_home = artifacts / CONDUCTOR_CODEX_HOME
@@ -8811,6 +8917,7 @@ def _configure_client(
             base_url=base_url,
             require_receipt=conductor_require_receipt,
             lock_held=conductor_lock_held,
+            models=models,
         )
         return path, default_model, False
 
@@ -8860,7 +8967,9 @@ def _refresh_client_models(
     if client == "hermes":
         return _refresh_hermes_model(path, default_model)
     if client == "conductor":
-        _refresh_conductor_models(path, api_key, default_model, base_url=base_url)
+        _refresh_conductor_models(
+            path, api_key, default_model, models, base_url=base_url
+        )
         return default_model
     return _refresh_plugin_model(client, _json_config_path(client), default_model)
 
@@ -8978,6 +9087,9 @@ def _refresh_codex_models(
     harnesses = admin_defaults.coding_agent_settings(
         api_key, _statusline_origin(base_url)
     )
+    native_windows = _codex_bundled_context_windows(
+        shutil.which("codex") or _codex_app_bundled_cli()
+    )
     with codex_config_lock(path):
         existing, existing_data = _read_codex_config(path)
         state_path = path.parent / "ramp-router-state.json"
@@ -9028,7 +9140,9 @@ def _refresh_codex_models(
             picker_catalog = _compact_codex_catalog(
                 router_catalog, compact_models, default_model
             )
-        catalog_body = _render_codex_catalog(picker_catalog, default_model)
+        catalog_body = _render_codex_catalog(
+            picker_catalog, default_model, models, native_windows=native_windows
+        )
         writes: list[tuple[Path, str]] = []
         original_receipt = dict(receipt)
         receipt[CODEX_ROUTER_CATALOG_DIGEST_KEY] = _content_digest(catalog_body)
@@ -9050,7 +9164,7 @@ def _refresh_codex_models(
             if existing_data.get("model_instructions_file") == str(
                 instructions_path.resolve()
             ):
-                prompt = _codex_harness_prompt(default_model)
+                prompt = _codex_harness_prompt(default_model, router_models=models)
                 if prompt:
                     writes.append((instructions_path, prompt))
         _write_model_files(writes, "codex")
@@ -9058,11 +9172,22 @@ def _refresh_codex_models(
 
 
 def _refresh_conductor_models(
-    path: Path, api_key: str, default_model: str, *, base_url: str | None
+    path: Path,
+    api_key: str,
+    default_model: str,
+    models: list[RouterModel],
+    *,
+    base_url: str | None,
 ) -> None:
     """Rewrite the isolated Codex home's catalog and ``model``; nothing else."""
+    vendored_codex = conductor.vendored_binary("codex")
     router_catalog = _render_codex_catalog(
-        _fetch_codex_catalog(api_key, base_url=base_url), default_model
+        _fetch_codex_catalog(api_key, base_url=base_url),
+        default_model,
+        models,
+        native_windows=_codex_bundled_context_windows(
+            vendored_codex if vendored_codex.is_file() else None
+        ),
     )
     if not _conductor_receipt_enrolls(_conductor_state_path(path)):
         raise _not_configured("conductor")
@@ -9080,11 +9205,11 @@ def _refresh_conductor_models(
             (config_path, _with_root_model(config_path, existing, data, default_model))
         )
         if data.get("model_instructions_file"):
-            vendored_codex = conductor.vendored_binary("codex")
             prompt = _codex_harness_prompt_from(
                 vendored_codex if vendored_codex.is_file() else None,
                 default_model,
                 bundled=True,
+                router_models=models,
             )
             if prompt:
                 writes.append((codex_home / "ramp-router-instructions.md", prompt))
@@ -10353,7 +10478,13 @@ def _compact_codex_catalog(
     return {**catalog, "models": [*visible, *hidden]}
 
 
-def _render_codex_catalog(catalog: dict, selected_model: str) -> str:
+def _render_codex_catalog(
+    catalog: dict,
+    selected_model: str,
+    router_models: list[RouterModel],
+    *,
+    native_windows: dict[str, int] | None = None,
+) -> str:
     """Bound a validated catalog while retaining Codex's current selection."""
     models = catalog["models"]
     limited = list(models[:CODEX_CATALOG_MODEL_LIMIT])
@@ -10367,7 +10498,84 @@ def _render_codex_catalog(catalog: dict, selected_model: str) -> str:
         )
     if selected is not None and selected not in limited:
         limited[-1] = selected
-    return json.dumps({**catalog, "models": limited}, indent=2) + "\n"
+
+    # Codex's projection omits pricing. Reuse discovery rather than fetching
+    # it again, matching canonical names before unambiguous promoted slugs.
+    by_name = {
+        name: model
+        for model in router_models
+        for name in (model.id, model.metadata.request_name)
+        if name
+    }
+    by_display: dict[str, list[RouterModel]] = {}
+    for model in router_models:
+        by_display.setdefault(model.metadata.display_name, []).append(model)
+    for name, matches in by_display.items():
+        if name and len(matches) == 1:
+            by_name.setdefault(name, matches[0])
+    capped = []
+    for row in limited:
+        model = by_name.get(row["slug"])
+        threshold = model.metadata.long_context_token_threshold if model else None
+        overrides = {}
+        if model is not None:
+            identity = (
+                model.metadata.provider_model or model.metadata.request_name or model.id
+            )
+            is_gpt = _GPT_MODEL_ID.search(identity) is not None
+            native_max = None
+            if is_gpt:
+                native_max = next(
+                    (
+                        native_windows[name]
+                        for name in (
+                            model.metadata.provider_model,
+                            model.metadata.request_name,
+                            model.id,
+                        )
+                        if native_windows and name in native_windows
+                    ),
+                    None,
+                )
+                if native_max is None and threshold is None:
+                    capped.append(row)
+                    continue
+            reported = row.get("max_context_window")
+            if (
+                not isinstance(reported, int)
+                or isinstance(reported, bool)
+                or reported <= 0
+            ):
+                reported = model.metadata.context_window
+            if is_gpt:
+                # GPT fallbacks reserve output plus 50k headroom tokens while
+                # retaining the whole standard-price window.
+                maximum = (
+                    native_max
+                    if native_max is not None
+                    else max(
+                        threshold, reported - model.metadata.max_output_tokens - 50_000
+                    )
+                )
+                maximum = min(maximum, reported, model.metadata.context_window)
+                overrides["max_context_window"] = maximum
+                threshold = (
+                    min(threshold, maximum) if threshold is not None else maximum
+                )
+            else:
+                # Other families retain their full override ceiling and reserve
+                # 20% by default instead of using GPT's pricing/output budgets.
+                maximum = min(reported, model.metadata.context_window)
+                overrides["max_context_window"] = maximum
+                threshold = max(1, maximum * 4 // 5)
+        if threshold is not None:
+            # Cap defaults without removing explicit extended-context overrides.
+            # GPT pricing thresholds are inclusive; other families reserve 20%.
+            window = row.get("context_window")
+            if isinstance(window, int) and window > threshold:
+                overrides["context_window"] = threshold
+        capped.append({**row, **overrides} if overrides else row)
+    return json.dumps({**catalog, "models": capped}, indent=2) + "\n"
 
 
 def _codex_provider_is_out_of_date(existing: dict) -> bool:
@@ -10458,6 +10666,9 @@ def _configure_codex(
     admin_default = admin_defaults.admin_default_model(
         CODEX_CLIENT_NAME, api_key, _statusline_origin(base_url)
     )
+    native_windows = _codex_bundled_context_windows(
+        shutil.which("codex") or _codex_app_bundled_cli()
+    )
     with codex_config_lock(path):
         if strict_model and (
             _stored_router_api_key("codex", path) != api_key
@@ -10480,6 +10691,7 @@ def _configure_codex(
             admin_default=admin_default,
             model_view=model_view,
             compact_models=compact_models,
+            native_windows=native_windows,
         )
 
 
@@ -10498,6 +10710,7 @@ def _configure_codex_in_lock(
     admin_default: str | None = None,
     model_view: str | None = None,
     compact_models: list[RouterModel] | None = None,
+    native_windows: dict[str, int] | None = None,
 ) -> tuple[str, bool]:
     existing, existing_data = _read_codex_config(path)
     if selected_model is None:
@@ -10544,7 +10757,9 @@ def _configure_codex_in_lock(
         picker_catalog = _compact_codex_catalog(
             router_catalog, compact_models, default_model
         )
-    router_catalog_body = _render_codex_catalog(picker_catalog, default_model)
+    router_catalog_body = _render_codex_catalog(
+        picker_catalog, default_model, models, native_windows=native_windows
+    )
     chunks = _config_chunks(existing)
     repaired = _codex_provider_is_out_of_date(existing_data)
 
@@ -10552,7 +10767,7 @@ def _configure_codex_in_lock(
     # recorded there along with what it was written to hold, and both depend
     # on the model this run settles on.
     instructions_path = path.parent / "ramp-router-instructions.md"
-    harness_prompt = _codex_harness_prompt(default_model)
+    harness_prompt = _codex_harness_prompt(default_model, router_models=models)
     if (
         harness_prompt is None
         and existing_data.get("model_provider") == ROUTER_PROVIDER

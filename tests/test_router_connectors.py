@@ -85,7 +85,10 @@ def test_combined_login_requests_explicit_consent_and_retains_old_grant_on_incom
         wait_for_code=lambda *a, **kw: "code",
         shutdown=lambda: None,
     )
-    monkeypatch.setattr(oauth, "start_pkce_callback", lambda: callback)
+    started = {}
+    monkeypatch.setattr(
+        oauth, "start_pkce_callback", lambda **kw: started.update(kw) or callback
+    )
     urls = []
     monkeypatch.setattr(oauth, "_open_browser", lambda url: urls.append(url) or True)
     client = setup(
@@ -95,11 +98,39 @@ def test_combined_login_requests_explicit_consent_and_retains_old_grant_on_incom
     monkeypatch.setattr(client, "ensure_edge_access", lambda **kw: None)
     with pytest.raises(RampCLIError, match="Connector authorization required"):
         client.login(connectors=True)
+    assert started == {"success_redirect": "https://app.router.com/connectors"}
     query = parse_qs(urlsplit(urls[0]).query)
     assert query["connectors"] == ["1"]
     assert query["resource"] == [auth()["resource"]]
     assert query["client_id"] == [credentials.CLIENT_ID]
     assert client._load()["connector_authorization"] == auth()
+
+
+def test_connector_callback_sends_browser_to_connectors_page():
+    callback = oauth.start_pkce_callback(
+        success_redirect="https://app.router.com/connectors"
+    )
+    try:
+        with httpx.Client(trust_env=False, follow_redirects=False) as http:
+            denied = http.get(
+                callback.redirect_uri,
+                params={"state": callback.state, "error": "access_denied"},
+            )
+            assert denied.status_code == 200
+            assert "Authentication failed" in denied.text
+        callback.shutdown()
+        callback = oauth.start_pkce_callback(
+            success_redirect="https://app.router.com/connectors"
+        )
+        with httpx.Client(trust_env=False, follow_redirects=False) as http:
+            response = http.get(
+                callback.redirect_uri, params={"state": callback.state, "code": "c"}
+            )
+        assert response.status_code == 303
+        assert response.headers["location"] == "https://app.router.com/connectors"
+        assert callback.wait_for_code(0, timeout_message="not completed") == "c"
+    finally:
+        callback.shutdown()
 
 
 def test_shared_issuance_and_same_user_relogin_never_retargets_binding(monkeypatch):

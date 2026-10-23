@@ -173,6 +173,15 @@ is disabled and only session hooks are in use. They preserve plugin options,
 credentials, custom registrations, and config comments. An existing plugin path
 is left alone; use `ramp router refresh` for full setup repair.
 
+When Router states a long-context pricing band, setup caps the default context
+window at the last standard-priced input token, as Pi and OpenCode do. The
+separate `max_context_window` still permits explicit extended-context overrides;
+setup reads the installed Codex binary's `debug models --bundled` catalog for
+that ceiling. Without a matching entry, a model with long-context pricing uses
+`max(threshold, Router maximum - max output tokens - 50000)`, bounded by Router's
+advertised limits. Models without a threshold keep Router's maximum. This is not
+a billing guarantee: a large prompt or tool result can still cross the threshold.
+
 ## Router connectors MCP
 
 Set up Router login, connector tools, and your coding harnesses in one command:
