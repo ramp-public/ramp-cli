@@ -846,17 +846,14 @@ class RouterUserClient:
         *,
         json: dict,
         idempotency_key: str | None = None,
+        headers: dict | None = None,
         timeout: float = 30,
     ) -> dict:
         # A 401 retry only follows a rejected request; key creation also sends
         # an idempotency key so a retry can never mint a second secret.
-        return self._request(
-            "POST",
-            path,
-            json=json,
-            headers={"Idempotency-Key": idempotency_key} if idempotency_key else None,
-            timeout=timeout,
-        )
+        if idempotency_key:
+            headers = {**(headers or {}), "Idempotency-Key": idempotency_key}
+        return self._request("POST", path, json=json, headers=headers, timeout=timeout)
 
     def patch(self, path: str, *, json: dict, timeout: float = 30) -> dict:
         return self._request("PATCH", path, json=json, timeout=timeout)

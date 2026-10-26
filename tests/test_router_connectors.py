@@ -538,3 +538,76 @@ def test_saturated_bridge_keeps_cancellation_unblocked(monkeypatch):
     assert not timed_out
     assert len(output) == 1 and output[0]["id"] == 16
     assert output[0]["error"]["code"] == -32000
+
+
+def routed(handler):
+    """Answers the CLI's own session check and hands Router API calls to `handler`."""
+
+    def handle(request):
+        if request.url.path == "/api/auth/cli/session":
+            fresh = state()
+            fresh.pop("issued_at")
+            return httpx.Response(200, json=fresh)
+        return handler(request)
+
+    return handle
+
+
+ROW = {
+    "key": "slack",
+    "title": "Slack",
+    "availability": "self_service",
+    "connected": False,
+}
+
+
+def test_catalog_commands(monkeypatch):
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        if request.method == "POST":
+            return httpx.Response(200, json={"url": "https://slack.com/oauth"})
+        return httpx.Response(
+            200,
+            json=[{**ROW, "credentials": ["secret"]}]
+            if request.method == "GET"
+            else ROW,
+        )
+
+    setup(monkeypatch, routed(handler))
+    monkeypatch.setattr(oauth, "_open_browser", lambda url: pytest.fail("opened"))
+
+    def run(*args):
+        return CliRunner().invoke(
+            cli, ["router", "connectors", *args, "--output", "json"]
+        )
+
+    listed = json.loads(run("list").output)
+    assert listed["available"] and listed["connectors"][0]["key"] == "slack"
+    assert "credentials" not in listed["connectors"][0]
+    assert (
+        json.loads(run("connect", "slack", "--no-browser").output)["url"]
+        == "https://slack.com/oauth"
+    )
+    assert seen[-1].headers["Origin"] == "https://app.router.com"
+    assert json.loads(run("disconnect", "slack").output)["connector"]["key"] == "slack"
+    assert (seen[-1].method, seen[-1].url.path) == ("DELETE", "/admin/connectors/slack")
+    assert run("connect", "../keys").exit_code != 0
+
+
+def test_catalog_reports_connectors_off(monkeypatch):
+    setup(
+        monkeypatch,
+        routed(
+            lambda request: httpx.Response(404, json={"error": {"code": "not_found"}})
+        ),
+    )
+    result = CliRunner().invoke(
+        cli, ["router", "connectors", "list", "--output", "json"]
+    )
+    assert json.loads(result.output) == {
+        "contract_version": 1,
+        "available": False,
+        "connectors": [],
+    }

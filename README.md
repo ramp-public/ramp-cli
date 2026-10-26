@@ -219,6 +219,18 @@ connector registration, run `ramp router connectors disable --harness claude-cod
 Unrelated harness settings and MCP servers are preserved; foreign or customized
 `ramp-connectors` entries are not overwritten.
 
+To see and change the services (Slack, Linear, Notion…) you've connected:
+
+```bash
+ramp router connectors list
+ramp router connectors connect slack
+ramp router connectors disconnect slack
+```
+
+`connect` opens the service's consent page in your default browser, which must be
+signed in to Router as you. `disconnect` also removes the connection from other
+Ramp products.
+
 Connector setup uses **Router account authentication**, not `ramp auth login`
 (Developer API authentication). Supported deployments are the public, internal,
 QA, and internal QA Router origins. Capability discovery is available through

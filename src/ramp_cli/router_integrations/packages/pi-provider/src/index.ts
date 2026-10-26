@@ -115,6 +115,7 @@ const PI_THINKING_LEVELS = [
 ] as const
 
 type RouterApi = "openai-responses" | "anthropic-messages"
+type NativeModel = Model<"openai-responses"> | Model<"anthropic-messages">
 type RouterOwner = "anthropic" | "openai" | "other"
 // Discovery owns this classification; Pi's Responses adapter also serves
 // non-OpenAI Router models, so API alone is not enough to enable native tools.
@@ -138,6 +139,34 @@ function modelBaseURL(api: RouterApi, routerBaseURL: string): string {
     : routerBaseURL
 }
 
+function withNativeModelMetadata(model: RouterModel, native?: NativeModel): RouterModel {
+  if (native?.promptCache && model.routerOwner !== "other") {
+    model = { ...model, promptCache: { ...native.promptCache, ...model.promptCache } }
+  }
+  if (model.api === "anthropic-messages") {
+    const compat = { ...native?.compat, ...model.compat }
+    // Opus 5.5 rejects budget-based and disabled thinking.
+    if (model.id === "claude-opus-5-5") {
+      return {
+        ...model,
+        reasoning: true,
+        thinkingLevelMap: { ...model.thinkingLevelMap, off: null },
+        compat: { ...compat, forceAdaptiveThinking: true },
+      }
+    }
+    return native?.compat ? { ...model, compat } : model
+  }
+  const nativeCompat = native?.api === "openai-responses" ? native.compat : undefined
+  const explicitCache = nativeCompat?.supportsExplicitPromptCacheMode ??
+    (!native && supportsExplicitPromptCacheMode(model.id) ? true : undefined)
+  const compat = {
+    ...(model.routerOwner === "openai" ? nativeCompat : {}),
+    ...(explicitCache !== undefined ? { supportsExplicitPromptCacheMode: explicitCache } : {}),
+    ...model.compat,
+  }
+  return Object.keys(compat).length > 0 ? { ...model, compat } : model
+}
+
 async function hostApi(providerId: string): Promise<ProviderStreams> {
   // Pi only makes its public package roots available to path-installed
   // extensions. Resolve the built-in adapter through the host runtime instead
@@ -150,52 +179,22 @@ async function hostApi(providerId: string): Promise<ProviderStreams> {
   const provider = runtime.getProvider(providerId)
   if (!provider) throw new Error(`Pi's ${providerId} provider is unavailable`)
 
-  const withNativeCompat = (model: RouterModel): RouterModel => {
-    if (providerId === "anthropic") {
-      // Anthropic models need Pi's model-specific thinking compatibility.
-      const native = provider.getModels().find(
-        (candidate) => candidate.id === model.id && candidate.api === model.api,
-      )
-      const compat = { ...native?.compat, ...model.compat }
-      if (model.id === "claude-opus-5-5") {
-        // Older Pi hosts don't know Opus 5.5 yet. Its Messages API rejects
-        // both budget-based and disabled thinking, even when a local override
-        // tries to turn reasoning off. Keep Pi's adapter on adaptive.
-        return {
-          ...model,
-          reasoning: true,
-          thinkingLevelMap: { ...model.thinkingLevelMap, off: null },
-          compat: { ...compat, forceAdaptiveThinking: true },
-        }
-      }
-      return native?.compat ? { ...model, compat } : model
-    }
-    // Only Router models discovered as OpenAI inherit native tool behavior.
-    // Old caches without ownership remain usable with cache-only compat.
-    // Router can serve GPT models before Pi lists them (e.g. gpt-6-sol).
+  const withNativeMetadata = (model: RouterModel): RouterModel => {
     const native = provider.getModels().find(
-      (candidate): candidate is Model<"openai-responses"> =>
-        candidate.id === model.id && candidate.api === "openai-responses",
+      (candidate): candidate is NativeModel => candidate.id === model.id && candidate.api === model.api,
     )
-    const explicitCache = native?.compat?.supportsExplicitPromptCacheMode ??
-      (!native && supportsExplicitPromptCacheMode(model.id) ? true : undefined)
-    const compat = {
-      ...(model.routerOwner === "openai" ? native?.compat : {}),
-      ...(explicitCache !== undefined ? { supportsExplicitPromptCacheMode: explicitCache } : {}),
-      ...model.compat,
-    }
-    return Object.keys(compat).length > 0 ? { ...model, compat } : model
+    return withNativeModelMetadata(model, native)
   }
 
   return {
-    stream: (model, context, options) => provider.stream(withNativeCompat(model as RouterModel), context, options),
+    stream: (model, context, options) => provider.stream(withNativeMetadata(model as RouterModel), context, options),
     streamSimple: (model, context, options) =>
-      provider.streamSimple(withNativeCompat(model as RouterModel), context, options),
+      provider.streamSimple(withNativeMetadata(model as RouterModel), context, options),
   }
 }
 
 type HostSupport = {
-  modelIDs: ReadonlyMap<RouterApi, ReadonlySet<string>>
+  models: ReadonlyMap<RouterApi, ReadonlyMap<string, NativeModel>>
   /** Pi's built-in classifiers by API; empty on hosts before classifier support. */
   classifiers: ReadonlyMap<ClassifierApi, ProviderClassifier>
   /** OpenAI's Decisions models in Pi's catalog, with the window Pi states for each. */
@@ -203,7 +202,7 @@ type HostSupport = {
 }
 
 async function hostSupport(): Promise<HostSupport> {
-  const ids = new Map<RouterApi, ReadonlySet<string>>()
+  const models = new Map<RouterApi, ReadonlyMap<string, NativeModel>>()
   const classifiers = new Map<ClassifierApi, ProviderClassifier>()
   const decisionModels = new Map<string, number>()
   try {
@@ -219,7 +218,11 @@ async function hostSupport(): Promise<HostSupport> {
       ["anthropic-messages", "anthropic"],
       ["openai-responses", "openai"],
     ] as const) {
-      ids.set(api, new Set(runtime.getProvider(provider)?.getModels().map((model) => model.id)))
+      models.set(api, new Map(
+        runtime.getProvider(provider)?.getModels()
+          .filter((model): model is NativeModel => model.api === api)
+          .map((model) => [model.id, model]),
+      ))
     }
     // Classifier models arrived with Pi 0.99, OpenAI's Decisions models with
     // 1.1. A host can run a Router classifier API only if the built-in
@@ -240,7 +243,7 @@ async function hostSupport(): Promise<HostSupport> {
     // No native compatibility catalog means neither adapter can safely
     // advertise Router models until Pi loads on the next launch.
   }
-  return { modelIDs: ids, classifiers, decisionModels }
+  return { models, classifiers, decisionModels }
 }
 
 /**
@@ -707,7 +710,7 @@ function routerProvider(
   // entry. Router-owned models still use the Responses adapter without one.
   const isSupportedByPi = (model: RouterModel) =>
     model.routerOwner === "other" ||
-    host.modelIDs.get(model.api)?.has(model.id) === true
+    host.models.get(model.api)?.has(model.id) === true
   // Pi owns the effective credential, including runtime --api-key
   // overrides. Filter against that exact resolved value instead of trying
   // to infer whether a refresh credential came from disk or runtime state.
@@ -893,6 +896,7 @@ function routerProvider(
       cost: composed.cost,
       contextWindow: composed.contextWindow,
       maxTokens: composed.maxTokens,
+      ...(composed.promptCache === undefined ? {} : { promptCache: composed.promptCache }),
       ...(composed.samplingParams === undefined
         ? {}
         : { samplingParams: composed.samplingParams }),
@@ -1040,7 +1044,11 @@ function routerProvider(
   }
   const hostRunsClassifier = (classifier: RouterClassifier) =>
     host.classifiers.has(classifier.api)
-  const getModels = () => copyModels(currentModels.filter(isSupportedByPi))
+  // The warmer checks TTL and replay safety before calling our stream adapter.
+  const getModels = () => copyModels(currentModels.filter(isSupportedByPi).map((model) => {
+    const native = host.models.get(model.api)?.get(model.id)
+    return withNativeModelMetadata(model, native)
+  }))
   const registeredProvider = {
     ...provider,
     getModels,
@@ -1617,8 +1625,13 @@ function cachedRouterModel(value: unknown, baseUrl: string): RouterModel | undef
 
 // System One reads text only; Decisions also judges images.
 function cachedClassifierInput(api: ClassifierApi, input: unknown[]): boolean {
-  const allowed = api === "openai-decisions" ? [["text"], ["text", "image"]] : [["text"]]
-  return allowed.some((modalities) => modalities.join() === input.join())
+  const allowed = api === "openai-decisions" ? ["text", "image"] : ["text"]
+  // Router does not fix the order of a model's modalities.
+  return (
+    input.includes("text") &&
+    new Set(input).size === input.length &&
+    input.every((kind) => allowed.includes(kind as string))
+  )
 }
 
 function cachedRouterClassifier(value: unknown, baseUrl: string): RouterClassifier | undefined {

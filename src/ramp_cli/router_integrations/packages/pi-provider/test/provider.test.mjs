@@ -501,7 +501,7 @@ describe("Pi provider extension", () => {
         return id === "openai" && native
           ? { ...native, getModels: () => [
               ...native.getModels(),
-              ...fixtureIDs.map((id) => ({ id, compat: {} })),
+              ...fixtureIDs.map((id) => ({ id, api: "openai-responses", compat: {} })),
             ] }
           : native
       }
@@ -1648,6 +1648,7 @@ describe("Pi provider extension", () => {
         cacheWrite: 4,
       },
       contextWindow: 64_000,
+      promptCache: { short: 120 },
       maxTokens: 4_096,
       samplingParams: { temperature: 0.25 },
       compat: {
@@ -3156,15 +3157,28 @@ describe("Router OpenAI Decisions classifiers", () => {
       [LUNA_MODEL],
     )
 
-    // System One models read text only, so an image-capable one is not ours.
     const cachePath = join(process.env.PI_CODING_AGENT_DIR, "ramp-router-model-cache.json")
     const cache = JSON.parse(readFileSync(cachePath, "utf8"))
+    // Router may list modalities in either order.
     writeFileSync(cachePath, JSON.stringify({
       ...cache,
-      classifiers: [{ ...JEV_MODEL, input: ["text", "image"] }],
+      classifiers: [{ ...LUNA_MODEL, input: ["image", "text"] }],
     }))
-    const { provider: restored } = await register()
-    assert.deepEqual(restored.getModels(), [])
+    const { provider: reordered } = await register()
+    assert.deepEqual(
+      reordered.getAllModels().filter(({ type }) => type === "classifier"),
+      [{ ...LUNA_MODEL, input: ["image", "text"] }],
+    )
+
+    // System One models read text only, so an image-capable one is not ours.
+    for (const input of [["text", "image"], ["image"], ["text", "text"]]) {
+      writeFileSync(cachePath, JSON.stringify({
+        ...cache,
+        classifiers: [{ ...JEV_MODEL, input }, { ...LUNA_MODEL, input: ["image"] }],
+      }))
+      const { provider: restored } = await register()
+      assert.deepEqual(restored.getModels(), [])
+    }
   })
 })
 

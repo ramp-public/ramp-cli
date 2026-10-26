@@ -1,12 +1,83 @@
 from __future__ import annotations
 
+import re
+
 import click
 
+from ramp_cli.auth import oauth
 from ramp_cli.client.router_user import RouterUserClient, selected_origin
 from ramp_cli.commands import router_credentials
 from ramp_cli.commands.router_user import _output
-from ramp_cli.errors import RampCLIError
+from ramp_cli.errors import ApiError, RampCLIError
+from ramp_cli.output.formatter import resolve_format
 from ramp_cli.router_connectors import auth, harnesses
+
+# The fields `connectors list` promises; the rest of Router's row is internal.
+CATALOG_FIELDS = (
+    "key",
+    "title",
+    "description",
+    "logo_url",
+    "availability",
+    "connected",
+    "internal_service",
+    "company_setup_required",
+)
+_CONNECTOR_KEY = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def _catalog_row(row: dict) -> dict:
+    return {field: row.get(field) for field in CATALOG_FIELDS}
+
+
+def _connector_path(key: str, suffix: str = "") -> str:
+    if not _CONNECTOR_KEY.match(key):
+        raise click.BadParameter("Expected a connector key such as 'slack'.")
+    return f"/admin/connectors/{key}{suffix}"
+
+
+def _not_found(key: str) -> RampCLIError:
+    return RampCLIError(
+        f"No connector '{key}' is available to you in Router. "
+        "Run `ramp router connectors list` to see them."
+    )
+
+
+def catalog(client: RouterUserClient) -> dict:
+    """The connectors this member can see in Router, and which they've connected.
+    Router answers 404 when connectors aren't on for the account."""
+    try:
+        rows = client.get("/admin/connectors")
+    except ApiError as error:
+        if error.status_code != 404:
+            raise
+        rows, available = [], False
+    else:
+        available = True
+    return {
+        "contract_version": 1,
+        "available": available,
+        "connectors": [_catalog_row(row) for row in rows],
+    }
+
+
+def connect_url(client: RouterUserClient, key: str) -> str:
+    """The provider's consent page. It returns to Router's web app (named by Origin),
+    so the browser that opens it must be signed in to Router as the same person."""
+    path = _connector_path(key, "/connect-url")
+    try:
+        body = client.post(path, json={}, headers={"Origin": client.origin})
+    except ApiError as error:
+        raise _not_found(key) if error.status_code == 404 else error from None
+    return body["url"]
+
+
+def disconnect(client: RouterUserClient, key: str) -> dict:
+    path = _connector_path(key)
+    try:
+        return _catalog_row(client.delete(path))
+    except ApiError as error:
+        raise _not_found(key) if error.status_code == 404 else error from None
 
 
 def _renew_other_harnesses(clients: tuple[str, ...], binding: str) -> None:
@@ -116,7 +187,10 @@ def register(group: click.Group) -> None:
             ctx,
             {
                 "contract_version": 1,
-                "capabilities": ["router-connectors-mcp-v1"],
+                "capabilities": [
+                    "router-connectors-mcp-v1",
+                    "router-connectors-catalog-v1",
+                ],
                 "harnesses": list(harnesses.HARNESSES),
             },
         )
@@ -129,6 +203,59 @@ def register(group: click.Group) -> None:
             _output(ctx, auth.status(client))
         finally:
             client.close()
+
+    @connectors.command("list")
+    @click.pass_context
+    def list_connectors(ctx):
+        """Connectors you can use in Router, and whether you've connected each."""
+        client = _client(ctx)
+        try:
+            result = catalog(client)
+        finally:
+            client.close()
+        if not _human(ctx):
+            return _output(ctx, result)
+        if not result["available"]:
+            click.echo("Connectors aren't available for this Router account.")
+        for row in result["connectors"]:
+            state = "connected" if row["connected"] else row["availability"]
+            click.echo(f"{row['key']}: {row['title']} ({state})")
+
+    @connectors.command("connect")
+    @click.argument("key")
+    @click.option(
+        "--no-browser", is_flag=True, help="Print the link instead of opening it."
+    )
+    @click.pass_context
+    def connect(ctx, key, no_browser):
+        """Connect a service (e.g. slack) in your browser.
+
+        The browser must be signed in to Router as you: the service returns
+        there to finish. Run `ramp router connectors list` afterwards.
+        """
+        client = _client(ctx)
+        try:
+            url = connect_url(client, key)
+        finally:
+            client.close()
+        opened = not no_browser and oauth._open_browser(url)
+        if not _human(ctx):
+            return _output(
+                ctx, {"contract_version": 1, "key": key, "url": url, "opened": opened}
+            )
+        click.echo(f"Opened {key} in your browser." if opened else url)
+
+    @connectors.command("disconnect")
+    @click.argument("key")
+    @click.pass_context
+    def disconnect_connector(ctx, key):
+        """Remove your connection to a service, including in other Ramp products."""
+        client = _client(ctx)
+        try:
+            row = disconnect(client, key)
+        finally:
+            client.close()
+        _output(ctx, {"contract_version": 1, "connector": row})
 
     @connectors.command("enable")
     @click.option("--harness", required=True, type=click.Choice(harnesses.HARNESSES))
@@ -167,6 +294,15 @@ def register(group: click.Group) -> None:
             raise SystemExit(
                 error.code if isinstance(error, RampCLIError) else 1
             ) from None
+
+
+def _human(ctx: click.Context) -> bool:
+    if ctx.obj.get("agent_mode"):
+        return False
+    return (
+        resolve_format(ctx.obj.get("format"), ctx.obj.get("config_format", ""))
+        == "table"
+    )
 
 
 def _client(ctx: click.Context) -> RouterUserClient:
