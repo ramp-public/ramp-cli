@@ -645,6 +645,55 @@ def test_configure_connectors_does_not_retarget_unselected_harnesses(
     assert connector_harnesses.status("opencode")["state"] == "enabled"
 
 
+@pytest.mark.parametrize("same_account", [True, False])
+def test_connector_login_renews_only_same_account_registrations(
+    connector_setup, same_account
+):
+    runner = CliRunner()
+    first = runner.invoke(
+        cli, ["--human", "router", "configure", "codex", "--connectors"]
+    )
+    assert first.exit_code == 0, first.output
+    binding = connector_harnesses.status("codex")["binding_id"]
+    if not same_account:
+        path = connector_auth._binding_path(binding)
+        saved = json.loads(path.read_text())
+        saved["authorization"]["user_id"] = "another-user"
+        path.write_text(json.dumps(saved))
+    config = connector_harnesses.config_path("codex")
+    before = config.read_bytes()
+
+    result = runner.invoke(cli, ["--human", "router", "login", "--connectors"])
+
+    assert result.exit_code == 0, result.output
+    if same_account:
+        current = connector_harnesses.status("codex")["binding_id"]
+        assert current != binding
+        client = RouterUserClient(router_module.ROUTER_UI_URL)
+        try:
+            assert connector_auth.load_binding(current)["authorization"] == (
+                connector_auth.authorization(client)
+            )
+        finally:
+            client.close()
+    else:
+        assert config.read_bytes() == before
+    assert connector_harnesses.status("opencode")["state"] == "disabled"
+
+
+def test_connector_login_survives_unreadable_harness_config(
+    connector_setup, monkeypatch
+):
+    def unreadable(_harness):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(connector_harnesses, "status", unreadable)
+
+    result = CliRunner().invoke(cli, ["--human", "router", "login", "--connectors"])
+
+    assert result.exit_code == 0, result.output
+
+
 def test_configure_connectors_reports_failed_renewal(connector_setup, monkeypatch):
     runner = CliRunner()
     first = runner.invoke(

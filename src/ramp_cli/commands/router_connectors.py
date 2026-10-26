@@ -108,6 +108,24 @@ def _renew_other_harnesses(clients: tuple[str, ...], binding: str) -> None:
             harnesses.enable(harness, binding)
 
 
+def _registered(harness: str) -> bool:
+    try:
+        return harnesses.status(harness)["state"] == "enabled"
+    except RampCLIError:
+        return False
+
+
+def renew_after_login(client: RouterUserClient) -> None:
+    """Keep same-account connector registrations working after a new sign-in."""
+    try:
+        if not any(_registered(harness) for harness in harnesses.HARNESSES):
+            return
+        _renew_other_harnesses((), auth.create_binding(client))
+    except (RampCLIError, OSError):
+        # Sign-in succeeded. Any registration left stale still shows as a conflict.
+        pass
+
+
 def configure_harnesses(
     ctx: click.Context,
     clients: tuple[str, ...],

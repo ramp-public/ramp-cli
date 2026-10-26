@@ -1061,15 +1061,22 @@ def register_router_user_commands(
             timeout=timeout,
         ):
             return
-        _output_session(
-            ctx,
-            _client(ctx, ui_url).login(
+        client = _client(ctx, ui_url)
+        try:
+            session = client.login(
                 no_browser=no_browser,
                 timeout=timeout,
                 **({"connectors": True} if connectors else {}),
-            ),
-            title="Signed in to Router",
-        )
+            )
+            if connectors:
+                from ramp_cli.commands.router_connectors import (  # noqa: PLC0415
+                    renew_after_login,
+                )
+
+                renew_after_login(client)
+        finally:
+            client.close()
+        _output_session(ctx, session, title="Signed in to Router")
 
     @group.command(
         "status", help="Show Router user-login status without exposing credentials."
