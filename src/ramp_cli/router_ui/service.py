@@ -1294,7 +1294,7 @@ class RouterService:
         models = router._fetch_models(
             key,
             claude_code_view=True,
-            model_view_all=True,
+            model_view="all",
             base_url=router._configured_claude_code_router_url(path),
         )
         environment = claude_code.read_settings(path).get("env") or {}

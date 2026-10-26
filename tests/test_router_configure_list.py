@@ -53,7 +53,7 @@ def machine(monkeypatch):
             raise router.click.UsageError("Connect this harness to Router first.")
         yield harness.Connection(client, Path(f"/x/{client}.json"), SECRET, BASE_URL)
 
-    def fetch_models(key, *, claude_code_view=False, model_view_all=False, base_url):
+    def fetch_models(key, *, claude_code_view=False, model_view=None, base_url):
         assert (key, base_url) == (SECRET, BASE_URL)
         state["fetched"].append("models")
         return [

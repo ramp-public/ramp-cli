@@ -77,7 +77,7 @@ def _models(current: Connection):
     models = router._fetch_models(
         current.key,
         claude_code_view=current.client == "claude-code",
-        model_view_all=current.client == "claude-code",
+        model_view="all" if current.client == "claude-code" else None,
         base_url=current.base_url,
     )
     choices = [(model.metadata.display_name, model.id) for model in models]

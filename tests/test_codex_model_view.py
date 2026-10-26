@@ -164,7 +164,7 @@ def test_malformed_receipt_is_not_silently_replaced(tmp_path, state):
 
 @pytest.fixture
 def model_server(monkeypatch):
-    """Serve distinct Codex/all and Claude/compact views without network access."""
+    """Serve distinct Codex, compact, and full model views without network access."""
     requests = []
     catalog = {"models": [_row("recommended"), _row("other"), _row("legacy", "hide")]}
     state = {"fail_compact": False}
@@ -175,14 +175,14 @@ def model_server(monkeypatch):
             return httpx.Response(404, request=request)
         assert headers["Authorization"] == "Bearer test-key"
         client = headers.get("X-Gateway-Client")
-        requests.append(client)
+        view = headers.get("X-Gateway-Model-View")
+        requests.append(client or view)
         if client == "codex":
             return httpx.Response(200, json=copy.deepcopy(catalog), request=request)
-        if client == "claude-code":
-            all_models = headers.get("X-Gateway-Model-View") == "all"
-            if state["fail_compact"] and not all_models:
+        if view == "compact" or (client == "claude-code" and view != "all"):
+            if state["fail_compact"]:
                 return httpx.Response(503, request=request)
-            names = ["recommended", "other"] if all_models else ["recommended"]
+            names = ["recommended"]
         else:
             names = ["recommended", "other"]
         return httpx.Response(
@@ -253,7 +253,7 @@ def test_configure_compact_refresh_then_all_restores_server_visibility(
     catalog_path = home / router.CODEX_ROUTER_CATALOG
     _configure(runner, "all")
     assert json.loads(catalog_path.read_text()) == server_catalog
-    assert "claude-code" not in requests
+    assert "compact" not in requests
 
     configured = _configure(runner, "compact")
     data = json.loads(configured.output)["data"][0]
@@ -262,23 +262,23 @@ def test_configure_compact_refresh_then_all_restores_server_visibility(
     compact = json.loads(catalog_path.read_text())
     assert _visible(compact) == ["recommended"]
     assert router._configured_codex_model_view(home / "config.toml") == "compact"
-    assert requests.count("claude-code") == 1
+    assert requests.count("compact") == 1
     config = tomllib.loads((home / "config.toml").read_text())
     assert config["model_catalog_json"] == str(catalog_path)
 
     refreshed = runner.invoke(cli, ["--agent", "router", "refresh"])
     assert refreshed.exit_code == 0, refreshed.output
     assert json.loads(catalog_path.read_text()) == compact
-    assert requests.count("claude-code") == 2
+    assert requests.count("compact") == 2
 
     _configure(runner, "all")
     assert json.loads(catalog_path.read_text()) == server_catalog
     assert router._configured_codex_model_view(home / "config.toml") == "all"
-    assert requests.count("claude-code") == 2
+    assert requests.count("compact") == 2
     refreshed = runner.invoke(cli, ["--agent", "router", "refresh"])
     assert refreshed.exit_code == 0, refreshed.output
     assert json.loads(catalog_path.read_text()) == server_catalog
-    assert requests.count("claude-code") == 2
+    assert requests.count("compact") == 2
 
 
 @pytest.mark.parametrize("view", ["compact", "all"])
@@ -322,7 +322,7 @@ def test_configure_and_refresh_cap_context_without_extra_discovery(
             window if row["slug"] == "legacy" else ceiling
         )
     assert requests.count(None) == requests.count("codex") == 1
-    assert requests.count("claude-code") == (1 if view == "compact" else 0)
+    assert requests.count("compact") == (1 if view == "compact" else 0)
 
     state["pricing"]["long_context_token_threshold"] = 120_000
     result = runner.invoke(cli, ["--agent", "router", "refresh"])
@@ -335,7 +335,7 @@ def test_configure_and_refresh_cap_context_without_extra_discovery(
             window if row["slug"] == "legacy" else ceiling
         )
     assert requests.count(None) == requests.count("codex") == 2
-    assert requests.count("claude-code") == (2 if view == "compact" else 0)
+    assert requests.count("compact") == (2 if view == "compact" else 0)
     assert catalog == original
 
 
@@ -527,7 +527,7 @@ def test_refresh_honors_view_changed_during_discovery(
 
     def change_view(*args, **kwargs):
         result = fetch(*args, **kwargs)
-        if kwargs.get("claude_code_view"):
+        if kwargs.get("model_view") == "compact":
             state = json.loads(state_path.read_text())
             state[router.CODEX_MODEL_VIEW_KEY] = "all"
             state_path.write_text(json.dumps(state))
@@ -564,7 +564,7 @@ def test_new_connection_uses_compact_without_view_flag(tmp_path, model_server):
     assert _visible(json.loads((home / router.CODEX_ROUTER_CATALOG).read_text())) == [
         "recommended"
     ]
-    assert requests.count("claude-code") == 1
+    assert requests.count("compact") == 1
 
 
 def test_repeat_configure_without_view_flag_preserves_explicit_all(
@@ -575,7 +575,7 @@ def test_repeat_configure_without_view_flag_preserves_explicit_all(
     _configure(runner, "all")
     result = _configure(runner)
     assert json.loads(result.output)["data"][0]["model_view"] == "all"
-    assert "claude-code" not in requests
+    assert "compact" not in requests
     home = tmp_path / "codex"
     assert json.loads((home / router.CODEX_ROUTER_CATALOG).read_text()) == catalog
 

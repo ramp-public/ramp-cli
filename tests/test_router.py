@@ -149,7 +149,9 @@ def _mock_models(
                 "codex",
             }
         if "X-Gateway-Model-View" in headers:
-            assert headers["X-Gateway-Model-View"] == "all"
+            assert headers["X-Gateway-Model-View"] == (
+                "all" if "X-Gateway-Client" in headers else "compact"
+            )
         assert timeout == 10
         # A model naming "views" is listed only in those projections (None
         # is the generic one); every other model is listed in all of them.
@@ -1162,9 +1164,9 @@ def test_configure_setup_file_keeps_discovery_and_credits_on_its_router(
     assert [headers.get("X-Gateway-Client") for headers in model_headers] == [
         None,
         "codex",
-        "claude-code",
+        None,
     ]
-    assert "X-Gateway-Model-View" not in model_headers[-1]
+    assert model_headers[-1]["X-Gateway-Model-View"] == "compact"
 
 
 def test_configure_codex_keeps_the_setup_file_when_configuration_fails(
@@ -7509,9 +7511,9 @@ def test_configure_waits_for_a_browser_created_key_to_reach_the_data_plane(
         None,
         None,
         "codex",
-        "claude-code",
+        None,
     ]
-    assert "X-Gateway-Model-View" not in model_headers[-1]
+    assert model_headers[-1]["X-Gateway-Model-View"] == "compact"
     assert (codex_home / "ramp-router-key").read_text() == "router-secret"
 
 

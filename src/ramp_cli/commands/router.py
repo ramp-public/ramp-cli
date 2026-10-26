@@ -2202,7 +2202,7 @@ def _run_configure(
             models_by_client["claude-code"] = _fetch_models(
                 api_key,
                 claude_code_view=True,
-                model_view_all=True,
+                model_view="all",
                 base_url=base_url,
                 wait_for_key=setup_file is not None or newly_created_key,
             )
@@ -2924,7 +2924,7 @@ def _refresh_clients(
                         _fetch_models(
                             api_key,
                             claude_code_view=True,
-                            model_view_all=True,
+                            model_view="all",
                             base_url=base_url,
                         )
                         if claude_code_view
@@ -4270,7 +4270,7 @@ def router_subagents(
         models = _fetch_models(
             api_key,
             claude_code_view=True,
-            model_view_all=True,
+            model_view="all",
             base_url=_configured_claude_code_router_url(path),
         )
     models_by_id = {model.id: model for model in models}
@@ -9078,7 +9078,7 @@ def _refresh_codex_models(
     # Discovery before the lock, as in _configure_codex.
     router_catalog = _fetch_codex_catalog(api_key, base_url=base_url)
     compact_models = (
-        _fetch_models(api_key, claude_code_view=True, base_url=base_url)
+        _fetch_models(api_key, model_view="compact", base_url=base_url)
         if _configured_codex_model_view(path) == "compact"
         else None
     )
@@ -10248,7 +10248,7 @@ def _fetch_models(
     claude_code_view: bool = False,
     *,
     gateway_client: str | None = None,
-    model_view_all: bool = False,
+    model_view: str | None = None,
     base_url: str | None = None,
     wait_for_key: bool = False,
 ) -> list[RouterModel]:
@@ -10269,7 +10269,9 @@ def _fetch_models(
                         else {}
                     ),
                     **(
-                        {claude_code.MODEL_VIEW_HEADER: "all"} if model_view_all else {}
+                        {claude_code.MODEL_VIEW_HEADER: model_view}
+                        if model_view is not None
+                        else {}
                     ),
                 },
                 timeout=10,
@@ -10649,7 +10651,7 @@ def _configure_codex(
         )
     effective_view = model_view or _configured_codex_model_view(path)
     compact_models = (
-        _fetch_models(api_key, claude_code_view=True, base_url=base_url)
+        _fetch_models(api_key, model_view="compact", base_url=base_url)
         if effective_view == "compact"
         else None
     )
