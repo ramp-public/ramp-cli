@@ -11,6 +11,16 @@ const { sandbox, fixture } = require('./helpers');
 
 const bin = name => path.join(__dirname, '..', name === 'ramp' ? 'cli' : 'router', 'bin', `${name}.js`);
 
+test('only the known agent-enablement feature has a native version floor', () => {
+  const { requiredVersion } = require('../cli/lib/launch');
+  assert.equal(requiredVersion(['router', 'configure', '--enable-agent']), '0.2.71');
+  assert.equal(requiredVersion(['--no-input', 'router', 'configure', '--enable-agent']), '0.2.71');
+  assert.equal(requiredVersion(['router', '--human', 'configure', '--enable-agent']), '0.2.71');
+  for (const args of [[], ['router'], ['router', 'status'], ['auth', 'login'], ['router', 'configure'], ['router', 'configure', '--enable-agent', '--help'], ['--version']]) {
+    assert.equal(requiredVersion(args), null);
+  }
+});
+
 test('launcher preserves arguments and exit codes without editing global users shell settings', async t => {
   const p = sandbox(t);
   await install({ ...p, download: (await fixture(p.home)).download });
@@ -125,6 +135,50 @@ test('SIGTERM remains a termination signal rather than becoming exit zero', { ti
   const [code, signal] = await completion;
   assert.equal(code, null, stderr);
   assert.equal(signal, 'SIGTERM');
+});
+
+for (const [signal, exitCode, mode = 'ramp'] of [
+  ['SIGINT', null], ['SIGTERM', null], ['SIGHUP', null], ['SIGINT', 130], ['SIGINT', 130, 'router'],
+]) test(`${mode}: ${signal} during auto-update${exitCode ? ` handled as exit ${exitCode}` : ''} cancels the launch without running the requested write`, { timeout: 10_000, skip: process.platform === 'win32' }, async t => {
+  const p = sandbox(t);
+  const other = path.join(p.home, 'other bin');
+  fs.mkdirSync(other);
+  const log = path.join(p.home, 'invocations.jsonl');
+  fs.writeFileSync(path.join(other, 'ramp'), `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.ROUTER_TEST_LOG, JSON.stringify(args) + '\\n');
+if (args[0] === '--version') console.log('ramp, version 0.1.0');
+else if (args.includes('update')) {
+  // Like Click Abort in the real CLI, handle SIGINT with a numeric exit status.
+  if (${exitCode} === 130) process.on('SIGINT', () => process.exit(130));
+  setInterval(() => {}, 1000); console.error('UPDATE_READY');
+}
+else { console.log('REQUESTED_WRITE_RAN'); }
+`, { mode: 0o755 });
+  const script = `
+process.getuid = () => 1000;
+Object.defineProperty(process.stdin, 'isTTY', { value: true });
+Object.defineProperty(process.stderr, 'isTTY', { value: true });
+require(${JSON.stringify(require.resolve('../cli/package.json'))}).nativeCliVersion = '1.0.0';
+process.argv = [process.execPath, ${JSON.stringify(bin(mode))}, ...${JSON.stringify(mode === 'ramp' ? ['funds', 'create'] : ['configure'])}];
+require(${JSON.stringify(bin(mode))});
+`;
+  const child = spawn(process.execPath, ['-e', script], { env: { ...p.env, RAMP_CLI_VERSION: '', RAMP_NO_UPDATE_CHECK: '', PATH: `${other}:${p.runtimePath}`, ROUTER_TEST_LOG: log }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stderr = '', stdout = '';
+  child.stdout.on('data', chunk => { stdout += chunk; });
+  const ready = new Promise(resolve => child.stderr.on('data', chunk => { stderr += chunk; if (stderr.includes('UPDATE_READY')) resolve(); }));
+  const completion = once(child, 'exit');
+  t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); });
+  await ready;
+  child.kill(signal);
+  const [code, actualSignal] = await completion;
+  assert.equal(actualSignal, exitCode ? null : signal, stderr);
+  assert.equal(code, exitCode, stderr);
+  assert.equal(stdout, '');
+  assert.deepEqual(fs.readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line)), [['--version'], ['--version'], ['--no-input', 'update']]);
+  assert.equal(fs.existsSync(path.join(p.root, '.existing-update-lock')), false);
+  assert.equal(fs.existsSync(path.join(p.root, '.existing-update-attempt')), false);
 });
 
 test('the launcher answers update for a managed CLI and gives it a guarded PATH', async t => {

@@ -6,6 +6,14 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { postinstall, globalPackage } = require('../cli/lib/postinstall');
+const { launchUpdate } = require('../cli/lib/launch');
+
+test('install-time CLI resolution also uses the network-bounded updater', async () => {
+  await postinstall('ramp', { env: {}, resolveCLI: async ({ update }) => {
+    assert.equal(update, launchUpdate);
+    return '/test/ramp';
+  } });
+});
 
 test('interactive global Router install opens the workspace once', async () => {
   const calls = [];

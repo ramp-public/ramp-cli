@@ -10,6 +10,7 @@ const { isUpdateCommand } = require('./update-guard');
 const { installationContext } = require('./npm-context');
 const { exposeCommand, refreshPath } = require('./commands');
 const { onboardingSession, informational } = require('./onboarding');
+const { updateNetwork } = require('./update-network');
 
 // True when this package sits in a global npm install (not npx's cache or a
 // project's node_modules). Lifecycle scripts may have been skipped
@@ -50,7 +51,7 @@ function stableRampDir(executable, env = process.env) {
 
 const managed = executable => path.resolve(executable).startsWith(`${paths().root}${path.sep}`);
 
-async function launch(executable, args, stdio = 'inherit', workspace = false) {
+async function launch(executable, args, stdio = 'inherit', workspace = false, networkTimeouts = false) {
   const env = { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' };
   // Let native Router choose the workspace or help using its terminal checks.
   if (workspace) env.RAMP_TUI = '1';
@@ -70,7 +71,8 @@ async function launch(executable, args, stdio = 'inherit', workspace = false) {
     const dir = stableRampDir(executable, env);
     if (dir) env.PATH = `${dir}${path.delimiter}${env.PATH || ''}`;
   }
-  const child = spawn(executable, args, { stdio, env, shell: false });
+  const network = networkTimeouts ? updateNetwork(env) : null;
+  const child = spawn(executable, args, { stdio, env: network?.env || env, shell: false });
   const handlers = new Map(['SIGINT', 'SIGTERM', 'SIGHUP'].map(signal => [signal, () => child.kill(signal)]));
   for (const [signal, handler] of handlers) process.on(signal, handler);
   try {
@@ -80,7 +82,18 @@ async function launch(executable, args, stdio = 'inherit', workspace = false) {
     });
   } finally {
     for (const [signal, handler] of handlers) process.removeListener(signal, handler);
+    network?.cleanup();
   }
+}
+
+const launchUpdate = (file, args, stdio) => launch(file, args, stdio, false, true);
+
+function requiredVersion(args) {
+  // This flag shipped in 0.2.71. Do not require every reused CLI to match the
+  // launcher release, or offline/package-manager users lose working commands.
+  if (informational(args)) return null;
+  const router = args.indexOf('router');
+  return router >= 0 && args.indexOf('configure', router + 1) > router && args.includes('--enable-agent') ? '0.2.71' : null;
 }
 
 async function main(mode, args) {
@@ -88,7 +101,10 @@ async function main(mode, args) {
   const session = workspace ? onboardingSession(args) : null;
   let result;
   try {
-    const executable = await resolveCLI({ command: workspace ? 'router' : 'ramp', package: mode === 'router' ? '@ramp/router' : '@ramp/cli', session, update: launch, forUpdate: mode === 'ramp' && args.includes('update') });
+    const nativeArgs = mode !== 'router' ? args
+      : args.some(arg => ['--version', '-V'].includes(arg)) ? ['--version']
+        : ['router', ...args];
+    const executable = await resolveCLI({ command: workspace ? 'router' : 'ramp', package: mode === 'router' ? '@ramp/router' : '@ramp/cli', session, update: launchUpdate, autoUpdate: Boolean(process.stdin.isTTY && process.stderr.isTTY), forUpdate: mode === 'ramp' && args.includes('update'), requiredVersion: requiredVersion(nativeArgs) });
     if (globalLayout()) {
       try { syncReceipt({ command: mode, package: require('./postinstall').globalPackage(mode), globalInstall: true }); }
       catch { /* A receipt we cannot refresh must not block launching. */ }
@@ -107,10 +123,12 @@ async function main(mode, args) {
         else exposeCommand({ command: mode, nativeExecutable: executable });
       } catch (error) { console.error(`${error.message}\nThe CLI installation succeeded.`); }
     }
-    const nativeArgs = mode !== 'router' ? args
-      : args.some(arg => ['--version', '-V'].includes(arg)) ? ['--version']
-        : ['router', ...args];
     result = await launch(executable, nativeArgs, session?.stdio || 'inherit', workspace);
+  } catch (error) {
+    if (!error.signal) throw error;
+    // Mirror an interrupted updater just like an interrupted native command,
+    // after resolution has released its lock and the terminal session closes.
+    result = { code: null, signal: error.signal };
   } finally { session?.close(); }
   if (workspace && (result.signal || (result.code !== 0 && result.code !== 2))) console.error('Ramp CLI remains installed. Retry `router` from an interactive terminal.');
   process.exitCode = result.code ?? (128 + (constants.signals[result.signal] || 1));
@@ -122,4 +140,4 @@ async function main(mode, args) {
   }
 }
 
-module.exports = { main, launch, globalLayout, stableRampDir };
+module.exports = { main, launch, launchUpdate, globalLayout, stableRampDir, requiredVersion };

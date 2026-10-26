@@ -3,7 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { resolveCLI } = require('./existing-cli');
-const { launch } = require('./launch');
+const { launch, launchUpdate } = require('./launch');
 const { shouldOnboard, onboardingSession } = require('./onboarding');
 
 const packageName = file => { try { return JSON.parse(fs.readFileSync(file, 'utf8')).name; } catch { return null; } };
@@ -30,7 +30,7 @@ async function postinstall(command = 'ramp', options = {}) {
   try {
     // A headless install can defer the UI, including when an older curl CLI
     // needs an interactive update before the workspace is available.
-    executable = await (options.resolveCLI || resolveCLI)({ command: session ? command : 'ramp', package: env.npm_config_global === 'true' ? globalPackage(command, options.cliDir) : command === 'router' ? '@ramp/router' : '@ramp/cli', globalInstall: env.npm_config_global === 'true', session, update: options.launch || launch });
+    executable = await (options.resolveCLI || resolveCLI)({ command: session ? command : 'ramp', package: env.npm_config_global === 'true' ? globalPackage(command, options.cliDir) : command === 'router' ? '@ramp/router' : '@ramp/cli', globalInstall: env.npm_config_global === 'true', session, update: options.launch || launchUpdate });
     if (!automatic || !session) {
       write(command === 'router' ? 'Ramp CLI ready. Run `router` in an interactive terminal to open Ramp Router.' : 'Ramp CLI ready. Run `ramp --help` to get started.');
       return;

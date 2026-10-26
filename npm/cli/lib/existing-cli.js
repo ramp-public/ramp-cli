@@ -7,7 +7,6 @@ const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const lockfile = require('proper-lockfile');
 const { install, paths, readState, syncReceipt } = require('./installer');
-const { confirm } = require('./terminal');
 
 const run = promisify(execFile);
 
@@ -75,27 +74,59 @@ async function resolveCLI(options = {}) {
   if (env.RAMP_CLI_VERSION || env.RAMP_CLI_FORCE_UPDATE === '1' || env.RAMP_NPM_UPDATE === '1') return managedCLI();
   let found = await findExisting(options);
   if (!found) return managedCLI();
-  const minimum = require('../package.json').nativeCliVersion;
+  const target = require('../package.json').nativeCliVersion;
   const session = options.session;
-  if (isOlder(found.version, minimum) && session) {
-    session.write(`Found Ramp CLI ${found.version} at ${found.executable} (this launcher targets ${minimum}).`);
-    if (await (options.confirm || confirm)(session, 'Update the existing Ramp CLI before opening Router?')) {
-      const root = paths(options).root;
+  const say = message => session ? session.write(message) : process.stderr.write(`${message}\n`);
+  const root = paths(options).root;
+  const attempt = path.join(root, '.existing-update-attempt');
+  const key = `${found.executable}\n${found.version}\n${target}`;
+  const failedUpdate = detail => new Error(`${detail}\nThe requested command was not run. Run \`ramp update\` and retry. If ramp no longer runs, reinstall with \`curl -fsSL https://agents.ramp.com/install.sh | sh\`.`);
+  let tried = null;
+  // Expire it daily so a lagging curl release or a failure is retried.
+  try { if (Date.now() - fs.statSync(attempt).mtimeMs < 86_400_000) tried = fs.readFileSync(attempt, 'utf8'); } catch { /* Never attempted. */ }
+  // Interactive launches update an older external CLI in place with its own
+  // updater so newer commands work. A run that leaves it old (e.g. Homebrew,
+  // offline) is not repeated that day. Never headless, as root, or on Windows
+  // (no native updater). RAMP_NO_UPDATE_CHECK opts out.
+  if (isOlder(found.version, target) && (session || options.autoUpdate) && !options.forUpdate && !env.RAMP_NO_UPDATE_CHECK
+    && (options.platform || process.platform) !== 'win32' && process.getuid?.() !== 0) {
+    if (tried === key) say('An automatic Ramp update already made no progress in the last 24 hours; skipping another attempt.');
+    else {
+      say(`Updating Ramp CLI ${found.version} at ${found.executable} (this launcher targets ${target}).`);
       fs.mkdirSync(root, { recursive: true });
-      const unlock = await lockfile.lock(root, { lockfilePath: path.join(root, '.existing-update-lock'), stale: 10_000, retries: { retries: 40, minTimeout: 250, maxTimeout: 1_000 } });
-      try {
-        found = await probe(found.executable, options);
-        if (isOlder(found.version, minimum)) {
-          const result = await options.update(found.executable, ['update'], session.stdio);
-          if (result.code !== 0 || result.signal) session.write('Ramp update did not complete. Checking whether the existing CLI can still open Router.');
-          found = await probe(found.executable, options);
-          if (isOlder(found.version, minimum)) session.write(`Ramp remains at ${found.version}; follow the updater's instructions for your installation method.`);
+      let unlock = null;
+      try { unlock = await lockfile.lock(root, { lockfilePath: path.join(root, '.existing-update-lock'), stale: 10_000, retries: { retries: 40, minTimeout: 250, maxTimeout: 1_000 } }); }
+      catch { throw failedUpdate('Another Ramp update is still running. Wait for it to finish before retrying.'); }
+      if (unlock) try {
+        try { found = await probe(found.executable, options); }
+        catch { throw failedUpdate(`Ramp CLI at ${found.executable} could not run before the update.`); }
+        if (isOlder(found.version, target)) {
+          let result;
+          try { result = await options.update(found.executable, ['--no-input', 'update'], session?.stdio || ['ignore', 2, 2]); }
+          catch (error) {
+            if (error.signal || error.exitCode === 130) throw error;
+            say(`Could not run the Ramp updater: ${error.message}`);
+            result = { code: 1 };
+          }
+          // Cancellation must never fall through to the user's requested command.
+          // Click handles SIGINT as Abort and exits 130 rather than by signal.
+          if (result.signal || result.code === 130) throw Object.assign(new Error('Ramp update interrupted.'), { signal: result.signal, exitCode: result.code });
+          if (result.code !== 0) say('Ramp update did not complete. Checking whether the existing CLI can still be used.');
+          try { found = await probe(found.executable, options); }
+          catch { throw failedUpdate(`Ramp CLI at ${found.executable} could not run after the update.`); }
+          if (isOlder(found.version, target)) fs.writeFileSync(attempt, key);
         }
       } finally { await unlock(); }
     }
+    // The launcher target is an update preference, not a minimum for every
+    // command. Only known newer features require a specific native version.
+    if (options.requiredVersion && isOlder(found.version, options.requiredVersion)) {
+      throw failedUpdate(`Ramp remains at ${found.version}; the requested feature requires ${options.requiredVersion} or newer. Follow the updater's instructions for your installation method.`);
+    }
+    if (isOlder(found.version, target)) say(`Using existing Ramp CLI ${found.version}; follow the updater's instructions for your installation method to update it.`);
   }
-  // An older release can still be used if it has the Router terminal UI.
-  // Never silently overwrite it or create a second installation just for age.
+  // An older release that was not updated can still be used if it has the
+  // Router terminal UI. Never create a second installation just for age.
   if (options.command === 'router') {
     try {
       await (options.run || run)(found.executable, ['router', 'ui', '--help'], { env: { ...env, RAMP_NO_UPDATE_CHECK: '1', RAMP_VERSION: '' }, timeout: 10_000, windowsHide: true });

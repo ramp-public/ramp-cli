@@ -162,7 +162,10 @@ async function install(options = {}) {
     if (!fs.existsSync(owner)) {
       // Windows shortcuts may exist before the first managed installation.
       const shortcuts = path.dirname(p.bin) === p.root ? path.basename(p.bin) : null;
-      if (fs.readdirSync(p.root).some(name => name !== '.install-lock' && name !== shortcuts)) throw new Error(`Refusing to overwrite an unmanaged installation at ${p.root}. Choose another RAMP_CLI_INSTALL_DIR.`);
+      // Reusing an external CLI can also leave update metadata before npm has
+      // installed a distribution. Allow only these known entries, even expired.
+      const metadata = ['.install-lock', '.existing-update-attempt', '.existing-update-lock', shortcuts];
+      if (fs.readdirSync(p.root).some(name => !metadata.includes(name))) throw new Error(`Refusing to overwrite an unmanaged installation at ${p.root}. Choose another RAMP_CLI_INSTALL_DIR.`);
       fs.writeFileSync(owner, '@ramp/cli\n', { flag: 'wx' });
     }
     if (fs.readFileSync(owner, 'utf8') !== '@ramp/cli\n') throw new Error(`Unrecognized installation owner at ${p.root}.`);

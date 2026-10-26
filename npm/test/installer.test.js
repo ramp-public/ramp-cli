@@ -142,6 +142,8 @@ test('rejects unsafe archives before extraction', async t => {
 test('preserves unrelated installation directories and validates version overrides', async t => {
   const p = sandbox(t);
   fs.mkdirSync(p.root);
+  fs.writeFileSync(path.join(p.root, '.existing-update-attempt'), 'previous external update');
+  fs.mkdirSync(path.join(p.root, '.existing-update-lock'));
   fs.writeFileSync(path.join(p.root, 'important'), 'keep');
   await assert.rejects(install(p), /unmanaged installation/);
   assert.equal(fs.readFileSync(path.join(p.root, 'important'), 'utf8'), 'keep');
@@ -149,6 +151,18 @@ test('preserves unrelated installation directories and validates version overrid
   await assert.rejects(install(p), /Unrecognized installation owner/);
   assert.equal(fs.existsSync(path.join(p.root, '.install-lock')), false);
   await assert.rejects(install({ ...p, env: { ...p.env, RAMP_CLI_VERSION: '../latest' } }), /release tag/);
+});
+
+test('external update metadata and an update lock do not make the install root unmanaged', async t => {
+  const p = sandbox(t);
+  fs.mkdirSync(p.root);
+  const attempt = path.join(p.root, '.existing-update-attempt');
+  const lock = path.join(p.root, '.existing-update-lock');
+  fs.writeFileSync(attempt, 'previous external update');
+  fs.mkdirSync(lock);
+  assert.equal(await install({ ...p, download: (await fixture(p.home)).download }), p.executable);
+  assert.equal(fs.readFileSync(attempt, 'utf8'), 'previous external update');
+  assert.ok(fs.statSync(lock).isDirectory());
 });
 
 test('Windows uses a native user-owned location and exe asset', () => {
