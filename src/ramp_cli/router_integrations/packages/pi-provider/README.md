@@ -51,6 +51,18 @@ The recommended installer is:
 ramp router configure pi
 ```
 
+To also use Router connector tools inside Pi (0.99 or later):
+
+```bash
+ramp router configure pi --connectors
+```
+
+This signs in with connector access and registers `ramp-connectors` in Pi's
+native `mcp.json`. Run `/reload` in an existing session, then `/mcp` to inspect
+the connection and tools. Tools are available through Pi's default codemode
+exposure. To remove the registration, run
+`ramp router connectors disable --harness pi`.
+
 For development, verify this workspace and install the TypeScript package directly:
 
 ```bash

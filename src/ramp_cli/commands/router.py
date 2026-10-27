@@ -1576,7 +1576,7 @@ def _validate_deployment_url(
     is_flag=True,
     help=(
         "Sign in with connector access on every run, enable MCP, and configure Claude Code, "
-        "Codex, or OpenCode. Create a key if none is saved; otherwise offer reuse."
+        "Codex, OpenCode, or Pi. Create a key if none is saved; otherwise offer reuse."
     ),
 )
 @click.option(

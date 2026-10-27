@@ -15,7 +15,7 @@ import json5
 from ramp_cli.auth.refresh import _refresh_lock
 from ramp_cli.errors import RampCLIError
 
-HARNESSES = ("claude-code", "codex", "opencode")
+HARNESSES = ("claude-code", "codex", "opencode", "pi")
 SERVER = "ramp-connectors"
 EXECUTABLE_NAMES = (
     "ramp",
@@ -40,6 +40,13 @@ def config_path(harness: str, *, require_unambiguous: bool = True) -> Path:
         return (
             Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
             / "config.toml"
+        )
+    if harness == "pi":
+        return (
+            Path(
+                os.environ.get("PI_CODING_AGENT_DIR", Path.home() / ".pi" / "agent")
+            ).expanduser()
+            / "mcp.json"
         )
     configured = os.environ.get("OPENCODE_CONFIG")
     if configured:

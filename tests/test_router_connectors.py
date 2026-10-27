@@ -7,6 +7,7 @@ import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
@@ -288,8 +289,14 @@ def test_legacy_grant_fails_without_browser_or_exchange(monkeypatch):
 def test_registration_preserves_settings_rebinds_only_owned_entry_and_disable_is_scoped(
     monkeypatch, tmp_path, harness, executable_name
 ):
-    path = tmp_path / ("config.toml" if harness == "codex" else "config.json")
-    monkeypatch.setattr(harnesses, "config_path", lambda _: path)
+    if harness == "pi":
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("PI_CODING_AGENT_DIR", "~/custom-pi")
+        path = tmp_path / "custom-pi" / "mcp.json"
+    else:
+        path = harnesses.config_path(harness)
+    assert path.is_relative_to(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     executable = tmp_path / "bin" / executable_name
     executable.parent.mkdir()
     executable.touch(mode=0o700)
@@ -337,6 +344,35 @@ def test_registration_preserves_settings_rebinds_only_owned_entry_and_disable_is
         with pytest.raises(RampCLIError, match="not CLI-owned"):
             harnesses.disable(harness)
         assert path.read_text() == before
+
+
+def test_pi_connector_cli_uses_default_agent_directory(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("PI_CODING_AGENT_DIR")
+    monkeypatch.setattr(harnesses, "_executable", lambda: "/usr/local/bin/ramp")
+    setup(monkeypatch, lambda request: issued())
+    runner = CliRunner()
+    enabled = runner.invoke(
+        cli, ["router", "connectors", "enable", "--harness", "pi", "--output", "json"]
+    )
+    assert enabled.exit_code == 0, enabled.output
+    path = Path.home() / ".pi" / "agent" / "mcp.json"
+    entry = json.loads(path.read_text())["mcpServers"]["ramp-connectors"]
+    assert entry == {
+        "command": "/usr/local/bin/ramp",
+        "args": [
+            "router",
+            "connectors",
+            "bridge",
+            "--binding",
+            harnesses.status("pi")["binding_id"],
+        ],
+    }
+    disabled = runner.invoke(
+        cli, ["router", "connectors", "disable", "--harness", "pi"]
+    )
+    assert disabled.exit_code == 0, disabled.output
+    assert json.loads(path.read_text())["mcpServers"] == {}
 
 
 @pytest.mark.parametrize("enabled", [True, False])

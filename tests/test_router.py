@@ -333,7 +333,7 @@ def test_configure_agent_composes_with_optional_connectors(
 
 @pytest.mark.parametrize(
     "clients",
-    [("claude-code",), ("codex",), ("opencode",), connector_harnesses.HARNESSES],
+    [(h,) for h in connector_harnesses.HARNESSES] + [connector_harnesses.HARNESSES],
 )
 @pytest.mark.parametrize("quiet", [False, True])
 def test_configure_connectors_shows_setup_progress_then_notice(
@@ -414,7 +414,7 @@ def test_configure_connectors_creates_key_without_reuse_prompt(
     monkeypatch.setattr(router_module, "_installed_clients", lambda: ("codex", "pi"))
 
     def choose_clients(message, candidates):
-        assert candidates == ("codex",)
+        assert candidates == ("codex", "pi")
         return candidates
 
     monkeypatch.setattr(router_module, "_pick_clients", choose_clients)
@@ -444,7 +444,7 @@ def test_configure_connectors_creates_key_without_reuse_prompt(
 
 
 @pytest.mark.parametrize("reuse", [True, False])
-@pytest.mark.parametrize("harness", ["claude-code", "codex", "opencode"])
+@pytest.mark.parametrize("harness", connector_harnesses.HARNESSES)
 def test_configure_connectors_offers_saved_key_before_creating_another(
     monkeypatch, connector_setup, reuse, harness
 ):
@@ -904,7 +904,7 @@ def test_configure_connectors_preserves_foreign_mcp_and_does_not_create_key(
 @pytest.mark.parametrize(
     "args",
     [
-        ["pi"],
+        ["cursor"],
         ["codex", "--no-input"],
         ["codex", "--confirm-browser"],
         ["codex", "--ui-url", "https://internal.router.com"],

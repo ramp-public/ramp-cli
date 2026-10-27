@@ -190,7 +190,7 @@ Set up Router login, connector tools, and your coding harnesses in one command:
 ramp router configure --connectors
 ```
 
-Choose from Claude Code, Codex, and OpenCode, or name them explicitly, for example
+Choose from Claude Code, Codex, OpenCode, and Pi, or name them explicitly, for example
 `ramp router configure codex --connectors`. Setup signs in with connector consent
 on every run, enables connectors for the selected harnesses, and configures them
 with a Router API key. If no compatible key is saved locally, it creates a
@@ -212,12 +212,20 @@ ramp router connectors status --output json
 ramp router connectors enable --harness claude-code
 ```
 
-The supported harness IDs are `claude-code`, `codex`, and `opencode`. Enable each
+The supported harness IDs are `claude-code`, `codex`, `opencode`, and `pi`. Enable each
 selected harness explicitly; this does not configure Claude Desktop or change
 existing Slack, Google, or other provider connections. To remove only the CLI's
 connector registration, run `ramp router connectors disable --harness claude-code`.
 Unrelated harness settings and MCP servers are preserved; foreign or customized
 `ramp-connectors` entries are not overwritten.
+
+For Pi 0.99 or later, run `ramp router configure pi --connectors`, or
+`ramp router connectors enable --harness pi` after connector login. Setup registers
+the bridge in `~/.pi/agent/mcp.json` (or `$PI_CODING_AGENT_DIR/mcp.json`). Run
+`/reload` in an existing Pi session, then `/mcp` to inspect `ramp-connectors` and
+its tools. Tools use Pi's default codemode exposure. Pi's built-in MCP extension
+must be enabled; a third-party extension that replaces `/mcp` must be removed to
+use this configuration.
 
 To see and change the services (Slack, Linear, Notion…) you've connected:
 

@@ -21,6 +21,9 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """
     router._bundled_codex_catalog_from.cache_clear()
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    # Explicit OpenCode paths take precedence over the isolated XDG directory.
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+    monkeypatch.delenv("OPENCODE_TUI_CONFIG", raising=False)
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
     monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "pi"))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
