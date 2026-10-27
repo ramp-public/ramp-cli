@@ -124,6 +124,61 @@ def _edge_token(origin: str, *, cached_only: bool = False) -> str | None:
     return token
 
 
+def _cached_expiry(path: Path) -> float:
+    try:
+        token = path.read_text().strip() if path.stat().st_size <= 16384 else ""
+    except (OSError, UnicodeError):
+        return 0
+    return _token_expiry(token) if token.count(".") == 2 else 0
+
+
+def edge_renewal_due(origin: str) -> float | None:
+    host = urlsplit(origin).hostname or ""
+    cache = Path.home() / ".cloudflared"
+    if not shutil.which("cloudflared") or not host:
+        return None
+    if not any(cache.glob(f"{host}-*-token*")):
+        return None
+    if not any(
+        _cached_expiry(p) > time.time() + 600
+        for p in cache.glob("*.cloudflareaccess.com-org-token")
+    ):
+        return None
+    tokens = cache.glob(f"{host}-*-token")
+    return max((_cached_expiry(p) for p in tokens), default=0) - 7200
+
+
+def renew_edge_access(origin: str) -> bool:
+    due = edge_renewal_due(origin)
+    binary = shutil.which("cloudflared")
+    if due is None or due > time.time() or binary is None:
+        return False
+    host = urlsplit(origin).hostname or ""
+    tokens = list((Path.home() / ".cloudflared").glob(f"{host}-*-token"))
+    for path in tokens:
+        path.rename(path.with_name(path.name + ".old"))
+    try:
+        result = subprocess.run(
+            [binary, "access", "login", "--quiet", origin],
+            capture_output=True,
+            timeout=30,
+            stdin=subprocess.DEVNULL,
+            env={**os.environ, "PATH": ""},
+        )
+        renewed = (
+            result.returncode == 0 and (edge_renewal_due(origin) or 0) > time.time()
+        )
+    except (OSError, subprocess.SubprocessError):
+        renewed = False
+    for path in tokens:
+        old = path.with_name(path.name + ".old")
+        if renewed or path.exists():
+            old.unlink(missing_ok=True)
+        else:
+            old.rename(path)
+    return renewed
+
+
 def _target_path(profile: str | None) -> Path:
     key = hashlib.sha256((profile or "").encode()).hexdigest()[:16]
     return settings.config_dir() / "router-users" / f"target-{key}.json"
@@ -151,6 +206,16 @@ def saved_origin(*, profile: str | None = None) -> str | None:
             "Invalid saved Router target; pass --ui-url to login."
         ) from exc
     return validate_origin(origin)
+
+
+def saved_origins() -> set[str]:
+    origins = set()
+    for path in (settings.config_dir() / "router-users").glob("target-*.json"):
+        try:
+            origins.add(validate_origin(json.loads(path.read_text())["origin"]))
+        except (OSError, KeyError, TypeError, ValueError, RampCLIError):
+            continue
+    return origins
 
 
 def remember_origin(origin: str, *, profile: str | None = None) -> None:
@@ -579,11 +644,15 @@ class RouterUserClient:
         )
         deadline = time.monotonic() + timeout
         try:
-            message = "Approve the sign-in in your browser to continue..."
-            if no_browser or not oauth._open_browser(url):
-                # One message: a progress display replaces the last one, and
-                # the URL must stay visible until sign-in completes.
-                message = f"Open this URL to sign in:\n\n  {url}\n\n{message}"
+            if not no_browser:
+                oauth._open_browser(url)
+            # Always show the URL: a launcher can start fine yet open nothing
+            # (SSH, containers). One message: a progress display replaces the
+            # last one, and the URL must stay visible until sign-in completes.
+            message = (
+                f"Open this URL to sign in:\n\n  {url}\n\n"
+                "Approve the sign-in in your browser to continue..."
+            )
             if progress is not None:
                 progress(message)
             else:

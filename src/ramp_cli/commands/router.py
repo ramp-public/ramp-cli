@@ -3820,7 +3820,9 @@ def _warn_if_agent_off() -> None:
         pass
 
 
-def _write_agent_manifest(connections: list[_SyncConnection]) -> None:
+def _write_agent_manifest(
+    connections: list[_SyncConnection], renew_at: float | None = None
+) -> None:
     """Tell the Ramp Router agent what to check until the next scheduled sync.
 
     The agent repeats each connection's version requests and compares them
@@ -3899,6 +3901,8 @@ def _write_agent_manifest(connections: list[_SyncConnection]) -> None:
             # No connection can be refreshed before its revocation cooldown
             # ends. An overdue daily refresh must not bypass those cooldowns.
             due_at = max(due_at, min(entry["skip_until"] for entry in entries))
+        if renew_at is not None:
+            due_at = min(due_at, renew_at)
         unsupported_due_at = router_sync_module.cooldown_due_at()
         if isinstance(retry_after, int | float):
             # Rust checks this deadline independently of due_at. An expired
@@ -3934,18 +3938,36 @@ def _run_scheduled_sync(ctx: click.Context) -> None:
             # interrupts nothing.
             router_schedule.remove_after_opt_out()
             return
+        from ramp_cli.client.router_user import (  # noqa: PLC0415
+            edge_renewal_due,
+            renew_edge_access,
+            saved_origins,
+            selected_origin,
+        )
+
+        dues = []
+        origins = saved_origins()
+        with contextlib.suppress(Exception):
+            origins.add(selected_origin(profile=ctx.obj.get("profile")))
+        for origin in origins:
+            with contextlib.suppress(Exception):
+                renew_edge_access(origin)
+                due = edge_renewal_due(origin)
+                if due is not None:
+                    dues.append(max(due, time.time() + 3600))
+        renew_at = min(dues, default=None)
         with sync_lock() as locked:
             if not locked:
                 return
             connections = _scheduled_sync_connections()
             if not connections:
-                _write_agent_manifest(connections)
+                _write_agent_manifest(connections, renew_at)
                 return
             state = router_schedule.load_state()
             if state.get("cowork_pending"):
                 state = _retry_pending_cowork(state)
             _scheduled_tick(ctx, connections, state)
-            _write_agent_manifest(connections)
+            _write_agent_manifest(connections, renew_at)
     except Exception as exc:  # fail-open is this mode's contract
         log_failure(f"scheduled sync failed: {exc!r}")
     finally:

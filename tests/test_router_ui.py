@@ -696,7 +696,8 @@ def test_login_progress_can_cancel_without_stdout_or_token_exchange(
         RouterUserClient("https://app.router.com").login(
             progress=messages.append, cancel=cancel
         )
-    assert messages == ["Approve the sign-in in your browser to continue..."]
+    assert len(messages) == 1
+    assert "Open this URL to sign in:" in messages[0]
     assert calls == ["shutdown"]
     assert capsys.readouterr() == ("", "")
 
