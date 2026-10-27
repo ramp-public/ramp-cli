@@ -196,15 +196,20 @@ CLIENT_EXECUTABLES = {
     "pi": "pi",
     "hermes": "hermes",
 }
-# The Codex desktop app is now part of OpenAI's ChatGPT app. It carries its
-# own Codex CLI inside the bundle and puts no `codex` on PATH, so the bundled
-# CLI is the evidence that Codex is present. Legacy chat-only ChatGPT installs
-# have no such CLI and are ignored.
+# Codex ships standalone and inside ChatGPT, with its CLI off PATH. Require
+# the bundled CLI so legacy chat-only ChatGPT installs are not counted.
 _CODEX_APP_LOCATIONS = (
     Path("/Applications/ChatGPT.app"),
     Path.home() / "Applications" / "ChatGPT.app",
+    Path("/Applications/Codex.app"),
+    Path.home() / "Applications" / "Codex.app",
+    # The picker mod replaces ChatGPT.app with a launcher and moves the real app here.
+    Path("/Applications/.openai/ChatGPT.app"),
 )
-_CODEX_APP_BUNDLED_CLI = Path("Contents/Resources/codex-cli/bin/codex")
+_CODEX_APP_BUNDLED_CLIS = (
+    Path("Contents/Resources/codex-cli/bin/codex"),
+    Path("Contents/Resources/codex"),
+)
 # Claude Desktop joins the configure and unconfigure pickers but stays out of
 # CLIENT_NAMES: it has no config file of its own, exists only on macOS, and is
 # set up through Claude Desktop's profile library rather than through the
@@ -1071,18 +1076,19 @@ def _installed_clients() -> tuple[str, ...]:
 
 
 def _codex_app_bundled_cli() -> Path | None:
-    """Locate the Codex CLI bundled inside the ChatGPT app on this Mac."""
+    """Locate the Codex CLI bundled inside Codex or ChatGPT on this Mac."""
     if sys.platform != "darwin":
         return None
     for location in _CODEX_APP_LOCATIONS:
-        bundled_cli = location / _CODEX_APP_BUNDLED_CLI
-        if bundled_cli.is_file():
-            return bundled_cli
+        for relative_path in _CODEX_APP_BUNDLED_CLIS:
+            bundled_cli = location / relative_path
+            if bundled_cli.is_file():
+                return bundled_cli
     return None
 
 
 def _codex_app_installed() -> bool:
-    """Report whether the ChatGPT app with Codex is installed on this Mac.
+    """Report whether a desktop app with Codex is installed on this Mac.
 
     The app reads the same Codex config the Codex entry writes, so it earns
     that entry a place in the picker even where no `codex` is on PATH.
@@ -1094,7 +1100,7 @@ def _detected_clients() -> tuple[str, ...]:
     """Return every harness present on this machine, apps included.
 
     PATH detection alone misses Conductor, which ships no executable, and
-    Codex on machines that only have the ChatGPT app's bundled CLI.
+    Codex on machines that only have a desktop app's bundled CLI.
     """
     detected = set(_installed_clients())
     if _codex_app_installed():

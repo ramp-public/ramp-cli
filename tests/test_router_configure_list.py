@@ -112,10 +112,45 @@ def test_list_reports_every_supported_harness(machine):
     assert result["pi"]["endpoint"] is None and result["pi"]["api_key"] is None
 
 
-def test_list_detects_the_codex_app_as_installed(machine):
-    assert rows(agent("list"))["codex"]["installed"] is True
-    machine["codex_app"] = False
+@pytest.mark.parametrize(
+    "applications", [Path("/Applications"), Path.home() / "Applications"]
+)
+@pytest.mark.parametrize("app_name", ["Codex.app", "ChatGPT.app"])
+@pytest.mark.parametrize("cli_path", ["codex", "codex-cli/bin/codex"])
+def test_list_detects_the_codex_app_as_installed(
+    tmp_path, monkeypatch, applications, app_name, cli_path
+):
+    monkeypatch.setattr(router.sys, "platform", "darwin")
+    monkeypatch.setattr(router.shutil, "which", lambda _: None)
+    resources = (
+        tmp_path
+        / "apps"
+        / applications.relative_to(applications.anchor)
+        / app_name
+        / "Contents"
+        / "Resources"
+    )
+    resources.mkdir(parents=True)
+
+    # An app name alone must not classify a chat-only ChatGPT install as Codex.
     assert rows(agent("list"))["codex"]["installed"] is False
+    binary = resources / cli_path
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.touch()
+    assert rows(agent("list"))["codex"]["installed"] is True
+
+
+def test_list_detects_codex_behind_the_chatgpt_mod_launcher(tmp_path, monkeypatch):
+    monkeypatch.setattr(router.sys, "platform", "darwin")
+    monkeypatch.setattr(router.shutil, "which", lambda _: None)
+    applications = tmp_path / "apps/Applications"
+    (applications / "ChatGPT.app/Contents/Resources").mkdir(parents=True)
+    assert rows(agent("list"))["codex"]["installed"] is False
+
+    binary = applications / ".openai/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
+    binary.parent.mkdir(parents=True)
+    binary.touch()
+    assert rows(agent("list"))["codex"]["installed"] is True
 
 
 def test_list_never_prints_the_full_key(machine):

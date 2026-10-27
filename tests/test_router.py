@@ -10688,7 +10688,7 @@ def _write_chatgpt_app(directory, *, with_codex):
     bundle = directory / "ChatGPT.app"
     (bundle / "Contents").mkdir(parents=True)
     if with_codex:
-        cli = bundle / router_module._CODEX_APP_BUNDLED_CLI
+        cli = bundle / "Contents/Resources/codex-cli/bin/codex"
         cli.parent.mkdir(parents=True)
         cli.write_text("")
     return bundle
@@ -11489,7 +11489,7 @@ def test_codex_app_alone_supplies_the_harness_prompt(tmp_path, monkeypatch):
     assert config["model_instructions_file"] == str(instructions.resolve())
     # The app's own binary, reading its shipped catalog rather than whatever
     # provider the shared config already selects.
-    assert commands[0][0] == str(app / router_module._CODEX_APP_BUNDLED_CLI)
+    assert commands[0][0] == str(app / "Contents/Resources/codex-cli/bin/codex")
     assert "--bundled" in commands[0]
 
 

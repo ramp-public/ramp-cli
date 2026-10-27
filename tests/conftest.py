@@ -51,11 +51,14 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     )
     monkeypatch.setattr("ramp_cli.client.router_user._edge_origins", set())
     monkeypatch.setattr("ramp_cli.client.router_user._edge_rejected", {})
-    # Codex desktop app detection looks for the ChatGPT app's bundled Codex
-    # CLI; a sandbox location keeps a developer's real app out of the picker.
+    # Preserve the app names and locations under a sandbox root so detection
+    # tests exercise the real search paths without finding a developer's apps.
     monkeypatch.setattr(
         "ramp_cli.commands.router._CODEX_APP_LOCATIONS",
-        (tmp_path / "ChatGPT.app",),
+        tuple(
+            tmp_path / "apps" / path.relative_to(path.anchor)
+            for path in router._CODEX_APP_LOCATIONS
+        ),
     )
     # Configuring a fixture must not quit the developer's desktop apps.
     monkeypatch.setattr("ramp_cli.codex_desktop.restart_running", lambda: [])
