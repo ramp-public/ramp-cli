@@ -372,6 +372,25 @@ describe("OpenCode v2 setup", () => {
     assert.deepEqual(replay.added[0].models, models)
   })
 
+  it("registers only the compact view and the default model", async () => {
+    mock.method(globalThis, "fetch", async (url, init) => {
+      if (!url.endsWith("/v1/models")) return new Response("", { status: 404 })
+      const ids = init.headers["X-Gateway-Model-View"] === "compact"
+        ? ["recommended"]
+        : ["recommended", "configured", "other"]
+      return modelList(...ids.map((id) => ({ id, router: routerMetadata(id) })))
+    })
+    const { ctx, added } = fakeContext({
+      apiKey: "inline-secret",
+      modelView: "compact",
+      defaultModel: "configured",
+    })
+
+    await plugin.setup(ctx)
+
+    assert.deepEqual(added[0].models.map(({ id }) => id), ["recommended", "configured"])
+  })
+
   it("replaces an earlier registration of the same provider id", async () => {
     mock.method(globalThis, "fetch", async () =>
       modelList({ id: "m", router: routerMetadata("m") }),

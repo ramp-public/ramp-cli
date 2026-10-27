@@ -22,6 +22,8 @@ export type RouterPluginOptions = PluginOptions & {
   apiKeyEnv?: string
   rampExecutable?: string
   rampCliVersion?: string
+  /** "compact" (recommended models) or "all", as `ramp router configure` saved it. */
+  modelView?: string
   /** The model `ramp router configure` chose for new sessions. */
   defaultModel?: string
 }
@@ -77,6 +79,11 @@ export function resolveUsageAPIKey(options: RouterPluginOptions): string | undef
 /** The CLI version recorded at configure time, absent for a hand-written entry. */
 export function resolveRampCliVersion(options: RouterPluginOptions): string | undefined {
   return nonEmpty(options.rampCliVersion, "") || undefined
+}
+
+/** Only the compact view changes the listing; "all" is Router's default. */
+export function resolveModelView(options: RouterPluginOptions): "compact" | undefined {
+  return options.modelView === "compact" ? "compact" : undefined
 }
 
 /** The configured starting model, absent for a hand-written entry. */

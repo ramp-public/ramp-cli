@@ -649,8 +649,20 @@ ROW = {
 }
 
 
-def test_catalog_commands(monkeypatch):
+@pytest.mark.parametrize(
+    "channel_fields",
+    [
+        pytest.param({}, id="missing"),
+        pytest.param({"release_channel": None}, id="null"),
+        pytest.param({"release_channel": "alpha"}, id="alpha"),
+        pytest.param({"release_channel": "beta"}, id="beta"),
+        pytest.param({"release_channel": "stable"}, id="stable"),
+        pytest.param({"release_channel": "preview"}, id="future"),
+    ],
+)
+def test_catalog_commands(monkeypatch, channel_fields):
     seen = []
+    row = {**ROW, **channel_fields, "credentials": ["secret"]}
 
     def handler(request):
         seen.append(request)
@@ -658,9 +670,7 @@ def test_catalog_commands(monkeypatch):
             return httpx.Response(200, json={"url": "https://slack.com/oauth"})
         return httpx.Response(
             200,
-            json=[{**ROW, "credentials": ["secret"]}]
-            if request.method == "GET"
-            else ROW,
+            json=[row] if request.method == "GET" else row,
         )
 
     setup(monkeypatch, routed(handler))
@@ -674,12 +684,18 @@ def test_catalog_commands(monkeypatch):
     listed = json.loads(run("list").output)
     assert listed["available"] and listed["connectors"][0]["key"] == "slack"
     assert "credentials" not in listed["connectors"][0]
+    assert listed["connectors"][0]["release_channel"] == channel_fields.get(
+        "release_channel"
+    )
     assert (
         json.loads(run("connect", "slack", "--no-browser").output)["url"]
         == "https://slack.com/oauth"
     )
     assert seen[-1].headers["Origin"] == "https://app.router.com"
-    assert json.loads(run("disconnect", "slack").output)["connector"]["key"] == "slack"
+    assert (
+        json.loads(run("disconnect", "slack").output)["connector"]
+        == listed["connectors"][0]
+    )
     assert (seen[-1].method, seen[-1].url.path) == ("DELETE", "/admin/connectors/slack")
     assert run("connect", "../keys").exit_code != 0
 

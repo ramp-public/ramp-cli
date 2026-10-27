@@ -755,3 +755,52 @@ def test_relative_codex_home_reports_visible_count(
     assert config["model_catalog_json"] == str(
         tmp_path / "relative-codex" / router.CODEX_ROUTER_CATALOG
     )
+
+
+@pytest.mark.parametrize("client", ["opencode", "pi"])
+def test_plugin_model_view_defaults_to_all_and_persists(model_server, client):
+    runner = CliRunner()
+    path = router._json_config_path(client)
+    written = path.parent / (
+        "opencode.json" if client == "opencode" else router.PI_PLUGIN_CONFIG_FILE
+    )
+    configure = [
+        "--agent",
+        "router",
+        "configure",
+        client,
+        "--no-browser",
+        "--api-key",
+        "test-key",
+    ]
+    refresh = ["--agent", "router", "refresh"]
+    for arguments, view in (
+        (configure, "all"),
+        (refresh, "all"),
+        ([*configure, f"--{client}-models", "compact"], "compact"),
+        (configure, "compact"),
+    ):
+        result = runner.invoke(cli, arguments)
+        assert result.exit_code == 0, result.output
+        assert router._configured_plugin_model_view(path) == view
+        assert f'"modelView": "{view}"' in written.read_text()
+
+
+def test_interactive_picker_applies_the_answer_to_plugins(monkeypatch, model_server):
+    monkeypatch.setattr(router, "_can_prompt", lambda *_a: True)
+    monkeypatch.setattr(router, "_pick_installed_clients", lambda: ("opencode", "pi"))
+    seen = []
+
+    def pick(current, clients):
+        seen.append((current, clients))
+        return "compact"
+
+    monkeypatch.setattr(router, "_pick_claude_models", pick)
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "--no-browser", "--api-key", "test-key"]
+    )
+    assert result.exit_code == 0, result.output
+    assert seen == [("all", ("opencode", "pi"))]
+    for client in ("opencode", "pi"):
+        path = router._json_config_path(client)
+        assert router._configured_plugin_model_view(path) == "compact"

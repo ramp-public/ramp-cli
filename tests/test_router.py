@@ -2167,6 +2167,7 @@ def test_refresh_reapplies_only_clients_with_router_receipts(tmp_path, monkeypat
             "usageBaseURL": "https://app.router.com",
             "apiKey": "keep-me",
             "rampCliVersion": __version__,
+            "modelView": "all",
             "rampExecutable": "/opt/ramp-cli/bin/ramp",
         },
     ]
@@ -7586,6 +7587,7 @@ def test_configure_opencode_installs_plugin_and_preserves_config(tmp_path, monke
             # OpenCode calls Router directly, so the plugin reports the CLI
             # version recorded here rather than one it could observe.
             "rampCliVersion": __version__,
+            "modelView": "all",
             "rampExecutable": "/opt/ramp-cli/bin/ramp",
         },
     ]
@@ -7924,6 +7926,7 @@ def test_configure_opencode_v2_writes_plugins_objects_and_cli_json(
             "usageBaseURL": "https://app.router.com",
             "apiKey": "router-secret",
             "rampCliVersion": __version__,
+            "modelView": "all",
             "rampExecutable": "/opt/ramp-cli/bin/ramp",
             # v2's starting model rides with the plugin, which gives it to
             # the agents and the registry, so the config's own ``model``
@@ -10634,6 +10637,26 @@ def test_model_picker_names_the_selected_agents(monkeypatch, clients, subject):
     ]
 
 
+def test_model_picker_says_opencode_can_use_only_recommended(monkeypatch):
+    captured = {}
+
+    class Prompt:
+        def ask(self):
+            return "all"
+
+    def select(message, **kwargs):
+        captured.update(kwargs)
+        return Prompt()
+
+    monkeypatch.setattr(router_module.questionary, "select", select)
+
+    router_module._pick_claude_models("all", ("opencode",))
+    assert [choice.title for choice in captured["choices"]] == [
+        "Recommended models - OpenCode can use only these",
+        "All available models (default)",
+    ]
+
+
 def test_installed_clients_requires_each_agent_executable(tmp_path, monkeypatch):
     # Stale configuration from any supported agent is not installation evidence.
     for client in router_module.CLIENT_EXECUTABLES:
@@ -10769,7 +10792,7 @@ def test_configure_picker_targets_only_selected_clients(tmp_path, monkeypatch):
     )
 
     assert configure.exit_code == 0, configure.output
-    assert prompt["message"] == "Which models should Codex show?"
+    assert prompt["message"] == "Which models should Codex and Pi show?"
     assert "Connected to: Codex and Pi" in configure.output
     notice = _notice_lines(configure.output)
     # Pi keeps its own default, so the notice speaks only for Codex.
@@ -11821,6 +11844,7 @@ def test_pi_is_told_which_router_to_call(tmp_path, monkeypatch):
         "baseUrl": "http://127.0.0.1:28362/v1",
         "usageBaseUrl": "http://127.0.0.1:28362",
         "rampCliVersion": __version__,
+        "modelView": "all",
     }
 
     assert runner.invoke(cli, ["--human", "router", "unconfigure", "pi"]).exit_code == 0

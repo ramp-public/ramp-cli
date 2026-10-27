@@ -1,6 +1,6 @@
 import type { Plugin } from "@opencode/plugin"
 
-import { RAMP_CLI_VERSION_HEADER, discoverRouterModels } from "./discovery.ts"
+import { RAMP_CLI_VERSION_HEADER, discoverRouterCatalog } from "./discovery.ts"
 import type { RouterModel } from "./discovery.ts"
 import {
   defaultReasoningSettings,
@@ -17,6 +17,7 @@ import {
   resolveDefaultModel,
   resolveProviderID,
   resolveProviderName,
+  resolveModelView,
   resolveRampCliVersion,
   resolveUsageOrigin,
   routerPluginOptions,
@@ -201,6 +202,7 @@ export async function setupRouterProviderV2(
   const name = resolveProviderName(options)
   const apiKeyEnv = nonEmpty(options.apiKeyEnv, DEFAULT_API_KEY_ENV)
   const rampCliVersion = resolveRampCliVersion(options)
+  const modelView = resolveModelView(options)
   const baseURL = resolveBaseURL(options)
   const apiKey = resolveAPIKey(options)
   if (!apiKey) {
@@ -218,11 +220,18 @@ export async function setupRouterProviderV2(
   })
   defaults.prefetch()
 
-  const discovered = await discoverRouterModels({
-    baseURL,
-    apiKey,
-    ...(rampCliVersion ? { rampCliVersion } : {}),
-  })
+  const configuredModel = resolveDefaultModel(options)
+  // OpenCode cannot hide a model it can still use, so the compact view keeps
+  // only the shortlist and the configured model.
+  const discovered = (
+    await discoverRouterCatalog({
+      baseURL,
+      apiKey,
+      ...(rampCliVersion ? { rampCliVersion } : {}),
+      ...(modelView ? { modelView } : {}),
+      ...(configuredModel ? { keepVisible: configuredModel } : {}),
+    })
+  ).filter((model) => !model.hidden)
   const models = discovered.map((model) => toV2Model(providerID, model))
   const info = toV2Provider({
     providerID,
@@ -253,7 +262,7 @@ export async function setupRouterProviderV2(
     agent: ctx.agent as unknown as Parameters<typeof workspaceDefaultApplier>[0]["agent"],
     model: ctx.model,
     session: ctx.session as unknown as SessionDomainLike,
-    configured: resolveDefaultModel(options),
+    configured: configuredModel,
     providerID,
     modelIDs: new Set(models.filter((model) => model.enabled).map((model) => model.id)),
     defaults,

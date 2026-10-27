@@ -19,6 +19,7 @@ CATALOG_FIELDS = (
     "description",
     "logo_url",
     "availability",
+    "release_channel",
     "connected",
     "internal_service",
     "company_setup_required",

@@ -114,6 +114,7 @@ describe("discoverRouterModels", () => {
       baseURL: "http://localhost:8002",
       apiKey: "test-secret",
       rampCliVersion: "0.2.38",
+      modelView: "compact",
       fetch: fetcher,
     })
     assert.deepEqual(
@@ -138,6 +139,7 @@ describe("discoverRouterModels", () => {
       "user-agent": "ramp-cli-pi-provider",
       "X-Gateway-Client": "pi",
       "X-Gateway-Ramp-Cli-Version": "0.2.38",
+      "X-Gateway-Model-View": "compact",
     })
   })
 
@@ -1122,6 +1124,57 @@ describe("Pi provider extension", () => {
     assert.deepEqual(
       provider.getModels().map(({ id, baseUrl }) => ({ id, baseUrl })),
       [{ id: "second-model", baseUrl: "https://second.example/v1" }],
+    )
+  })
+
+  it("keeps the full catalog callable and shows only the compact view and the default", async () => {
+    const home = process.env.PI_CODING_AGENT_DIR
+    writeFileSync(
+      join(home, "auth.json"),
+      JSON.stringify({
+        "ramp-router": { type: "api_key", key: "stored-secret" },
+      }),
+    )
+    mock.method(globalThis, "fetch", async (_url, init) => {
+      const ids = init.headers["X-Gateway-Model-View"]
+        ? ["compact-model"]
+        : ["compact-model", "default-model", "full-model"]
+      return new Response(
+        JSON.stringify({
+          data: ids.map((id) => ({ id, owned_by: "router", router: routerMetadata(id) })),
+        }),
+        { status: 200 },
+      )
+    })
+    // A catalog cached without the compact view must not be restored for it.
+    await registerRouterProvider({ registerProvider: mock.fn() })
+    writeFileSync(
+      join(home, "ramp-router-config.json"),
+      JSON.stringify({ modelView: "compact" }),
+    )
+    writeFileSync(
+      join(home, "settings.json"),
+      JSON.stringify({ defaultProvider: "ramp-router", defaultModel: "default-model" }),
+    )
+    const registerProvider = mock.fn()
+    await registerRouterProvider({ registerProvider })
+
+    assert.equal(globalThis.fetch.mock.callCount(), 3)
+    const [provider] = registerProvider.mock.calls[0].arguments
+    const models = provider.getModels()
+    assert.deepEqual(models.map(({ id }) => id), ["compact-model", "default-model", "full-model"])
+    assert.deepEqual(
+      provider.filterModels(models, { type: "api_key", key: "stored-secret" }).map(({ id }) => id),
+      ["compact-model", "default-model"],
+    )
+    // A later default change applies without rediscovery, as after a cached launch.
+    writeFileSync(
+      join(home, "settings.json"),
+      JSON.stringify({ defaultProvider: "ramp-router", defaultModel: "full-model" }),
+    )
+    assert.deepEqual(
+      provider.filterModels(models, { type: "api_key", key: "stored-secret" }).map(({ id }) => id),
+      ["compact-model", "full-model"],
     )
   })
 

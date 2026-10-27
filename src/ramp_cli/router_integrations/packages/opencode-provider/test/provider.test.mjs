@@ -75,6 +75,7 @@ describe("discoverRouterModels", () => {
       baseURL: "http://localhost:8002",
       apiKey: "test-secret",
       rampCliVersion: "0.2.38",
+      modelView: "compact",
       fetch: fetcher,
     })
     assert.deepEqual(
@@ -98,6 +99,7 @@ describe("discoverRouterModels", () => {
       authorization: "Bearer test-secret",
       "X-Gateway-Client": "opencode",
       "X-Gateway-Ramp-Cli-Version": "0.2.38",
+      "X-Gateway-Model-View": "compact",
     })
   })
 
@@ -228,6 +230,27 @@ describe("OpenCode provider plugin", () => {
     assert.equal(
       config.provider["ramp-router"].options.baseURL,
       "https://api.router.com/v1",
+    )
+  })
+
+  it("limits a compact view to the shortlist and the configured model", async () => {
+    mock.method(globalThis, "fetch", async (_url, init) => {
+      const ids = init.headers["X-Gateway-Model-View"] === "compact"
+        ? ["recommended"]
+        : ["recommended", "configured", "other"]
+      return new Response(
+        JSON.stringify({ object: "list", data: ids.map((id) => ({ id, router: routerMetadata(id) })) }),
+        { status: 200 },
+      )
+    })
+
+    const hooks = await plugin.server({}, { apiKey: "inline-secret", modelView: "compact" })
+    const config = { model: "ramp-router/configured" }
+    await hooks.config(config)
+
+    assert.deepEqual(
+      Object.keys(config.provider["ramp-router"].models),
+      ["recommended", "configured"],
     )
   })
 

@@ -153,6 +153,7 @@ CODEX_ROUTER_CATALOG = "ramp-router-models.json"
 CODEX_ROUTER_CATALOG_DIGEST_KEY = "router_catalog_digest"
 CODEX_ROUTER_CATALOG_MANAGED_KEY = "router_catalog_managed"
 CODEX_MODEL_VIEW_KEY = "codex_model_view"
+PLUGIN_MODEL_VIEW_KEY = "model_view"
 # The name the Router dashboard serves; manual installs land on the same file.
 CODEX_COST_HOOK = "codex-cost-hook"
 CODEX_COST_HOOK_MANAGED_KEY = "cost_hook_managed"
@@ -861,6 +862,7 @@ def _render_codex_original_profile(
 
 
 _PROFILE_CLIENTS = ("claude-code", "codex")
+_MODEL_VIEW_CLIENTS = (*_PROFILE_CLIENTS, "opencode", "pi")
 
 
 def _profile_notice(results: list[dict], restore_clients: str) -> list[str]:
@@ -1315,13 +1317,23 @@ def _pick_clients(
 def _pick_claude_models(
     current: str = "compact", clients: tuple[str, ...] = ("claude-code",)
 ) -> str:
-    model_clients = tuple(client for client in clients if client in _PROFILE_CLIENTS)
+    model_clients = tuple(client for client in clients if client in _MODEL_VIEW_CLIENTS)
     subject = _human_join([CLIENT_NAMES[client] for client in model_clients])
+    recommended_default = any(client in _PROFILE_CLIENTS for client in model_clients)
+    recommended = "Recommended models"
+    if recommended_default:
+        recommended += " (default)"
+    if "opencode" in model_clients:
+        recommended += " - OpenCode can use only these"
     selected = questionary.select(
         f"Which models should {subject} show?",
         choices=[
-            questionary.Choice(title="Recommended models (default)", value="compact"),
-            questionary.Choice(title="All available models", value="all"),
+            questionary.Choice(title=recommended, value="compact"),
+            questionary.Choice(
+                title="All available models"
+                + ("" if recommended_default else " (default)"),
+                value="all",
+            ),
         ],
         default=current,
         style=_picker_style(),
@@ -1594,6 +1606,16 @@ def _validate_deployment_url(
     help="Models shown by Codex: compact recommendations (default) or all models. Saved across refreshes.",
 )
 @click.option(
+    "--opencode-models",
+    type=click.Choice(("compact", "all"), case_sensitive=False),
+    help="Models OpenCode offers: all models (default) or compact recommendations, the only models OpenCode can then use. Saved across refreshes.",
+)
+@click.option(
+    "--pi-models",
+    type=click.Choice(("compact", "all"), case_sensitive=False),
+    help="Models shown by Pi: all models (default) or compact recommendations. Saved across refreshes.",
+)
+@click.option(
     "--claude-models",
     type=click.Choice(("compact", "all"), case_sensitive=False),
     help="Models shown by Claude Code: recommended compact list or all models.",
@@ -1625,6 +1647,8 @@ def router_configure(
     confirm_browser: bool,
     claude_models: str | None,
     codex_models: str | None,
+    opencode_models: str | None,
+    pi_models: str | None,
     base_url: str | None,
     ui_url: str | None,
 ) -> None:
@@ -1685,6 +1709,8 @@ def router_configure(
     # --reuse-existing-key and --confirm-browser (MDM) runs never open it.
     if (
         codex_models is None
+        and opencode_models is None
+        and pi_models is None
         and not no_browser
         and not reuse_existing_key
         and not confirm_browser
@@ -1717,6 +1743,8 @@ def router_configure(
         no_browser=no_browser,
         claude_models=claude_models,
         codex_models=codex_models,
+        opencode_models=opencode_models,
+        pi_models=pi_models,
         api_key_source=ctx.get_parameter_source("api_key"),
         deployment_override=bool(base_url or ui_url),
         reuse_existing_key=reuse_existing_key,
@@ -1832,6 +1860,8 @@ def _run_configure(
     claude_models: str | None,
     api_key_source: ParameterSource | None,
     codex_models: str | None = None,
+    opencode_models: str | None = None,
+    pi_models: str | None = None,
     legacy_cowork_alias: bool = False,
     deployment_override: bool = False,
     reuse_existing_key: bool = False,
@@ -1850,6 +1880,8 @@ def _run_configure(
     admin_defaults.clear_cache()
     if (
         codex_models is None
+        and opencode_models is None
+        and pi_models is None
         and not no_browser
         and not reuse_existing_key
         and not connectors
@@ -1883,11 +1915,16 @@ def _run_configure(
             raise click.BadParameter(
                 "cannot be empty", param_hint="'--api-key'"
             ) from None
-    if codex_models is not None and clients != ("codex",):
-        raise click.UsageError(
-            "--codex-models requires exactly one agent: "
-            "'ramp router configure codex --codex-models compact|all'."
-        )
+    for client, view in (
+        ("codex", codex_models),
+        ("opencode", opencode_models),
+        ("pi", pi_models),
+    ):
+        if view is not None and clients != (client,):
+            raise click.UsageError(
+                f"--{client}-models requires exactly one agent: "
+                f"'ramp router configure {client} --{client}-models compact|all'."
+            )
     all_clients = (
         connector_harnesses.HARNESSES
         if connectors
@@ -2043,7 +2080,7 @@ def _run_configure(
             f"and process listings. Create a key at {router_ui_url()}."
         )
     asks_model_view = "claude-code" in clients or (
-        picked_from_menu and "codex" in clients
+        picked_from_menu and any(client in clients for client in _MODEL_VIEW_CLIENTS)
     )
     if asks_model_view and claude_models is None:
         if "claude-code" in clients:
@@ -2057,14 +2094,20 @@ def _run_configure(
         elif "codex" in clients:
             current_view = _configured_codex_model_view(_codex_config_path())
         else:
-            current_view = "compact"
+            current_view = _configured_plugin_model_view(
+                _json_config_path("opencode" if "opencode" in clients else "pi")
+            )
         if not enable_agent and _can_prompt(ctx, fmt):
             claude_models = _pick_claude_models(current_view, clients)
-            # The question names both profile clients. Apply an answer to
-            # Codex too, but never copy an unprompted Claude default over a
-            # saved Codex preference during unattended multi-client setup.
+            # The question names every listed client. Apply an answer to
+            # them all, but never copy an unprompted Claude default over a
+            # saved preference during unattended multi-client setup.
             if "codex" in clients and codex_models is None:
                 codex_models = claude_models
+            if "opencode" in clients and opencode_models is None:
+                opencode_models = claude_models
+            if "pi" in clients and pi_models is None:
+                pi_models = claude_models
         else:
             claude_models = current_view
     restore_clients = (
@@ -2309,6 +2352,10 @@ def _run_configure(
                     configure_options["claude_model_view"] = claude_models
                 elif item == "codex" and codex_models is not None:
                     configure_options["codex_model_view"] = codex_models
+                elif item == "opencode" and opencode_models is not None:
+                    configure_options["plugin_model_view"] = opencode_models
+                elif item == "pi" and pi_models is not None:
+                    configure_options["plugin_model_view"] = pi_models
                 # The same origin this setup is being written to send its
                 # session-usage calls to.
                 pushed = switchyard_push.plan(
@@ -8856,6 +8903,7 @@ def _configure_client(
     selected_model: str | None = None,
     claude_model_view: str | None = None,
     codex_model_view: str | None = None,
+    plugin_model_view: str | None = None,
     preserve_model_view_ownership: bool = False,
     hermes_require_receipt: bool = False,
     hermes_lock_held: bool = False,
@@ -8952,6 +9000,7 @@ def _configure_client(
         default_model,
         base_url=base_url,
         replace_model=replace_model is True,
+        model_view=plugin_model_view,
     )
     return path, default_model, False
 
@@ -9625,6 +9674,7 @@ def _configure_opencode(
     usage_base_url: str | None = None,
     usage_api_key: str | None = None,
     replace_model: bool = False,
+    model_view: str = "all",
 ) -> tuple[str | None, list[tuple[Path, dict]]]:
     """Register the bundled plugin for whichever OpenCode generation is installed.
 
@@ -9735,6 +9785,7 @@ def _configure_opencode(
             else {}
         ),
         "rampCliVersion": __version__,
+        "modelView": model_view,
         **(
             {"rampExecutable": str(executable)}
             if (executable := router_sync_module.ramp_executable()) is not None
@@ -9786,9 +9837,11 @@ def _configure_plugin_client(
     default_model: str,
     base_url: str | None = None,
     replace_model: bool = False,
+    model_view: str | None = None,
 ) -> None:
     package_path = _bundled_plugin_path(client)
     state_path = path.parent / "ramp-router-state.json"
+    model_view = model_view or _configured_plugin_model_view(path)
     state = None
     actual_base_url = base_url
     real_api_key = api_key
@@ -9807,6 +9860,7 @@ def _configure_plugin_client(
             usage_base_url=_statusline_origin(actual_base_url),
             usage_api_key=real_api_key,
             replace_model=replace_model,
+            model_view=model_view,
         )
     else:
         settings = _read_json_config(client, path)
@@ -9894,6 +9948,7 @@ def _configure_plugin_client(
                         else {}
                     ),
                     "rampCliVersion": __version__,
+                    "modelView": model_view,
                 },
             ),
         ]
@@ -9908,8 +9963,13 @@ def _configure_plugin_client(
     plugin_path_changed = installed_state.get("installed_plugin_path") != str(
         package_path
     )
-    if state is not None or plugin_path_changed:
+    if (
+        state is not None
+        or plugin_path_changed
+        or installed_state.get(PLUGIN_MODEL_VIEW_KEY) != model_view
+    ):
         installed_state["installed_plugin_path"] = str(package_path)
+        installed_state[PLUGIN_MODEL_VIEW_KEY] = model_view
         state = _dump_state(installed_state)
     try:
         # A path change and its receipt must roll back together. Otherwise keep
@@ -10435,18 +10495,25 @@ def _fetch_codex_catalog(api_key: str, *, base_url: str | None = None) -> dict:
 
 def _configured_codex_model_view(path: Path) -> str:
     """Use compact recommendations unless the user explicitly chose all."""
+    return (
+        "all" if _saved_model_view(path, CODEX_MODEL_VIEW_KEY) == "all" else "compact"
+    )
+
+
+def _configured_plugin_model_view(path: Path) -> str:
+    """Show all models unless the user explicitly chose compact."""
+    return (
+        "compact"
+        if _saved_model_view(path, PLUGIN_MODEL_VIEW_KEY) == "compact"
+        else "all"
+    )
+
+
+def _saved_model_view(path: Path, key: str) -> str | None:
     state_path = path.parent / "ramp-router-state.json"
     if not state_path.exists():
-        return "compact"
-    try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        if not isinstance(state, dict):
-            raise ValueError("expected an object")
-    except (OSError, UnicodeError, ValueError) as exc:
-        raise click.ClickException(
-            f"Could not read Ramp Router setup state from {state_path}: {exc}"
-        ) from None
-    return "all" if state.get(CODEX_MODEL_VIEW_KEY) == "all" else "compact"
+        return None
+    return _read_plugin_state(state_path).get(key)
 
 
 def _compact_codex_catalog(

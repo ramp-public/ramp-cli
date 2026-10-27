@@ -44,6 +44,8 @@ export type RouterModel = {
    * answers that were confidently wrong, and refusing to guess is the point.
    */
   metadata: RouterModelMetadata
+  /** Outside Router's compact view: callable, but kept out of the picker. */
+  hidden?: true
 }
 
 /**
@@ -88,6 +90,7 @@ const DEFAULT_DISCOVERY_TIMEOUT_MS = 10_000
 // Telemetry only: Router records the CLI version that wrote this plugin's
 // config and grants nothing for it.
 export const RAMP_CLI_VERSION_HEADER = "X-Gateway-Ramp-Cli-Version"
+const MODEL_VIEW_HEADER = "X-Gateway-Model-View"
 
 /** The metadata shape this client understands. */
 const SUPPORTED_SCHEMA_VERSION = 1
@@ -313,6 +316,8 @@ export async function discoverRouterModels(input: {
   baseURL: string
   apiKey: string
   rampCliVersion?: string
+  /** "compact" asks Router for its recommended shortlist. */
+  modelView?: string
   fetch?: typeof globalThis.fetch
   timeoutMs?: number
   signal?: AbortSignal
@@ -335,6 +340,7 @@ export async function discoverRouterModels(input: {
       ...(input.rampCliVersion
         ? { [RAMP_CLI_VERSION_HEADER]: input.rampCliVersion }
         : {}),
+      ...(input.modelView ? { [MODEL_VIEW_HEADER]: input.modelView } : {}),
     },
     signal: input.signal
       ? AbortSignal.any([input.signal, timeoutSignal])
@@ -392,4 +398,24 @@ export async function discoverRouterModels(input: {
     throw new Error("Ramp Router model discovery returned no models for this API key")
   }
   return { models, classifiers }
+}
+
+/**
+ * The full catalog, which stays callable, with models outside the requested
+ * view marked hidden. A failed compact listing hides nothing.
+ */
+export async function discoverRouterCatalog(
+  input: Parameters<typeof discoverRouterModels>[0],
+): Promise<RouterCatalog> {
+  const { modelView, ...full } = input
+  const [catalog, shortlist] = await Promise.all([
+    discoverRouterModels(full),
+    modelView ? discoverRouterModels({ ...full, modelView }).catch(() => undefined) : undefined,
+  ])
+  if (!shortlist) return catalog
+  const shown = new Set(shortlist.models.map((model) => model.id))
+  return {
+    ...catalog,
+    models: catalog.models.map((model) => (shown.has(model.id) ? model : { ...model, hidden: true })),
+  }
 }

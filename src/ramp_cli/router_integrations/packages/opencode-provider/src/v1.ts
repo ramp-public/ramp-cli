@@ -1,6 +1,6 @@
 import type { Config, Plugin } from "@opencode-ai/plugin"
 
-import { RAMP_CLI_VERSION_HEADER, discoverRouterModels } from "./discovery.ts"
+import { RAMP_CLI_VERSION_HEADER, discoverRouterCatalog } from "./discovery.ts"
 import type { RouterModel } from "./discovery.ts"
 import {
   openCodeModalities,
@@ -16,6 +16,7 @@ import {
   resolveBaseURL,
   resolveProviderID,
   resolveProviderName,
+  resolveModelView,
   resolveRampCliVersion,
   routerPluginOptions,
 } from "./options.ts"
@@ -98,6 +99,7 @@ export const RouterProviderV1: Plugin = async (_input, rawOptions) => {
   const apiKeyEnv = nonEmpty(options.apiKeyEnv, DEFAULT_API_KEY_ENV)
   const inlineAPIKey = nonEmpty(options.apiKey, "")
   const rampCliVersion = resolveRampCliVersion(options)
+  const modelView = resolveModelView(options)
 
   return {
     // OpenCode passes the current user message to every chat request; its ID
@@ -115,11 +117,20 @@ export const RouterProviderV1: Plugin = async (_input, rawOptions) => {
         )
       }
 
-      const discovered = await discoverRouterModels({
-        baseURL,
-        apiKey,
-        ...(rampCliVersion ? { rampCliVersion } : {}),
-      })
+      const configuredModel = config.model?.startsWith(`${providerID}/`)
+        ? config.model.slice(providerID.length + 1)
+        : undefined
+      // OpenCode cannot hide a model it can still use, so the compact view
+      // keeps only the shortlist and the configured model.
+      const discovered = (
+        await discoverRouterCatalog({
+          baseURL,
+          apiKey,
+          ...(rampCliVersion ? { rampCliVersion } : {}),
+          ...(modelView ? { modelView } : {}),
+          ...(configuredModel ? { keepVisible: configuredModel } : {}),
+        })
+      ).filter((model) => !model.hidden)
       const existing = providerConfig(config, providerID)
       const existingModels = existing?.models ?? {}
       const models = Object.fromEntries(

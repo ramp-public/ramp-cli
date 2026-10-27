@@ -44,7 +44,7 @@ import { join } from "node:path"
 
 import {
   RAMP_CLI_VERSION_HEADER,
-  discoverRouterModels,
+  discoverRouterCatalog,
   normalizeBaseURL,
 } from "./discovery.ts"
 import type {
@@ -119,7 +119,8 @@ type NativeModel = Model<"openai-responses"> | Model<"anthropic-messages">
 type RouterOwner = "anthropic" | "openai" | "other"
 // Discovery owns this classification; Pi's Responses adapter also serves
 // non-OpenAI Router models, so API alone is not enough to enable native tools.
-type RouterModel = Model<RouterApi> & { routerOwner: RouterOwner }
+// routerHidden models stay callable but are left out of the picker.
+type RouterModel = Model<RouterApi> & { routerOwner: RouterOwner; routerHidden?: true }
 // Pi's TypeSafe adapter speaks System One, which Router serves on
 // /v1/systemone; its OpenAI adapter speaks Decisions, served on /v1/decisions.
 // Each classifier API is run by the built-in Pi provider that owns its adapter.
@@ -536,6 +537,7 @@ function toPiModel(model: DiscoveredModel, baseUrl: string): RouterModel {
     provider: PROVIDER_ID,
     routerOwner: model.ownedBy === "anthropic" || model.ownedBy === "openai"
       ? model.ownedBy : "other",
+    ...(model.hidden ? { routerHidden: true as const } : {}),
     baseUrl: modelBaseURL(api, baseUrl),
     reasoning,
     ...(reasoning ? { thinkingLevelMap: thinkingLevelMap(model) } : {}),
@@ -627,6 +629,7 @@ function configuredRouter(): {
   usageApiKey?: string
   localApiKey?: string
   rampCliVersion?: string
+  modelView?: "compact"
 } {
   const home = piHome()
   try {
@@ -638,6 +641,7 @@ function configuredRouter(): {
         usageApiKey?: unknown
         localApiKey?: unknown
         rampCliVersion?: unknown
+        modelView?: unknown
       }
       return {
         ...(typeof record.usageApiKey === "string" && typeof record.localApiKey === "string"
@@ -652,6 +656,8 @@ function configuredRouter(): {
         ...(typeof record.rampCliVersion === "string" && record.rampCliVersion.trim()
           ? { rampCliVersion: record.rampCliVersion.trim() }
           : {}),
+        // Only the compact view changes the listing; "all" is Router's default.
+        ...(record.modelView === "compact" ? { modelView: "compact" as const } : {}),
       }
     }
   } catch {
@@ -659,6 +665,21 @@ function configuredRouter(): {
     // recorded, so fall through to the environment and then the default.
   }
   return {}
+}
+
+/** The Router model Pi's settings start new sessions on, if any. */
+function configuredDefaultModel(): string | undefined {
+  try {
+    const settings: unknown = JSON.parse(readFileSync(join(piHome(), "settings.json"), "utf8"))
+    const record = settings && typeof settings === "object"
+      ? settings as { defaultProvider?: unknown; defaultModel?: unknown }
+      : {}
+    return record.defaultProvider === PROVIDER_ID && typeof record.defaultModel === "string"
+      ? record.defaultModel
+      : undefined
+  } catch {
+    return undefined
+  }
 }
 
 type CatalogGeneration = { current: number }
@@ -686,6 +707,7 @@ function routerProvider(
   connectionFor: (key: string) => RouterConnection,
   initialCredentialIdentity?: string,
   rampCliVersion?: string,
+  modelView?: string,
 ) {
   // Pi's generic dynamic-provider helper restores models-store.json by only
   // provider ID. That store carries neither Router URL nor credential scope,
@@ -721,11 +743,16 @@ function routerProvider(
   // Pi's models.json composer rebuilds models from a fixed field list,
   // dropping routerOwner. Use only the private Router catalog for the owner
   // decision; an unknown or API-swapped model stays hidden.
-  const isAvailableChatModel = (candidate: Model<RouterApi>) => {
+  // The configured default stays listed even outside the compact view.
+  const isAvailableChatModel = (candidate: Model<RouterApi>, shownDefault?: string) => {
     const canonical = currentModels.find(
       (model) => model.id === candidate.id && model.api === candidate.api,
     )
-    return canonical !== undefined && isSupportedByPi(canonical)
+    return (
+      canonical !== undefined &&
+      (!canonical.routerHidden || canonical.id === shownDefault) &&
+      isSupportedByPi(canonical)
+    )
   }
   const payloadModelError = () =>
     new Error("Ramp Router request model is not in the active catalog")
@@ -1052,8 +1079,11 @@ function routerProvider(
   const registeredProvider = {
     ...provider,
     getModels,
-    filterModels: (candidateModels: readonly RouterModel[], credential?: Credential) =>
-      credentialMatchesCatalog(credential) ? candidateModels.filter(isAvailableChatModel) : [],
+    filterModels: (candidateModels: readonly RouterModel[], credential?: Credential) => {
+      if (!credentialMatchesCatalog(credential)) return []
+      const shownDefault = configuredDefaultModel()
+      return candidateModels.filter((candidate) => isAvailableChatModel(candidate, shownDefault))
+    },
     // Classifier members exist only on hosts that can run them; older Pi
     // reads getModels and never sees a classifier.
     ...(host.classifiers.size > 0
@@ -1062,19 +1092,20 @@ function routerProvider(
           filterAllModels: (
             candidates: readonly (Model<RouterApi> | RouterClassifier)[],
             credential?: Credential,
-          ) =>
-            credentialMatchesCatalog(credential)
-              ? candidates.filter((candidate) =>
-                  candidate.type === "classifier"
-                    ? currentClassifiers.some(
-                        (classifier) =>
-                          classifier.id === candidate.id &&
-                          classifier.api === candidate.api &&
-                          hostRunsClassifier(classifier),
-                      )
-                    : isAvailableChatModel(candidate),
-                )
-              : [],
+          ) => {
+            if (!credentialMatchesCatalog(credential)) return []
+            const shownDefault = configuredDefaultModel()
+            return candidates.filter((candidate) =>
+              candidate.type === "classifier"
+                ? currentClassifiers.some(
+                    (classifier) =>
+                      classifier.id === candidate.id &&
+                      classifier.api === candidate.api &&
+                      hostRunsClassifier(classifier),
+                  )
+                : isAvailableChatModel(candidate, shownDefault),
+            )
+          },
           classify,
         }
       : {}),
@@ -1130,15 +1161,16 @@ function routerProvider(
         )
       }
       const refreshGeneration = ++catalogGeneration.current
-      const connection = connectionFor(apiKey)
-      const discovered = await discoverRouterModels({
-        baseURL: connection.baseUrl,
-        apiKey: connection.apiKey,
-        ...(rampCliVersion ? { rampCliVersion } : {}),
-        ...(signal ? { signal } : {}),
-      })
+      const refreshed = await discoverModels(
+        baseUrl,
+        apiKey,
+        rampCliVersion,
+        modelView,
+        host,
+        connectionFor,
+        signal,
+      )
       if (signal.aborted) return
-      const refreshed = toPiCatalog(discovered, baseUrl, host)
       if (refreshGeneration !== catalogGeneration.current) return
       if (signal.aborted || refreshGeneration !== catalogGeneration.current) return
       // Cross Pi's refresh-generation gate before mutating either catalog.
@@ -1157,7 +1189,7 @@ function routerProvider(
           // superseded response can never overwrite a newer credential's
           // private cache.
           try {
-            writeModelCache(baseUrl, apiKey, refreshed)
+            writeModelCache(baseUrl, apiKey, refreshed, modelView)
           } catch {
             // The live provider refresh remains useful when its optional
             // startup cache cannot be updated.
@@ -1184,7 +1216,7 @@ function routerProvider(
       const configuredIdentity = configuredCredentialIdentityNow()
       if (configuredIdentity === null) {
         try {
-          writeModelCache(baseUrl, apiKey, refreshed)
+          writeModelCache(baseUrl, apiKey, refreshed, modelView)
         } catch {
           // The cache is an optional next-launch optimization.
         }
@@ -1195,7 +1227,7 @@ function routerProvider(
       }
       adoptCatalog(refreshed, requestCredentialIdentity)
       try {
-        writeModelCache(baseUrl, apiKey, refreshed)
+        writeModelCache(baseUrl, apiKey, refreshed, modelView)
       } catch {
         // A safely published live catalog remains useful when storage fails.
       }
@@ -1542,6 +1574,7 @@ function cachedRouterModel(value: unknown, baseUrl: string): RouterModel | undef
     "api",
     "provider",
     "routerOwner",
+    "routerHidden",
     "baseUrl",
     "reasoning",
     "thinkingLevelMap",
@@ -1557,6 +1590,7 @@ function cachedRouterModel(value: unknown, baseUrl: string): RouterModel | undef
     typeof model.name !== "string" ||
     model.provider !== PROVIDER_ID ||
     (model.routerOwner !== "anthropic" && model.routerOwner !== "openai" && model.routerOwner !== "other") ||
+    (model.routerHidden !== undefined && model.routerHidden !== true) ||
     (model.api !== "openai-responses" && model.api !== "anthropic-messages") ||
     (model.routerOwner === "anthropic" && model.api !== "anthropic-messages") ||
     (model.routerOwner !== "anthropic" && model.api !== "openai-responses") ||
@@ -1611,6 +1645,7 @@ function cachedRouterModel(value: unknown, baseUrl: string): RouterModel | undef
     api: model.api as RouterApi,
     provider: PROVIDER_ID,
     routerOwner: model.routerOwner as RouterOwner,
+    ...(model.routerHidden ? { routerHidden: true as const } : {}),
     baseUrl: modelBaseURL(model.api as RouterApi, baseUrl),
     reasoning: model.reasoning,
     ...(restoredThinkingLevelMap
@@ -1675,7 +1710,11 @@ function cachedRouterClassifier(value: unknown, baseUrl: string): RouterClassifi
 
 const EMPTY_CATALOG: RouterCatalog = { models: [], classifiers: [] }
 
-function readModelCache(baseUrl: string, apiKey: string): RouterCatalog {
+function readModelCache(
+  baseUrl: string,
+  apiKey: string,
+  modelView: string | undefined,
+): RouterCatalog {
   try {
     const expectedCredentialIdentity = cacheCredentialIdentity(apiKey)
     if (expectedCredentialIdentity === undefined) return EMPTY_CATALOG
@@ -1690,12 +1729,14 @@ function readModelCache(baseUrl: string, apiKey: string): RouterCatalog {
       version?: unknown
       baseUrl?: unknown
       credentialIdentity?: unknown
+      modelView?: unknown
       models?: unknown
       classifiers?: unknown
     }
     if (
       cache.version !== MODEL_CACHE_VERSION ||
       cache.baseUrl !== baseUrl ||
+      cache.modelView !== modelView ||
       cache.credentialIdentity !== expectedCredentialIdentity ||
       !Array.isArray(cache.models) ||
       !Array.isArray(cache.classifiers)
@@ -1728,6 +1769,7 @@ function writeModelCache(
   baseUrl: string,
   apiKey: string,
   catalog: RouterCatalog,
+  modelView: string | undefined,
 ): void {
   const persistentCredentialIdentity = cacheCredentialIdentity(apiKey)
   if (persistentCredentialIdentity === undefined) return
@@ -1740,6 +1782,7 @@ function writeModelCache(
       version: MODEL_CACHE_VERSION,
       baseUrl,
       credentialIdentity: persistentCredentialIdentity,
+      modelView,
       models: catalog.models,
       classifiers: catalog.classifiers,
     }),
@@ -1750,15 +1793,17 @@ async function discoverModels(
   baseUrl: string,
   apiKey: string,
   rampCliVersion: string | undefined,
+  modelView: string | undefined,
   host: HostSupport,
   connectionFor: (key: string) => RouterConnection,
   signal?: AbortSignal,
 ): Promise<RouterCatalog> {
   const connection = connectionFor(apiKey)
-  const discovered = await discoverRouterModels({
+  const discovered = await discoverRouterCatalog({
     baseURL: connection.baseUrl,
     apiKey: connection.apiKey,
     ...(rampCliVersion ? { rampCliVersion } : {}),
+    ...(modelView ? { modelView } : {}),
     ...(signal ? { signal } : {}),
   })
   return toPiCatalog(discovered, baseUrl, host)
@@ -1776,6 +1821,7 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
   // environment override aimed at another stack.
   const usageOrigin = environmentBaseUrl ? undefined : configured.usageBaseUrl
   const rampCliVersion = configured.rampCliVersion
+  const modelView = configured.modelView
   const connectionFor = (key: string) => resolveRouterConnection(baseUrl, key, configured)
   let usageBaseUrl = baseUrl
   try {
@@ -1806,7 +1852,7 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
     apiKey = await routerApiKey()
     if (!apiKey) throw new Error("Ramp Router credential is unavailable")
     startupCredentialIdentity = credentialIdentity(apiKey)
-    startupCatalog = readModelCache(baseUrl, apiKey)
+    startupCatalog = readModelCache(baseUrl, apiKey, modelView)
     restoredCatalog = startupCatalog.models.length > 0
 
     // Match Pi's own network policy exactly: the CLI implements --offline by
@@ -1818,6 +1864,7 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
         baseUrl,
         apiKey,
         rampCliVersion,
+        modelView,
         host,
         connectionFor,
         AbortSignal.timeout(STARTUP_DISCOVERY_TIMEOUT_MS),
@@ -1827,7 +1874,7 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
         apiKey = undefined
         throw new Error("Ramp Router credential changed during discovery")
       }
-      if (startupCatalog.models.length > 0) writeModelCache(baseUrl, apiKey, startupCatalog)
+      if (startupCatalog.models.length > 0) writeModelCache(baseUrl, apiKey, startupCatalog, modelView)
     }
   } catch {
     // A malformed local store or unavailable Router must not prevent Pi from
@@ -1857,6 +1904,7 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
     connectionFor,
     startupCredentialIdentity,
     rampCliVersion,
+    modelView,
   )
   pi.registerProvider(registeredProvider)
   registerUsageWidget(pi, {
@@ -1937,7 +1985,7 @@ export default async function registerRouterProvider(pi: ExtensionAPI): Promise<
   // private cache is an optional next-launch optimization, not a prerequisite
   // for using the newer catalog in this process.
   if (apiKey && backgroundGeneration !== undefined) {
-    void discoverModels(baseUrl, apiKey, rampCliVersion, host, connectionFor)
+    void discoverModels(baseUrl, apiKey, rampCliVersion, modelView, host, connectionFor)
       .then(async (refreshed) => {
         if (refreshed.models.length > 0) {
           // Pi resolves auth again for inference. If /login or a concurrent
