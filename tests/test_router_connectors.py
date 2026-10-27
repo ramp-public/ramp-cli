@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import os
@@ -133,42 +134,98 @@ def test_connector_callback_sends_browser_to_connectors_page():
         callback.shutdown()
 
 
-def test_shared_issuance_and_same_user_relogin_never_retargets_binding(monkeypatch):
+def test_shared_issuance_and_same_user_relogin_preserves_binding(monkeypatch):
     requests = []
+    current_auth = auth()
+    current_token = "mcp-access-secret"
 
     def handle(request):
         requests.append(request)
         assert request.url.path == "/api/auth/cli/mcp-token"
         assert request.headers["authorization"] == "Bearer cli-refresh-secret"
         assert json.loads(request.content) == {
-            k: auth()[k] for k in credentials.IDENTITY_FIELDS
+            k: current_auth[k] for k in credentials.AUTHORIZATION_FIELDS
         }
-        return issued()
+        return issued(**current_auth, access_token=current_token)
 
     client = setup(monkeypatch, handle)
     binding = credentials.create_binding(client)
+    bound = credentials.load_binding(binding)
     with ThreadPoolExecutor(max_workers=4) as pool:
         tokens = list(
             pool.map(
-                lambda _: credentials.issue(
-                    client, credentials.authorization(client), binding
-                ),
+                lambda _: credentials.issue(client, bound["identity"], binding),
                 range(4),
             )
         )
     assert tokens == ["mcp-access-secret"] * 4
     assert len(requests) == 1
     assert "secret" not in credentials._binding_path(binding).read_text()
-    client._save(
-        state(connector_authorization=auth(session_id="router-cli:session:replacement"))
-    )
-    old = credentials.load_binding(binding)
-    with pytest.raises(RampCLIError, match="authorization changed"):
-        credentials.issue(client, old["authorization"], binding)
-    assert len(requests) == 1
+    current_auth = auth(session_id="router-cli:session:replacement")
+    current_token = "replacement-mcp-secret"
+    client._save(state(connector_authorization=current_auth))
+    assert credentials.issue(client, bound["identity"], binding) == current_token
+    assert credentials.create_binding(client) == binding
+    assert credentials.load_binding(binding) == bound
+    assert len(requests) == 2
     client._clear()
     with pytest.raises(RampCLIError, match="Sign in"):
-        credentials.issue(client, old["authorization"], binding)
+        credentials.issue(client, bound["identity"], binding)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"connector_authorization": None},
+        {"connector_authorization": auth(scope="other")},
+        {"connector_authorization": auth(session_id="")},
+        {"connector_authorization": auth(user_id="other-user")},
+        {"connector_authorization": auth(business_uuid="other-business")},
+        {"connector_authorization": auth(core_user_uuid="other-core-user")},
+        {"connector_authorization": auth(resource="https://evil.example/v1/mcp")},
+        {"connector_authorization": auth(client_id="other-client")},
+        {"refresh_token": None},
+        {"issued_at": 0},
+    ],
+)
+@pytest.mark.parametrize("during_renewal", [False, True])
+def test_binding_rejects_invalid_or_different_identity_even_with_cached_token(
+    monkeypatch, change, during_renewal
+):
+    requests = []
+    client = setup(monkeypatch, lambda request: requests.append(request) or issued())
+    binding = credentials.create_binding(client)
+    bound = credentials.load_binding(binding)
+    if during_renewal:
+        monkeypatch.setattr(
+            client, "access_token", lambda: client._save(state(**change))
+        )
+    else:
+        client._save(state(**change))
+    with pytest.raises(RampCLIError) as error:
+        credentials.issue(client, bound["identity"], binding)
+    assert error.value.code == 4
+    assert len(requests) == 1
+
+
+def test_binding_rejects_revoked_replacement_authorization(monkeypatch):
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        if len(requests) == 1:
+            return issued()
+        assert json.loads(request.content)["session_id"] == "replacement"
+        return httpx.Response(401, json={"error": "invalid_grant"})
+
+    client = setup(monkeypatch, handle)
+    binding = credentials.create_binding(client)
+    client._save(state(connector_authorization=auth(session_id="replacement")))
+    with pytest.raises(RampCLIError, match="Connector authorization required"):
+        credentials.issue(
+            client, credentials.load_binding(binding)["identity"], binding
+        )
+    assert len(requests) == 2
 
 
 def test_issuance_finishes_pending_cli_rotation_and_uses_new_secret(monkeypatch):
@@ -371,9 +428,8 @@ def test_passive_edge_auth_never_invokes_browser_capable_helper(monkeypatch, tmp
     assert client._access_headers() == {}
 
 
-def test_status_distinguishes_replaced_binding_and_cli_json_contract(
-    monkeypatch, tmp_path
-):
+@pytest.mark.parametrize("same_account", [True, False])
+def test_status_after_relogin_and_cli_json_contract(monkeypatch, same_account):
     client = setup(monkeypatch, lambda request: issued())
     binding = credentials.create_binding(client)
     monkeypatch.setattr(
@@ -383,27 +439,41 @@ def test_status_distinguishes_replaced_binding_and_cli_json_contract(
     )
     assert credentials.status(client)["harnesses"][0]["state"] == "enabled"
     client._save(
-        state(connector_authorization=auth(session_id="router-cli:session:new"))
+        state(
+            connector_authorization=auth(
+                session_id="router-cli:session:new",
+                user_id="router-user" if same_account else "other-user",
+            )
+        )
     )
-    assert credentials.status(client)["harnesses"][0]["state"] == "conflict"
+    expected = "enabled" if same_account else "conflict"
+    assert credentials.status(client)["harnesses"][0]["state"] == expected
     result = CliRunner().invoke(
         cli, ["router", "connectors", "status", "--output", "json"]
     )
     assert result.exit_code == 0, result.output
-    assert json.loads(result.output)["harnesses"][0]["state"] == "conflict"
+    assert json.loads(result.output)["harnesses"][0]["state"] == expected
 
 
+@pytest.mark.parametrize("legacy_binding", [False, True])
 def test_bridge_forwards_json_and_sse_preserves_session_and_does_not_follow_redirects(
-    monkeypatch, capsys
+    monkeypatch, capsys, legacy_binding
 ):
     requests = []
+    current_auth = auth()
+    current_refresh = "cli-refresh-secret"
+    current_token = "mcp-access-secret"
 
     def handle(request):
         requests.append(request)
         if request.url.path == "/api/auth/cli/mcp-token":
-            return issued()
+            assert request.headers["authorization"] == "Bearer " + current_refresh
+            assert json.loads(request.content) == {
+                key: current_auth[key] for key in credentials.AUTHORIZATION_FIELDS
+            }
+            return issued(**current_auth, access_token=current_token)
         payload = json.loads(request.content)
-        assert request.headers["authorization"] == "Bearer mcp-access-secret"
+        assert request.headers["authorization"] == "Bearer " + current_token
         if payload.get("method") == "initialize":
             return httpx.Response(
                 200,
@@ -429,9 +499,26 @@ def test_bridge_forwards_json_and_sse_preserves_session_and_does_not_follow_redi
 
     client = setup(monkeypatch, handle)
     binding = credentials.create_binding(client)
+    if legacy_binding:
+        data = {
+            "origin": client.origin,
+            "profile": client.profile,
+            "authorization": credentials.authorization(client),
+        }
+        binding = hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[
+            :32
+        ]
+        credentials._binding_path(binding).write_text(json.dumps(data))
+    binding_contents = credentials._binding_path(binding).read_bytes()
     instance = bridge.Bridge(binding)
     try:
         instance.send({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+        current_auth = auth(session_id="router-cli:session:replacement")
+        current_refresh = "replacement-refresh-secret"
+        current_token = "replacement-mcp-secret"
+        client._save(
+            state(connector_authorization=current_auth, refresh_token=current_refresh)
+        )
         instance.send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         instance.send({"jsonrpc": "2.0", "id": 3, "method": "redirect"})
     finally:
@@ -441,6 +528,7 @@ def test_bridge_forwards_json_and_sse_preserves_session_and_does_not_follow_redi
     assert [m["id"] for m in messages] == [1, 2, 3]
     assert messages[1]["result"] == {"tools": []}
     assert messages[2]["error"]["code"] == -32000
+    assert credentials._binding_path(binding).read_bytes() == binding_contents
     assert "secret" not in output.out + output.err
     assert all(request.url.host != "evil.example" for request in requests)
 

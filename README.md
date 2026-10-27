@@ -200,9 +200,9 @@ Use `--reuse-existing-key` to reuse a saved key without the key-selection prompt
 OAuth sign-in still runs. `--no-input` and `--agent` are incompatible with this
 flow. Use `--no-browser` to print the sign-in URL and open it yourself.
 Previously enabled connector registrations for the same Router account,
-business, deployment, and credential profile are renewed for the new sign-in
-too, even when their harness is not selected. Their provider settings are left
-unchanged; disabled, custom, and other-account registrations are not retargeted.
+business, deployment, and credential profile keep working with the new sign-in
+through their existing bindings. Setup only writes connector registrations for
+the selected harnesses; other registrations are left unchanged.
 
 To authorize and enable connectors separately:
 
@@ -238,15 +238,21 @@ QA, and internal QA Router origins. Capability discovery is available through
 
 Harness configuration contains only the CLI executable and an opaque binding ID,
 never tokens. Each registration pins the Router deployment, MCP resource, profile,
-user, business, Core identity, and authorizing device session. Signing in again,
-even as the same user, requires explicit re-enable; status reports the old
-registration as `conflict`. Status is local/cached and does not guarantee live
+user, business, and Core identity, independently of a particular login session.
+The bridge resolves the current connector authorization for that identity on each
+call. Signing in again with `ramp router login --connectors` as the same user and
+business keeps the binding and MCP registration working, including older bindings.
+A different account or business requires explicit re-enable; status reports an
+identity mismatch as `conflict`. Status is local/cached and does not guarantee live
 server authorization. The bridge never opens a browser to recover authentication.
 
 Credentials remain in the private Router CLI store. Processes share its locked,
-durable refresh protocol and a private short-lived MCP token cache. Logging out or
-revoking the authorizing session prevents further issuance; an already-issued MCP
-token can remain valid for at most 300 seconds after issuance plus the existing
+durable refresh protocol and a private short-lived MCP token cache. A replacement
+login cannot reuse an MCP token cached for the previous authorization. Logging out,
+missing connector consent, or expired refresh credentials stops the bridge until
+valid connector authorization is available for the bound identity. Revoking the
+current authorizing session prevents further issuance; an already-issued MCP token
+can remain valid for at most 300 seconds after issuance plus the existing
 10-second server clock tolerance (310 seconds total), not immediate revocation.
 Other sessions and provider connections are unaffected.
 

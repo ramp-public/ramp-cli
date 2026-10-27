@@ -80,52 +80,6 @@ def disconnect(client: RouterUserClient, key: str) -> dict:
         raise _not_found(key) if error.status_code == 404 else error from None
 
 
-def _renew_other_harnesses(clients: tuple[str, ...], binding: str) -> None:
-    target = auth.load_binding(binding)
-    for harness in harnesses.HARNESSES:
-        if harness in clients:
-            continue
-        try:
-            registration = harnesses.status(harness)
-            if registration["state"] != "enabled":
-                continue
-            previous = auth.load_binding(registration["binding_id"])
-        except RampCLIError:
-            # An unrelated malformed/custom configuration must not block setup.
-            continue
-        # Fresh consent replaces the shared device session. Renew previously
-        # enabled registrations, but never retarget them to another account,
-        # business, deployment, or credential profile after an account switch.
-        if (
-            previous["origin"] == target["origin"]
-            and previous.get("profile") == target.get("profile")
-            and all(
-                previous["authorization"][field] == target["authorization"][field]
-                for field in auth.IDENTITY_FIELDS
-                if field != "session_id"
-            )
-        ):
-            harnesses.enable(harness, binding)
-
-
-def _registered(harness: str) -> bool:
-    try:
-        return harnesses.status(harness)["state"] == "enabled"
-    except RampCLIError:
-        return False
-
-
-def renew_after_login(client: RouterUserClient) -> None:
-    """Keep same-account connector registrations working after a new sign-in."""
-    try:
-        if not any(_registered(harness) for harness in harnesses.HARNESSES):
-            return
-        _renew_other_harnesses((), auth.create_binding(client))
-    except (RampCLIError, OSError):
-        # Sign-in succeeded. Any registration left stale still shows as a conflict.
-        pass
-
-
 def configure_harnesses(
     ctx: click.Context,
     clients: tuple[str, ...],
@@ -179,7 +133,6 @@ def configure_harnesses(
         binding = auth.create_binding(client)
         for harness in clients:
             harnesses.enable(harness, binding)
-        _renew_other_harnesses(clients, binding)
 
         if api_key is not None:
             return api_key, False

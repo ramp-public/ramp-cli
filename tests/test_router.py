@@ -513,10 +513,10 @@ def test_configure_connectors_machine_output_reauthenticates_and_reuses_key(
     assert all(row["connectors_enabled"] for row in data["clients"])
     for harness, previous in previous_bindings.items():
         current = connector_harnesses.status(harness)["binding_id"]
-        assert current != previous
-        assert connector_auth.load_binding(current)["authorization"] == (
-            connector_auth.authorization(client)
-        )
+        assert current == previous
+    assert all(
+        row["state"] == "enabled" for row in connector_auth.status(client)["harnesses"]
+    )
     assert "router-secret" not in result.output
 
     connector_setup.clear()
@@ -532,7 +532,7 @@ def test_configure_connectors_machine_output_reauthenticates_and_reuses_key(
 
 
 @pytest.mark.parametrize("selected", connector_harnesses.HARNESSES)
-def test_configure_connectors_renews_previously_enabled_harnesses(
+def test_configure_connectors_preserves_previously_enabled_harnesses(
     connector_setup, selected
 ):
     runner = CliRunner()
@@ -562,22 +562,16 @@ def test_configure_connectors_renews_previously_enabled_harnesses(
     client = RouterUserClient(router_module.ROUTER_UI_URL)
     try:
         current = connector_harnesses.status(selected)["binding_id"]
-        assert current != old_binding
+        assert current == old_binding
         assert all(
             row["state"] == "enabled"
             for row in connector_auth.status(client)["harnesses"]
         )
         for harness in previous:
             assert connector_harnesses.status(harness)["binding_id"] == current
-            parse = tomllib.loads if harness == "codex" else json.loads
-            assert parse(connector_harnesses.config_path(harness).read_text()) == (
-                parse(before[harness].replace(old_binding, current))
+            assert (
+                connector_harnesses.config_path(harness).read_text() == before[harness]
             )
-        # The old binding remains pinned; existing bridges cannot silently
-        # switch authorization without reloading their harness registration.
-        assert connector_auth.load_binding(old_binding)["authorization"] != (
-            connector_auth.authorization(client)
-        )
     finally:
         client.close()
 
@@ -617,13 +611,13 @@ def test_configure_connectors_does_not_retarget_unselected_harnesses(
     else:
         if difference == "origin":
             saved["origin"] = "https://internal.router.com"
-            saved["authorization"]["resource"] = connector_auth.resource_for_origin(
+            saved["identity"]["resource"] = connector_auth.resource_for_origin(
                 saved["origin"]
             )
         elif difference == "profile":
             saved["profile"] = "agent"
         else:
-            saved["authorization"][difference] = "another-identity"
+            saved["identity"][difference] = "another-identity"
         path.write_text(json.dumps(saved))
     config = connector_harnesses.config_path("codex")
     before = config.read_bytes()
@@ -646,7 +640,7 @@ def test_configure_connectors_does_not_retarget_unselected_harnesses(
 
 
 @pytest.mark.parametrize("same_account", [True, False])
-def test_connector_login_renews_only_same_account_registrations(
+def test_connector_login_preserves_bindings_and_checks_identity(
     connector_setup, same_account
 ):
     runner = CliRunner()
@@ -658,7 +652,7 @@ def test_connector_login_renews_only_same_account_registrations(
     if not same_account:
         path = connector_auth._binding_path(binding)
         saved = json.loads(path.read_text())
-        saved["authorization"]["user_id"] = "another-user"
+        saved["identity"]["user_id"] = "another-user"
         path.write_text(json.dumps(saved))
     config = connector_harnesses.config_path("codex")
     before = config.read_bytes()
@@ -666,18 +660,15 @@ def test_connector_login_renews_only_same_account_registrations(
     result = runner.invoke(cli, ["--human", "router", "login", "--connectors"])
 
     assert result.exit_code == 0, result.output
-    if same_account:
-        current = connector_harnesses.status("codex")["binding_id"]
-        assert current != binding
-        client = RouterUserClient(router_module.ROUTER_UI_URL)
-        try:
-            assert connector_auth.load_binding(current)["authorization"] == (
-                connector_auth.authorization(client)
-            )
-        finally:
-            client.close()
-    else:
-        assert config.read_bytes() == before
+    assert connector_harnesses.status("codex")["binding_id"] == binding
+    assert config.read_bytes() == before
+    client = RouterUserClient(router_module.ROUTER_UI_URL)
+    try:
+        status = connector_auth.status(client)
+        codex = next(row for row in status["harnesses"] if row["harness"] == "codex")
+        assert codex["state"] == ("enabled" if same_account else "conflict")
+    finally:
+        client.close()
     assert connector_harnesses.status("opencode")["state"] == "disabled"
 
 
@@ -692,36 +683,6 @@ def test_connector_login_survives_unreadable_harness_config(
     result = CliRunner().invoke(cli, ["--human", "router", "login", "--connectors"])
 
     assert result.exit_code == 0, result.output
-
-
-def test_configure_connectors_reports_failed_renewal(connector_setup, monkeypatch):
-    runner = CliRunner()
-    first = runner.invoke(
-        cli, ["--human", "router", "configure", "codex", "--connectors"]
-    )
-    assert first.exit_code == 0, first.output
-    enable = connector_harnesses.enable
-
-    def fail_renewal(harness, binding):
-        if harness == "codex":
-            raise RampCLIError("Cannot renew Codex connector registration")
-        return enable(harness, binding)
-
-    monkeypatch.setattr(connector_harnesses, "enable", fail_renewal)
-    result = runner.invoke(
-        cli,
-        [
-            "--human",
-            "router",
-            "configure",
-            "opencode",
-            "--connectors",
-            "--reuse-existing-key",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert "Cannot renew Codex" in str(result.exception)
 
 
 @pytest.mark.parametrize("selection", ["reuse-required", "conflict", "cancel"])

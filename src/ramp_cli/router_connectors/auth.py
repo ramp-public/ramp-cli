@@ -27,9 +27,9 @@ IDENTITY_FIELDS = (
     "user_id",
     "business_uuid",
     "core_user_uuid",
-    "session_id",
 )
-UPGRADE = "Connector authorization required. Run 'ramp router login --connectors', then explicitly enable this harness again."
+AUTHORIZATION_FIELDS = (*IDENTITY_FIELDS, "session_id")
+UPGRADE = "Connector authorization required. Run 'ramp router login --connectors' for the bound account and business."
 
 
 def resource_for_origin(origin: str) -> str:
@@ -55,7 +55,7 @@ def authorization(client: RouterUserClient) -> dict:
 
 def validate_authorization(origin: str, value: object) -> dict:
     if not isinstance(value, dict) or any(
-        not isinstance(value.get(k), str) or not value[k] for k in IDENTITY_FIELDS
+        not isinstance(value.get(k), str) or not value[k] for k in AUTHORIZATION_FIELDS
     ):
         raise RampCLIError(UPGRADE, code=4)
     if (
@@ -67,7 +67,22 @@ def validate_authorization(origin: str, value: object) -> dict:
             "Stored connector authorization does not match this deployment/client.",
             code=4,
         )
-    return {key: value[key] for key in IDENTITY_FIELDS}
+    return {key: value[key] for key in AUTHORIZATION_FIELDS}
+
+
+def _identity(auth: dict) -> dict:
+    return {key: auth[key] for key in IDENTITY_FIELDS}
+
+
+def _bound_authorization(client: RouterUserClient, expected: dict) -> dict:
+    auth = authorization(client)
+    if _identity(auth) != expected:
+        raise RampCLIError(
+            "Router account or business changed. Sign in to the bound account "
+            "or explicitly enable this harness for the new identity.",
+            code=4,
+        )
+    return auth
 
 
 def _directory() -> Path:
@@ -83,23 +98,28 @@ def _binding_path(binding: str) -> Path:
 def load_binding(binding: str) -> dict:
     try:
         value = json.loads(_binding_path(binding).read_text())
-        if (
-            not isinstance(value, dict)
-            or value["origin"] not in RESOURCES
-            or not isinstance(value["authorization"], dict)
-        ):
+        if not isinstance(value, dict) or value["origin"] not in RESOURCES:
             raise ValueError
-        auth = value["authorization"]
+        # Older registrations keep their opaque ID, but their saved session no
+        # longer selects authorization. Only the bound identity is carried forward.
+        legacy = "identity" not in value
+        auth = value["authorization"] if legacy else value["identity"]
+        fields = AUTHORIZATION_FIELDS if legacy else IDENTITY_FIELDS
         if (
-            set(auth) != set(IDENTITY_FIELDS)
-            or any(not isinstance(auth[k], str) or not auth[k] for k in IDENTITY_FIELDS)
+            not isinstance(auth, dict)
+            or set(auth) != set(fields)
+            or any(not isinstance(auth[k], str) or not auth[k] for k in fields)
             or auth["resource"] != RESOURCES[value["origin"]]
             or auth["client_id"] != CLIENT_ID
         ):
             raise ValueError
         if value.get("profile") is not None and not isinstance(value["profile"], str):
             raise ValueError
-        return value
+        return {
+            "origin": value["origin"],
+            "profile": value.get("profile"),
+            "identity": _identity(auth),
+        }
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise RampCLIError(
             "Connector binding is missing or invalid; explicitly enable the harness again.",
@@ -108,11 +128,11 @@ def load_binding(binding: str) -> dict:
 
 
 def create_binding(client: RouterUserClient) -> str:
-    auth = authorization(client)
-    data = {"origin": client.origin, "profile": client.profile, "authorization": auth}
-    # All harnesses for a single device authorization share one access-token cache.
+    identity = _identity(authorization(client))
+    data = {"origin": client.origin, "profile": client.profile, "identity": identity}
+    # A new login changes the token cache's authorization, not the binding ID.
     binding = hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:32]
-    issue(client, auth, binding)
+    issue(client, identity, binding)
     _atomic_write(_binding_path(binding), data)
     return binding
 
@@ -137,7 +157,7 @@ def status(client: RouterUserClient) -> dict:
                 if bound != {
                     "origin": client.origin,
                     "profile": client.profile,
-                    "authorization": auth,
+                    "identity": _identity(auth) if auth else None,
                 }:
                     result["state"] = "conflict"
             except RampCLIError:
@@ -166,11 +186,7 @@ def issue(
     with _refresh_lock("router-connectors-" + binding):
         cache_path = _directory() / f"token-{binding}.json"
         with _refresh_lock(client.namespace):
-            if authorization(client) != expected:
-                raise RampCLIError(
-                    "Router authorization changed. Explicitly enable this harness again.",
-                    code=4,
-                )
+            _bound_authorization(client, expected)
         # Recover/rotate through the existing durable CLI refresh protocol only.
         # no_input prevents Router's reauthorization recovery from opening a browser.
         try:
@@ -180,15 +196,11 @@ def issue(
                 "Router account renewal failed; retry or explicitly sign in again."
             ) from exc
         with _refresh_lock(client.namespace):
-            if authorization(client) != expected:
-                raise RampCLIError(
-                    "Router authorization changed. Explicitly enable this harness again.",
-                    code=4,
-                )
+            current = _bound_authorization(client, expected)
             try:
                 cache = json.loads(cache_path.read_text())
                 if (
-                    cache.get("authorization") == expected
+                    cache.get("authorization") == current
                     and time.time() < cache.get("expires_at", 0) - 30
                     and cache.get("access_token") != rejected
                 ):
@@ -203,7 +215,7 @@ def issue(
             try:
                 response = client._pool().post(
                     client.origin + "/api/auth/cli/mcp-token",
-                    json=expected,
+                    json=current,
                     headers={
                         **client._access_headers(),
                         "Authorization": "Bearer " + state["refresh_token"],
@@ -226,7 +238,7 @@ def issue(
                 lifetime = token["expires_in"]
                 access = token["access_token"]
                 if (
-                    any(token.get(k) != expected[k] for k in IDENTITY_FIELDS)
+                    any(token.get(k) != current[k] for k in AUTHORIZATION_FIELDS)
                     or token.get("scope") != "connectors:execute"
                     or token.get("token_type", "").lower() != "bearer"
                     or type(lifetime) is not int
@@ -244,7 +256,7 @@ def issue(
             _atomic_write(
                 cache_path,
                 {
-                    "authorization": expected,
+                    "authorization": current,
                     "access_token": access,
                     "expires_at": time.time() + lifetime,
                 },

@@ -1068,12 +1068,6 @@ def register_router_user_commands(
                 timeout=timeout,
                 **({"connectors": True} if connectors else {}),
             )
-            if connectors:
-                from ramp_cli.commands.router_connectors import (  # noqa: PLC0415
-                    renew_after_login,
-                )
-
-                renew_after_login(client)
         finally:
             client.close()
         _output_session(ctx, session, title="Signed in to Router")

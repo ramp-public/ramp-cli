@@ -111,7 +111,7 @@ class Bridge:
                         "id": message["id"],
                         "error": {
                             "code": -32000,
-                            "message": "Router connectors unavailable. Check 'ramp router connectors status'; sign in with 'ramp router login --connectors' and explicitly re-enable if authorization changed.",
+                            "message": "Router connectors unavailable. Check 'ramp router connectors status'; sign in with 'ramp router login --connectors' for the bound account and business, or explicitly re-enable to use a different identity.",
                         },
                     }
                 )
@@ -121,7 +121,7 @@ class Bridge:
             )
 
     def _send(self, message: dict, responded: list[bool]):
-        expected = self.target["authorization"]
+        expected = self.target["identity"]
         token = issue(self.account, expected, self.binding)
         for attempt in range(2):
             with self.session_lock:
