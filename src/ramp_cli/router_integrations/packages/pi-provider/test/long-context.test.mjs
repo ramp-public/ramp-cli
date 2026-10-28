@@ -12,6 +12,7 @@ import registerRouterProvider from "../src/index.ts"
 function routerMetadata() {
   return {
     schema_version: 1,
+    provider_model: "gpt-5.4",
     limits: { context_window: 1_000_000, max_output_tokens: 128_000 },
     pricing: {
       input: "2",
@@ -70,9 +71,38 @@ describe("standard-price context windows", () => {
   }
 })
 
+describe("provider identity context policy", () => {
+  const cases = [
+    ["provider GPT outranks a readable id", "GPT 6.1 Sol", { provider_model: "gpt-6.1-sol" }, 272_000],
+    ...["openai/gpt-6.1-sol", "openai:gpt-6.1-sol", "openai.gpt-6.1-sol"].map(
+      (provider_model) => [provider_model, "Sol", { provider_model }, 272_000],
+    ),
+    ["non-GPT provider outranks GPT alias", "gpt-route", { provider_model: "claude-haiku-5-5", request_name: "gpt-route" }, 1_000_000],
+    ["non-GPT provider outranks GPT label", "grok-4.7", { provider_model: "grok-4.7", display_name: "gpt-6.1-sol" }, 1_000_000],
+    ["missing provider falls back to request name", "Readable", { provider_model: undefined, request_name: "openai/gpt-6.1-sol" }, 272_000],
+    ["empty provider falls back to request name", "Readable", { provider_model: "", request_name: "gpt-6.1-sol" }, 272_000],
+    ["request identity outranks GPT id", "gpt-route", { provider_model: undefined, request_name: "grok-4.7" }, 1_000_000],
+    ["missing identities fall back to id", "openai:gpt-6.1-sol", { provider_model: undefined }, 272_000],
+    ["readable label is not identity", "Sol", { provider_model: undefined, display_name: "gpt-6.1-sol" }, 1_000_000],
+    ["GPT substring is not GPT identity", "not-gpt-model", { provider_model: "not-gpt-model" }, 1_000_000],
+    ["full window without pricing", "haiku", { provider_model: "claude-haiku-5-5", pricing: undefined }, 1_000_000],
+  ]
+  for (const [name, id, overrides, expected] of cases) {
+    it(name, () => {
+      const original = { ...routerMetadata(), ...overrides }
+      const gpt = parseRouterMetadata({ ...original, provider_model: "gpt-6.1-sol" }, undefined, id)
+      const parsed = parseRouterMetadata(original, undefined, id)
+      assert.equal(parsed.contextWindow, expected)
+      // Classification changes no pricing, output, reasoning, or other metadata.
+      assert.deepEqual({ ...parsed, contextWindow: gpt.contextWindow }, gpt)
+      assert.equal(original.limits.context_window, 1_000_000)
+    })
+  }
+})
+
 afterEach(() => mock.restoreAll())
 
-it("publishes, refreshes, and caches Pi's capped window", async () => {
+it("publishes, refreshes, and caches GPT caps and full non-GPT windows", { timeout: 5000 }, async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-long-context-"))
   const previousHome = process.env.PI_CODING_AGENT_DIR
   const previousOffline = process.env.PI_OFFLINE
@@ -83,14 +113,20 @@ it("publishes, refreshes, and caches Pi's capped window", async () => {
       "ramp-router": { type: "api_key", key: "test-secret" },
     }))
     const metadata = routerMetadata()
+    const models = [
+      { id: "test-model", owned_by: "vertex", router: metadata },
+      { id: "claude-haiku-5-5", owned_by: "anthropic", router: { ...routerMetadata(), provider_model: "claude-haiku-5-5" } },
+      { id: "grok-4.7", owned_by: "xai", router: { ...routerMetadata(), provider_model: "grok-4.7", limits: { context_window: 500_000, max_output_tokens: 128_000 } } },
+    ]
     mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({
-      data: [{ id: "test-model", owned_by: "vertex", router: metadata }],
+      data: models,
     })))
     const registerProvider = mock.fn()
     await registerRouterProvider({ registerProvider })
     const [provider] = registerProvider.mock.calls[0].arguments
     assert.equal(provider.getModels()[0].contextWindow, 272_000)
     assert.equal(provider.getModels()[0].maxTokens, 128_000)
+    assert.deepEqual(provider.getModels().map((model) => model.contextWindow), [272_000, 1_000_000, 500_000])
 
     metadata.pricing.long_context_token_threshold = 200_000
     await provider.refreshModels({
@@ -106,6 +142,7 @@ it("publishes, refreshes, and caches Pi's capped window", async () => {
     assert.equal(provider.getModels()[0].cost.tiers[0].inputTokensAbove, 200_000)
     const cached = JSON.parse(readFileSync(join(home, "ramp-router-model-cache.json"), "utf8"))
     assert.equal(cached.models[0].contextWindow, 200_000)
+    assert.deepEqual(cached.models.map((model) => model.contextWindow), [200_000, 1_000_000, 500_000])
 
     process.env.PI_OFFLINE = "1"
     mock.method(globalThis, "fetch", async () => {
@@ -114,6 +151,37 @@ it("publishes, refreshes, and caches Pi's capped window", async () => {
     const offlineProvider = mock.fn()
     await registerRouterProvider({ registerProvider: offlineProvider })
     assert.equal(offlineProvider.mock.calls[0].arguments[0].getModels()[0].contextWindow, 200_000)
+    assert.deepEqual(offlineProvider.mock.calls[0].arguments[0].getModels().map((model) => model.contextWindow), [200_000, 1_000_000, 500_000])
+
+    // An existing same-version cache remains usable at startup, then the usual
+    // background discovery upgrades its old non-GPT caps without invalidation.
+    const cachePath = join(home, "ramp-router-model-cache.json")
+    const previousCache = structuredClone(cached)
+    previousCache.models[1].contextWindow = 100_000
+    previousCache.models[2].contextWindow = 200_000
+    writeFileSync(cachePath, JSON.stringify(previousCache))
+    delete process.env.PI_OFFLINE
+    const discovery = Promise.withResolvers()
+    const published = Promise.withResolvers()
+    mock.method(globalThis, "fetch", () => discovery.promise)
+    const handlers = new Map()
+    const upgradedRegistration = mock.fn()
+    await registerRouterProvider({
+      registerProvider: upgradedRegistration,
+      on: (event, handler) => handlers.set(event, handler),
+    })
+    const upgraded = upgradedRegistration.mock.calls[0].arguments[0]
+    assert.deepEqual(upgraded.getModels().map((model) => model.contextWindow), [200_000, 100_000, 200_000])
+    await handlers.get("session_start")({}, {
+      modelRegistry: { refresh: async () => published.resolve() },
+    })
+    discovery.resolve(new Response(JSON.stringify({ data: models })))
+    await published.promise
+    assert.deepEqual(upgraded.getModels().map((model) => model.contextWindow), [200_000, 1_000_000, 500_000])
+    const upgradedCache = JSON.parse(readFileSync(cachePath, "utf8"))
+    assert.equal(upgradedCache.version, previousCache.version)
+    assert.equal(upgradedCache.credentialIdentity, previousCache.credentialIdentity)
+    assert.deepEqual(upgradedCache.models.map((model) => model.contextWindow), [200_000, 1_000_000, 500_000])
   } finally {
     if (previousHome === undefined) delete process.env.PI_CODING_AGENT_DIR
     else process.env.PI_CODING_AGENT_DIR = previousHome
@@ -136,7 +204,7 @@ async function withOutputProvider(ownedBy, run) {
     }))
     const id = ownedBy === "anthropic" ? "claude-sonnet-4-6" : "gpt-5.4"
     mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({
-      data: [{ id, owned_by: ownedBy, router: routerMetadata() }],
+      data: [{ id, owned_by: ownedBy, router: { ...routerMetadata(), provider_model: id } }],
     })))
     const registerProvider = mock.fn()
     await registerRouterProvider({ registerProvider })
@@ -156,7 +224,9 @@ describe("output budgets", () => {
     it(`matches native ${ownedBy} output budgeting`, async () => {
       await withOutputProvider(ownedBy, async (provider, home) => {
         const [model] = provider.getModels()
-        assert.equal(model.contextWindow, 272_000)
+        const contextWindow = ownedBy === "openai" ? 272_000 : 1_000_000
+        const outputBudget = ownedBy === "openai" ? 12_904 : 128_000
+        assert.equal(model.contextWindow, contextWindow)
         const contextForTokens = (tokens) => ({ messages: [
           { role: "user", content: [{ type: "text", text: "hello" }], timestamp: 1 },
           {
@@ -203,9 +273,9 @@ describe("output budgets", () => {
           assert.equal(await matchesNative(provider, model, method, { maxTokens: 4_096 }), 4_096)
           await matchesNative(provider, { ...model, maxTokens: 32_768 }, method)
         }
-        assert.equal(await matchesNative(provider, model, "streamSimple"), 12_904)
+        assert.equal(await matchesNative(provider, model, "streamSimple"), outputBudget)
         assert.equal(await matchesNative(provider, model, "streamSimple", {}, contextForTokens(1_000)), 128_000)
-        assert.equal(provider.getModels()[0].contextWindow, 272_000)
+        assert.equal(provider.getModels()[0].contextWindow, contextWindow)
 
         let reasoningPayload
         await matchesNative(provider, { ...model, reasoning: true }, "streamSimple", {
@@ -228,8 +298,8 @@ describe("output budgets", () => {
         await registerRouterProvider({ registerProvider: offlineProvider })
         const cached = offlineProvider.mock.calls[0].arguments[0]
         const [cachedModel] = cached.getModels()
-        assert.equal(cachedModel.contextWindow, 272_000)
-        assert.equal(await matchesNative(cached, cachedModel, "streamSimple"), 12_904)
+        assert.equal(cachedModel.contextWindow, contextWindow)
+        assert.equal(await matchesNative(cached, cachedModel, "streamSimple"), outputBudget)
 
         const cachePath = join(home, "ramp-router-model-cache.json")
         const cache = JSON.parse(readFileSync(cachePath, "utf8"))

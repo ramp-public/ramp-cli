@@ -20,7 +20,7 @@ export type RouterModelMetadata = {
   description?: string
   /** Router's stable presentation order. Not a quality ranking. */
   listingOrder: number
-  /** Router's window, capped at the standard-price input threshold when stated. */
+  /** Router's full window, except GPT's stated standard-price input cap. */
   contextWindow: number
   maxOutputTokens: number
   inputModalities: string[]
@@ -72,6 +72,7 @@ const MODEL_VIEW_HEADER = "X-Gateway-Model-View"
 
 /** The metadata shape this client understands. */
 const SUPPORTED_SCHEMA_VERSION = 1
+const GPT_MODEL_ID = /(?:^|[/:.])gpt-/
 
 export function normalizeBaseURL(value: string): string {
   const url = new URL(value)
@@ -192,9 +193,14 @@ export function parseRouterMetadata(
   const defaultEffort = text(reasoning.default_effort)
   const rates = pricing(router.pricing)
   const priceBands = record(router.pricing)
-  const longContextThreshold = pricing(priceBands.long_context) !== undefined
-    ? count(priceBands.long_context_token_threshold)
-    : undefined
+  const longContextThreshold = count(priceBands.long_context_token_threshold)
+  // Provider identity outranks request aliases; readable labels are not model ids.
+  const contextCap =
+    longContextThreshold !== undefined &&
+    GPT_MODEL_ID.test(text(router.provider_model) ?? text(router.request_name) ?? identifier) &&
+    pricing(priceBands.long_context) !== undefined
+      ? longContextThreshold
+      : contextWindow
   const status = text(router.status)
   const temperature = flag(capabilities.temperature)
   const summaryRequestable = flag(summary.request_parameter_supported) ?? false
@@ -211,8 +217,8 @@ export function parseRouterMetadata(
     reasoningSummaryValues: strings(summary.values),
     reasoningSummaryRequestable: summaryRequestable,
     reasoningInclude: strings(continuation.request_include),
-    // Router charges the long-context band strictly above the threshold.
-    contextWindow: Math.min(contextWindow, longContextThreshold ?? contextWindow),
+    // GPT retains its inclusive pricing cap. OpenCode owns compaction for other families.
+    contextWindow: Math.min(contextWindow, contextCap),
     maxOutputTokens,
     ...(description !== undefined ? { description } : {}),
     ...(toolCalls !== undefined ? { toolCalls } : {}),

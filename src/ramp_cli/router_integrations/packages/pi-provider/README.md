@@ -7,14 +7,16 @@ Router API key. Anthropic-owned models use Router's Anthropic Messages
 compatibility endpoint; other models use the OpenAI Responses API. Rows Router
 marks as unable to serve their selected API are left out.
 
-For chat models with `router.pricing.long_context` and a valid
+For GPT-class chat models with `router.pricing.long_context` and a valid
 `long_context_token_threshold`, the discovered context window is capped at
-that threshold so Pi compacts before entering the higher-priced band. Models
-without that pricing band keep their stated window. Published output limits and
-standard rates are unchanged. This is a cost-aware default, not a hard spending
-limit: manual window overrides or a large prompt/tool result can still cross it.
+that threshold so Pi compacts before entering the higher-priced band. Non-GPT
+models always advertise Router's full window; Pi handles compaction independently.
+GPT models without that pricing band also keep their stated window. Published
+output limits and standard rates are unchanged. This is a cost-aware default,
+not a hard spending limit: manual window overrides or a large prompt/tool result
+can still cross it.
 
-As in native Pi, the capped window controls both compaction and per-request
+As in native Pi, the advertised window controls both compaction and per-request
 output budgeting. Available output shrinks as the context fills. Caller output
 limits and model tuning still follow Pi's normal adapter behavior.
 

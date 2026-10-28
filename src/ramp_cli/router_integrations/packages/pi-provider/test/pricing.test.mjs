@@ -63,7 +63,7 @@ describe("native Pi context pricing", () => {
   for (const [name, tokens, expected] of cases) {
     it(name, () => {
       const parsed = parseRouterMetadata(metadata(), undefined, "test-model")
-      assert.equal(parsed.contextWindow, 272_000)
+      assert.equal(parsed.contextWindow, 1_000_000)
       assert.deepEqual(parsed.pricing, expectedCost)
       assertCost(calculateCost({ cost: parsed.pricing }, usage(tokens)), expected)
     })

@@ -9,13 +9,14 @@ deprecation state taken from Router's metadata. Model requests use the OpenAI
 Responses API. Rows Router marks as unable to serve Responses traffic (for
 example TypeSafe, which answers only on `/v1/systemone`) are left out.
 
-When Router supplies `router.pricing.long_context` and a valid
+For GPT-class models, when Router supplies `router.pricing.long_context` and a valid
 `long_context_token_threshold`, both generations cap the discovered context
 window at that threshold so automatic compaction avoids the higher-priced
-band. Models without that band keep their stated window; output limits and
-displayed standard rates are unchanged. User-configured limits still override
-the discovered defaults. This is not a hard spending limit: an oversized prompt
-or tool result can still cross the threshold.
+band. Non-GPT models always advertise Router's full window; OpenCode handles
+compaction independently. GPT models without that band also keep their stated
+window; output limits and displayed standard rates are unchanged. User-configured
+limits still override the discovered defaults. This is not a hard spending limit:
+an oversized prompt or tool result can still cross the threshold.
 
 The recommended installer is:
 

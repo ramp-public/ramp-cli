@@ -7,6 +7,7 @@ import plugin from "../src/index.ts"
 function routerMetadata() {
   return {
     schema_version: 1,
+    provider_model: "gpt-5.4",
     limits: { context_window: 1_000_000, max_output_tokens: 128_000 },
     pricing: {
       input: "2",
@@ -61,9 +62,42 @@ describe("standard-price context windows", () => {
 
 afterEach(() => mock.restoreAll())
 
-it("registers the capped window in OpenCode v1 and v2", async () => {
+describe("provider identity context policy", () => {
+  const cases = [
+    ["provider GPT outranks a readable id", "GPT 6.1 Sol", { provider_model: "gpt-6.1-sol" }, 272_000],
+    ...["openai/gpt-6.1-sol", "openai:gpt-6.1-sol", "openai.gpt-6.1-sol"].map(
+      (provider_model) => [provider_model, "Sol", { provider_model }, 272_000],
+    ),
+    ["non-GPT provider outranks GPT alias", "gpt-route", { provider_model: "claude-haiku-5-5", request_name: "gpt-route" }, 1_000_000],
+    ["non-GPT provider outranks GPT label", "grok-4.7", { provider_model: "grok-4.7", display_name: "gpt-6.1-sol" }, 1_000_000],
+    ["missing provider falls back to request name", "Readable", { provider_model: undefined, request_name: "openai/gpt-6.1-sol" }, 272_000],
+    ["empty provider falls back to request name", "Readable", { provider_model: "", request_name: "gpt-6.1-sol" }, 272_000],
+    ["request identity outranks GPT id", "gpt-route", { provider_model: undefined, request_name: "grok-4.7" }, 1_000_000],
+    ["missing identities fall back to id", "openai:gpt-6.1-sol", { provider_model: undefined }, 272_000],
+    ["readable label is not identity", "Sol", { provider_model: undefined, display_name: "gpt-6.1-sol" }, 1_000_000],
+    ["GPT substring is not GPT identity", "not-gpt-model", { provider_model: "not-gpt-model" }, 1_000_000],
+    ["full window without pricing", "haiku", { provider_model: "claude-haiku-5-5", pricing: undefined }, 1_000_000],
+  ]
+  for (const [name, id, overrides, expected] of cases) {
+    it(name, () => {
+      const original = { ...routerMetadata(), ...overrides }
+      const gpt = parseRouterMetadata({ ...original, provider_model: "gpt-6.1-sol" }, undefined, id)
+      const parsed = parseRouterMetadata(original, undefined, id)
+      assert.equal(parsed.contextWindow, expected)
+      assert.deepEqual({ ...parsed, contextWindow: gpt.contextWindow }, gpt)
+      assert.equal(original.limits.context_window, 1_000_000)
+    })
+  }
+})
+
+it("registers GPT caps and full non-GPT windows in OpenCode v1 and v2", async () => {
+  const models = [
+    { id: "test-model", router: routerMetadata() },
+    { id: "gpt-route", router: { ...routerMetadata(), provider_model: "claude-haiku-5-5" } },
+    { id: "grok-4.7", router: { ...routerMetadata(), provider_model: "grok-4.7", limits: { context_window: 500_000, max_output_tokens: 128_000 } } },
+  ]
   mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({
-    data: [{ id: "test-model", router: routerMetadata() }],
+    data: models,
   })))
   const options = { apiKey: "test-secret", baseURL: "http://localhost:8002" }
   const hooks = await plugin.server({}, options)
@@ -73,6 +107,8 @@ it("registers the capped window in OpenCode v1 and v2", async () => {
     context: 272_000,
     output: 128_000,
   })
+  assert.equal(config.provider["ramp-router"].models["gpt-route"].limit.context, 1_000_000)
+  assert.equal(config.provider["ramp-router"].models["grok-4.7"].limit.context, 500_000)
 
   const add = mock.fn()
   await plugin.setup({
@@ -92,4 +128,5 @@ it("registers the capped window in OpenCode v1 and v2", async () => {
     context: 272_000,
     output: 128_000,
   })
+  assert.deepEqual(add.mock.calls[0].arguments[0].models.map((model) => model.limit.context), [272_000, 1_000_000, 500_000])
 })
