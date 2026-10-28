@@ -4220,6 +4220,12 @@ def _run_hook_sync(client: str | None, event: str | None = None) -> None:
                 _apply_codex_admin_default(_codex_config_path())
             except (OSError, click.ClickException, tomllib.TOMLDecodeError) as exc:
                 log_failure(f"admin default model reset failed: {exc!r}")
+        elif client == "claude-code":
+            # The same offline reset for Claude Code's saved model.
+            try:
+                _apply_claude_code_admin_default(claude_code.settings_path())
+            except (OSError, click.ClickException, ValueError) as exc:
+                log_failure(f"admin default model reset failed: {exc!r}")
         # claim_sync_slot re-checks dueness and advances the cooldown under
         # an exclusive lock, so concurrent session starts cannot stampede;
         # losers fall through silently. Spawned before the notice because the
@@ -5264,11 +5270,12 @@ class _SwitchyardPush:
         token = _switchyard_push_token(api_key, base_url)
         # Router offers Switchyard only when the key can reach it; a harness
         # whose list lacks it (a BYOK-only capable model, say) is passed
-        # over, as is Codex under an org default: it has one model setting,
-        # which its hooks keep on that default for every new session.
+        # over, as are Codex and Claude Code under an org default: each has
+        # one model setting, which its hooks keep on that default for every
+        # new session.
         model = _switchyard_model_id(models)
         if model is None or (
-            client == CODEX_CLIENT_NAME
+            client in (CODEX_CLIENT_NAME, "claude-code")
             and admin_defaults.admin_default_model(client, api_key, origin) is not None
         ):
             self._skipped.setdefault(token, set()).add(client)
@@ -7769,19 +7776,27 @@ def _configure_claude_code(
     model_view: str = "compact",
     preserve_model_view_ownership: bool = False,
     expected_connection: tuple[str, str] | None = None,
+    explicit_model: bool = False,
 ) -> str:
     """Write Claude Code's gateway settings and record how to undo them.
 
     ``expected_connection`` (key, base URL) makes a model-only edit fail
     instead of writing when the saved connection changed since it was read.
+    ``explicit_model`` writes ``selected_model`` as the user's own choice even
+    while a workspace default is in effect (see _resolve_claude_code_model).
 
     The default model is read from Router's Claude Code view of /v1/models
     rather than derived locally, because that view is what Claude Code's picker
     shows and a model written here must be an id it will recognize.
     """
     _require_truthful_claude_code_model_names()
-    model = _claude_code_default_model(models, selected_model=selected_model)
     statusline = _install_claude_code_statusline(path, base_url)
+    # Router's workspace default for this connection, asked at the origin the
+    # setup's session-usage calls go to. Another network read, so it stays
+    # outside the lock; the mapping onto Claude Code's ids happens inside.
+    harnesses = admin_defaults.coding_agent_settings(
+        api_key, _statusline_origin(base_url)
+    )
     # Read after the network calls, not before. The settings are rewritten as a
     # whole document, so anything Claude Code or the user changed while the
     # requests were in flight would be silently discarded by a stale snapshot.
@@ -7806,6 +7821,17 @@ def _configure_claude_code(
         previous_state = claude_code.read_state(path) if state_path.exists() else None
         endpoint, client_key = router_repo.client_credentials(
             base_url or router_base_url(), api_key
+        )
+        model, default_records = _resolve_claude_code_model(
+            settings,
+            previous_state,
+            models,
+            selected_model=selected_model,
+            explicit_model=explicit_model,
+            harnesses=harnesses,
+            connection=_claude_code_default_connection(
+                api_key, _statusline_origin(base_url)
+            ),
         )
         updated, state = claude_code.plan_configuration(
             settings,
@@ -7832,16 +7858,30 @@ def _configure_claude_code(
                 state,
                 preserve_model_view_ownership=preserve_model_view_ownership,
             )
+        # Cache the enforced default for the hooks, which run without the
+        # network, along with the model it displaced. A cleared default drops
+        # both records so the hooks stand down.
+        state = _with_claude_code_default_records(state, default_records)
         updated, state = claude_code.plan_automatic_subagent_cleanup(
             updated, path, state
         )
         # In the shared configure/refresh path so existing setups gain the
-        # hook and refresh repairs a stale ramp path. None (Windows or no
-        # resolvable entrypoint) registers nothing.
+        # hooks and refresh repairs a stale ramp path. None (Windows or no
+        # resolvable entrypoint) registers nothing. The Stop hook reruns the
+        # sync after every turn so a session's own /model pick, which Claude
+        # Code saves as the default for new sessions, is put back to the
+        # workspace default before the next session starts.
         sync_hook_command = session_sync_hook_command("claude-code")
         if sync_hook_command is not None:
             updated, state = claude_code.plan_session_start_hook(
                 updated, state, sync_hook_command
+            )
+        stop_hook_command = session_sync_hook_command(
+            "claude-code", SYNC_HOOK_STOP_EVENT
+        )
+        if stop_hook_command is not None:
+            updated, state = claude_code.plan_stop_hook(
+                updated, state, stop_hook_command
             )
         # Rendered before the receipt is written so the receipt can record
         # what the overlay holds, which is what lets unconfigure tell its own
@@ -7971,6 +8011,7 @@ def _unconfigure_claude_code(path: Path) -> None:
         settings = claude_code.read_settings(path)
         restored = claude_code.plan_restoration(settings, path, state)
         restored = claude_code.plan_session_start_hook_removal(restored, state)
+        restored = claude_code.plan_stop_hook_removal(restored, state)
         _write_private_file(path, json.dumps(restored, indent=2) + "\n")
         # The script lives under a name this command manages, so it goes even
         # when the statusLine setting itself was the user's and stays.
@@ -8005,6 +8046,246 @@ def _claude_code_default_model(
         if model.metadata.request_name == preferred:
             return model.id
     return preferred
+
+
+def _claude_code_admin_default_model(
+    admin_default: str | None, models: list[RouterModel]
+) -> str | None:
+    """The Claude Code id for the workspace default, when its view lists it.
+
+    ``admin_default`` is Router's answer (see ``admin_defaults``): a request
+    name such as ``claude-fable-5``, never one of the ids Claude Code's view
+    publishes (``claude-fable-5[1m]``). It is matched the way the ordinary
+    default is, through the canonical model each entry names. A default the
+    view does not list is ignored rather than written: Claude Code would
+    otherwise start every new session on a model that cannot answer.
+    """
+    if admin_default is None:
+        return None
+    if any(model.id == admin_default for model in models):
+        return admin_default
+    return next(
+        (model.id for model in models if model.metadata.request_name == admin_default),
+        None,
+    )
+
+
+def _claude_code_default_connection(api_key: str, usage_origin: str) -> dict[str, str]:
+    """The receipt's name for the workspace a cached default was read under.
+
+    The Router key and the control-plane origin together name the workspace;
+    a write under another key or Router is a new connection, whose cached
+    default is not carried forward. The key is the upstream one Claude
+    Code's usage calls carry, not the data-plane credential: toggling
+    repository tagging swaps that for a local token on the same workspace
+    (see router_repo.client_credentials). Only its fingerprint is recorded;
+    the receipt already holds the key once, among the written values.
+    """
+    return {
+        "router_api_key_sha256": hashlib.sha256(api_key.encode("utf-8")).hexdigest(),
+        "router_base_url": usage_origin.rstrip("/"),
+    }
+
+
+def _claude_code_receipt_matches_connection(
+    state: dict | None, api_key: str, usage_origin: str
+) -> bool:
+    """Whether the receipt's cached default was read under this connection.
+
+    Recorded alongside the default itself (not taken from the values
+    configure wrote), so a default read under a key the user swapped in by
+    hand is still recognised, and cleared, on the runs that follow.
+    """
+    if not isinstance(state, dict):
+        return False
+    return state.get(
+        claude_code.ADMIN_DEFAULT_CONNECTION_STATE_KEY
+    ) == _claude_code_default_connection(api_key, usage_origin)
+
+
+def _recorded_claude_code_default(
+    state: dict | None, connection: dict[str, str] | None = None
+) -> tuple[str | None, str | None]:
+    """The default the receipt caches for the hooks, and the model it displaced.
+
+    With ``connection`` given, only a default read under that connection
+    counts; one cached for another key or Router is another workspace's.
+    """
+    if not isinstance(state, dict):
+        return None, None
+    if (
+        connection is not None
+        and state.get(claude_code.ADMIN_DEFAULT_CONNECTION_STATE_KEY) != connection
+    ):
+        return None, None
+    recorded = state.get(claude_code.ADMIN_DEFAULT_MODEL_STATE_KEY)
+    displaced = state.get(claude_code.ADMIN_DEFAULT_DISPLACED_MODEL_STATE_KEY)
+    return (
+        recorded if isinstance(recorded, str) and recorded else None,
+        displaced if isinstance(displaced, str) and displaced else None,
+    )
+
+
+def _resolve_claude_code_model(
+    settings: dict,
+    state: dict | None,
+    models: list[RouterModel],
+    *,
+    selected_model: str | None,
+    explicit_model: bool,
+    harnesses: dict | None,
+    connection: dict[str, str],
+) -> tuple[str, dict[str, object]]:
+    """The model this write settles on, and the receipt's default records.
+
+    A workspace default is what every new session starts on: it wins over
+    the preferred model and over whatever a session's own pick left in the
+    settings. Claude Code resolves a session's model when it starts and a
+    resumed session keeps its own, so rewriting the saved model only reaches
+    sessions started afterwards; between refreshes the SessionStart and Stop
+    hooks keep it in place from the receipt's cached copy (see
+    _apply_claude_code_admin_default).
+
+    The model the default displaces is recorded alongside it, so a cleared
+    default puts the user's own choice back instead of leaving them on a
+    model they never picked. A model the user names explicitly is written as
+    asked and becomes that choice; the next hook run puts the default back
+    for the sessions after it. ``harnesses`` None means Router could not be
+    asked: the recorded default stays in force rather than being dropped for
+    a transient failure, but only when it was read under ``connection`` (see
+    _claude_code_default_connection), as a default cached for another key or
+    Router is another workspace's; a write onto a new connection starts from
+    nothing. The records carry the connection they were read under.
+    """
+    recorded, displaced = _recorded_claude_code_default(state, connection)
+    admin_default = _claude_code_admin_default_model(
+        admin_defaults.effective_model(harnesses, "claude-code")
+        if harnesses is not None
+        else recorded,
+        models,
+    )
+    default_key = claude_code.ADMIN_DEFAULT_MODEL_STATE_KEY
+    displaced_key = claude_code.ADMIN_DEFAULT_DISPLACED_MODEL_STATE_KEY
+    connection_key = claude_code.ADMIN_DEFAULT_CONNECTION_STATE_KEY
+    if explicit_model:
+        model = _claude_code_default_model(models, selected_model=selected_model)
+        if admin_default is None:
+            return model, {}
+        return model, {
+            default_key: admin_default,
+            displaced_key: model,
+            connection_key: connection,
+        }
+    if admin_default is not None:
+        if recorded is None:
+            current = settings.get("model")
+            displaced = current if isinstance(current, str) and current else None
+        records: dict[str, object] = {
+            default_key: admin_default,
+            connection_key: connection,
+        }
+        if displaced is not None:
+            records[displaced_key] = displaced
+        return admin_default, records
+    if recorded is not None:
+        # Cleared: back to the displaced model while Router still lists it
+        # (under today's id, should a Switchyard alias have been renamed
+        # meanwhile), otherwise to the ordinary choice of default.
+        return (
+            _claude_code_default_model(
+                models, selected_model=_follow_switchyard_rename(displaced, models)
+            ),
+            {},
+        )
+    return _claude_code_default_model(models, selected_model=selected_model), {}
+
+
+def _with_claude_code_default_records(state: dict, records: dict[str, object]) -> dict:
+    """The receipt with exactly ``records`` as its workspace-default entries."""
+    updated = {
+        key: value
+        for key, value in state.items()
+        if key not in claude_code.ADMIN_DEFAULT_STATE_KEYS
+    }
+    updated.update(records)
+    return updated
+
+
+def _claude_code_settings_match_default_connection(
+    path: Path, settings: dict, state: dict
+) -> bool:
+    """Whether the saved settings still use the connection the default was read under.
+
+    The same identity refresh checks, taken from the settings themselves:
+    the upstream key behind ``ANTHROPIC_AUTH_TOKEN`` (a local tagging token
+    resolves from disk, no network) and the usage origin in
+    ``ROUTER_BASE_URL``. The data-plane endpoint must also still be the
+    gateway configure wrote: another one is not a Router setup of ours.
+    """
+    environment = settings.get("env")
+    if not isinstance(environment, dict):
+        return False
+    written = state["written"]["env"].get("ANTHROPIC_BASE_URL")
+    if written is not None and environment.get("ANTHROPIC_BASE_URL") != written:
+        return False
+    origin = environment.get("ROUTER_BASE_URL")
+    if not isinstance(origin, str) or not origin.strip():
+        return False
+    try:
+        api_key = _stored_router_api_key("claude-code", path)
+    except click.ClickException:
+        return False
+    return _claude_code_receipt_matches_connection(state, api_key, origin)
+
+
+def _apply_claude_code_admin_default(path: Path) -> bool:
+    """Put the saved Claude Code model back to the cached default; report a write.
+
+    The hook half of enforcement: no network, one lock, and a no-op when the
+    model already matches, which is the common case. Only the model moves,
+    so a session's other edits survive, and only while the settings still
+    use the connection the cached default was read under (see
+    _claude_code_settings_match_default_connection): after an unconfigure
+    the restored file is the user's, and a key swapped in by hand names
+    another workspace, whose default a refresh caches under that key before
+    the hooks enforce it, whatever a stale hook entry still says.
+
+    Claude Code saves a ``/model`` pick as the default for new sessions and
+    resolves a session's model before SessionStart runs, so this reset
+    reaches the sessions started after it, not the one running it; a resumed
+    session keeps the model it recorded. The Stop hook runs the same reset
+    after every turn, so the next new session starts on the default.
+    """
+    if not claude_code.state_path(path).is_file():
+        return False
+    with claude_code.settings_lock(path):
+        # Read under the lock: a refresh clearing the default while this
+        # hook waited must not have its settings overwritten from a receipt
+        # read before it ran.
+        if not claude_code.state_path(path).is_file():
+            return False
+        state = claude_code.read_state(path)
+        admin_default, _displaced = _recorded_claude_code_default(state)
+        if admin_default is None:
+            return False
+        settings = claude_code.read_settings(path)
+        if not _claude_code_settings_match_default_connection(path, settings, state):
+            return False
+        if settings.get("model") == admin_default:
+            return False
+        updated, new_state = claude_code.plan_model_update(
+            settings, state, admin_default
+        )
+        state_path = claude_code.state_path(path)
+        if new_state != state:
+            _write_private_file(state_path, json.dumps(new_state, indent=2) + "\n")
+        try:
+            _write_private_file(path, json.dumps(updated, indent=2) + "\n")
+        except OSError:
+            if new_state != state:
+                _restore_private_file(state_path, json.dumps(state, indent=2) + "\n")
+            raise
+        return True
 
 
 def _router_host(base_url: str | None = None) -> str:
@@ -8922,8 +9203,9 @@ def _configure_client(
 ) -> tuple[Path, str, bool]:
     """Configure one client, reporting whether it replaced an outdated setup.
 
-    ``explicit_model`` makes Codex write ``selected_model`` as given instead of
-    re-reading its config for a selection; ``strict_model`` implies it.
+    ``explicit_model`` makes Codex and Claude Code write ``selected_model`` as
+    given instead of re-reading their config for a selection or applying a
+    workspace default; ``strict_model`` implies it.
     For Codex, ``replace_model`` does the same, but only while its config still holds
     that selection (None for no selection) when the write happens; a selection
     changed since is kept instead.
@@ -8943,6 +9225,7 @@ def _configure_client(
                 model_view=claude_model_view or "compact",
                 preserve_model_view_ownership=preserve_model_view_ownership,
                 expected_connection=expected_connection,
+                explicit_model=strict_model or explicit_model,
             ),
             False,
         )
@@ -9030,7 +9313,9 @@ def _refresh_client_models(
     Refresh already holds the Hermes and Conductor locks around this call.
     """
     if client == "claude-code":
-        return _refresh_claude_code_model(path, models, selected_model)
+        return _refresh_claude_code_model(
+            path, api_key, models, base_url=base_url, selected_model=selected_model
+        )
     if client == "codex":
         return _refresh_codex_models(
             path,
@@ -9058,26 +9343,65 @@ def _not_configured(client: str) -> click.ClickException:
 
 
 def _refresh_claude_code_model(
-    path: Path, models: list[RouterModel], selected_model: str | None
+    path: Path,
+    api_key: str,
+    models: list[RouterModel],
+    *,
+    base_url: str | None,
+    selected_model: str | None,
 ) -> str:
-    model = _claude_code_default_model(models, selected_model=selected_model)
+    """Rewrite only Claude Code's saved model; return it.
+
+    The workspace default wins as it does in configure, and its cached copy
+    in the receipt follows, so the hooks put back the current default. A
+    cleared default puts the displaced model back. Without one, a model the
+    user picked outside Router's list is theirs.
+    """
+    # Discovery before the lock, as in _configure_claude_code. None when
+    # Router did not answer: a background run then keeps the recorded
+    # default instead of dropping it for a transient failure, provided it
+    # was read under the saved connection; a key the user swapped in by hand
+    # names a workspace whose default the receipt does not know, so a
+    # default cached for the old one is dropped, not carried over.
+    origin = _statusline_origin(base_url)
+    harnesses = admin_defaults.coding_agent_settings(api_key, origin)
+    connection = _claude_code_default_connection(api_key, origin)
     with claude_code.settings_lock(path):
         if not claude_code.state_path(path).is_file():
             raise _not_configured("claude-code")
         state = claude_code.read_state(path)
         settings = claude_code.read_settings(path)
         current = settings.get("model")
-        if not (
-            current is None
-            or current == state["written"]["top_level"].get("model")
-            or claude_code._is_router_model(current)
-        ):
-            # A model the user picked outside Router's list is theirs.
-            return current
-        updated, new_state = claude_code.plan_model_update(settings, state, model)
-        updated, new_state = claude_code.plan_automatic_subagent_cleanup(
-            updated, path, new_state
+        model, default_records = _resolve_claude_code_model(
+            settings,
+            state,
+            models,
+            selected_model=selected_model,
+            explicit_model=False,
+            harnesses=harnesses,
+            connection=connection,
         )
+        recorded, _displaced = _recorded_claude_code_default(state, connection)
+        if (
+            not default_records
+            and recorded is None
+            and not (
+                current is None
+                or current == state["written"]["top_level"].get("model")
+                or claude_code._is_router_model(current)
+            )
+        ):
+            # A model the user picked outside Router's list is theirs. Only
+            # the receipt moves, and only to drop a default another
+            # connection cached, which no longer applies to this one.
+            model, updated = current, settings
+            new_state = _with_claude_code_default_records(state, {})
+        else:
+            updated, new_state = claude_code.plan_model_update(settings, state, model)
+            new_state = _with_claude_code_default_records(new_state, default_records)
+            updated, new_state = claude_code.plan_automatic_subagent_cleanup(
+                updated, path, new_state
+            )
         if updated == settings and new_state == state:
             return model
         state_path = claude_code.state_path(path)
@@ -9089,6 +9413,8 @@ def _refresh_claude_code_model(
             raise click.ClickException(
                 f"Could not save Claude Code setup state to {state_path}: {exc}"
             ) from None
+        if updated == settings:
+            return model
         try:
             _write_private_file(path, json.dumps(updated, indent=2) + "\n")
         except OSError as exc:

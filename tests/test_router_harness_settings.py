@@ -294,7 +294,20 @@ def test_organization_default_labels_codex_too(monkeypatch):
     assert len(get.calls) == 1
 
 
-@pytest.mark.parametrize("client", ["claude-code", "hermes"])
+def test_organization_default_labels_claude_code_too(monkeypatch):
+    # Claude Code applies the default through its settings and session hooks.
+    get = _settings_response(
+        {"claude-code": {"model": "new", "effective_model": "new"}}
+    )
+    monkeypatch.setattr(router.httpx, "get", get)
+    current = harness.Connection(
+        "claude-code", None, "key", "https://qa.router.invalid/v1"
+    )
+    assert harness.organization_default(current) == "new"
+    assert len(get.calls) == 1
+
+
+@pytest.mark.parametrize("client", ["hermes", "conductor"])
 def test_organization_default_is_only_read_for_harnesses_that_apply_it(
     monkeypatch, client
 ):
@@ -340,3 +353,23 @@ def test_codex_organization_default_maps_a_router_id_to_its_slug(
     )
     monkeypatch.setattr(harness, "organization_default", lambda current: "new")
     assert harness.editor("codex")["organization_default"] == "codex-new"
+
+
+def test_claude_code_organization_default_maps_a_request_name_to_its_id(
+    installed, monkeypatch
+):
+    # Router names the default by request name; Claude Code's view lists the
+    # model under its own id, which is what the picker offers.
+    monkeypatch.setattr(
+        router,
+        "_fetch_models",
+        lambda *args, **kwargs: [
+            SimpleNamespace(
+                id=f"{name}[1m]",
+                metadata=SimpleNamespace(display_name=name, request_name=name),
+            )
+            for name in ("old", "new")
+        ],
+    )
+    monkeypatch.setattr(harness, "organization_default", lambda current: "new")
+    assert harness.editor("claude-code")["organization_default"] == "new[1m]"

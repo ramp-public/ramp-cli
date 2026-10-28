@@ -53,7 +53,7 @@ def test_reads_the_effective_model_for_the_harness(monkeypatch):
     )
     # Listed, but nothing set.
     assert admin_defaults.admin_default_model("pi", "secret", ORIGIN) is None
-    # Not listed at all: Router does not support a default for it (yet).
+    # Not listed at all: an older Router without a default for that harness.
     assert admin_defaults.admin_default_model("claude-code", "secret", ORIGIN) is None
     ((url, headers, timeout),) = calls
     assert url == URL

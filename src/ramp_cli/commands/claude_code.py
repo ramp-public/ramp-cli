@@ -19,6 +19,7 @@ import click
 
 from ramp_cli import __version__
 from ramp_cli.commands.router_sync import (
+    SYNC_HOOK_STOP_EVENT,
     SYNC_HOOK_USER_MANAGED,
     command_runs_session_sync,
 )
@@ -525,6 +526,11 @@ def _statusline_slot_is_ours(settings: dict, path: Path) -> bool:
 SESSION_START_HOOK_STATE_KEY = "session_start_hook"
 SESSION_START_HOOKS_PRESENT_STATE_KEY = "session_start_hooks_present"
 SESSION_START_PRESENT_STATE_KEY = "session_start_present"
+# The same for the Stop entry, which reruns the sync after every turn so a
+# session's own /model pick (which Claude Code saves as the default for new
+# sessions) is put back to the workspace default before the next session.
+STOP_HOOK_STATE_KEY = "stop_hook"
+STOP_PRESENT_STATE_KEY = "stop_present"
 # Headroom for interpreter startup; the hook itself only stats a file or
 # spawns a detached refresh. Set explicitly because Claude's default hook
 # timeout (60s) could stall session start that long; Codex's group sets no
@@ -532,6 +538,23 @@ SESSION_START_PRESENT_STATE_KEY = "session_start_present"
 SESSION_START_HOOK_TIMEOUT_SECONDS = 20
 # Fresh and resumed sessions both read the installed artifacts.
 _SESSION_START_MATCHER = "startup|resume"
+
+# The Claude Code model id the workspace default resolves to, cached from the
+# last configure or refresh for the hooks, which stay off the network; absent
+# when no default is in effect. The second key holds the model the default
+# displaced (the user's own saved choice), so clearing the default can put it
+# back instead of leaving the user pinned to a model they never chose. The
+# third names the connection (Router key fingerprint and control-plane origin)
+# the default was read under, so a cached default is only ever applied to,
+# and cleared for, the workspace it came from.
+ADMIN_DEFAULT_MODEL_STATE_KEY = "admin_default_model"
+ADMIN_DEFAULT_DISPLACED_MODEL_STATE_KEY = "admin_default_displaced_model"
+ADMIN_DEFAULT_CONNECTION_STATE_KEY = "admin_default_connection"
+ADMIN_DEFAULT_STATE_KEYS = (
+    ADMIN_DEFAULT_MODEL_STATE_KEY,
+    ADMIN_DEFAULT_DISPLACED_MODEL_STATE_KEY,
+    ADMIN_DEFAULT_CONNECTION_STATE_KEY,
+)
 
 
 def session_start_hook_entry(command: str) -> dict:
@@ -548,12 +571,30 @@ def session_start_hook_entry(command: str) -> dict:
     }
 
 
-def _entry_invokes_sync(entry: object) -> bool:
-    """Report whether one SessionStart entry runs the managed sync at all.
+def stop_hook_entry(command: str) -> dict:
+    """The Stop entry this CLI registers; Stop takes no matcher."""
+    return {
+        "hooks": [
+            {
+                "type": "command",
+                "command": command,
+                "timeout": SESSION_START_HOOK_TIMEOUT_SECONDS,
+            }
+        ],
+    }
+
+
+def _entry_invokes_sync(
+    entry: object, event: str | None = None, client: str | None = None
+) -> bool:
+    """Report whether one hook entry runs the managed sync at all.
 
     Any-command on purpose: a user hook wrapping the sync already keeps the
     artifacts fresh, so registration stands down. This never establishes
-    ownership — only the receipt-recorded entry is ours to touch.
+    ownership — only the receipt-recorded entry is ours to touch. ``event``
+    is the non-session-start hook event the command must declare, if any;
+    ``client`` the client it must name, when the hook's work is specific to
+    one (the Stop reset runs only for ``--client claude-code``).
     """
     if not isinstance(entry, dict):
         return False
@@ -563,9 +604,55 @@ def _entry_invokes_sync(entry: object) -> bool:
     return any(
         isinstance(hook, dict)
         and isinstance(hook.get("command"), str)
-        and command_runs_session_sync(hook["command"])
+        and command_runs_session_sync(hook["command"], event, client)
         for hook in hooks
     )
+
+
+def _plan_hook(
+    settings: dict,
+    state: dict,
+    *,
+    table: str,
+    entry: dict,
+    event: str | None,
+    client: str | None = None,
+    state_key: str,
+    present_key: str,
+) -> tuple[dict, dict]:
+    hooks = settings.get("hooks", {})
+    if not isinstance(hooks, dict):
+        return settings, state
+    registered = hooks.get(table, [])
+    if not isinstance(registered, list):
+        return settings, state
+    state = dict(state)
+    state.setdefault(SESSION_START_HOOKS_PRESENT_STATE_KEY, "hooks" in settings)
+    state.setdefault(present_key, table in hooks)
+    recorded = state.get(state_key)
+    owned_index = next(
+        (index for index, item in enumerate(registered) if item == recorded), None
+    )
+    if any(
+        _entry_invokes_sync(item, event, client)
+        for index, item in enumerate(registered)
+        if index != owned_index
+    ):
+        # Two registrations would run the sync twice; the user's supersedes.
+        retained = [
+            item for index, item in enumerate(registered) if index != owned_index
+        ]
+        updated_state = {**state, state_key: SYNC_HOOK_USER_MANAGED}
+        if retained == registered:
+            return settings, updated_state
+        return {**settings, "hooks": {**hooks, table: retained}}, updated_state
+    if owned_index is not None:
+        updated_list = list(registered)
+        updated_list[owned_index] = entry
+    else:
+        updated_list = [*registered, entry]
+    updated = {**settings, "hooks": {**hooks, table: updated_list}}
+    return updated, {**state, state_key: entry}
 
 
 def plan_session_start_hook(
@@ -579,40 +666,66 @@ def plan_session_start_hook(
     user-managed. An unreadable hooks layout is the user's; nothing is
     registered.
     """
-    hooks = settings.get("hooks", {})
-    if not isinstance(hooks, dict):
-        return settings, state
-    session_start = hooks.get("SessionStart", [])
-    if not isinstance(session_start, list):
-        return settings, state
-    state = dict(state)
-    state.setdefault(SESSION_START_HOOKS_PRESENT_STATE_KEY, "hooks" in settings)
-    state.setdefault(SESSION_START_PRESENT_STATE_KEY, "SessionStart" in hooks)
-    recorded = state.get(SESSION_START_HOOK_STATE_KEY)
-    owned_index = next(
-        (index for index, item in enumerate(session_start) if item == recorded), None
+    return _plan_hook(
+        settings,
+        state,
+        table="SessionStart",
+        entry=session_start_hook_entry(command),
+        event=None,
+        state_key=SESSION_START_HOOK_STATE_KEY,
+        present_key=SESSION_START_PRESENT_STATE_KEY,
     )
-    if any(
-        _entry_invokes_sync(item)
-        for index, item in enumerate(session_start)
-        if index != owned_index
-    ):
-        # Two registrations would run the sync twice; the user's supersedes.
-        retained = [
-            item for index, item in enumerate(session_start) if index != owned_index
-        ]
-        updated_state = {**state, SESSION_START_HOOK_STATE_KEY: SYNC_HOOK_USER_MANAGED}
-        if retained == session_start:
-            return settings, updated_state
-        return {**settings, "hooks": {**hooks, "SessionStart": retained}}, updated_state
-    entry = session_start_hook_entry(command)
-    if owned_index is not None:
-        updated_list = list(session_start)
-        updated_list[owned_index] = entry
+
+
+def plan_stop_hook(settings: dict, state: dict, command: str) -> tuple[dict, dict]:
+    """Merge the receipt-owned Stop sync hook, under the SessionStart rules.
+
+    Only a user Stop hook that names Claude Code supersedes it: the reset
+    this hook exists for runs for ``--client claude-code`` alone, so a
+    wrapper for another client (or none) would leave a /model pick saved.
+    """
+    return _plan_hook(
+        settings,
+        state,
+        table="Stop",
+        entry=stop_hook_entry(command),
+        event=SYNC_HOOK_STOP_EVENT,
+        client="claude-code",
+        state_key=STOP_HOOK_STATE_KEY,
+        present_key=STOP_PRESENT_STATE_KEY,
+    )
+
+
+def _plan_hook_removal(
+    settings: dict, state: dict, *, table: str, state_key: str, present_key: str
+) -> dict:
+    recorded = state.get(state_key)
+    if not isinstance(recorded, dict):
+        return settings
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return settings
+    registered = hooks.get(table)
+    if not isinstance(registered, list):
+        return settings
+    try:
+        owned_index = registered.index(recorded)
+    except ValueError:
+        return settings
+    retained = registered[:owned_index] + registered[owned_index + 1 :]
+    updated_hooks = dict(hooks)
+    if retained:
+        updated_hooks[table] = retained
+    elif state.get(present_key) is True:
+        updated_hooks[table] = []
     else:
-        updated_list = [*session_start, entry]
-    updated = {**settings, "hooks": {**hooks, "SessionStart": updated_list}}
-    return updated, {**state, SESSION_START_HOOK_STATE_KEY: entry}
+        updated_hooks.pop(table)
+    restored = dict(settings)
+    if updated_hooks or state.get(SESSION_START_HOOKS_PRESENT_STATE_KEY) is True:
+        restored["hooks"] = updated_hooks
+    else:
+        restored.pop("hooks", None)
+    return restored
 
 
 def plan_session_start_hook_removal(settings: dict, state: dict) -> dict:
@@ -622,33 +735,24 @@ def plan_session_start_hook_removal(settings: dict, state: dict) -> dict:
     was configured — are never touched; the user-managed sentinel removes
     nothing.
     """
-    recorded = state.get(SESSION_START_HOOK_STATE_KEY)
-    if not isinstance(recorded, dict):
-        return settings
-    hooks = settings.get("hooks")
-    if not isinstance(hooks, dict):
-        return settings
-    session_start = hooks.get("SessionStart")
-    if not isinstance(session_start, list):
-        return settings
-    try:
-        owned_index = session_start.index(recorded)
-    except ValueError:
-        return settings
-    retained = session_start[:owned_index] + session_start[owned_index + 1 :]
-    updated_hooks = dict(hooks)
-    if retained:
-        updated_hooks["SessionStart"] = retained
-    elif state.get(SESSION_START_PRESENT_STATE_KEY) is True:
-        updated_hooks["SessionStart"] = []
-    else:
-        updated_hooks.pop("SessionStart")
-    restored = dict(settings)
-    if updated_hooks or state.get(SESSION_START_HOOKS_PRESENT_STATE_KEY) is True:
-        restored["hooks"] = updated_hooks
-    else:
-        restored.pop("hooks", None)
-    return restored
+    return _plan_hook_removal(
+        settings,
+        state,
+        table="SessionStart",
+        state_key=SESSION_START_HOOK_STATE_KEY,
+        present_key=SESSION_START_PRESENT_STATE_KEY,
+    )
+
+
+def plan_stop_hook_removal(settings: dict, state: dict) -> dict:
+    """Remove exactly the Stop entry the receipt records."""
+    return _plan_hook_removal(
+        settings,
+        state,
+        table="Stop",
+        state_key=STOP_HOOK_STATE_KEY,
+        present_key=STOP_PRESENT_STATE_KEY,
+    )
 
 
 def plan_configuration(

@@ -175,8 +175,9 @@ def prices(models) -> dict[str, tuple[str | None, str | None, str | None]]:
 
 # Harnesses a workspace admin can give a starting model in Router: the ones
 # whose Router integration can apply it to each new session (the OpenCode
-# and Pi plugins in process, Codex through its setup and session hooks).
-ORGANIZATION_DEFAULT_HARNESSES = ("codex", "opencode", "pi")
+# and Pi plugins in process, Codex and Claude Code through their setup and
+# session hooks).
+ORGANIZATION_DEFAULT_HARNESSES = ("claude-code", "codex", "opencode", "pi")
 
 
 def organization_default(current: Connection) -> str | None:
@@ -208,6 +209,10 @@ def editor(client: str) -> dict:
         suggested = None if app_managed else organization_default(current)
         if suggested is not None and client == "codex":
             suggested = _codex_slug(suggested, models, choices)
+        elif suggested is not None and client == "claude-code":
+            # Router names the default by request name; Claude Code's picker
+            # lists the ids of its own view.
+            suggested = router._claude_code_admin_default_model(suggested, models)
         # Router lists the policy's models for the workspace; this key may
         # still not serve one, and then there's nothing to offer.
         if suggested not in {value for _label, value in choices}:
@@ -280,6 +285,9 @@ def set_model(
                 if router._configured_claude_model_view_all(current.path)
                 else "compact",
                 preserve_model_view_ownership=True,
+                # The user asked for this model: written as given even while
+                # a workspace default is in effect, like Codex's strict write.
+                explicit_model=True,
                 # Rechecked under Claude Code's settings lock, right before
                 # the write, so a concurrent disconnect or reconnect wins.
                 expected_connection=(current.key, current.base_url),

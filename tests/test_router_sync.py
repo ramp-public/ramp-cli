@@ -233,6 +233,25 @@ def test_event_registrations_are_told_apart(monkeypatch):
     )
 
 
+def test_client_registrations_are_told_apart(monkeypatch):
+    monkeypatch.setattr(sync_module, "ramp_executable", lambda: Path("/opt/ramp"))
+    claude = sync_module.session_sync_hook_command(
+        "claude-code", sync_module.SYNC_HOOK_STOP_EVENT
+    )
+    codex = sync_module.session_sync_hook_command(
+        "codex", sync_module.SYNC_HOOK_STOP_EVENT
+    )
+    bare = "/opt/ramp router sync --hook --event stop"
+    # Without a client any registration counts; with one, only the hook
+    # naming that client does the client-specific work.
+    assert all(
+        sync_module.command_runs_session_sync(c, "stop") for c in (claude, codex, bare)
+    )
+    assert sync_module.command_runs_session_sync(claude, "stop", "claude-code") is True
+    assert sync_module.command_runs_session_sync(codex, "stop", "claude-code") is False
+    assert sync_module.command_runs_session_sync(bare, "stop", "claude-code") is False
+
+
 def test_ramp_executable_resolution(monkeypatch, tmp_path):
     # The invoked entrypoint wins when it is a real executable named ramp.
     fake = tmp_path / "bin" / "ramp"

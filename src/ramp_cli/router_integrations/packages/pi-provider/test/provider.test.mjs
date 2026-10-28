@@ -1387,6 +1387,71 @@ describe("Pi provider extension", () => {
     assert.equal(requests.length, 2)
   })
 
+  it("uses Pi's cached catalog updates for selection and native request metadata", async () => {
+    const home = process.env.PI_CODING_AGENT_DIR
+    const runtime = await ModelRuntime.create({
+      modelsPath: null, refreshOnCreate: false, allowModelNetwork: false,
+    })
+    const id = "claude-cached-catalog-fixture"
+    const native = {
+      ...runtime.getProvider("anthropic").getModels()[0],
+      id,
+      compat: { forceAdaptiveThinking: true },
+      promptCache: { short: 300, long: 3600 },
+    }
+    const terra = {
+      ...runtime.getProvider("openai").getModels()[0],
+      id: "gpt-6.1-terra",
+      promptCache: { short: 600 },
+    }
+    writeFileSync(join(home, "models-store.json"), JSON.stringify({
+      anthropic: { models: [native], lastModified: 8640000000000000 },
+      openai: { models: [terra], lastModified: 8640000000000000 },
+    }))
+    writeFileSync(join(home, "auth.json"), JSON.stringify({
+      "ramp-router": { type: "api_key", key: "current-secret" },
+    }))
+    // User overrides must not become native support or compatibility authority.
+    writeFileSync(join(home, "models.json"), JSON.stringify({
+      providers: { anthropic: { models: [{ id: "claude-user-only-fixture" }] } },
+    }))
+    const fetcher = mock.method(globalThis, "fetch", async (url) => {
+      assert.equal(String(url), "http://localhost:8002/v1/models")
+      return new Response(JSON.stringify({ data: [id, terra.id, "claude-user-only-fixture"].map((modelID) => ({
+        id: modelID, owned_by: modelID === terra.id ? "openai" : "anthropic", router: {
+          ...routerMetadata(modelID),
+          capabilities: {
+            ...routerMetadata(modelID).capabilities,
+            reasoning: { efforts: [{ value: "high", description: "" }] },
+          },
+        },
+      })) }), { status: 200 })
+    })
+    process.env.RAMP_ROUTER_BASE_URL = "http://localhost:8002/v1"
+    const registered = mock.fn()
+    await registerRouterProvider({ registerProvider: registered })
+    const [provider] = registered.mock.calls[0].arguments
+    assert.deepEqual(provider.getModels().map((model) => model.id), [id, terra.id])
+    const [model, terraModel] = provider.getModels()
+    assert.deepEqual(model.promptCache, native.promptCache)
+    assert.deepEqual(terraModel.promptCache, terra.promptCache)
+    assert.equal(fetcher.mock.calls.length, 1)
+    const requests = []
+    await provider.streamSimple(model, {
+      messages: [{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() }],
+    }, {
+      apiKey: "current-secret", reasoning: "high", maxRetries: 0,
+      fetch: async (_url, init) => {
+        requests.push(JSON.parse(init.body))
+        return new Response(JSON.stringify({ error: { message: "fixture stop" } }), {
+          status: 400, headers: { "content-type": "application/json" },
+        })
+      },
+    }).result()
+    assert.equal(requests[0].thinking.type, "adaptive")
+    assert.equal(requests[0].model, id)
+  })
+
   it("hides unsupported Anthropic models until Pi's native catalog includes them", async () => {
     const home = process.env.PI_CODING_AGENT_DIR
     writeFileSync(join(home, "auth.json"), JSON.stringify({

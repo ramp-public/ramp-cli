@@ -2090,3 +2090,83 @@ def test_plan_session_start_hook_defers_to_a_user_wrapper():
 
     assert updated["hooks"]["SessionStart"] == [ours]
     assert state[claude_code.SESSION_START_HOOK_STATE_KEY] == ours
+
+
+_STOP_SYNC_COMMAND = (
+    "[ -x /opt/ramp-cli/bin/ramp ] && /opt/ramp-cli/bin/ramp "
+    "router sync --hook --client claude-code --event stop || true"
+)
+
+
+def test_plan_stop_hook_registers_and_removes_a_matcherless_entry():
+    settings, state = claude_code.plan_session_start_hook({}, {}, _SYNC_COMMAND)
+    settings, state = claude_code.plan_stop_hook(settings, state, _STOP_SYNC_COMMAND)
+
+    (entry,) = settings["hooks"]["Stop"]
+    assert entry == claude_code.stop_hook_entry(_STOP_SYNC_COMMAND)
+    assert "matcher" not in entry
+    assert (
+        entry["hooks"][0]["timeout"] == claude_code.SESSION_START_HOOK_TIMEOUT_SECONDS
+    )
+    assert state[claude_code.STOP_HOOK_STATE_KEY] == entry
+    assert state[claude_code.STOP_PRESENT_STATE_KEY] is False
+    again, again_state = claude_code.plan_stop_hook(settings, state, _STOP_SYNC_COMMAND)
+    assert (again, again_state) == (settings, state)
+
+    # Removing both entries also removes the hooks object this CLI created.
+    restored = claude_code.plan_session_start_hook_removal(settings, state)
+    restored = claude_code.plan_stop_hook_removal(restored, state)
+    assert restored == {}
+
+
+def test_plan_stop_hook_keeps_the_users_stop_entries_and_defers_to_a_wrapper():
+    theirs = {"hooks": [{"type": "command", "command": "/home/me/notify.sh"}]}
+    settings = {"hooks": {"Stop": [theirs]}}
+
+    configured, state = claude_code.plan_stop_hook(settings, {}, _STOP_SYNC_COMMAND)
+
+    assert configured["hooks"]["Stop"] == [
+        theirs,
+        claude_code.stop_hook_entry(_STOP_SYNC_COMMAND),
+    ]
+    assert claude_code.plan_stop_hook_removal(configured, state) == settings
+
+    # A session-start registration is not a Stop registration: the event
+    # flag tells them apart, so the user's SessionStart wrapper does not
+    # stand the Stop hook down...
+    wrapper = {"hooks": [{"type": "command", "command": _SYNC_COMMAND}]}
+    configured, state = claude_code.plan_stop_hook(
+        {"hooks": {"Stop": [wrapper]}}, {}, _STOP_SYNC_COMMAND
+    )
+    assert len(configured["hooks"]["Stop"]) == 2
+    # ...while a user wrapper for the Stop event does, but only one naming
+    # Claude Code: the reset the hook exists for runs for that client alone.
+    other = {
+        "hooks": [
+            {
+                "type": "command",
+                "command": "nice /custom/ramp router sync --hook --event stop",
+            }
+        ]
+    }
+    configured, state = claude_code.plan_stop_hook(
+        {"hooks": {"Stop": [other]}}, {}, _STOP_SYNC_COMMAND
+    )
+    assert len(configured["hooks"]["Stop"]) == 2
+    assert state[claude_code.STOP_HOOK_STATE_KEY] != "user-managed"
+    wrapper = {
+        "hooks": [
+            {
+                "type": "command",
+                "command": (
+                    "nice /custom/ramp router sync --hook "
+                    "--client claude-code --event stop"
+                ),
+            }
+        ]
+    }
+    configured, state = claude_code.plan_stop_hook(
+        {"hooks": {"Stop": [wrapper]}}, {}, _STOP_SYNC_COMMAND
+    )
+    assert configured == {"hooks": {"Stop": [wrapper]}}
+    assert state[claude_code.STOP_HOOK_STATE_KEY] == "user-managed"

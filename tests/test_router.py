@@ -2748,6 +2748,491 @@ def test_a_failed_codex_config_write_leaves_no_cached_admin_default(
     )
 
 
+# Claude Code's view of /v1/models publishes its own ids (here with the
+# 1M-window marker) and names the canonical model behind each; Router's
+# workspace default is always the canonical request name.
+CLAUDE_VIEW_MODELS = [
+    {
+        "id": f"{name}[1m]",
+        "router": _router_metadata(f"{name}[1m]", request_name=name),
+    }
+    for name in ("claude-haiku-5-5", "claude-fable-5", "claude-fable-5-1")
+]
+CLAUDE_ADMIN_DEFAULT_KEY = claude_code.ADMIN_DEFAULT_MODEL_STATE_KEY
+CLAUDE_DISPLACED_KEY = claude_code.ADMIN_DEFAULT_DISPLACED_MODEL_STATE_KEY
+
+
+def _claude_admin_default(model, source="workspace"):
+    """Router's coding-agent settings with ``model`` as the Claude Code default."""
+    return {
+        "claude-code": {
+            "model": model,
+            "effective_model": model,
+            "effective_model_source": source if model else None,
+            "status": "available" if model else "unset",
+        },
+        **_admin_default(None),
+    }
+
+
+def _claude_settings(claude_home):
+    return json.loads((claude_home / "settings.json").read_text())
+
+
+def _claude_router_state(claude_home):
+    return json.loads((claude_home / "ramp-router-state.json").read_text())
+
+
+def _claude_hook_sync(*extra):
+    return CliRunner().invoke(
+        cli, ["router", "sync", "--hook", "--client", "claude-code", *extra]
+    )
+
+
+def _offline(monkeypatch):
+    """The hooks must work offline and must not wait on the cooldown."""
+    monkeypatch.setattr(
+        "ramp_cli.commands.router.httpx.get",
+        lambda *a, **k: pytest.fail("hook reset must not use the network"),
+    )
+    monkeypatch.setattr(router_module, "sync_is_due", lambda: False)
+    monkeypatch.setattr(router_module, "update_notice", lambda: None)
+
+
+def test_configure_claude_code_starts_new_sessions_on_the_admin_default_model(
+    tmp_path, monkeypatch
+):
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    get = _mock_models(
+        monkeypatch,
+        CLAUDE_VIEW_MODELS,
+        coding_agent_settings=_claude_admin_default("claude-fable-5"),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "claude-code"],
+        input="router-secret\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    settings = _claude_settings(claude_home)
+    # Without an admin default the first listed model would have been
+    # written; the default is written under Claude Code's own id.
+    assert settings["model"] == "claude-fable-5[1m]"
+    # One read of Router's settings serves the whole configure: the admin
+    # default and the Switchyard decision share it.
+    assert get.settings_requests == [
+        f"{router_module._router_key_origin(ROUTER_BASE_URL)}"
+        "/self-service/coding-agent-settings"
+    ]
+    state = _claude_router_state(claude_home)
+    assert state[CLAUDE_ADMIN_DEFAULT_KEY] == "claude-fable-5[1m]"
+    # A fresh setup had no model of the user's to displace.
+    assert CLAUDE_DISPLACED_KEY not in state
+    # Both hooks run the sync: SessionStart for the sessions after a pick
+    # that outlived its session, Stop for the turn that followed the pick.
+    (start,) = settings["hooks"]["SessionStart"]
+    (stop,) = settings["hooks"]["Stop"]
+    assert start["hooks"][0]["command"].endswith("--client claude-code || true")
+    assert stop["hooks"][0]["command"].endswith(
+        "--client claude-code --event stop || true"
+    )
+    assert "matcher" not in stop
+    assert state[claude_code.STOP_HOOK_STATE_KEY] == stop
+
+
+def test_claude_code_hooks_reset_the_model_without_the_network(tmp_path, monkeypatch):
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    _mock_models(
+        monkeypatch,
+        CLAUDE_VIEW_MODELS,
+        coding_agent_settings=_claude_admin_default("claude-fable-5"),
+    )
+    configured = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "claude-code"],
+        input="router-secret\n",
+    )
+    assert configured.exit_code == 0, configured.output
+    settings_path = claude_home / "settings.json"
+    _offline(monkeypatch)
+
+    # Claude Code saves a /model pick as the default for new sessions.
+    picked = {**_claude_settings(claude_home), "model": "claude-fable-5-1[1m]"}
+    picked["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = "950000"  # the user's edit
+    settings_path.write_text(json.dumps(picked))
+
+    # Stop: after the turn that followed the pick.
+    stop = _claude_hook_sync("--event", "stop")
+    assert stop.exit_code == 0, stop.output
+    # Nothing on stdout: Claude Code shows hook output to the user.
+    assert stop.output == ""
+    # Only the model changed.
+    assert _claude_settings(claude_home) == {**picked, "model": "claude-fable-5[1m]"}
+    # Recorded as Router's write, so unconfigure still restores the original.
+    state = _claude_router_state(claude_home)
+    assert state["written"]["top_level"]["model"] == "claude-fable-5[1m]"
+
+    # SessionStart: the same reset, for a pick that outlived its session.
+    settings_path.write_text(json.dumps(picked))
+    start = _claude_hook_sync()
+    assert start.exit_code == 0, start.output
+    assert _claude_settings(claude_home)["model"] == "claude-fable-5[1m]"
+
+    # A matching model is left byte-for-byte alone.
+    before = settings_path.read_text()
+    assert _claude_hook_sync("--event", "stop").exit_code == 0
+    assert settings_path.read_text() == before
+
+
+def test_claude_code_hook_reset_stands_down_without_a_default_or_after_unconfigure(
+    tmp_path, monkeypatch
+):
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    _mock_models(
+        monkeypatch,
+        CLAUDE_VIEW_MODELS,
+        coding_agent_settings=_claude_admin_default(None),
+    )
+    configured = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "claude-code"],
+        input="router-secret\n",
+    )
+    assert configured.exit_code == 0, configured.output
+    assert CLAUDE_ADMIN_DEFAULT_KEY not in _claude_router_state(claude_home)
+    settings_path = claude_home / "settings.json"
+    picked = {**_claude_settings(claude_home), "model": "claude-fable-5-1[1m]"}
+    settings_path.write_text(json.dumps(picked))
+    _offline(monkeypatch)
+    assert _claude_hook_sync("--event", "stop").exit_code == 0
+    assert _claude_settings(claude_home) == picked
+
+    # A stale receipt record outliving an unconfigure must not rewrite the
+    # user's restored settings either.
+    state_path = claude_home / "ramp-router-state.json"
+    state = _claude_router_state(claude_home)
+    state_path.write_text(
+        json.dumps({**state, CLAUDE_ADMIN_DEFAULT_KEY: "claude-fable-5[1m]"})
+    )
+    theirs = {**picked, "env": {"ANTHROPIC_BASE_URL": "https://their-gateway.test"}}
+    settings_path.write_text(json.dumps(theirs))
+    assert _claude_hook_sync().exit_code == 0
+    assert _claude_settings(claude_home) == theirs
+    # Likewise another Router key swapped in by hand on the same endpoint:
+    # it names a workspace whose default this receipt does not know.
+    other_key = json.loads(json.dumps(picked))
+    other_key["env"]["ANTHROPIC_AUTH_TOKEN"] = "other"
+    settings_path.write_text(json.dumps(other_key))
+    assert _claude_hook_sync().exit_code == 0
+    assert _claude_settings(claude_home) == other_key
+    state_path.unlink()
+    assert _claude_hook_sync().exit_code == 0
+    assert _claude_settings(claude_home) == other_key
+
+
+def test_refresh_puts_the_claude_code_admin_default_back_over_a_sessions_pick(
+    tmp_path, monkeypatch
+):
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    _mock_models(
+        monkeypatch,
+        CLAUDE_VIEW_MODELS,
+        coding_agent_settings=_claude_admin_default("claude-fable-5"),
+    )
+    configured = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "claude-code"],
+        input="router-secret\n",
+    )
+    assert configured.exit_code == 0, configured.output
+    settings_path = claude_home / "settings.json"
+    settings_path.write_text(
+        json.dumps({**_claude_settings(claude_home), "model": "claude-fable-5-1[1m]"})
+    )
+    refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+    assert refreshed.exit_code == 0, refreshed.output
+    assert _claude_settings(claude_home)["model"] == "claude-fable-5[1m]"
+
+    # A changed admin default follows on the next refresh, including the
+    # background one that moves only the model.
+    _mock_models(
+        monkeypatch,
+        CLAUDE_VIEW_MODELS,
+        coding_agent_settings=_claude_admin_default("claude-haiku-5-5"),
+    )
+    _background_refresh(monkeypatch)
+    assert _claude_settings(claude_home)["model"] == "claude-haiku-5-5[1m]"
+    assert (
+        _claude_router_state(claude_home)[CLAUDE_ADMIN_DEFAULT_KEY]
+        == "claude-haiku-5-5[1m]"
+    )
+
+
+def test_clearing_the_claude_code_admin_default_restores_the_users_model(
+    tmp_path, monkeypatch
+):
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    _mock_models(
+        monkeypatch, CLAUDE_VIEW_MODELS, coding_agent_settings=_admin_default(None)
+    )
+    configured = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "claude-code"],
+        input="router-secret\n",
+    )
+    assert configured.exit_code == 0, configured.output
+    settings_path = claude_home / "settings.json"
+    # The user's own saved choice, made in a session before the admin acted.
+    settings_path.write_text(
+        json.dumps({**_claude_settings(claude_home), "model": "claude-fable-5-1[1m]"})
+    )
+
+    _mock_models(
+        monkeypatch,
+        CLAUDE_VIEW_MODELS,
+        coding_agent_settings=_claude_admin_default("claude-fable-5"),
+    )
+    _background_refresh(monkeypatch)
+    assert _claude_settings(claude_home)["model"] == "claude-fable-5[1m]"
+    state = _claude_router_state(claude_home)
+    assert state[CLAUDE_ADMIN_DEFAULT_KEY] == "claude-fable-5[1m]"
+    assert state[CLAUDE_DISPLACED_KEY] == "claude-fable-5-1[1m]"
+
+    # A later change of default keeps the original displaced model.
+    _mock_models(
+        monkeypatch,
+        CLAUDE_VIEW_MODELS,
+        coding_agent_settings=_claude_admin_default("claude-haiku-5-5"),
+    )
+    _background_refresh(monkeypatch)
+    assert _claude_settings(claude_home)["model"] == "claude-haiku-5-5[1m]"
+    assert _claude_router_state(claude_home)[CLAUDE_DISPLACED_KEY] == (
+        "claude-fable-5-1[1m]"
+    )
+
+    # Cleared: the user is back on their own model, and nothing stays pinned.
+    _mock_models(
+        monkeypatch, CLAUDE_VIEW_MODELS, coding_agent_settings=_admin_default(None)
+    )
+    _background_refresh(monkeypatch)
+    assert _claude_settings(claude_home)["model"] == "claude-fable-5-1[1m]"
+    state = _claude_router_state(claude_home)
+    assert CLAUDE_ADMIN_DEFAULT_KEY not in state
+    assert CLAUDE_DISPLACED_KEY not in state
+    _offline(monkeypatch)
+    picked = {**_claude_settings(claude_home), "model": "claude-haiku-5-5[1m]"}
+    settings_path.write_text(json.dumps(picked))
+    assert _claude_hook_sync("--event", "stop").exit_code == 0
+    assert _claude_settings(claude_home) == picked
+
+
+def test_explicit_claude_code_model_is_written_but_the_admin_default_returns(
+    tmp_path, monkeypatch
+):
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    _mock_models(
+        monkeypatch,
+        CLAUDE_VIEW_MODELS,
+        coding_agent_settings=_claude_admin_default("claude-fable-5"),
+    )
+    configured = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "claude-code"],
+        input="router-secret\n",
+    )
+    assert configured.exit_code == 0, configured.output
+
+    # The command does what it says for the sessions started right after...
+    _choose("claude-code", "claude-fable-5-1[1m]")
+    assert _claude_settings(claude_home)["model"] == "claude-fable-5-1[1m]"
+    state = _claude_router_state(claude_home)
+    assert state[CLAUDE_ADMIN_DEFAULT_KEY] == "claude-fable-5[1m]"
+    # ...and becomes the choice to restore once the default is cleared.
+    assert state[CLAUDE_DISPLACED_KEY] == "claude-fable-5-1[1m]"
+    # The next sync puts the admin default back for the ones after.
+    _offline(monkeypatch)
+    assert _claude_hook_sync("--event", "stop").exit_code == 0
+    assert _claude_settings(claude_home)["model"] == "claude-fable-5[1m]"
+
+
+def test_claude_code_admin_default_outside_its_view_is_ignored(tmp_path, monkeypatch):
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    # Router only lets Claude Code see Anthropic models and rejects any other
+    # default on save; a view that nonetheless lacks the model falls back.
+    _mock_models(
+        monkeypatch,
+        CLAUDE_VIEW_MODELS,
+        coding_agent_settings=_claude_admin_default("gpt-5.6-sol"),
+    )
+    configured = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "claude-code"],
+        input="router-secret\n",
+    )
+    assert configured.exit_code == 0, configured.output
+    assert _claude_settings(claude_home)["model"] == "claude-haiku-5-5[1m]"
+    assert CLAUDE_ADMIN_DEFAULT_KEY not in _claude_router_state(claude_home)
+
+
+def test_background_refresh_keeps_the_claude_code_admin_default_when_router_is_silent(
+    tmp_path, monkeypatch
+):
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    _mock_models(
+        monkeypatch,
+        CLAUDE_VIEW_MODELS,
+        coding_agent_settings=_claude_admin_default("claude-fable-5"),
+    )
+    configured = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "claude-code"],
+        input="router-secret\n",
+    )
+    assert configured.exit_code == 0, configured.output
+    settings_path = claude_home / "settings.json"
+    settings_path.write_text(
+        json.dumps({**_claude_settings(claude_home), "model": "claude-fable-5-1[1m]"})
+    )
+    # A 404 from the settings endpoint: nothing to apply, nothing to drop.
+    _mock_models(monkeypatch, CLAUDE_VIEW_MODELS)
+    _background_refresh(monkeypatch)
+    assert _claude_settings(claude_home)["model"] == "claude-fable-5[1m]"
+    assert (
+        _claude_router_state(claude_home)[CLAUDE_ADMIN_DEFAULT_KEY]
+        == "claude-fable-5[1m]"
+    )
+
+    # Unless the user has since swapped in another Router key by hand: that
+    # names a workspace this receipt knows nothing about, so the cached
+    # default is dropped rather than applied to it, and a model picked
+    # outside Router's list stays theirs as it would without any record.
+    settings = _claude_settings(claude_home)
+    settings["env"]["ANTHROPIC_AUTH_TOKEN"] = "other-secret"
+    settings["model"] = "opus"
+    settings_path.write_text(json.dumps(settings))
+    _mock_models(monkeypatch, CLAUDE_VIEW_MODELS, key="other-secret")
+    _background_refresh(monkeypatch)
+    assert _claude_settings(claude_home) == settings
+    assert not any(
+        key in _claude_router_state(claude_home)
+        for key in claude_code.ADMIN_DEFAULT_STATE_KEYS
+    )
+
+
+def test_background_refresh_records_a_claude_code_default_under_the_key_in_use(
+    tmp_path, monkeypatch
+):
+    """A default read under a hand-swapped key is cleared under it too."""
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    _mock_models(monkeypatch, CLAUDE_VIEW_MODELS, coding_agent_settings={})
+    configured = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "claude-code"],
+        input="router-secret\n",
+    )
+    assert configured.exit_code == 0, configured.output
+    settings_path = claude_home / "settings.json"
+    settings = _claude_settings(claude_home)
+    settings["env"]["ANTHROPIC_AUTH_TOKEN"] = "other-secret"
+    settings["model"] = "claude-fable-5-1[1m]"
+    settings_path.write_text(json.dumps(settings))
+
+    # The other workspace's default takes over, with the user's model
+    # recorded as displaced under the connection it was read from.
+    _mock_models(
+        monkeypatch,
+        CLAUDE_VIEW_MODELS,
+        key="other-secret",
+        coding_agent_settings=_claude_admin_default("claude-fable-5"),
+    )
+    _background_refresh(monkeypatch)
+    assert _claude_settings(claude_home)["model"] == "claude-fable-5[1m]"
+    state = _claude_router_state(claude_home)
+    assert state[CLAUDE_ADMIN_DEFAULT_KEY] == "claude-fable-5[1m]"
+    assert state[CLAUDE_DISPLACED_KEY] == "claude-fable-5-1[1m]"
+    assert state[
+        claude_code.ADMIN_DEFAULT_CONNECTION_STATE_KEY
+    ] == router_module._claude_code_default_connection(
+        "other-secret", router_module._statusline_origin(None)
+    )
+    assert state["written"]["env"]["ROUTER_API_KEY"] == "router-secret"
+
+    # Router silent: the default read under this key stays in force.
+    _mock_models(monkeypatch, CLAUDE_VIEW_MODELS, key="other-secret")
+    settings_path.write_text(
+        json.dumps({**_claude_settings(claude_home), "model": "claude-haiku-5-5[1m]"})
+    )
+    _background_refresh(monkeypatch)
+    assert _claude_settings(claude_home)["model"] == "claude-fable-5[1m]"
+
+    # The hooks enforce it under this key, offline, from the receipt alone.
+    _offline(monkeypatch)
+    settings_path.write_text(
+        json.dumps({**_claude_settings(claude_home), "model": "claude-haiku-5-5[1m]"})
+    )
+    assert _claude_hook_sync("--event", "stop").exit_code == 0
+    assert _claude_settings(claude_home)["model"] == "claude-fable-5[1m]"
+    # But not once the user swaps the original key back in: that is the
+    # first workspace again, and this default is the other one's.
+    swapped_back = _claude_settings(claude_home)
+    swapped_back["env"]["ANTHROPIC_AUTH_TOKEN"] = "router-secret"
+    swapped_back["model"] = "claude-haiku-5-5[1m]"
+    settings_path.write_text(json.dumps(swapped_back))
+    assert _claude_hook_sync("--event", "stop").exit_code == 0
+    assert _claude_settings(claude_home) == swapped_back
+    settings = _claude_settings(claude_home)
+    settings["env"]["ANTHROPIC_AUTH_TOKEN"] = "other-secret"
+    settings_path.write_text(json.dumps(settings))
+    monkeypatch.undo()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+
+    # Cleared: the displaced model comes back rather than the enforced one.
+    _mock_models(
+        monkeypatch, CLAUDE_VIEW_MODELS, key="other-secret", coding_agent_settings={}
+    )
+    _background_refresh(monkeypatch)
+    assert _claude_settings(claude_home)["model"] == "claude-fable-5-1[1m]"
+    assert not any(
+        key in _claude_router_state(claude_home)
+        for key in claude_code.ADMIN_DEFAULT_STATE_KEYS
+    )
+
+
+def test_unconfigure_claude_code_restores_the_pre_router_model_and_removes_hooks(
+    tmp_path, monkeypatch
+):
+    claude_home = tmp_path / "claude"
+    claude_home.mkdir()
+    (claude_home / "settings.json").write_text(json.dumps({"model": "opus"}))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    _mock_models(
+        monkeypatch,
+        CLAUDE_VIEW_MODELS,
+        coding_agent_settings=_claude_admin_default("claude-fable-5"),
+    )
+    _configure_agent("claude-code")
+    settings = _claude_settings(claude_home)
+    assert settings["model"] == "claude-fable-5[1m]"
+    assert set(settings["hooks"]) == {"SessionStart", "Stop"}
+    state = _claude_router_state(claude_home)
+    assert state[CLAUDE_DISPLACED_KEY] == "opus"
+
+    _unconfigure_agent("claude-code")
+
+    assert _claude_settings(claude_home) == {"model": "opus"}
+
+
 def test_refresh_reapplies_claude_config_and_preserves_selected_model(
     tmp_path, monkeypatch
 ):
@@ -3532,6 +4017,201 @@ def test_org_defaults_still_start_new_sessions_after_the_push(tmp_path, monkeypa
     assert tomllib.loads(config_path.read_text())["model"] == "gpt-5.5"
     refreshed = _refresh()
     assert tomllib.loads(config_path.read_text())["model"] == "gpt-5.5"
+
+
+def test_claude_code_org_default_passes_over_the_switchyard_push(tmp_path, monkeypatch):
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    models = [*CLAUDE_VIEW_MODELS, {"id": "gpt-5.6-sol"}, SWITCHYARD, CLAUDE_SWITCHYARD]
+    _mock_models(monkeypatch, models, coding_agent_settings=_admin_default(None))
+    _configure_agent("claude-code")
+    settings_path = claude_home / "settings.json"
+    assert _claude_settings(claude_home)["model"] == "gpt-5.6-sol"
+
+    _mock_models(
+        monkeypatch,
+        models,
+        coding_agent_settings=_claude_admin_default("claude-fable-5"),
+        switchyard_offered=True,
+    )
+    refreshed = _refresh()
+    # Claude Code has a single model setting that its hooks hold on the org
+    # default for every new session, so the push leaves it alone, for good.
+    assert _claude_settings(claude_home)["model"] == "claude-fable-5[1m]"
+    assert "Switched Claude Code" not in refreshed.output
+    # Passed over, not owed: no push was started for this connection.
+    assert _pushes() == {}
+    # Clearing the default later puts the user's model back, not Switchyard.
+    _mock_models(monkeypatch, models, coding_agent_settings=_admin_default(None))
+    _refresh()
+    assert _claude_settings(claude_home)["model"] == "gpt-5.6-sol"
+    assert settings_path.exists()
+
+
+def test_clearing_the_claude_code_default_follows_a_renamed_displaced_alias(
+    tmp_path, monkeypatch
+):
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    models = [*CLAUDE_VIEW_MODELS, {"id": "gpt-5.6-sol"}, SWITCHYARD, CLAUDE_SWITCHYARD]
+    _mock_models(monkeypatch, models, coding_agent_settings=_admin_default(None))
+    _configure_agent("claude-code")
+    # The user is on Switchyard when the admin sets a default...
+    _choose("claude-code", "claude-router-switchyard-3e865a[1m]")
+    _mock_models(
+        monkeypatch,
+        models,
+        coding_agent_settings=_claude_admin_default("claude-fable-5"),
+    )
+    _refresh()
+    assert _claude_settings(claude_home)["model"] == "claude-fable-5[1m]"
+    assert _claude_router_state(claude_home)[CLAUDE_DISPLACED_KEY] == (
+        "claude-router-switchyard-3e865a[1m]"
+    )
+
+    # ...and Router renames the alias (capable model lost its 1M window)
+    # before the default is cleared: they return to Switchyard, not to the
+    # ordinary default.
+    renamed = {
+        **CLAUDE_SWITCHYARD,
+        "id": "claude-router-switchyard-3e865a",
+        "router": _router_metadata(
+            "claude-router-switchyard-3e865a", request_name="switchyard"
+        ),
+    }
+    _mock_models(
+        monkeypatch,
+        [*CLAUDE_VIEW_MODELS, {"id": "gpt-5.6-sol"}, SWITCHYARD, renamed],
+        coding_agent_settings=_admin_default(None),
+    )
+    _refresh()
+    assert _claude_settings(claude_home)["model"] == "claude-router-switchyard-3e865a"
+    assert CLAUDE_DISPLACED_KEY not in _claude_router_state(claude_home)
+
+
+def test_reconfiguring_claude_code_onto_another_router_drops_the_cached_default(
+    tmp_path, monkeypatch
+):
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    _mock_models(
+        monkeypatch,
+        CLAUDE_VIEW_MODELS,
+        coding_agent_settings=_claude_admin_default("claude-fable-5"),
+    )
+    _configure_agent("claude-code")
+    assert _claude_router_state(claude_home)[CLAUDE_ADMIN_DEFAULT_KEY] == (
+        "claude-fable-5[1m]"
+    )
+
+    # Another key on another Router whose settings endpoint does not answer
+    # (an older Router, say): the first workspace's default is not carried
+    # over, and nothing is left for the hooks to enforce.
+    _mock_models(
+        monkeypatch,
+        CLAUDE_VIEW_MODELS,
+        key="other-secret",
+        base_url="https://other.router.example/v1",
+    )
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure",
+            "claude-code",
+            "--api-key",
+            "other-secret",
+            "--base-url",
+            "https://other.router.example/v1",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert _claude_settings(claude_home)["model"] == "claude-haiku-5-5[1m]"
+    state = _claude_router_state(claude_home)
+    assert CLAUDE_ADMIN_DEFAULT_KEY not in state
+    assert CLAUDE_DISPLACED_KEY not in state
+
+    # The same connection, though, keeps it through a silent Router.
+    other = [
+        "--api-key",
+        "other-secret",
+        "--base-url",
+        "https://other.router.example/v1",
+    ]
+    _mock_models(
+        monkeypatch,
+        CLAUDE_VIEW_MODELS,
+        key="other-secret",
+        base_url="https://other.router.example/v1",
+        coding_agent_settings=_claude_admin_default("claude-fable-5"),
+    )
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "claude-code", *other]
+    )
+    assert result.exit_code == 0, result.output
+    _mock_models(
+        monkeypatch,
+        CLAUDE_VIEW_MODELS,
+        key="other-secret",
+        base_url="https://other.router.example/v1",
+    )
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "claude-code", *other]
+    )
+    assert result.exit_code == 0, result.output
+    assert _claude_router_state(claude_home)[CLAUDE_ADMIN_DEFAULT_KEY] == (
+        "claude-fable-5[1m]"
+    )
+
+
+def test_repository_tagging_toggle_keeps_the_claude_code_displaced_model(
+    tmp_path, monkeypatch
+):
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    _mock_models(
+        monkeypatch, CLAUDE_VIEW_MODELS, coding_agent_settings=_admin_default(None)
+    )
+    _configure_agent("claude-code")
+    _choose("claude-code", "claude-fable-5-1[1m]")
+    _mock_models(
+        monkeypatch,
+        CLAUDE_VIEW_MODELS,
+        coding_agent_settings=_claude_admin_default("claude-fable-5"),
+    )
+    _refresh()
+    assert _claude_router_state(claude_home)[CLAUDE_DISPLACED_KEY] == (
+        "claude-fable-5-1[1m]"
+    )
+
+    # Turning repository tagging on swaps the data-plane credential for a
+    # local token on the same workspace. That is not a new connection: the
+    # record of the user's own model survives the refresh...
+    local_token = "ramp-local-token"
+    monkeypatch.setattr(
+        router_module.router_repo,
+        "client_credentials",
+        lambda base_url, api_key: (
+            router_module.router_repo.wrap_url(base_url, 7777),
+            local_token,
+        ),
+    )
+    monkeypatch.setattr(
+        router_module.router_repo,
+        "upstream_api_key",
+        lambda token, base_url: "router-secret" if token == local_token else token,
+    )
+    _refresh()
+    state = _claude_router_state(claude_home)
+    assert state["written"]["env"]["ANTHROPIC_AUTH_TOKEN"] == local_token
+    assert state[CLAUDE_DISPLACED_KEY] == "claude-fable-5-1[1m]"
+    # ...so clearing the default still puts them back on it.
+    _mock_models(
+        monkeypatch, CLAUDE_VIEW_MODELS, coding_agent_settings=_admin_default(None)
+    )
+    _refresh()
+    assert _claude_settings(claude_home)["model"] == "claude-fable-5-1[1m]"
 
 
 def test_switchyard_offer_is_read_from_the_setups_dashboard_origin(

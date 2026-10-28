@@ -7,8 +7,8 @@ policy and reports it to API-key callers as ``effective_model`` in
 set, the model is no longer allowed, or the key is personal; the harness is
 missing entirely when Router does not support a default for it.
 
-:func:`admin_default_model` is the read behind the Codex setup. Callers only
-depend on its contract:
+:func:`admin_default_model` is the read behind the Codex and Claude Code
+setups. Callers only depend on its contract:
 
 * It returns the model Router names as the default for a harness, or
   ``None`` when there is none. The value is Router's id; mapping it onto a
@@ -20,9 +20,9 @@ depend on its contract:
   key and origin within :data:`CACHE_TTL_SECONDS`, so a configure that also
   reads the same response for the one-time Switchyard push shares it.
 
-Only ``configure`` and ``refresh`` call it. The Codex SessionStart and Stop
-hooks apply the value those runs cached in the setup receipt and stay off the
-network.
+Only ``configure`` and ``refresh`` call it. The Codex and Claude Code session
+hooks apply the value those runs cached in the setup receipt and stay off
+the network.
 """
 
 from __future__ import annotations

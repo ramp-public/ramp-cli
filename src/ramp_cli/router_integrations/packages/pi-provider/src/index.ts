@@ -168,15 +168,19 @@ function withNativeModelMetadata(model: RouterModel, native?: NativeModel): Rout
   return Object.keys(compat).length > 0 ? { ...model, compat } : model
 }
 
+async function nativeRuntime(): Promise<ModelRuntime> {
+  return ModelRuntime.create({
+    // Use Pi's persisted catalog without loading user model overrides.
+    modelsPath: runtimeModelsPath(),
+    allowModelNetwork: false,
+  })
+}
+
 async function hostApi(providerId: string): Promise<ProviderStreams> {
   // Pi only makes its public package roots available to path-installed
   // extensions. Resolve the built-in adapter through the host runtime instead
   // of importing an SDK subpath that does not exist beside this package.
-  const runtime = await ModelRuntime.create({
-    modelsPath: null,
-    refreshOnCreate: false,
-    allowModelNetwork: false,
-  })
+  const runtime = await nativeRuntime()
   const provider = runtime.getProvider(providerId)
   if (!provider) throw new Error(`Pi's ${providerId} provider is unavailable`)
 
@@ -207,14 +211,8 @@ async function hostSupport(): Promise<HostSupport> {
   const classifiers = new Map<ClassifierApi, ProviderClassifier>()
   const decisionModels = new Map<string, number>()
   try {
-    // Router models are dynamic, but both Pi adapters have native per-model
-    // compatibility settings. Upgrading Pi unlocks models without changing
-    // Router's credential-scoped catalog or cache.
-    const runtime = await ModelRuntime.create({
-      modelsPath: null,
-      refreshOnCreate: false,
-      allowModelNetwork: false,
-    })
+    // Include Pi's cached catalog updates in native compatibility checks.
+    const runtime = await nativeRuntime()
     for (const [api, provider] of [
       ["anthropic-messages", "anthropic"],
       ["openai-responses", "openai"],

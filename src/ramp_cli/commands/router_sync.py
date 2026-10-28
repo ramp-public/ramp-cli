@@ -232,11 +232,15 @@ def session_sync_hook_command(client: str, event: str | None = None) -> str | No
     )
 
 
-def command_runs_session_sync(command: str, event: str | None = None) -> bool:
+def command_runs_session_sync(
+    command: str, event: str | None = None, client: str | None = None
+) -> bool:
     """Return whether a shell command actually invokes `ramp router sync --hook`.
 
     With ``event`` None this recognizes the session-start registration only;
-    with an event name it recognizes the registration for that event.
+    with an event name it recognizes the registration for that event. With
+    ``client`` set, only a registration naming that client counts: a hook for
+    another client (or for none) does not run that client's work.
     """
     try:
         tokens = shlex.split(command)
@@ -266,6 +270,8 @@ def command_runs_session_sync(command: str, event: str | None = None) -> bool:
         if tail[-2:] != ["--event", event]:
             return False
         tail = tail[:-2]
+    if client is not None:
+        return tail == ["--client", client]
     return tail in (
         [],
         ["--client", "claude-code"],

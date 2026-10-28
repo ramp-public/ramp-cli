@@ -188,6 +188,8 @@ pub fn nearest_existing_directory(path: &str) -> Option<String> {
 static SHELL_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*=").unwrap());
 static SHELL_RESET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Shell cwd was reset to (/[^\s]+)").unwrap());
 static PATCH_FILE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$|^\*\*\* Move to: (.+?)\s*$").unwrap());
+/// The operator line of a command that is exactly `apply_patch <<EOF`.
+static SOLE_PATCH_HEREDOC: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"^<<(-?)[ \t]*(?:'([A-Za-z_][A-Za-z0-9_]*)'|"([A-Za-z_][A-Za-z0-9_]*)"|\\?([A-Za-z_][A-Za-z0-9_]*))$"#).unwrap());
 static WAS_SUFFIX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+\(was [^)]*\)$").unwrap());
 
 /// Last repository per harness session, for side requests and post-compaction turns.
@@ -1482,6 +1484,78 @@ fn shell_path_tokens(cmd: &str) -> Vec<String> {
     out
 }
 
+/// Files patched by a shell command that is exactly one Codex `apply_patch` call:
+/// `apply_patch <<'EOF'` followed by a complete patch and the closing delimiter, or an argv list
+/// joined with spaces (`apply_patch *** Begin Patch ...`). The patch must be the command's whole
+/// input, so patch-looking text elsewhere in a script never counts. Any other shell command stays
+/// weak evidence; general shell parsing is deliberately out of scope.
+///
+/// The whole command is scanned (not `MAX_COMMAND_CHARS`): a large patch is still one patch, and
+/// the header regex is linear in its length.
+fn shell_write_targets(cmd: &str) -> Vec<String> {
+    let Some(patch) = sole_apply_patch(cmd.trim()) else { return Vec::new() };
+    let mut paths = Vec::new();
+    for m in PATCH_FILE.captures_iter(&patch) {
+        if let Some(path) = m.get(1).or(m.get(2)) {
+            let path = path.as_str().trim();
+            if !path.is_empty() {
+                paths.push(path.to_string());
+            }
+        }
+    }
+    // Keep the newest occurrence of each path, matching how attribution picks the newest event.
+    let mut seen = HashSet::new();
+    paths.reverse();
+    paths.retain(|path| seen.insert(path.clone()));
+    paths.reverse();
+    paths
+}
+
+/// The patch text when `cmd` is exactly one `apply_patch` call whose input is that patch.
+fn sole_apply_patch(cmd: &str) -> Option<String> {
+    let program_end = cmd.find(|c: char| c.is_whitespace() || c == '<').unwrap_or(cmd.len());
+    let program = cmd[..program_end].trim_matches(['\'', '"']);
+    if program != "apply_patch" && !program.ends_with("/apply_patch") {
+        return None;
+    }
+    let rest = cmd[program_end..].trim_start_matches([' ', '\t']);
+    if rest.starts_with("*** Begin Patch") {
+        return complete_patch(rest).map(str::to_string); // argv form: everything after the program is the patch
+    }
+    if rest.starts_with(['\'', '"']) {
+        let (patch, end) = shell_word(rest)?;
+        let patch = patch?;
+        return rest[end..].trim().is_empty().then_some(()).and_then(|_| complete_patch(&patch).map(str::to_string));
+    }
+    let (operator, after) = rest.split_once('\n')?;
+    let caps = SOLE_PATCH_HEREDOC.captures(operator.trim_end())?;
+    let strip_tabs = !caps[1].is_empty();
+    let delimiter = caps.get(2).or(caps.get(3)).or(caps.get(4))?.as_str();
+    let is_delimiter = |line: &str| {
+        let line = line.trim_end_matches('\r');
+        (if strip_tabs { line.trim_start_matches('\t') } else { line }) == delimiter
+    };
+    // The heredoc ends at the first delimiter line, and nothing may follow it.
+    let (body, last) = after.trim_end_matches(['\n', '\r']).rsplit_once('\n')?;
+    if !is_delimiter(last) || body.lines().any(is_delimiter) {
+        return None;
+    }
+    let body = if strip_tabs {
+        body.lines().map(|line| line.trim_start_matches('\t')).collect::<Vec<_>>().join("\n")
+    } else {
+        body.to_string()
+    };
+    complete_patch(&body).map(str::to_string)
+}
+
+/// `patch` when its first line is exactly `*** Begin Patch` and its last is exactly `*** End Patch`.
+fn complete_patch(patch: &str) -> Option<&str> {
+    let patch = patch.trim_matches(['\n', '\r']);
+    let first = patch.lines().next()?.trim_end();
+    let last = patch.lines().last()?.trim_end();
+    (first == "*** Begin Patch" && last == "*** End Patch").then_some(patch)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct Event {
     dir: String,
@@ -1618,6 +1692,12 @@ fn events_over(doc: &Doc, calls: &[u32], roots: &[u32], h: Harness, stated: Opti
                 for tok in shell_path_tokens(&cmd) {
                     if let Some(d) = abs_from(loc_dir.as_deref(), &tok).and_then(|p| dir_of_file(&p)) {
                         out.push(Event { dir: d, strength: Strength::Weak });
+                    }
+                }
+                // files the command writes (apply_patch, redirects, tee, sed -i): strong, like an edit tool
+                for tok in shell_write_targets(&cmd) {
+                    if let Some(d) = abs_from(loc_dir.as_deref(), &tok).and_then(|p| dir_of_file(&p)) {
+                        out.push(Event { dir: d, strength: Strength::Strong });
                     }
                 }
             }
