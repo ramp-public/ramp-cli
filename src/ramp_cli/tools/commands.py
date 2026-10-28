@@ -397,8 +397,9 @@ def _json_option_help(
 ) -> str:
     """Describe when raw JSON is useful for this operation."""
     complex_fields = [param.name for param in tool.params if param.is_complex]
+    source_hint = " Pass @path/to/file.json to read from a file, or - for stdin."
     if not complex_fields:
-        return "Raw JSON input (validated against the tool schema)"
+        return f"Raw JSON input (validated against the tool schema).{source_hint}"
     group_name = group_name or CATEGORY_REMAP.get(tool.category, tool.category)
     command_name = command_name or tool.alias or tool.name
     schema_hint = (
@@ -408,8 +409,25 @@ def _json_option_help(
     )
     return (
         f"Raw JSON input; required for complex fields: {', '.join(complex_fields)}."
-        f"{schema_hint}"
+        f"{schema_hint}{source_hint}"
     )
+
+
+def _resolve_json_source(raw: str) -> str:
+    """Resolve '--json' values of '@file' or '-' (stdin) into the raw JSON text."""
+    if raw == "-":
+        return click.get_text_stream("stdin").read()
+    if raw.startswith("@"):
+        path = os.path.expanduser(raw[1:])
+        try:
+            with open(path, encoding="utf-8") as f:
+                return f.read()
+        except OSError as e:
+            raise click.BadParameter(
+                f"cannot read JSON file {path!r}: {e.strerror or e}",
+                param_hint="'--json'",
+            )
+    return raw
 
 
 def _build_option(param: ToolParam) -> click.Option:
@@ -531,6 +549,7 @@ def _execute_tool(ctx: click.Context, tool: ToolDef, kwargs: dict[str, Any]) -> 
         )
 
     if json_body_raw:
+        json_body_raw = _resolve_json_source(json_body_raw)
         try:
             raw_values = json.loads(json_body_raw)
         except json.JSONDecodeError as e:

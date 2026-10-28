@@ -441,7 +441,7 @@ Each tool has its own flags. Common patterns:
 
 | Flag                   | Description                              |
 | ---------------------- | ---------------------------------------- |
-| `--json TEXT`          | Raw JSON request body (bypasses flags)   |
+| `--json TEXT`          | Raw JSON request body (bypasses flags); `@file.json` reads a file, `-` reads stdin |
 | `--dry_run`, `-n`      | Print request without sending            |
 | `--page_size N`        | Results per page                         |
 | `--next_page_cursor`   | Resume pagination from previous response |
