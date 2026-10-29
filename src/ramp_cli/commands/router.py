@@ -1297,6 +1297,8 @@ def _pick_clients(
     message: str,
     candidates: tuple[str, ...],
     titles: dict[str, str] | None = None,
+    *,
+    allow_empty: bool = False,
 ) -> tuple[str, ...]:
     """Ask which of ``candidates`` to act on, starting with none selected."""
     labels = titles or AGENT_NAMES
@@ -1306,7 +1308,9 @@ def _pick_clients(
             questionary.Choice(title=labels[client], value=client, checked=False)
             for client in candidates
         ],
-        validate=lambda answer: bool(answer) or "Select at least one agent.",
+        validate=lambda answer: (
+            allow_empty or bool(answer) or "Select at least one agent."
+        ),
         style=_picker_style(),
         pointer=_PICKER_POINTER,
         instruction="(↑/↓ move, enter/space toggle, a toggle all; Submit confirm, Esc back)",
@@ -1582,7 +1586,8 @@ def _validate_deployment_url(
     is_flag=True,
     help=(
         "Sign in with connector access on every run, enable MCP, and configure Claude Code, "
-        "Codex, OpenCode, or Pi. Create a key if none is saved; otherwise offer reuse."
+        "Claude Desktop, Codex, OpenCode, or Pi. Create a key if none is saved; otherwise offer reuse. "
+        "Bare --connectors includes installed Claude Desktop and restarts it."
     ),
 )
 @click.option(
@@ -1697,11 +1702,7 @@ def router_configure(
         _validate_deployment_url(ctx, click.Option(["--ui-url"]), origin)
         if origin != _router_key_origin(base):
             raise click.UsageError("Router API and sign-in deployments must match.")
-        supported = (
-            connector_harnesses.HARNESSES
-            if connectors
-            else router_credentials.HARNESSES
-        )
+        supported = router_credentials.HARNESSES
         if any(client not in supported for client in clients):
             raise click.UsageError(
                 "--enable-agent supports only " + ", ".join(supported) + "."
@@ -1932,30 +1933,55 @@ def _run_configure(
                 f"'ramp router configure {client} --{client}-models compact|all'."
             )
     all_clients = (
-        connector_harnesses.HARNESSES
-        if connectors
-        else router_credentials.HARNESSES
+        router_credentials.HARNESSES
         if enable_agent
+        else tuple(
+            COWORK_CLIENT if harness == DESKTOP_COMMAND_NAME else harness
+            for harness in connector_harnesses.HARNESSES
+        )
+        if connectors
         else tuple(CLIENT_NAMES)
     )
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     requested_clients = tuple(dict.fromkeys(clients))
     if connectors and any(item not in all_clients for item in requested_clients):
         raise click.UsageError(
-            "--connectors supports only " + ", ".join(all_clients) + "."
+            "--connectors supports only "
+            + ", ".join(_command_name(client) for client in all_clients)
+            + "."
         )
     picked_from_menu = False
     if not requested_clients:
+        include_desktop = (
+            connectors and COWORK_CLIENT in all_clients and claude_cowork.is_available()
+        )
+        if connectors and not include_desktop:
+            all_clients = tuple(item for item in all_clients if item != COWORK_CLIENT)
+        if include_desktop and fmt != "json":
+            click.echo("Claude Desktop is included and will restart during setup.")
         if _can_prompt(ctx, fmt):
             if connectors or enable_agent:
-                installed = set(_installed_clients())
-                if _codex_app_installed():
-                    installed.add("codex")
+                installed = set(_detected_clients())
                 candidates = tuple(item for item in all_clients if item in installed)
-                requested_clients = _pick_clients(
-                    "Choose the agents you want to configure with Ramp Router",
-                    candidates or all_clients,
-                )
+                if include_desktop:
+                    candidates = tuple(
+                        item for item in candidates if item != COWORK_CLIENT
+                    )
+                    additional = (
+                        _pick_clients(
+                            "Choose any additional coding agents to configure with Ramp Router",
+                            candidates,
+                            allow_empty=True,
+                        )
+                        if candidates
+                        else ()
+                    )
+                    requested_clients = (*additional, COWORK_CLIENT)
+                else:
+                    requested_clients = _pick_clients(
+                        "Choose the agents you want to configure with Ramp Router",
+                        candidates or all_clients,
+                    )
                 if not requested_clients:
                     raise click.Abort()
             else:
@@ -2148,8 +2174,9 @@ def _run_configure(
         # Named on a host that cannot run Conductor: fail before a browser
         # opens or a key is created for a setup that cannot be written.
         raise click.ClickException("Conductor is only available on macOS.")
+    connector_binding = None
     if connectors:
-        api_key, newly_created_key = configure_connector_harnesses(
+        api_key, newly_created_key, connector_binding = configure_connector_harnesses(
             ctx,
             clients,
             base_url=base_url,
@@ -2284,9 +2311,14 @@ def _run_configure(
                         api_key,
                         base_url,
                         model_ids=tuple(model.id for model in models),
+                        **(
+                            {"connector_binding": connector_binding}
+                            if connector_binding is not None
+                            else {}
+                        ),
                     )
-                except click.ClickException as exc:
-                    failures.append(f"{AGENT_NAMES[item]}: {exc.message}")
+                except (click.ClickException, RampCLIError) as exc:
+                    failures.append(f"{AGENT_NAMES[item]}: {exc}")
                     continue
                 preferred = next(
                     (
@@ -2325,6 +2357,7 @@ def _run_configure(
                         "migrated_model_selections": len(migrated_selections),
                         "models_available": len(models),
                         "setup_file_deleted": setup_file is not None,
+                        **({"connectors_enabled": True} if connectors else {}),
                     }
                 )
                 continue
@@ -2472,7 +2505,8 @@ def _run_configure(
     connector_undo = (
         "\nTo disable connector tools, run:\n"
         + "\n".join(
-            f"  ramp router connectors disable --harness {client}" for client in clients
+            f"  ramp router connectors disable --harness {_command_name(client)}"
+            for client in clients
         )
         if connectors
         else ""
@@ -2498,6 +2532,8 @@ def _run_configure(
                     if trust_lines:
                         notice.extend(["", *trust_lines])
             notice.extend(connector_undo.splitlines())
+            if cowork_note:
+                notice.extend(["", cowork_note])
             if diagnostics:
                 notice.extend(["", *diagnostics.rstrip().splitlines()])
             if not ctx.obj["quiet"]:
@@ -4934,7 +4970,7 @@ def _resolve_strategy_api_key(ctx: click.Context, api_key: str | None, fmt: str)
             questionary.Choice(
                 title=(
                     "Key used by "
-                    f"{_human_join([CLIENT_NAMES[item] for item in clients])}"
+                    f"{_human_join([AGENT_NAMES[item] for item in clients])}"
                 ),
                 value=index,
             )
@@ -8579,6 +8615,14 @@ def _stored_router_api_key_choices() -> list[tuple[str, tuple[str, ...]]]:
         except click.ClickException:
             continue
         api_keys.setdefault(api_key, []).append(client)
+    if claude_cowork.state_path().is_file():
+        try:
+            api_key, gateway_url = claude_cowork.configured_router_connection()
+        except click.ClickException:
+            pass
+        else:
+            if _same_router(gateway_url.rstrip("/") + "/v1", active_url):
+                api_keys.setdefault(api_key, []).append(COWORK_CLIENT)
     return [(api_key, tuple(clients)) for api_key, clients in api_keys.items()]
 
 
@@ -8589,7 +8633,7 @@ def _pick_stored_router_api_key() -> str | None:
         return None
     choices = [
         questionary.Choice(
-            title=f"Reuse existing key used by {_human_join([CLIENT_NAMES[item] for item in clients])}",
+            title=f"Reuse existing key used by {_human_join([AGENT_NAMES[item] for item in clients])}",
             value=index,
         )
         for index, (_, clients) in enumerate(credentials)

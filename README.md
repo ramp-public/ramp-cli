@@ -184,14 +184,19 @@ a billing guarantee: a large prompt or tool result can still cross the threshold
 
 ## Router connectors MCP
 
-Set up Router login, connector tools, and your coding harnesses in one command:
+Set up Router login, connector tools, and your coding harnesses or desktop app
+in one command:
 
 ```bash
 ramp router configure --connectors
 ```
 
-Choose from Claude Code, Codex, OpenCode, and Pi, or name them explicitly, for example
-`ramp router configure codex --connectors`. Setup signs in with connector consent
+With no client names, setup automatically includes installed Claude Desktop on
+macOS and closes and reopens it during configuration. In an interactive terminal,
+you can add Claude Code, Codex, OpenCode, or Pi, or continue with Desktop alone.
+You can also name clients explicitly, for example
+`ramp router configure codex --connectors`.
+Setup signs in with connector consent
 on every run, enables connectors for the selected harnesses, and configures them
 with a Router API key. If no compatible key is saved locally, it creates a
 `Ramp CLI` key through the Router key API and uses it immediately, without a reuse
@@ -201,8 +206,9 @@ OAuth sign-in still runs. `--no-input` and `--agent` are incompatible with this
 flow. Use `--no-browser` to print the sign-in URL and open it yourself.
 Previously enabled connector registrations for the same Router account,
 business, deployment, and credential profile keep working with the new sign-in
-through their existing bindings. Setup only writes connector registrations for
-the selected harnesses; other registrations are left unchanged.
+through their existing bindings. Setup writes connector registrations for the
+selected harnesses and automatically included Desktop; other registrations are
+left unchanged.
 
 To authorize and enable connectors separately:
 
@@ -212,12 +218,22 @@ ramp router connectors status --output json
 ramp router connectors enable --harness claude-code
 ```
 
-The supported harness IDs are `claude-code`, `codex`, `opencode`, and `pi`. Enable each
-selected harness explicitly; this does not configure Claude Desktop or change
-existing Slack, Google, or other provider connections. To remove only the CLI's
+The supported harness IDs are `claude-code`, `desktop`, `codex`, `opencode`, and `pi`.
+Enable each selected harness explicitly; this does not change existing Slack,
+Google, or other provider connections. To remove only the CLI's
 connector registration, run `ramp router connectors disable --harness claude-code`.
 Unrelated harness settings and MCP servers are preserved; foreign or customized
 `ramp-connectors` entries are not overwritten.
+
+For Claude Desktop on macOS, run `ramp router configure desktop --connectors`.
+Setup enables MCP for Desktop's Router profile and restarts the app. The bridge is
+registered in `~/Library/Application Support/Claude-3p/claude_desktop_config.json`.
+If Desktop is already configured for Router, quit Claude Desktop first, then run
+`ramp router connectors enable --harness desktop` after connector login.
+To remove just the connector registration, quit Desktop first and run
+`ramp router connectors disable --harness desktop`. Reopen Desktop after either
+command. Standalone enable/disable refuses to edit while Desktop is running,
+because the app can overwrite the change when it quits.
 
 For Pi 0.99 or later, run `ramp router configure pi --connectors`, or
 `ramp router connectors enable --harness pi` after connector login. Setup registers

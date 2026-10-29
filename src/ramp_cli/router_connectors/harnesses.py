@@ -12,10 +12,11 @@ from pathlib import Path
 
 import json5
 
+from ramp_cli import claude_cowork
 from ramp_cli.auth.refresh import _refresh_lock
 from ramp_cli.errors import RampCLIError
 
-HARNESSES = ("claude-code", "codex", "opencode", "pi")
+HARNESSES = ("claude-code", "codex", "opencode", "pi", "desktop")
 SERVER = "ramp-connectors"
 EXECUTABLE_NAMES = (
     "ramp",
@@ -29,6 +30,9 @@ EXECUTABLE_NAMES = (
 
 
 def config_path(harness: str, *, require_unambiguous: bool = True) -> Path:
+    if harness == "desktop":
+        # Router's Desktop profile runs in the separate third-party data root.
+        return claude_cowork._desktop_config_path()
     if harness == "claude-code":
         configured = os.environ.get("CLAUDE_CONFIG_DIR")
         return (
@@ -358,6 +362,16 @@ def _write(path: Path, text: str, original: str) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
+def registration_entry(
+    harness: str, binding: str | None, current: object
+) -> dict | None:
+    if current is not None and not _owned(harness, current):
+        raise RampCLIError(
+            "Existing ramp-connectors registration is not CLI-owned; nothing was changed."
+        )
+    return _entry(harness, binding) if binding else None
+
+
 def _change(harness: str, binding: str | None) -> dict:
     path = config_path(harness)
     if harness == "codex":
@@ -365,18 +379,22 @@ def _change(harness: str, binding: str | None) -> dict:
         from ramp_cli.commands.router import codex_config_lock  # noqa: PLC0415
 
         lock = codex_config_lock(path)
+    elif harness == "desktop":
+        lock = claude_cowork.transaction_lock()
     else:
         lock = _refresh_lock(
             "connectors-config-"
             + hashlib.sha256(str(path.resolve()).encode()).hexdigest()
         )
     with lock:
-        text, data, current = _read(path, harness)
-        if current is not None and not _owned(harness, current):
+        # Desktop's shutdown flush is not serialized by the CLI's config lock.
+        if harness == "desktop" and claude_cowork.claude_is_running():
             raise RampCLIError(
-                "Existing ramp-connectors registration is not CLI-owned; nothing was changed."
+                "Quit Claude Desktop before changing its connector registration, "
+                "then rerun this command. Reopen Desktop afterwards."
             )
-        entry = _entry(harness, binding) if binding else None
+        text, data, current = _read(path, harness)
+        entry = registration_entry(harness, binding, current)
         if harness == "codex":
             updated = _render_codex(text, data, entry)
         else:

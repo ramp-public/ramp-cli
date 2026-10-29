@@ -4,6 +4,7 @@ import re
 
 import click
 
+from ramp_cli import claude_cowork
 from ramp_cli.auth import oauth
 from ramp_cli.client.router_user import RouterUserClient, selected_origin
 from ramp_cli.commands import router_credentials
@@ -90,7 +91,7 @@ def configure_harnesses(
     no_browser: bool,
     reuse_existing_key: bool,
     can_prompt: bool,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, str]:
     from ramp_cli.commands import router  # noqa: PLC0415
 
     origin = router._statusline_origin(base_url)
@@ -133,12 +134,15 @@ def configure_harnesses(
         router_credentials.sign_in(client, connectors=True, no_browser=no_browser)
         binding = auth.create_binding(client)
         for harness in clients:
-            harnesses.enable(harness, binding)
+            # Desktop flushes its cached configuration on quit. Its bridge is
+            # written with its Router profile after the app has stopped.
+            if harness != router.COWORK_CLIENT:
+                harnesses.enable(harness, binding)
 
         if api_key is not None:
-            return api_key, False
+            return api_key, False, binding
 
-        return router_credentials.create_key(client), True
+        return router_credentials.create_key(client), True, binding
     finally:
         client.close()
 
@@ -233,6 +237,8 @@ def register(group: click.Group) -> None:
     @click.option("--harness", required=True, type=click.Choice(harnesses.HARNESSES))
     @click.pass_context
     def enable(ctx, harness):
+        if harness == "desktop":
+            claude_cowork.preflight()
         client = _client(ctx)
         try:
             binding = auth.create_binding(client)

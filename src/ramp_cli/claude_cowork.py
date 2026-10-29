@@ -463,7 +463,13 @@ def _restore_document(path: Path, value: dict, existed: bool) -> None:
         pass
 
 
-def _configure_stopped(api_key: str, router_base_url: str, profile: dict) -> Path:
+def _configure_stopped(
+    api_key: str,
+    router_base_url: str,
+    profile: dict,
+    *,
+    connector_binding: str | None = None,
+) -> Path:
     """Write the Cowork profile after Claude Desktop has stopped."""
     previous_state = _read_state()
     if previous_state is None:
@@ -496,6 +502,17 @@ def _configure_stopped(api_key: str, router_base_url: str, profile: dict) -> Pat
 
     desktop_config["deploymentMode"] = "3p"
     desktop_config.pop("awaitingSignIn", None)
+    if connector_binding is not None:
+        from ramp_cli.router_connectors import harnesses  # noqa: PLC0415
+
+        servers = desktop_config.setdefault("mcpServers", {})
+        if not isinstance(servers, dict):
+            raise click.ClickException(
+                "Could not read Claude Desktop configuration: 'mcpServers' must be an object."
+            )
+        servers[harnesses.SERVER] = harnesses.registration_entry(
+            "desktop", connector_binding, servers.get(harnesses.SERVER)
+        )
     meta["entries"] = [
         entry
         for entry in entries
@@ -816,6 +833,8 @@ def configure(
     api_key: str,
     router_base_url: str,
     model_ids: tuple[str, ...] = (),
+    *,
+    connector_binding: str | None = None,
 ) -> tuple[Path, tuple[dict, ...]]:
     """Configure and relaunch Claude Desktop with a Cowork-safe Router profile."""
     preflight()
@@ -827,7 +846,9 @@ def configure(
     with transaction_lock():
         _quit_claude()
         try:
-            profile_path = _configure_stopped(api_key, router_base_url, profile)
+            profile_path = _configure_stopped(
+                api_key, router_base_url, profile, connector_binding=connector_binding
+            )
         except BaseException:
             try:
                 _launch_claude()

@@ -17,6 +17,7 @@ import json5
 import pytest
 from click.testing import CliRunner
 
+from ramp_cli import claude_cowork
 from ramp_cli.auth import oauth
 from ramp_cli.client.router_user import RouterUserClient
 from ramp_cli.client.router_user import _edge_token as original_edge_token
@@ -289,6 +290,7 @@ def test_legacy_grant_fails_without_browser_or_exchange(monkeypatch):
 def test_registration_preserves_settings_rebinds_only_owned_entry_and_disable_is_scoped(
     monkeypatch, tmp_path, harness, executable_name
 ):
+    monkeypatch.setattr(claude_cowork, "claude_is_running", lambda: False)
     if harness == "pi":
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv("PI_CODING_AGENT_DIR", "~/custom-pi")
@@ -346,17 +348,39 @@ def test_registration_preserves_settings_rebinds_only_owned_entry_and_disable_is
         assert path.read_text() == before
 
 
-def test_pi_connector_cli_uses_default_agent_directory(monkeypatch, tmp_path):
+@pytest.mark.parametrize("harness", ["pi", "desktop"])
+def test_connector_cli_uses_default_app_directory_and_requires_closed_desktop(
+    monkeypatch, tmp_path, harness
+):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("PI_CODING_AGENT_DIR")
+    monkeypatch.delenv("RAMP_CLAUDE_DESKTOP_APP_SUPPORT")
+    monkeypatch.setattr(claude_cowork, "preflight", lambda: None)
+    monkeypatch.setattr(claude_cowork, "claude_is_running", lambda: True)
     monkeypatch.setattr(harnesses, "_executable", lambda: "/usr/local/bin/ramp")
     setup(monkeypatch, lambda request: issued())
     runner = CliRunner()
-    enabled = runner.invoke(
-        cli, ["router", "connectors", "enable", "--harness", "pi", "--output", "json"]
+    path = (
+        Path.home() / "Library/Application Support/Claude-3p/claude_desktop_config.json"
+        if harness == "desktop"
+        else Path.home() / ".pi" / "agent" / "mcp.json"
     )
+    enable_args = [
+        "router",
+        "connectors",
+        "enable",
+        "--harness",
+        harness,
+        "--output",
+        "json",
+    ]
+    enabled = runner.invoke(cli, enable_args)
+    if harness == "desktop":
+        assert isinstance(enabled.exception, RampCLIError)
+        assert not path.exists()
+        monkeypatch.setattr(claude_cowork, "claude_is_running", lambda: False)
+        enabled = runner.invoke(cli, enable_args)
     assert enabled.exit_code == 0, enabled.output
-    path = Path.home() / ".pi" / "agent" / "mcp.json"
     entry = json.loads(path.read_text())["mcpServers"]["ramp-connectors"]
     assert entry == {
         "command": "/usr/local/bin/ramp",
@@ -365,12 +389,18 @@ def test_pi_connector_cli_uses_default_agent_directory(monkeypatch, tmp_path):
             "connectors",
             "bridge",
             "--binding",
-            harnesses.status("pi")["binding_id"],
+            harnesses.status(harness)["binding_id"],
         ],
     }
-    disabled = runner.invoke(
-        cli, ["router", "connectors", "disable", "--harness", "pi"]
-    )
+    before = path.read_bytes()
+    monkeypatch.setattr(claude_cowork, "claude_is_running", lambda: True)
+    disable_args = ["router", "connectors", "disable", "--harness", harness]
+    disabled = runner.invoke(cli, disable_args)
+    if harness == "desktop":
+        assert isinstance(disabled.exception, RampCLIError)
+        assert path.read_bytes() == before
+        monkeypatch.setattr(claude_cowork, "claude_is_running", lambda: False)
+        disabled = runner.invoke(cli, disable_args)
     assert disabled.exit_code == 0, disabled.output
     assert json.loads(path.read_text())["mcpServers"] == {}
 

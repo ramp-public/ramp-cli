@@ -11,6 +11,7 @@ import click
 import pytest
 
 from ramp_cli import __version__, claude_cowork
+from ramp_cli.router_connectors import harnesses
 
 
 @pytest.fixture
@@ -647,8 +648,9 @@ def test_unconfigure_preserves_shared_values_changed_while_router_is_active(
     }
 
 
+@pytest.mark.parametrize("connector_binding", [None, "a" * 32])
 def test_failed_configure_rolls_back_partial_files_and_reopens_claude(
-    cowork_host, monkeypatch
+    cowork_host, monkeypatch, connector_binding
 ):
     root, events = cowork_host
     third_party = root / "Claude-3p"
@@ -669,9 +671,14 @@ def test_failed_configure_rolls_back_partial_files_and_reopens_claude(
         real_write(path, value)
 
     monkeypatch.setattr(claude_cowork, "_write_private_json", fail_once)
+    monkeypatch.setattr(harnesses, "_executable", lambda: "/usr/local/bin/ramp")
 
     with pytest.raises(click.ClickException, match="Could not configure"):
-        claude_cowork.configure("router-secret", "https://router.example/v1")
+        claude_cowork.configure(
+            "router-secret",
+            "https://router.example/v1",
+            connector_binding=connector_binding,
+        )
 
     assert json.loads(desktop_path.read_text()) == {"deploymentMode": "1p"}
     assert json.loads(meta_path.read_text()) == {"appliedId": "", "entries": []}

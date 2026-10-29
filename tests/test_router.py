@@ -225,6 +225,13 @@ def _router_model(identifier, *, request_name=None, display_name=None):
 def connector_setup(monkeypatch):
     _mock_models(monkeypatch)
     _mock_codex_catalog(monkeypatch)
+    monkeypatch.setattr(claude_cowork, "_quit_claude", lambda: None)
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: False)
+
+    def launch(**kwargs):
+        assert connector_harnesses.status("desktop")["state"] == "enabled"
+
+    monkeypatch.setattr(claude_cowork, "_launch_claude", launch)
     monkeypatch.setattr(connector_harnesses, "_executable", lambda: "/usr/bin/ramp")
     monkeypatch.setattr(connector_auth, "issue", lambda *a, **kw: "mcp-secret")
     monkeypatch.setattr(router_module, "_can_prompt", lambda *a: True)
@@ -270,10 +277,6 @@ def connector_setup(monkeypatch):
         assert path == "/client/api-keys"
         assert kwargs["json"]["routing_profile_id"] == "default-profile"
         assert kwargs["idempotency_key"]
-        assert any(
-            connector_harnesses.status(h)["state"] == "enabled"
-            for h in connector_harnesses.HARNESSES
-        )
         calls.append(("create", kwargs["json"]))
         return {"id": "created-key", "secret": "router-secret"}
 
@@ -339,6 +342,24 @@ def test_configure_agent_composes_with_optional_connectors(
 def test_configure_connectors_shows_setup_progress_then_notice(
     monkeypatch, connector_setup, clients, quiet
 ):
+    if "desktop" in clients:
+        desktop_config = connector_harnesses.config_path("desktop")
+        desktop_config.parent.mkdir(parents=True)
+        desktop_config.write_text(
+            json.dumps({"mcpServers": {"slack": {"command": "slack"}}})
+        )
+
+        def quit_and_flush():
+            desktop_config.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {"slack": {"command": "slack"}},
+                        "flushedOnQuit": True,
+                    }
+                )
+            )
+
+        monkeypatch.setattr(claude_cowork, "_quit_claude", quit_and_flush)
     if "opencode" in clients:
         monkeypatch.setenv("RAMP_OPENCODE_MAJOR", "2")
         opencode_config = router_module._client_config_path("opencode")
@@ -380,6 +401,13 @@ def test_configure_connectors_shows_setup_progress_then_notice(
         assert f"ramp router connectors disable --harness {client}" in notice
         assert connector_harnesses.status(client)["state"] == "enabled"
     expected_notes = []
+    if "desktop" in clients:
+        assert json.loads(desktop_config.read_text())["flushedOnQuit"] is True
+        assert json.loads(desktop_config.read_text())["mcpServers"]["slack"] == {
+            "command": "slack"
+        }
+        assert claude_cowork.desktop_status() == "connected"
+        expected_notes.append("Claude Desktop was restarted.")
     if "opencode" in clients:
         assert (
             json.loads(opencode_config.read_text())["model"]
@@ -399,9 +427,48 @@ def test_configure_connectors_shows_setup_progress_then_notice(
         assert " ".join(note.split()) in text
 
 
+@pytest.mark.parametrize(
+    "servers", [{"ramp-connectors": {"command": "third-party", "args": []}}, []]
+)
+def test_configure_desktop_connectors_preserves_conflicts_flushed_on_quit(
+    monkeypatch, connector_setup, servers
+):
+    path = connector_harnesses.config_path("desktop")
+    path.parent.mkdir(parents=True)
+    path.write_text("{}")
+    flushed = {"mcpServers": servers, "flushedOnQuit": True}
+    monkeypatch.setattr(
+        claude_cowork, "_quit_claude", lambda: path.write_text(json.dumps(flushed))
+    )
+    launches = []
+    monkeypatch.setattr(
+        claude_cowork, "_launch_claude", lambda **kwargs: launches.append(kwargs)
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--output",
+            "json",
+            "router",
+            "configure",
+            "desktop",
+            "--connectors",
+            "--api-key",
+            "router-secret",
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    assert json.loads(path.read_text()) == flushed
+    assert not claude_cowork.state_path().exists()
+    assert launches == [{}]
+
+
 @pytest.mark.parametrize("prior_login", ["none", "ordinary", "connectors"])
+@pytest.mark.parametrize("desktop_available", [False, True])
 def test_configure_connectors_creates_key_without_reuse_prompt(
-    monkeypatch, connector_setup, prior_login
+    monkeypatch, connector_setup, prior_login, desktop_available
 ):
     client = RouterUserClient(router_module.ROUTER_UI_URL)
     if prior_login != "none":
@@ -412,9 +479,13 @@ def test_configure_connectors_creates_key_without_reuse_prompt(
             client._save(saved)
         connector_setup.clear()
     monkeypatch.setattr(router_module, "_installed_clients", lambda: ("codex", "pi"))
+    monkeypatch.setattr(claude_cowork, "is_available", lambda: desktop_available)
+    quits = []
+    monkeypatch.setattr(claude_cowork, "_quit_claude", lambda: quits.append(True))
 
-    def choose_clients(message, candidates):
+    def choose_clients(message, candidates, *, allow_empty=False):
         assert candidates == ("codex", "pi")
+        assert allow_empty is desktop_available
         return candidates
 
     monkeypatch.setattr(router_module, "_pick_clients", choose_clients)
@@ -438,9 +509,37 @@ def test_configure_connectors_creates_key_without_reuse_prompt(
     assert connector_setup[0][1] == {"connectors": True, "no_browser": False}
     assert waits[0] is True
     assert connector_harnesses.status("codex")["state"] == "enabled"
+    assert connector_harnesses.status("desktop")["state"] == (
+        "enabled" if desktop_available else "disabled"
+    )
+    assert quits == ([True] if desktop_available else [])
     path = router_module._client_config_path("codex")
     assert router_module._stored_router_api_key("codex", path) == "router-secret"
     assert "router-secret" not in result.output
+
+
+@pytest.mark.parametrize("installed", [(), ("codex",)])
+def test_bare_connectors_can_configure_only_automatic_desktop(
+    monkeypatch, connector_setup, installed
+):
+    monkeypatch.setattr(router_module, "_installed_clients", lambda: installed)
+    monkeypatch.setattr(claude_cowork, "is_available", lambda: True)
+    prompts = []
+
+    def choose_no_additional_clients(message, **kwargs):
+        assert kwargs["validate"]([]) is True
+        prompts.append(message)
+        return SimpleNamespace(ask=lambda: [])
+
+    monkeypatch.setattr(router_module, "_agent_checkbox", choose_no_additional_clients)
+
+    result = CliRunner().invoke(cli, ["--human", "router", "configure", "--connectors"])
+
+    assert result.exit_code == 0, result.output
+    assert bool(prompts) is bool(installed)
+    assert claude_cowork.desktop_status() == "connected"
+    assert connector_harnesses.status("desktop")["state"] == "enabled"
+    assert connector_harnesses.status("codex")["state"] == "disabled"
 
 
 @pytest.mark.parametrize("reuse", [True, False])
@@ -476,18 +575,27 @@ def test_configure_connectors_offers_saved_key_before_creating_another(
     assert [call[0] for call in connector_setup] == (
         ["login"] if reuse else ["login", "create"]
     )
-    path = router_module._client_config_path(harness)
-    assert router_module._stored_router_api_key(harness, path) == (
-        "router-secret" if reuse else "replacement-secret"
+    saved_key = (
+        claude_cowork.configured_api_key()
+        if harness == "desktop"
+        else router_module._stored_router_api_key(
+            harness, router_module._client_config_path(harness)
+        )
     )
+    assert saved_key == ("router-secret" if reuse else "replacement-secret")
     assert connector_harnesses.status(harness)["state"] == "enabled"
     assert "router-secret" not in result.output
     assert "replacement-secret" not in result.output
 
 
+@pytest.mark.parametrize("desktop_available", [False, True])
 def test_configure_connectors_machine_output_reauthenticates_and_reuses_key(
-    monkeypatch, connector_setup
+    monkeypatch, connector_setup, desktop_available
 ):
+    monkeypatch.setattr(claude_cowork, "is_available", lambda: desktop_available)
+    harnesses = tuple(
+        h for h in connector_harnesses.HARNESSES if desktop_available or h != "desktop"
+    )
     client = RouterUserClient(router_module.ROUTER_UI_URL)
     client.login(connectors=True)
     connector_setup.clear()
@@ -497,8 +605,7 @@ def test_configure_connectors_machine_output_reauthenticates_and_reuses_key(
     first = runner.invoke(cli, args)
     assert first.exit_code == 0, first.output
     previous_bindings = {
-        h: connector_harnesses.status(h)["binding_id"]
-        for h in connector_harnesses.HARNESSES
+        h: connector_harnesses.status(h)["binding_id"] for h in harnesses
     }
     connector_setup.clear()
 
@@ -507,15 +614,16 @@ def test_configure_connectors_machine_output_reauthenticates_and_reuses_key(
     assert result.exit_code == 0, result.output
     assert connector_setup == [("login", {"connectors": True, "no_browser": False})]
     data = json.loads(result.stdout)["data"][0]
-    assert {row["client"] for row in data["clients"]} == set(
-        connector_harnesses.HARNESSES
-    )
+    assert {
+        router_module._command_name(row["client"]) for row in data["clients"]
+    } == set(harnesses)
     assert all(row["connectors_enabled"] for row in data["clients"])
     for harness, previous in previous_bindings.items():
         current = connector_harnesses.status(harness)["binding_id"]
         assert current == previous
     assert all(
-        row["state"] == "enabled" for row in connector_auth.status(client)["harnesses"]
+        row["state"] == ("enabled" if row["harness"] in harnesses else "disabled")
+        for row in connector_auth.status(client)["harnesses"]
     )
     assert "router-secret" not in result.output
 
