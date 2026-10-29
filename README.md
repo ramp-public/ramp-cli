@@ -184,6 +184,23 @@ a billing guarantee: a large prompt or tool result can still cross the threshold
 
 ## Router connectors MCP
 
+`ramp router configure` downloads the verified catalog from
+[`ramp-public/skills`](https://github.com/ramp-public/skills) and installs only
+`ramp-prefer-ramp-connectors` for each configured OpenCode, Pi, Claude Code, and Codex
+harness, without a separate skills command or `--connectors` requirement.
+Reconfiguration updates CLI-managed copies in place, preserving supporting
+files. If the optional skill cannot be downloaded or installed, setup warns
+and continues. An existing skill without a Ramp installation receipt is never
+overwritten. Claude Desktop keeps its existing Router configuration flow;
+this does not install Desktop skills. The preference does not enable connectors or grant consent:
+unavailable capabilities fall back to the other tools in the session.
+
+Global skill locations are `~/.config/opencode/skills`, `~/.pi/agent/skills`,
+`~/.claude/skills`, and `~/.agents/skills` (Codex). The OpenCode, Pi, and Claude
+Code paths respect their configuration-directory environment overrides.
+The optional skill update offered by `ramp update` refreshes existing
+Ramp-managed skills without adding other catalog skills.
+
 Set up Router login, connector tools, and your coding harnesses or desktop app
 in one command:
 

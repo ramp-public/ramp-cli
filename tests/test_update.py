@@ -11,6 +11,9 @@ from click.testing import CliRunner
 
 from ramp_cli.commands.update import _is_homebrew_install
 from ramp_cli.main import cli
+from ramp_cli.router_connectors import skill as connector_skill
+from ramp_cli.skills import get_skill_content, record_receipt
+from ramp_cli.skills.remote import active_skills_dir
 from ramp_cli.version_check import latest_version, parse_version
 
 
@@ -143,38 +146,61 @@ class TestUpdateAvailable:
         assert "Ramp-managed skills are installed in" not in result.output
         mock_run.assert_called_once()
 
-    def test_accepting_skills_update_installs_latest_catalog(self, isolated_config):
-        targets = (Path("/managed/claude-skills"), Path("/custom/cursor-skills"))
-        with _interactive_update(targets) as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
+    def test_accepting_skills_update_refreshes_only_managed_skills(
+        self, isolated_config, monkeypatch
+    ):
+        monkeypatch.delenv("RAMP_NO_SKILLS_UPDATE_CHECK", raising=False)
+        monkeypatch.delenv("RAMP_SKILLS_VERSION", raising=False)
+        connector_skill.refresh()
+        catalog = active_skills_dir()
+        for name in ("manage-bills", "spend-analysis"):
+            skill = catalog / name / "SKILL.md"
+            skill.parent.mkdir()
+            skill.write_text(f"---\nname: ramp-{name}\n---\nOther skill\n")
+        targets = (isolated_config / "claude-skills", isolated_config / "codex-skills")
+        for target, name in zip(
+            targets, ("ramp-prefer-ramp-connectors", "prefer-ramp-connectors")
+        ):
+            skill = target / name / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text("Old guidance\n")
+            record_receipt(target, name)
+            # A user-deleted skill still has a receipt; updating must not restore it.
+            record_receipt(target, "ramp-spend-analysis")
+
+        def run_installed_cli(command):
+            if command[1:3] == ["skills", "install"]:
+                installed = _invoke(command[1:])
+                assert installed.exit_code == 0, installed.output
+            return MagicMock(returncode=0)
+
+        with (
+            _interactive_update(targets) as mock_run,
+            patch("ramp_cli.output.formatter.is_tty", return_value=True),
+            patch("ramp_cli.commands.skills._is_interactive", return_value=True),
+            patch(
+                "ramp_cli.commands.skills.latest_skills_version",
+                return_value=catalog.name,
+            ) as mock_latest,
+        ):
+            mock_run.side_effect = run_installed_cli
             result = _invoke(
                 ["--human", "update"],
                 input="y\n",
                 env={"RAMP_INSTALL_DIR": "/usr/local/bin"},
             )
 
+        mock_latest.assert_not_called()
         assert result.exit_code == 0
         assert all(str(target) in result.output for target in targets)
         assert "latest version? [y/N]: y" in result.output
-        assert [call.args[0] for call in mock_run.call_args_list[1:]] == [
-            ["/usr/local/bin/ramp", "skills", "update"],
-            [
-                "/usr/local/bin/ramp",
-                "skills",
-                "install",
-                "--all",
-                "--target",
-                "/managed/claude-skills",
-            ],
-            [
-                "/usr/local/bin/ramp",
-                "skills",
-                "install",
-                "--all",
-                "--target",
-                "/custom/cursor-skills",
-            ],
-        ]
+        for target in targets:
+            assert sorted(path.name for path in target.iterdir()) == [
+                "ramp-prefer-ramp-connectors"
+            ]
+            assert (
+                target / "ramp-prefer-ramp-connectors" / "SKILL.md"
+            ).read_text() == get_skill_content("prefer-ramp-connectors")
 
     def test_skills_catalog_failure_does_not_touch_skill_directories(
         self, isolated_config

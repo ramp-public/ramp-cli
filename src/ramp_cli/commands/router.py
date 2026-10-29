@@ -90,6 +90,7 @@ from ramp_cli.output.formatter import (
 )
 from ramp_cli.output.style import show_notice, start_spinner
 from ramp_cli.router_connectors import harnesses as connector_harnesses
+from ramp_cli.router_connectors import skill as connector_skill
 from ramp_cli.router_integrations import integration_package_path
 from ramp_cli.router_setup import (
     ROUTER_SETUP_DEFERRED_EXIT_CODE,
@@ -2051,6 +2052,8 @@ def _run_configure(
         # preference configures, so the repeat-configure shortcut clears it
         # like a full configure would.
         _scrub_stale_fable_verdict()
+        if connector_skill.refresh():
+            connector_skill.install("claude-code")
         # Like every other configure, so RAMP_NO_SESSION_SYNC=1 removes the
         # job here too.
         router_schedule.install()
@@ -2174,6 +2177,10 @@ def _run_configure(
         # Named on a host that cannot run Conductor: fail before a browser
         # opens or a key is created for a setup that cannot be written.
         raise click.ClickException("Conductor is only available on macOS.")
+    connector_skill_available = (
+        any(item in ("claude-code", "codex", "opencode", "pi") for item in clients)
+        and connector_skill.refresh()
+    )
     connector_binding = None
     if connectors:
         api_key, newly_created_key, connector_binding = configure_connector_harnesses(
@@ -2426,6 +2433,13 @@ def _run_configure(
                 failures.append(f"{AGENT_NAMES[item]}: {exc.message}")
                 continue
             switchyard_push.settle(written=True)
+            if connector_skill_available and item in (
+                "claude-code",
+                "codex",
+                "opencode",
+                "pi",
+            ):
+                connector_skill.install(item)
             switchyard_model = (
                 pushed if pushed is not None and default_model == pushed else None
             )

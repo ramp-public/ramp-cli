@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from ramp_cli.commands import router
+from ramp_cli.config.settings import config_dir
 
 
 @pytest.fixture(autouse=True)
@@ -28,6 +30,8 @@ def isolated_config(tmp_path: Path, request: pytest.FixtureRequest):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr("ramp_cli.commands.router_schedule._run", lambda *_args: False)
     router._bundled_codex_catalog_from.cache_clear()
+    # Codex discovers personal skills in ~/.agents independently of CODEX_HOME.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     # Explicit OpenCode paths take precedence over the isolated XDG directory.
     monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
@@ -128,4 +132,23 @@ def isolated_config(tmp_path: Path, request: pytest.FixtureRequest):
     monkeypatch.setattr("ramp_cli.admin_defaults._cache", {})
     monkeypatch.setattr("ramp_cli.admin_defaults._pinned", {})
     monkeypatch.setattr("ramp_cli.config.settings.default_environment", lambda: "")
+
+    def refresh_connector_catalog():
+        root = config_dir() / "skills" / "v-connectors-test"
+        skill = root / "prefer-ramp-connectors" / "SKILL.md"
+        skill.parent.mkdir(parents=True, exist_ok=True)
+        skill.write_text(
+            "---\nname: ramp-prefer-ramp-connectors\n"
+            "description: Prefer connected service tools.\n---\n"
+            "# Prefer ramp-connectors MCP\n"
+            "Use published connector capabilities for Slack and other connected services.\n"
+        )
+        (root.parent / "active.json").write_text(json.dumps({"version": root.name}))
+        return True
+
+    # Configure tests exercise installation without contacting GitHub; release
+    # download and verification have their own HTTP-mocked integration coverage.
+    monkeypatch.setattr(
+        "ramp_cli.router_connectors.skill.refresh", refresh_connector_catalog
+    )
     yield tmp_path

@@ -55,6 +55,11 @@ an unreceipted directory.
 
 ## Remote release contract
 
+`ramp router configure` downloads the verified public catalog and installs
+`ramp-prefer-ramp-connectors` for configured Claude Code, Codex, OpenCode, and Pi
+harnesses. Claude Desktop skill installation is not automated. Skill content
+remains owned by the external skills publishing pipeline, not bundled in the CLI.
+
 [`ramp-public/skills`](https://github.com/ramp-public/skills) is the source of
 truth for new skill content. Its independent GitHub Releases must publish these
 two assets:

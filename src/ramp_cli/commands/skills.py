@@ -256,6 +256,7 @@ def _install_one(
     name: str,
     *,
     install_all: bool,
+    quiet: bool = False,
 ) -> bool:
     """Install one available skill into ``target``; True when installed.
 
@@ -291,7 +292,8 @@ def _install_one(
             name, skill_dir, legacy_dir, migrated=migrated, created=created, exc=exc
         ) from exc
 
-    click.echo(f"  {status.capitalize()} {installed_name} → {skill_dir}/")
+    if not quiet:
+        click.echo(f"  {status.capitalize()} {installed_name} → {skill_dir}/")
     return True
 
 

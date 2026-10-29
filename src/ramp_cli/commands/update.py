@@ -20,7 +20,11 @@ from ramp_cli.install_record import (
     npm_update_lines,
 )
 from ramp_cli.output.formatter import resolve_format
-from ramp_cli.skills import managed_skill_targets
+from ramp_cli.skills import (
+    INSTALLED_SKILL_PREFIX,
+    managed_skill_names,
+    managed_skill_targets,
+)
 from ramp_cli.version_check import (
     latest_version,
     parse_version,
@@ -51,26 +55,45 @@ def _update_optional_skills(ramp_executable: Path, targets: list[Path]) -> None:
         return
 
     for target in targets:
-        retry_command = "ramp skills install --all --target " + shlex.quote(str(target))
-        try:
-            result = subprocess.run(
-                _installed_invocation(
-                    ramp_executable,
-                    "skills",
-                    "install",
-                    "--all",
-                    "--target",
-                    str(target),
+        # Only the skills this CLI already installed: --all would add the rest
+        # of the catalog to a user who asked to update, not to expand, their set.
+        names = sorted(
+            {
+                name.removeprefix(INSTALLED_SKILL_PREFIX)
+                for name in managed_skill_names(target)
+                if (target / name / "SKILL.md").is_file()
+            }
+        )
+        if not names:
+            continue
+        failed = []
+        for name in names:
+            try:
+                result = subprocess.run(
+                    _installed_invocation(
+                        ramp_executable,
+                        "skills",
+                        "install",
+                        name,
+                        "--target",
+                        str(target),
+                        "--no-input",
+                    )
                 )
-            )
-        except OSError:
-            result = None
-        if result is not None and result.returncode == 0:
+            except OSError:
+                result = None
+            if result is None or result.returncode != 0:
+                failed.append(name)
+        if not failed:
             click.echo(f"Skills updated in {target}.")
         else:
+            retry_commands = "\n".join(
+                f"  ramp skills install {name} --target {shlex.quote(str(target))}"
+                for name in failed
+            )
             click.echo(
                 f"Ramp CLI update succeeded, but optional skills in {target} could not "
-                f"be installed. Retry with:\n  {retry_command}",
+                f"be installed. Retry with:\n{retry_commands}",
                 err=True,
             )
 

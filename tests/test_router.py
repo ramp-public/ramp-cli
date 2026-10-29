@@ -14,6 +14,7 @@ import subprocess
 import tomllib
 from contextlib import contextmanager
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 
 import click
@@ -37,6 +38,10 @@ from ramp_cli.errors import RampCLIError
 from ramp_cli.main import cli
 from ramp_cli.router_connectors import auth as connector_auth
 from ramp_cli.router_connectors import harnesses as connector_harnesses
+from ramp_cli.router_connectors import skill as connector_skill
+from ramp_cli.router_connectors.skill import refresh as refresh_connector_catalog
+from ramp_cli.skills import managed_skill_names, record_receipt
+from ramp_cli.skills.remote import active_skills_dir
 
 
 @pytest.fixture(autouse=True)
@@ -56,6 +61,7 @@ def _complete_browser_key_setup(monkeypatch, tmp_path_factory):
         "RAMP_CLAUDE_DESKTOP_APP_SUPPORT",
         str(tmp_path_factory.mktemp("claude-app-support")),
     )
+    connector_skill.refresh()
 
 
 # What every request the CLI itself makes to Router carries.
@@ -400,6 +406,11 @@ def test_configure_connectors_shows_setup_progress_then_notice(
     for client in clients:
         assert f"ramp router connectors disable --harness {client}" in notice
         assert connector_harnesses.status(client)["state"] == "enabled"
+        if client != "desktop":
+            target = connector_skill.target_dir(client)
+            installed = target / connector_skill.NAME / "SKILL.md"
+            assert "name: ramp-prefer-ramp-connectors\n" in installed.read_text()
+            assert connector_skill.NAME in managed_skill_names(target)
     expected_notes = []
     if "desktop" in clients:
         assert json.loads(desktop_config.read_text())["flushedOnQuit"] is True
@@ -4959,6 +4970,122 @@ def test_configure_claude_all_models_sets_wire_header(tmp_path, monkeypatch):
     ]
 
 
+def test_configure_updates_connector_skill_without_connector_consent(
+    connector_setup, monkeypatch
+):
+    target = connector_skill.target_dir("codex")
+    installed = target / connector_skill.NAME
+    installed.mkdir(parents=True)
+    (installed / "SKILL.md").write_text("old connector preference")
+    (installed / "notes.md").write_text("user notes")
+    record_receipt(target, connector_skill.NAME)
+
+    runner = CliRunner()
+    args = [
+        "--agent",
+        "router",
+        "configure",
+        "codex",
+        "--api-key",
+        "router-secret",
+        "--no-browser",
+    ]
+    configured = runner.invoke(cli, args)
+    assert configured.exit_code == 0, configured.output
+    assert (installed / "SKILL.md").read_text() == connector_skill.content()
+    assert (installed / "notes.md").read_text() == "user notes"
+    assert managed_skill_names(target) == [connector_skill.NAME]
+    assert not connector_setup
+
+    (installed / "SKILL.md").write_text("outdated preference")
+    revised_policy = connector_skill.content().replace(
+        "Use published connector capabilities",
+        "Use newly published connector capabilities",
+    )
+
+    def refresh_published_catalog():
+        (active_skills_dir() / connector_skill.CLI_NAME / "SKILL.md").write_text(
+            revised_policy
+        )
+        return True
+
+    monkeypatch.setattr(connector_skill, "refresh", refresh_published_catalog)
+    repeated = runner.invoke(cli, args)
+    assert repeated.exit_code == 0, repeated.output
+    assert (installed / "SKILL.md").read_text() == revised_policy
+    assert (installed / "notes.md").read_text() == "user notes"
+
+
+def test_configure_reports_unmanaged_connector_skill_without_overwriting(
+    connector_setup,
+):
+    target = connector_skill.target_dir("codex")
+    installed = target / connector_skill.NAME / "SKILL.md"
+    installed.parent.mkdir(parents=True)
+    installed.write_text("user-owned preference")
+
+    result = CliRunner().invoke(
+        cli, ["--agent", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "no installation receipt" in result.stderr
+    assert json.loads(result.stdout)["data"][0]["client"] == "codex"
+    assert installed.read_text() == "user-owned preference"
+    assert managed_skill_names(target) == []
+
+
+@pytest.mark.parametrize(
+    "download_fails", [True, False], ids=["offline", "missing-skill"]
+)
+def test_configure_continues_without_optional_connector_skill(
+    monkeypatch, download_fails
+):
+    _mock_models(monkeypatch)
+    (active_skills_dir() / connector_skill.CLI_NAME / "SKILL.md").unlink()
+
+    def download(version):
+        if download_fails:
+            raise RuntimeError("GitHub unavailable")
+
+    monkeypatch.setattr("ramp_cli.skills.remote.download_skills", download)
+    monkeypatch.setattr(connector_skill, "refresh", refresh_connector_catalog)
+    runner = CliRunner()
+    args = ["--agent", "--no-input", "router", "configure", "claude-code"]
+    for options in (["--api-key", "router-secret"], ["--claude-models", "all"]):
+        result = runner.invoke(cli, [*args, *options])
+
+        assert result.exit_code == 0, result.output
+        assert "Warning: Skipping optional" in result.stderr
+        payload = json.loads(result.stdout)["data"][0]
+        settings = json.loads(Path(payload["config_path"]).read_text())
+        assert settings["env"]["ANTHROPIC_AUTH_TOKEN"] == "router-secret"
+        assert not managed_skill_names(connector_skill.target_dir("claude-code"))
+    assert payload["model_view"] == "all"
+
+
+@pytest.mark.parametrize(
+    "harness, override, relative_target",
+    [
+        ("claude-code", "CLAUDE_CONFIG_DIR", ".claude/skills"),
+        ("pi", "PI_CODING_AGENT_DIR", ".pi/agent/skills"),
+        ("opencode", "XDG_CONFIG_HOME", ".config/opencode/skills"),
+    ],
+)
+def test_connector_skill_install_uses_home_when_override_is_empty(
+    monkeypatch, tmp_path, harness, override, relative_target
+):
+    monkeypatch.setenv(override, "")
+    monkeypatch.chdir(tmp_path)
+    connector_skill.refresh()
+
+    connector_skill.install(harness)
+
+    target = Path.home() / relative_target
+    assert (target / connector_skill.NAME / "SKILL.md").is_file()
+    assert managed_skill_names(target) == [connector_skill.NAME]
+
+
 def test_reconfigure_claude_only_updates_model_view(tmp_path, monkeypatch):
     claude_home = tmp_path / "claude"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
@@ -4975,6 +5102,10 @@ def test_reconfigure_claude_only_updates_model_view(tmp_path, monkeypatch):
         ],
     )
     assert configured.exit_code == 0, configured.output
+    skill_path = (
+        connector_skill.target_dir("claude-code") / connector_skill.NAME / "SKILL.md"
+    )
+    skill_path.write_text("outdated preference")
     settings_path = claude_home / "settings.json"
     settings = json.loads(settings_path.read_text())
     settings["userSetting"] = "keep"
@@ -5002,6 +5133,7 @@ def test_reconfigure_claude_only_updates_model_view(tmp_path, monkeypatch):
     )
 
     assert expanded.exit_code == 0, expanded.output
+    assert "name: ramp-prefer-ramp-connectors\n" in skill_path.read_text()
     updated = json.loads(settings_path.read_text())
     assert updated["userSetting"] == "keep"
     assert updated["env"]["ANTHROPIC_AUTH_TOKEN"] == "router-secret"

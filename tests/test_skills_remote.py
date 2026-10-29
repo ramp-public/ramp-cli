@@ -13,6 +13,8 @@ from click.testing import CliRunner
 from ramp_cli.commands.skills import _install_one
 from ramp_cli.config.settings import config_dir
 from ramp_cli.main import cli
+from ramp_cli.router_connectors import skill as connector_skill
+from ramp_cli.router_connectors.skill import refresh as refresh_connector_catalog
 from ramp_cli.skills import (
     get_skill_content,
     install_skill,
@@ -150,6 +152,19 @@ def test_download_verifies_and_activates_catalog(monkeypatch):
     assert "demo" in skill_names()
     assert "new description" in get_skill_content("demo")
     assert skill_names() == ["demo"]
+
+
+def test_connector_refresh_falls_back_to_a_verified_cached_catalog(monkeypatch):
+    archive = _archive("ramp-prefer-ramp-connectors", content="cached published policy")
+    _mock_download(monkeypatch, archive, hashlib.sha256(archive).hexdigest())
+    assert refresh_connector_catalog()
+
+    def unavailable(*args):
+        raise RuntimeError("GitHub unavailable")
+
+    monkeypatch.setattr("ramp_cli.skills.remote.download_skills", unavailable)
+    assert refresh_connector_catalog()
+    assert "cached published policy" in connector_skill.content()
 
 
 def test_redownload_replaces_modified_cached_catalog(monkeypatch):
