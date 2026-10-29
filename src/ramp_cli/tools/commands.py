@@ -397,7 +397,9 @@ def _json_option_help(
 ) -> str:
     """Describe when raw JSON is useful for this operation."""
     complex_fields = [param.name for param in tool.params if param.is_complex]
-    source_hint = " Pass @path/to/file.json to read from a file, or - for stdin."
+    source_hint = (
+        " Pass a file path (e.g. payload.json) to read from a file, or - for stdin."
+    )
     if not complex_fields:
         return f"Raw JSON input (validated against the tool schema).{source_hint}"
     group_name = group_name or CATEGORY_REMAP.get(tool.category, tool.category)
@@ -414,20 +416,25 @@ def _json_option_help(
 
 
 def _resolve_json_source(raw: str) -> str:
-    """Resolve '--json' values of '@file' or '-' (stdin) into the raw JSON text."""
+    """Resolve a '--json' value into raw JSON text.
+
+    Values starting with '{' or '[' are inline JSON, '-' reads stdin, and
+    anything else is a file path (a leading '@' is accepted and stripped).
+    """
+    if raw.lstrip().startswith(("{", "[")):
+        return raw
     if raw == "-":
         return click.get_text_stream("stdin").read()
-    if raw.startswith("@"):
-        path = os.path.expanduser(raw[1:])
-        try:
-            with open(path, encoding="utf-8") as f:
-                return f.read()
-        except OSError as e:
-            raise click.BadParameter(
-                f"cannot read JSON file {path!r}: {e.strerror or e}",
-                param_hint="'--json'",
-            )
-    return raw
+    path = os.path.expanduser(raw[1:] if raw.startswith("@") else raw)
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError as e:
+        raise click.BadParameter(
+            f"cannot read JSON file {path!r}: {e.strerror or e}"
+            " (inline JSON must start with '{')",
+            param_hint="'--json'",
+        )
 
 
 def _build_option(param: ToolParam) -> click.Option:

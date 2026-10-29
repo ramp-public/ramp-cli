@@ -35,6 +35,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from xml.parsers.expat import ExpatError
 
 from ramp_cli.commands import conductor, router_sync
 from ramp_cli.commands.router_sync import (
@@ -300,6 +301,15 @@ def agent_executable(ramp: Path | None = None) -> Path | None:
         candidate = Path(os.path.realpath(ramp)).parent / AGENT_BINARY if ramp else None
     if candidate and candidate.is_file() and os.access(candidate, os.X_OK):
         return _homebrew_opt_path(Path(os.path.abspath(candidate)))
+    if override:
+        return None
+    # An install without its own agent adopts the one already installed, so
+    # reconciling rewrites that service with this CLI's paths instead of
+    # leaving it on another install's (possibly removed) ones.
+    installed = _installed_agent_arguments()
+    program = Path(installed[0]) if installed else None
+    if program and program.is_file() and os.access(program, os.X_OK):
+        return program
     return None
 
 
@@ -365,8 +375,16 @@ def write_manifest(manifest: dict) -> None:
 
 
 def clear_manifest() -> None:
-    """Make the agent run a sync soon; that sync writes a fresh manifest."""
-    manifest_path().unlink(missing_ok=True)
+    """Make the agent run a sync soon; that sync writes a fresh manifest.
+
+    The installed agent may read another configuration root's manifest; clear
+    that one too, or it keeps checking with the keys recorded there.
+    """
+    current = manifest_path()
+    installed = _installed_agent_manifest()
+    current.unlink(missing_ok=True)
+    if installed is not None and installed.name == current.name:
+        installed.unlink(missing_ok=True)
 
 
 def ca_files() -> list[str]:
@@ -599,6 +617,41 @@ def agent_installed() -> bool:
     if sys.platform == "darwin":
         return _agent_plist_path().exists()
     return (_systemd_dir() / f"{AGENT_SYSTEMD_NAME}.service").exists()
+
+
+def _installed_agent_arguments() -> list[str]:
+    """The installed agent service's command line, or [] when unreadable."""
+    try:
+        if sys.platform == "darwin":
+            with _agent_plist_path().open("rb") as plist:
+                arguments = plistlib.load(plist)["ProgramArguments"]
+        elif sys.platform.startswith("linux"):
+            unit = _systemd_dir() / f"{AGENT_SYSTEMD_NAME}.service"
+            line = next(
+                line
+                for line in unit.read_text(encoding="utf-8").splitlines()
+                if line.startswith("ExecStart=")
+            )
+            arguments = [
+                argument.replace("$$", "$").replace("%%", "%")
+                for argument in shlex.split(line.removeprefix("ExecStart="))
+            ]
+        else:
+            return []
+        if isinstance(arguments, list) and all(isinstance(a, str) for a in arguments):
+            return arguments
+    except (OSError, ValueError, ExpatError, LookupError, StopIteration, TypeError):
+        pass  # includes a plist truncated by an interrupted write
+    return []
+
+
+def _installed_agent_manifest() -> Path | None:
+    """The manifest the installed agent reads, which may be another root's."""
+    arguments = _installed_agent_arguments()
+    try:
+        return Path(arguments[arguments.index("--sync-manifest") + 1])
+    except (ValueError, IndexError):
+        return None
 
 
 def _install_agent(agent: Path, ramp: Path, listen: int | None) -> None:

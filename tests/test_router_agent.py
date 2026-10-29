@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -324,6 +325,29 @@ def test_install_without_the_agent_falls_back_to_the_plain_job(
 ):
     _REAL_INSTALL()
     assert "com.ramp.router" in launchd.loaded
+
+    # Another ramp without the agent (a dev checkout) keeps the installed agent
+    # but points its sync at this ramp and this configuration root.
+    agent = schedule.agent_executable()
+    other = _executable(tmp_path / "dev/ramp")
+    monkeypatch.setattr(schedule, "ramp_executable", lambda: other)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "other-config"))
+    _REAL_INSTALL()
+    arguments = _plist(tmp_path)["ProgramArguments"]
+    assert launchd.loaded == {"com.ramp.router"}
+    assert arguments[0] == str(agent)
+    assert arguments[arguments.index("--sync-ramp") + 1] == str(other)
+    assert arguments[arguments.index("--sync-manifest") + 1] == str(
+        schedule.manifest_path()
+    )
+    assert schedule.agent_executable() == agent  # so syncs write its manifest
+
+    # A stopped agent is started again rather than left as is.
+    launchd.loaded.clear()
+    _REAL_INSTALL()
+    assert launchd.loaded == {"com.ramp.router"}
+    monkeypatch.setattr(schedule, "ramp_executable", lambda: tmp_path / "bin/ramp")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
 
     # An install that no longer ships the agent: the plain job replaces it.
     (tmp_path / "lib/ramp-cli" / schedule.AGENT_BINARY).unlink()
@@ -968,3 +992,53 @@ def test_health_key_rejects_unsafe_permissions_and_symlinks(tmp_path):
     target.chmod(0o600)
     path.symlink_to(target)
     assert router_repo.health_token(create=True) is None
+
+
+def test_clear_manifest_reaches_the_installed_agents_root(
+    monkeypatch, tmp_path, launchd
+):
+    _REAL_INSTALL()
+    first = schedule.manifest_path()
+    schedule.write_manifest({"connections": ["removed key"]})
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "other-config"))
+    schedule.write_manifest({"connections": []})
+
+    schedule.clear_manifest()
+
+    assert not first.exists()
+    assert not schedule.manifest_path().exists()
+
+
+def test_disable_finishes_when_the_desktop_lock_is_unavailable(monkeypatch):
+    @contextlib.contextmanager
+    def unavailable():
+        raise click.ClickException("Could not lock Claude Desktop configuration")
+        yield
+
+    monkeypatch.setattr(router_repo.sys, "platform", "darwin")
+    monkeypatch.setattr(router_module.claude_cowork, "transaction_lock", unavailable)
+    monkeypatch.setattr(router_repo, "_refresh", lambda *_a, **_k: [])
+    monkeypatch.setattr(router_module, "clients_using_repo_helper", lambda: [])
+    removed = []
+    monkeypatch.setattr(router_repo, "uninstall_service", lambda: removed.append(1))
+    _tagging(True)
+
+    assert router_repo.disable(click.Context(cli)) == {
+        "enabled": False,
+        "still_using_helper": [],
+        "refreshed": [],
+    }
+    assert "keep_listening" not in router_repo.load_settings()
+    assert removed == [1]
+
+
+def test_a_truncated_agent_plist_does_not_block_reconciliation(
+    monkeypatch, tmp_path, launchd
+):
+    _REAL_INSTALL()
+    plist = tmp_path / "Library/LaunchAgents/com.ramp.router.plist"
+    plist.write_bytes(plist.read_bytes()[:80])
+    assert schedule._installed_agent_arguments() == []
+    schedule.clear_manifest()
+    _REAL_INSTALL()
+    assert "serve" in _plist(tmp_path)["ProgramArguments"]

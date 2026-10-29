@@ -25,6 +25,7 @@ import os
 import secrets
 import socket
 import statistics
+import sys
 import time
 import urllib.parse
 from collections import Counter
@@ -200,12 +201,15 @@ def wrap_url(base_url: str, helper_port: int) -> str | None:
 def is_wrapped(url: object) -> bool:
     if not isinstance(url, str):
         return False
-    parts = urllib.parse.urlsplit(url.strip())
-    return (
-        parts.scheme == "http"
-        and parts.hostname in _LOOPBACK_HOSTS
-        and split_upstream_path(parts.path) is not None
-    )
+    try:
+        parts = urllib.parse.urlsplit(url.strip())
+        return (
+            parts.scheme == "http"
+            and parts.hostname in _LOOPBACK_HOSTS
+            and split_upstream_path(parts.path) is not None
+        )
+    except ValueError:  # malformed, so not the helper; keep scanning the rest
+        return False
 
 
 def unwrap_url(url: str) -> str:
@@ -517,14 +521,22 @@ def disable(ctx: click.Context) -> dict:
         results = _refresh(ctx, "json")
     finally:
         # A setup still pointed at the agent would lose Router if its listener
-        # stopped, so the listener stays until none is left.
-        remaining = router_module.clients_using_repo_helper()
-        if remaining:
-            settings["keep_listening"] = True
-        else:
-            settings.pop("keep_listening", None)
-        _save_settings(settings)
-        uninstall_service()
+        # stopped, so the listener stays until none is left. Desktop setup picks
+        # the helper under this lock; holding it here sees that choice. When
+        # the lock cannot be taken, Desktop setup cannot take it either.
+        with contextlib.ExitStack() as desktop_lock:
+            if sys.platform == "darwin":
+                with contextlib.suppress(click.ClickException):
+                    desktop_lock.enter_context(
+                        router_module.claude_cowork.transaction_lock()
+                    )
+            remaining = router_module.clients_using_repo_helper()
+            if remaining:
+                settings["keep_listening"] = True
+            else:
+                settings.pop("keep_listening", None)
+            _save_settings(settings)
+            uninstall_service()
     return {"enabled": False, "still_using_helper": remaining, "refreshed": results}
 
 

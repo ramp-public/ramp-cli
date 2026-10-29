@@ -10,7 +10,7 @@ from ramp_cli.commands import router
 
 
 @pytest.fixture(autouse=True)
-def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def isolated_config(tmp_path: Path, request: pytest.FixtureRequest):
     """Redirect config to a temp directory so tests don't touch real config.
 
     Every coding agent this CLI configures keeps its files somewhere under the
@@ -19,6 +19,14 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     home, so a test that configured every agent wrote its fixture credential
     into the developer's own Codex and Pi setup.
     """
+    # A test may undo its own patches without removing this safety boundary.
+    monkeypatch = pytest.MonkeyPatch()
+    request.addfinalizer(monkeypatch.undo)
+    # Service removal can bypass the public install/uninstall wrappers.
+    # Isolate its filesystem paths AND OS calls for every test, including
+    # tests invoking agent disable directly. Lifecycle tests supply fakes.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("ramp_cli.commands.router_schedule._run", lambda *_args: False)
     router._bundled_codex_catalog_from.cache_clear()
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     # Explicit OpenCode paths take precedence over the isolated XDG directory.

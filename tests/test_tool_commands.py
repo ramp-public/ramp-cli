@@ -2635,7 +2635,7 @@ class TestCLIIntegration:
 
     def test_invalid_json_errors(self):
         runner = CliRunner()
-        result = runner.invoke(cli, ["get-funds", "--json", "not-json"])
+        result = runner.invoke(cli, ["get-funds", "--json", "{not-json"])
         assert result.exit_code != 0
         assert "invalid JSON" in result.output
 

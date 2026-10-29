@@ -2689,6 +2689,7 @@ def _run_configure(
 def _refresh_cowork_model_selections(
     *,
     models_only: bool = False,
+    restart_desktop: bool = False,
     skip: frozenset[tuple[str, str]] = frozenset(),
 ) -> dict | None:
     """Migrate Cowork's persisted model selections during a refresh.
@@ -2710,6 +2711,21 @@ def _refresh_cowork_model_selections(
     """
     if not claude_cowork.state_path().exists():
         return None
+    # Background refreshes also keep the route in step (the agent setting, or
+    # SSH sessions that cannot reach it), but only while Desktop is closed, so
+    # they never quit it. A temporary fallback is undone the same way.
+    if not models_only or not claude_cowork.claude_is_running():
+        try:
+            claude_cowork.refresh_agent_routing(
+                restart=restart_desktop and not models_only
+            )
+        except click.ClickException as exc:
+            return {
+                "client": COWORK_CLIENT,
+                "migrated_model_selections": 0,
+                "skipped_while_running": False,
+                "error": exc.message,
+            }
     if claude_cowork.claude_is_running():
         return {
             "client": COWORK_CLIENT,
@@ -2845,6 +2861,18 @@ def _print_background_status(ctx: click.Context) -> None:
         )
 
 
+RESTART_DESKTOP = "restart_claude_desktop"
+
+
+def _allow_desktop_restart(ctx: click.Context) -> None:
+    """Only a person at a terminal may have an open Claude Desktop restarted.
+
+    MDM and the Router app run these commands unattended; they leave Desktop
+    open and get the quit/refresh/reopen instruction instead.
+    """
+    ctx.meta[RESTART_DESKTOP] = _can_draw_picker(ctx)
+
+
 @router_agent.command(
     "enable", help="Enable background refresh and repository tagging at each login."
 )
@@ -2857,6 +2885,7 @@ def _print_background_status(ctx: click.Context) -> None:
 )
 @click.pass_context
 def router_agent_enable(ctx: click.Context, helper_port: int | None) -> None:
+    _allow_desktop_restart(ctx)
     if sys.platform != "darwin" and not sys.platform.startswith("linux"):
         raise click.UsageError("Background sync requires macOS or Linux.")
     if os.environ.get(SYNC_OPT_OUT_ENV):
@@ -2886,11 +2915,14 @@ def router_agent_enable(ctx: click.Context, helper_port: int | None) -> None:
 )
 @click.pass_context
 def router_agent_disable(ctx: click.Context) -> None:
+    _allow_desktop_restart(ctx)
     # Stop sync first, retaining the listener until endpoint migration finishes.
     router_schedule.disable_background()
     tagging = router_repo.enabled() or router_repo.listener_port() is not None
     if tagging or clients_using_repo_helper():
-        router_repo.disable(ctx)
+        for result in router_repo.disable(ctx)["refreshed"]:
+            if result.get("client") == COWORK_CLIENT and result.get("error"):
+                click.echo(f"Claude Desktop: {result['error']}", err=True)
     _print_background_status(ctx)
     if (
         tagging
@@ -3108,7 +3140,11 @@ def _refresh_clients(
             result["note_lines"] = notes
         results.append(result)
 
-    cowork_result = _refresh_cowork_model_selections(models_only=models_only, skip=skip)
+    cowork_result = _refresh_cowork_model_selections(
+        models_only=models_only,
+        skip=skip,
+        restart_desktop=ctx.meta.get(RESTART_DESKTOP, False),
+    )
     if cowork_result is not None:
         results.append(cowork_result)
         if failures_out is not None and cowork_result.get("error"):
@@ -5804,8 +5840,24 @@ def _run_unconfigure(
     )
     if results and not setup_remains:
         # Removes the agent too; the tagging setting stays, so a later
-        # configure starts its listener again.
-        router_schedule.uninstall()
+        # configure starts its listener again. A profile this CLI did not
+        # write may still use the listener; keep the agent for it.
+        if not clients_using_repo_helper():
+            router_schedule.uninstall()
+        else:
+            # The kept agent must not keep syncing the removed setup's key. A
+            # scheduled sync holds this lock from reading its connections to
+            # writing the manifest, so one already running cannot write the
+            # removed key back after this clears it.
+            with sync_lock(wait=router_schedule.REMOVE_WAIT_SECONDS) as acquired:
+                if not acquired:
+                    raise click.ClickException(
+                        "Your previous settings were restored, but the Ramp Router "
+                        "agent manifest cleanup is incomplete: could not acquire "
+                        "the background sync lock. A running sync may still "
+                        "retain the removed Router key."
+                    )
+                router_schedule.clear_manifest()
         # Ramp-owned version-nudge state leaves with the last Router setup; a
         # failed removal keeps its receipt, so its state stays.
         for stale in (installed_version_path(), server_recommended_version_path()):
@@ -8731,15 +8783,22 @@ def clients_using_repo_helper() -> list[str]:
     try:
         _, config = _read_codex_config(_codex_config_path())
         providers = config.get("model_providers")
-        provider = (
-            providers.get(ROUTER_PROVIDER) if isinstance(providers, dict) else None
-        )
-        if isinstance(provider, dict) and router_repo.is_wrapped(
-            provider.get("base_url")
+        # Any provider on the helper keeps it alive, including ones this CLI
+        # did not write: stopping the listener would strand that provider.
+        if isinstance(providers, dict) and any(
+            isinstance(provider, dict)
+            and router_repo.is_wrapped(provider.get("base_url"))
+            for provider in providers.values()
         ):
             clients.append("codex")
     except Exception:
         pass
+    try:
+        # Any Desktop profile on the helper keeps it alive, not just ours.
+        if any(map(router_repo.is_wrapped, claude_cowork.library_gateway_base_urls())):
+            clients.append(COWORK_CLIENT)
+    except click.ClickException:
+        clients.append(COWORK_CLIENT)  # unreadable: it may still use the helper
     for client in ("opencode", "pi"):
         try:
             if client == "opencode":

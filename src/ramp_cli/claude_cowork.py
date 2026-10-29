@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import os
+import plistlib
 import secrets
 import subprocess
 import sys
@@ -22,10 +23,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
+from xml.parsers.expat import ExpatError
 
 import click
 
 from ramp_cli import __version__
+from ramp_cli.commands import router_local_auth, router_repo
 from ramp_cli.commands.claude_code import RAMP_CLI_VERSION_HEADER
 
 try:
@@ -41,6 +44,8 @@ PROFILE_NAME = "Ramp Router"
 STATE_VERSION = 1
 
 _APP_SUPPORT_OVERRIDE = "RAMP_CLAUDE_DESKTOP_APP_SUPPORT"
+_PREFERENCES_DOMAIN = "com.anthropic.claudefordesktop"
+_PREFERENCES_OVERRIDE = "RAMP_CLAUDE_DESKTOP_PREFERENCES"
 _STATE_FILE = "ramp-router-cowork-state.json"
 _DESKTOP_CONFIG_FILE = "claude_desktop_config.json"
 _LOCAL_AGENT_SESSIONS_DIR = "local-agent-mode-sessions"
@@ -58,6 +63,48 @@ def _app_support_root() -> Path:
     if override:
         return Path(override).expanduser()
     return Path.home() / "Library" / "Application Support"
+
+
+def _preference_paths() -> tuple[Path, ...]:
+    """Where Desktop's managed and user preferences can set ``sshHostAllowlist``."""
+    name = f"{_PREFERENCES_DOMAIN}.plist"
+    override = os.environ.get(_PREFERENCES_OVERRIDE)
+    if override:
+        return (Path(override).expanduser() / name,)
+    if os.environ.get(_APP_SUPPORT_OVERRIDE):
+        return ()  # a relocated Desktop has no system-wide preferences
+    managed = Path("/Library/Managed Preferences")
+    user = os.environ.get("USER", "")
+    return (
+        *((managed / user / name,) if user else ()),
+        managed / name,
+        Path.home() / "Library" / "Preferences" / name,
+    )
+
+
+def ssh_remote_sessions_enabled() -> bool:
+    """Whether Desktop may run Code sessions on SSH hosts.
+
+    Those sessions refuse a gateway on device localhost, so the Router agent's
+    loopback URL would break them. Unreadable preferences count as enabled.
+    """
+    for path in _preference_paths():
+        try:
+            preferences = plistlib.loads(path.read_bytes())
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError, ExpatError):
+            return True  # unreadable or truncated, as an interrupted write leaves it
+        if isinstance(preferences, dict) and preferences.get("sshHostAllowlist"):
+            return True
+    return False
+
+
+def _desktop_credentials(base_url: str, api_key: str) -> tuple[str, str]:
+    """The agent's endpoint/token pair, or the direct pair for SSH sessions."""
+    if ssh_remote_sessions_enabled():
+        return router_repo.unwrap_url(base_url), api_key
+    return router_repo.client_credentials(base_url, api_key)
 
 
 def state_path() -> Path:
@@ -207,7 +254,7 @@ def _credential_matches(api_key: object, marker: object) -> bool:
     return hmac.compare_digest(actual, digest)
 
 
-def gateway_base_url(router_base_url: str) -> str:
+def gateway_base_url(router_base_url: str, *, local_token: bool = False) -> str:
     """Return the base Claude expects before it appends its own ``/v1``."""
     value = router_base_url.strip().rstrip("/")
     if value.endswith("/v1"):
@@ -222,7 +269,15 @@ def gateway_base_url(router_base_url: str) -> str:
             "Claude Desktop requires a valid HTTPS Router base URL."
         ) from None
     if (
-        parsed.scheme != "https"
+        (
+            parsed.scheme != "https"
+            and not (
+                local_token
+                and router_repo.is_wrapped(value)
+                and hostname == "127.0.0.1"
+                and parsed.port == router_repo.port()
+            )
+        )
         or not hostname
         or parsed.username is not None
         or parsed.password is not None
@@ -271,7 +326,10 @@ def read_setup_file(path: Path) -> tuple[str, str]:
 def _profile(api_key: str, router_base_url: str) -> dict:
     return {
         "inferenceProvider": "gateway",
-        "inferenceGatewayBaseUrl": gateway_base_url(router_base_url),
+        "inferenceGatewayBaseUrl": gateway_base_url(
+            router_base_url,
+            local_token=api_key.startswith(router_local_auth.TOKEN_PREFIX),
+        ),
         "inferenceCredentialKind": "static",
         "inferenceGatewayApiKey": api_key,
         "inferenceGatewayAuthScheme": "bearer",
@@ -439,7 +497,10 @@ def _new_state(api_key: str, router_base_url: str) -> dict:
         "version": STATE_VERSION,
         "profile_id": str(uuid.uuid4()),
         "credential_marker": _credential_marker(api_key),
-        "gateway_base_url": gateway_base_url(router_base_url),
+        "gateway_base_url": gateway_base_url(
+            router_base_url,
+            local_token=api_key.startswith(router_local_auth.TOKEN_PREFIX),
+        ),
         "desktop_config": {
             "existed": desktop_existed,
             "deploymentMode": _snapshot_key(desktop_config, "deploymentMode"),
@@ -841,9 +902,12 @@ def configure(
     api_key = api_key.strip()
     if not api_key:
         raise click.ClickException("The Ramp Router API key cannot be empty.")
-    profile = _profile(api_key, router_base_url)
+    gateway_base_url(router_base_url)
 
     with transaction_lock():
+        # Select the helper under the lock so a concurrent disable sees it.
+        router_base_url, api_key = _desktop_credentials(router_base_url, api_key)
+        profile = _profile(api_key, router_base_url)
         _quit_claude()
         try:
             profile_path = _configure_stopped(
@@ -957,6 +1021,27 @@ def configured_gateway_base_url() -> str:
     return base_url
 
 
+def library_gateway_base_urls() -> list[object]:
+    """Every Desktop profile's endpoint, including copies and edited ones."""
+    library = _config_library_path()
+    try:
+        # Unlike glob(), iterdir() reports a library it cannot list instead of
+        # returning nothing, which would read as "no profile uses the helper".
+        paths = sorted(path for path in library.iterdir() if path.suffix == ".json")
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise click.ClickException(
+            f"Could not list Claude Desktop profiles in {library}: {exc}"
+        ) from None
+    urls = []
+    for path in paths:
+        if path != _config_meta_path():
+            profile, _ = _read_object(path, "Claude Desktop profile")
+            urls.append(profile.get("inferenceGatewayBaseUrl"))
+    return urls
+
+
 def configured_router_connection() -> tuple[str, str]:
     """Read a coherent CLI-owned credential and endpoint pair.
 
@@ -965,7 +1050,11 @@ def configured_router_connection() -> tuple[str, str]:
     another generation's key.
     """
     with transaction_lock():
-        return configured_api_key(), configured_gateway_base_url()
+        endpoint = configured_gateway_base_url()
+        return (
+            router_repo.upstream_api_key(configured_api_key(), endpoint),
+            router_repo.unwrap_url(endpoint),
+        )
 
 
 def migrate_gateway_base_url(previous: str, replacement: str) -> bool:
@@ -977,30 +1066,89 @@ def migrate_gateway_base_url(previous: str, replacement: str) -> bool:
     is rewritten; an edited profile is the user's to reconfigure explicitly.
     """
     with transaction_lock():
-        if _claude_is_running():
-            return False
         state = _read_state()
-        if state is None or state.get("gateway_base_url") != previous:
+        current = state.get("gateway_base_url") if state else None
+        if not isinstance(current, str) or router_repo.unwrap_url(current) != previous:
             return False
-        profile = _owned_profile(state)
-        if profile is None:
+        key = router_repo.upstream_api_key(configured_api_key(), current)
+        endpoint, token = _desktop_credentials(replacement, key)
+        return _migrate_gateway_base_url(current, endpoint, api_key=token)
+
+
+def _migrate_gateway_base_url(
+    previous: str, replacement: str, *, api_key: str | None = None
+) -> bool:
+    if _claude_is_running():
+        return False
+    state = _read_state()
+    if state is None or state.get("gateway_base_url") != previous:
+        return False
+    profile = _owned_profile(state)
+    if profile is None:
+        raise click.ClickException(
+            "The Claude Desktop Router profile is missing. "
+            "Run the configure command again to repair it."
+        )
+    profile_path = _profile_path(state["profile_id"])
+    updated_profile = {**profile, "inferenceGatewayBaseUrl": replacement}
+    updated_state = {**state, "gateway_base_url": replacement}
+    if api_key is not None:
+        # replacement is already normalized; _profile strips one /v1 itself.
+        updated_profile = _profile(api_key, replacement + "/v1")
+        if api_key != profile["inferenceGatewayApiKey"]:
+            updated_state["credential_marker"] = _credential_marker(api_key)
+    try:
+        _write_private_json(profile_path, updated_profile)
+        _write_private_json(state_path(), updated_state)
+    except OSError as exc:
+        _restore_document(profile_path, profile, True)
+        _restore_document(state_path(), state, True)
+        raise click.ClickException(
+            f"Could not migrate the Claude Desktop Router profile: {exc}"
+        ) from None
+    return True
+
+
+def refresh_agent_routing(*, restart: bool = False) -> None:
+    """Keep the owned Desktop profile on the opt-in agent's endpoint/key pair."""
+    with transaction_lock():
+        previous = configured_gateway_base_url()
+        api_key = router_repo.upstream_api_key(configured_api_key(), previous)
+        direct = router_repo.unwrap_url(previous)
+        endpoint, token = _desktop_credentials(direct, api_key)
+        # Already normalized: validate it without stripping a real /v1 again.
+        endpoint = gateway_base_url(
+            endpoint + "/v1",
+            local_token=token.startswith(router_local_auth.TOKEN_PREFIX),
+        )
+        if (endpoint, token) == (previous, configured_api_key()):
+            return
+        # An edited profile is rejected below; find out before quitting the app.
+        state = _read_state()
+        if state is None or _owned_profile(state) is None:
             raise click.ClickException(
                 "The Claude Desktop Router profile is missing. "
                 "Run the configure command again to repair it."
             )
-        profile_path = _profile_path(state["profile_id"])
-        updated_profile = {**profile, "inferenceGatewayBaseUrl": replacement}
-        updated_state = {**state, "gateway_base_url": replacement}
+        running = _claude_is_running()
+        if running and restart:
+            if os.environ.get("CLAUDE_CODE_ENTRYPOINT", "").startswith(
+                "claude-desktop"
+            ):
+                raise click.ClickException(
+                    "Run the agent command from a separate terminal to restart "
+                    "Claude Desktop safely."
+                )
+            _quit_claude()
         try:
-            _write_private_json(profile_path, updated_profile)
-            _write_private_json(state_path(), updated_state)
-        except OSError as exc:
-            _restore_document(profile_path, profile, True)
-            _restore_document(state_path(), state, True)
-            raise click.ClickException(
-                f"Could not migrate the Claude Desktop Router profile: {exc}"
-            ) from None
-        return True
+            if not _migrate_gateway_base_url(previous, endpoint, api_key=token):
+                raise click.ClickException(
+                    "Quit Claude Desktop, run 'ramp router refresh', then reopen it "
+                    "to apply the Router agent setting."
+                )
+        finally:
+            if running and restart:
+                _launch_claude()
 
 
 def _owned_profile(state: dict) -> dict | None:

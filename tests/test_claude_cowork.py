@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import json
+import os
+import plistlib
 import stat
 from contextlib import contextmanager
 from pathlib import Path
 
 import click
 import pytest
+from click.testing import CliRunner
 
 from ramp_cli import __version__, claude_cowork
+from ramp_cli.commands import router, router_repo, router_schedule
+from ramp_cli.main import cli
 from ramp_cli.router_connectors import harnesses
 
 
@@ -1156,3 +1161,252 @@ def test_code_session_sync_needs_a_signed_in_target(cowork_host):
     (root / "Claude/claude-code-sessions/acct/org").mkdir(parents=True)
     assert claude_cowork._sync_code_sessions_stopped() == 1
     assert _code_session_titles(root, "Claude") == {"cli-z": "3p"}
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://router.example/v1",
+        "http://127.0.0.1:47317/v1",
+        "http://127.0.0.1:1234/u/api.router.com",
+        "http://localhost:47317/u/api.router.com",
+        "http://127.0.0.1:47317/u/api.router.com?x=1",
+        "http://user@127.0.0.1:47317/u/api.router.com",
+    ],
+)
+def test_desktop_http_only_for_managed_loopback_with_local_token(url):
+    with pytest.raises(click.ClickException, match="HTTPS"):
+        claude_cowork._profile("ramp-local-test", url)
+    with pytest.raises(click.ClickException, match="HTTPS"):
+        claude_cowork._profile(
+            "router-secret", "http://127.0.0.1:47317/u/api.router.com"
+        )
+
+
+@pytest.mark.parametrize("interactive", [True, False])
+@pytest.mark.parametrize("command", ["enable", "disable"])
+def test_agent_command_restarts_desktop_only_for_route_change(
+    cowork_host, monkeypatch, command, interactive
+):
+    _root, events = cowork_host
+    monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
+    monkeypatch.setattr(router_repo, "ensure_running", lambda: True)
+    monkeypatch.setattr(router_repo, "service_supported", lambda: True)
+    router_repo._save_settings({"enabled": command == "disable"})
+    claude_cowork.configure("router-secret", "https://api.router.com/v1")
+    events.clear()
+    running = [True]
+
+    def quit_app():
+        events.append("quit")
+        running[0] = False
+
+    def launch_app(**_kwargs):
+        events.append("launch")
+        running[0] = True
+
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: running[0])
+    monkeypatch.setattr(claude_cowork, "_quit_claude", quit_app)
+    monkeypatch.setattr(claude_cowork, "_launch_claude", launch_app)
+    monkeypatch.setattr(router, "configured_router_clients", lambda: [])
+    monkeypatch.setattr(router, "_scheduled_sync_connections", lambda: [object()])
+    monkeypatch.setattr(router, "_print_background_status", lambda _ctx: None)
+    monkeypatch.setattr(router, "_can_draw_picker", lambda _ctx: interactive)
+    args = ["--agent", "router", "agent", command]
+
+    result = CliRunner().invoke(cli, args)
+
+    assert result.exit_code == 0, result.output
+    if not interactive:  # MDM: an open Desktop is never quit
+        assert events == []
+        assert router_repo.is_wrapped(claude_cowork.configured_gateway_base_url()) == (
+            command == "disable"
+        )
+        return
+    assert events == ["quit", "launch"]
+    assert running[0]
+    assert router_repo.is_wrapped(claude_cowork.configured_gateway_base_url()) == (
+        command == "enable"
+    )
+    assert claude_cowork.configured_router_connection()[0] == "router-secret"
+    events.clear()
+    result = CliRunner().invoke(cli, args)
+    assert result.exit_code == 0, result.output
+    assert events == []
+
+
+def test_listener_stays_for_any_profile_on_the_helper(tmp_path):
+    helper = "http://127.0.0.1:47317/u/api.router.com"
+    codex = tmp_path / "codex/config.toml"
+    codex.parent.mkdir(parents=True)
+    codex.write_text(f'[model_providers.other]\nbase_url = "{helper}/v1"\n')
+    assert router.clients_using_repo_helper() == ["codex"]
+    codex.write_text(
+        '[model_providers.other]\nbase_url = "https://api.router.com/v1"\n'
+    )
+    # A Desktop profile the user copied from ours still uses the helper.
+    copy = claude_cowork._config_library_path() / "copy.json"
+    copy.parent.mkdir(parents=True)
+    copy.write_text(json.dumps({"inferenceGatewayBaseUrl": helper}))
+    assert router.clients_using_repo_helper() == ["cowork"]
+
+
+def test_last_unconfigure_keeps_agent_while_a_profile_uses_it(tmp_path, monkeypatch):
+    monkeypatch.setattr(claude_cowork, "unconfigure", lambda: None)
+    removed = []
+    monkeypatch.setattr(router_schedule, "uninstall", lambda: removed.append(1))
+    codex = tmp_path / "codex/config.toml"
+    codex.parent.mkdir(parents=True)
+    codex.write_text(
+        '[model_providers.other]\nbase_url = "http://127.0.0.1:47317/u/api.router.com/v1"\n'
+    )
+    args = ["--human", "router", "unconfigure", "cowork"]
+    assert CliRunner().invoke(cli, args).exit_code == 0
+    assert removed == []
+    codex.unlink()
+    assert CliRunner().invoke(cli, args).exit_code == 0
+    assert removed == [1]
+
+
+@pytest.fixture
+def tagging(cowork_host, monkeypatch):
+    monkeypatch.setattr(router_repo, "ensure_running", lambda: True)
+    router_repo._save_settings({"enabled": True})
+
+
+def test_agent_routing_keeps_a_real_v1_in_the_gateway_path(tagging):
+    router_repo._save_settings({"enabled": False})
+    claude_cowork.configure("router-secret", "https://api.router.com/v1/v1")
+    assert claude_cowork.configured_gateway_base_url() == "https://api.router.com/v1"
+
+    router_repo._save_settings({"enabled": True})
+    claude_cowork.refresh_agent_routing()
+    endpoint = claude_cowork.configured_gateway_base_url()
+    assert endpoint == "http://127.0.0.1:47317/u/api.router.com/v1"
+
+    router_repo._save_settings({"enabled": False})
+    claude_cowork.refresh_agent_routing()
+    assert claude_cowork.configured_gateway_base_url() == "https://api.router.com/v1"
+
+
+def test_ssh_remote_sessions_keep_desktop_on_the_direct_route(
+    tagging, tmp_path, monkeypatch
+):
+    preferences = tmp_path / "preferences"
+    preferences.mkdir()
+    monkeypatch.setenv("RAMP_CLAUDE_DESKTOP_PREFERENCES", str(preferences))
+    plist = preferences / "com.anthropic.claudefordesktop.plist"
+    plist.write_bytes(plistlib.dumps({"sshHostAllowlist": ["dev.example.com"]}))
+
+    claude_cowork.configure("router-secret", "https://api.router.com/v1")
+
+    # The SSH host cannot reach a gateway on this device's loopback.
+    assert claude_cowork.configured_gateway_base_url() == "https://api.router.com"
+    assert claude_cowork.configured_api_key() == "router-secret"
+
+    plist.write_bytes(plistlib.dumps({"sshHostAllowlist": []}))
+    claude_cowork.refresh_agent_routing()
+    assert router_repo.is_wrapped(claude_cowork.configured_gateway_base_url())
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can list any directory")
+def test_listener_stays_when_the_profile_library_cannot_be_listed(cowork_host):
+    library = claude_cowork._config_library_path()
+    library.mkdir(parents=True)
+    library.chmod(0o300)  # known profiles stay readable; listing fails
+    try:
+        assert router.clients_using_repo_helper() == ["cowork"]
+    finally:
+        library.chmod(0o700)
+
+
+def test_last_unconfigure_clears_the_manifest_under_the_sync_lock(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(claude_cowork, "unconfigure", lambda: None)
+    monkeypatch.setattr(router, "clients_using_repo_helper", lambda: ["codex"])
+    events = []
+
+    @contextmanager
+    def sync_lock(wait=0):
+        events.append(("lock", wait))
+        yield True
+        events.append("unlock")
+
+    monkeypatch.setattr(router, "sync_lock", sync_lock)
+    monkeypatch.setattr(
+        router_schedule, "clear_manifest", lambda: events.append("clear")
+    )
+    args = ["--human", "router", "unconfigure", "cowork"]
+    assert CliRunner().invoke(cli, args).exit_code == 0
+    assert events == [("lock", router_schedule.REMOVE_WAIT_SECONDS), "clear", "unlock"]
+
+
+@pytest.mark.parametrize("output_mode", ["--human", "--agent"])
+def test_last_unconfigure_reports_manifest_cleanup_when_sync_lock_times_out(
+    tmp_path, monkeypatch, output_mode
+):
+    monkeypatch.setattr(claude_cowork, "unconfigure", lambda: None)
+    monkeypatch.setattr(router, "clients_using_repo_helper", lambda: ["codex"])
+    events = []
+
+    @contextmanager
+    def sync_lock(wait=0):
+        events.append(("lock", wait))
+        try:
+            yield False
+        finally:
+            events.append("unlock")
+
+    monkeypatch.setattr(router, "sync_lock", sync_lock)
+    monkeypatch.setattr(
+        router_schedule, "clear_manifest", lambda: events.append("clear")
+    )
+    monkeypatch.setattr(
+        router_schedule, "uninstall", lambda: events.append("uninstall")
+    )
+
+    result = CliRunner().invoke(cli, [output_mode, "router", "unconfigure", "cowork"])
+
+    assert result.exit_code != 0, result.output
+    assert "settings were restored" in result.output
+    assert "manifest cleanup is incomplete" in result.output
+    assert "sync lock" in result.output
+    assert "Removed Ramp Router" not in result.output
+    assert events == [("lock", router_schedule.REMOVE_WAIT_SECONDS), "unlock"]
+
+
+def test_background_refresh_moves_desktop_off_the_agent_for_ssh(
+    tagging, tmp_path, monkeypatch
+):
+    claude_cowork.configure("router-secret", "https://api.router.com/v1")
+    assert router_repo.is_wrapped(claude_cowork.configured_gateway_base_url())
+    preferences = tmp_path / "preferences"
+    preferences.mkdir()
+    monkeypatch.setenv("RAMP_CLAUDE_DESKTOP_PREFERENCES", str(preferences))
+    plist = preferences / "com.anthropic.claudefordesktop.plist"
+    plist.write_bytes(plistlib.dumps({"sshHostAllowlist": ["dev.example.com"]}))
+    monkeypatch.setattr(claude_cowork, "migrate_model_selections", lambda _ids: None)
+
+    router._refresh_cowork_model_selections(models_only=True)
+
+    assert claude_cowork.configured_gateway_base_url() == "https://api.router.com"
+    assert claude_cowork.configured_api_key() == "router-secret"
+
+    # Once the preferences allow it again, the opted-in route comes back.
+    plist.write_bytes(plistlib.dumps({}))
+    router._refresh_cowork_model_selections(models_only=True)
+    assert router_repo.is_wrapped(claude_cowork.configured_gateway_base_url())
+
+    # An open Desktop is never moved, or quit, by a background refresh.
+    plist.write_bytes(plistlib.dumps({"sshHostAllowlist": ["dev.example.com"]}))
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: True)
+    router._refresh_cowork_model_selections(models_only=True)
+    assert router_repo.is_wrapped(claude_cowork.configured_gateway_base_url())
+
+
+def test_truncated_desktop_preferences_keep_the_direct_route(tmp_path, monkeypatch):
+    monkeypatch.setenv("RAMP_CLAUDE_DESKTOP_PREFERENCES", str(tmp_path))
+    plist = tmp_path / "com.anthropic.claudefordesktop.plist"
+    plist.write_bytes(plistlib.dumps({"sshHostAllowlist": []})[:60])
+    assert claude_cowork.ssh_remote_sessions_enabled()
