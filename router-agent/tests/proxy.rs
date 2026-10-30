@@ -111,6 +111,39 @@ async fn unverified_peer_cannot_attribute_request_supplied_paths() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[tokio::test]
+async fn guardian_request_inherits_parent_turn_repository_over_proxy() {
+    let root = std::env::temp_dir().join(format!("rrh-guardian-{}", std::process::id()));
+    let repo = root.join("repo");
+    let shared = root.join("code");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(repo.join(".git/config"), "[remote \"origin\"]\nurl = git@github.com:ramp/repo.git\n").unwrap();
+    let (url, task, upstream) = proxy(None).await;
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build_http::<Full<Bytes>>();
+    let parent_metadata = serde_json::json!({"session_id":"root-session","thread_id":"root-thread","turn_id":"parent-turn","workspaces":{repo.to_str().unwrap():{}}}).to_string();
+    let parent_body = serde_json::json!({"messages":[{"role":"user","content":format!("<environment_context>\n<cwd>{}</cwd>\n</environment_context>", repo.display())}]});
+    let parent = Request::post(format!("{url}/u/api.router.com/v1/messages"))
+        .header("content-type", "application/json").header("authorization", format!("Bearer {TOKEN}"))
+        .header("x-codex-turn-metadata", parent_metadata)
+        .body(Full::new(Bytes::from(serde_json::to_vec(&parent_body).unwrap()))).unwrap();
+    assert_eq!(client.request(parent).await.unwrap().status(), 200);
+
+    let guardian_metadata = serde_json::json!({"session_id":"guardian-session","thread_id":"guardian-thread","parent_thread_id":"root-thread","parent_turn_id":"parent-turn","turn_id":"guardian-turn"}).to_string();
+    let guardian_body = serde_json::json!({"messages":[{"role":"user","content":"Review the parent action."}],"input":[{"type":"function_call","call_id":"call_ps","name":"exec_command","arguments":serde_json::json!({"cmd":"ps -p 62196 -o pid,command","workdir":shared.to_str().unwrap()}).to_string()},{"type":"function_call_output","call_id":"call_ps","output":"operation not permitted"}]});
+    let guardian = Request::post(format!("{url}/u/api.router.com/v1/messages"))
+        .header("content-type", "application/json").header("authorization", format!("Bearer {TOKEN}"))
+        .header("x-codex-turn-metadata", guardian_metadata)
+        .body(Full::new(Bytes::from(serde_json::to_vec(&guardian_body).unwrap()))).unwrap();
+    let echoed = client.request(guardian).await.unwrap().into_body().collect().await.unwrap().to_bytes();
+    let value: serde_json::Value = serde_json::from_slice(&echoed).unwrap();
+    assert_eq!(value["metadata"]["repository"], "ramp/repo");
+    assert_eq!(value["metadata"]["repository_source"], "parent_turn_memory");
+    task.abort();
+    upstream.abort();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn loopback_alias_cannot_borrow_a_trusted_connections_source_port() {

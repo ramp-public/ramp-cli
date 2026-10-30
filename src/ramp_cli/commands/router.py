@@ -549,9 +549,14 @@ def _codex_catalog_from(
             command,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=30,
             check=False,
         )
+    except UnicodeError as exc:
+        raise click.ClickException(
+            f"Could not decode Codex model catalog from {executable}: {exc}"
+        ) from None
     except (OSError, subprocess.SubprocessError):
         return None
     if result.returncode != 0:
@@ -623,9 +628,14 @@ def _codex_original_catalog(root_values: dict) -> str | None:
                 command,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 timeout=30,
                 check=False,
             )
+        except UnicodeError as exc:
+            raise click.ClickException(
+                f"Could not decode Codex model catalog for provider {provider}: {exc}"
+            ) from None
         except (OSError, subprocess.SubprocessError):
             continue
         if result.returncode != 0:
@@ -685,7 +695,9 @@ def _codex_provider(
     if repository_attribution:
         setup_base_url, local_key = router_repo.client_credentials(
             base_url or router_base_url(),
-            api_key if api_key is not None else key_path.read_text().strip(),
+            api_key
+            if api_key is not None
+            else key_path.read_text(encoding="utf-8").strip(),
         )
         if router_repo.is_wrapped(setup_base_url):
             key_path = router_repo.local_token_path(local_key)
@@ -11580,17 +11592,24 @@ def _configure_codex_in_lock(
     # Kept so a failure can put the file back. Without it the undo below
     # deletes the key this config points at and leaves Codex configured for a
     # provider it can no longer authenticate to.
-    previous_config = path.read_text() if path.exists() else None
     # Read alongside the config so a failure can put back exactly what was
     # here. On a repeat configure these already exist and the restored config
     # still points at them, so deleting them would leave a setup that worked a
     # moment ago unable to authenticate.
-    previous_key = key_path.read_text() if key_path.exists() else None
-    previous_instructions = (
-        instructions_path.read_text() if instructions_path.exists() else None
-    )
-    previous_router_catalog = (
-        router_catalog_path.read_text() if router_catalog_path.exists() else None
+    previous_files = []
+    for snapshot_path in (path, key_path, instructions_path, router_catalog_path):
+        try:
+            previous_files.append(
+                snapshot_path.read_text(encoding="utf-8")
+                if snapshot_path.exists()
+                else None
+            )
+        except (OSError, UnicodeError) as exc:
+            raise click.ClickException(
+                f"Could not read Codex setup snapshot {snapshot_path}: {exc}"
+            ) from None
+    previous_config, previous_key, previous_instructions, previous_router_catalog = (
+        previous_files
     )
 
     previous_profile_body = None
@@ -11644,7 +11663,12 @@ def _configure_codex_in_lock(
             instructions_path.unlink(missing_ok=True)
         _sync_codex_sessions(path.parent, saved_sessions)
         _update_codex_session_index(path.parent, saved_sessions, restore=False)
-    except (OSError, tomllib.TOMLDecodeError, click.ClickException) as exc:
+    except (
+        OSError,
+        UnicodeError,
+        tomllib.TOMLDecodeError,
+        click.ClickException,
+    ) as exc:
         # Only sessions discovered by this invocation can have changed here.
         # Restoring the cumulative receipt would retag sessions that belonged
         # to the previously working Router setup.

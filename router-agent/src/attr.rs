@@ -1753,6 +1753,35 @@ fn session_key(doc: &Doc, ctx: &dyn Ctx, codex_md: Option<&Doc>) -> Option<Strin
     None
 }
 
+/// Memory key for one Codex thread. A thread's `session_id` can differ from its `thread_id`, and
+/// children name their parent by thread, so thread memory has its own namespace.
+fn thread_key(codex_md: Option<&Doc>) -> Option<String> {
+    let md = codex_md?;
+    let t = md.str_of(md.get(md.root, "thread_id")).or_else(|| md.str_of(md.get(md.root, "session_id"))).filter(|t| !t.is_empty())?;
+    Some(format!("thread:{t}"))
+}
+
+/// Memory keys for the parent of a Codex child thread (a guardian review or a spawned agent),
+/// most specific first: the exact parent turn, then the parent thread.
+fn parent_memory_keys(ctx: &dyn Ctx, codex_md: Option<&Doc>) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some(md) = codex_md {
+        if let Some(t) = md.str_of(md.get(md.root, "parent_turn_id")).filter(|t| !t.is_empty()) {
+            keys.push(format!("turn:{t}"));
+        }
+        if let Some(t) = md.str_of(md.get(md.root, "parent_thread_id")).filter(|t| !t.is_empty()) {
+            keys.push(format!("thread:{t}"));
+        }
+    }
+    if let Some(t) = ctx.header("x-codex-parent-thread-id").filter(|t| !t.is_empty()) {
+        let k = format!("thread:{t}");
+        if !keys.contains(&k) {
+            keys.push(k);
+        }
+    }
+    keys
+}
+
 fn basename_of(d: &str) -> String {
     paths::basename(paths::rstrip_chars(d, "/")).to_string()
 }
@@ -1996,6 +2025,21 @@ fn finish(doc: &Doc, ctx: &mut dyn Ctx, codex_md: Option<&Doc>, an: &Analysis) -
     }
     let evs = &an.events;
     let skey = session_key(doc, ctx, codex_md);
+    let tkey = a.turn_id.as_ref().map(|t| format!("turn:{t}"));
+    let thkey = thread_key(codex_md);
+    // Remember a resolved repository for this turn and thread, so child threads can inherit it.
+    let remember_turn = |ctx: &dyn Ctx, r: &Resolved, d: &str| {
+        for k in [&tkey, &thkey].into_iter().flatten() {
+            ctx.session_put(k, (r.clone(), d.to_string()));
+        }
+    };
+    // ... and for the session, when this request's own evidence resolved it.
+    let remember = |ctx: &dyn Ctx, r: &Resolved, d: &str| {
+        if let Some(k) = &skey {
+            ctx.session_put(k, (r.clone(), d.to_string()));
+        }
+        remember_turn(ctx, r, d);
+    };
 
     // newest event (of the allowed strengths) that resolves to a repository
     let pick = |allow_weak: bool| -> R<Option<(Resolved, String, Strength)>> {
@@ -2031,15 +2075,39 @@ fn finish(doc: &Doc, ctx: &mut dyn Ctx, codex_md: Option<&Doc>, an: &Analysis) -
             };
             set_repo(&mut a, &r, src, "tool_call", &d);
         }
-        if let Some(k) = &skey {
-            ctx.session_put(k, (r, d));
-        }
+        remember(ctx, &r, &d);
         return Ok(a);
     }
-    // no stated repository and no tool event in a repository
+    // Nothing in this request resolved a repository.
+    // A Codex child thread works for its parent turn. It often runs from a shared folder such as
+    // ~/code, and a guardian may run a probe like `ps` that stays in its history, which disables
+    // the session-memory rule below for the rest of the thread. Main threads keep that rule;
+    // only explicit child threads inherit the parent's repository, and the child's own evidence
+    // (handled above) always wins. The exact parent turn is current, so it beats the child's own
+    // session memory, which may come from an earlier task of a reused child thread.
+    let parents = parent_memory_keys(ctx, codex_md);
+    let inherit = |a: &mut Attribution, ctx: &dyn Ctx, k: &str| -> bool {
+        let Some((r, d)) = ctx.session_get(k) else { return false };
+        let src = if k.starts_with("turn:") { "parent_turn_memory" } else { "parent_session_memory" };
+        set_repo(a, &r, src, "parent_memory", &d);
+        // so this child's own children (which name this turn or thread) inherit it too
+        remember_turn(ctx, &r, &d);
+        true
+    };
+    if let Some(k) = parents.iter().find(|k| k.starts_with("turn:")) {
+        if inherit(&mut a, ctx, k) {
+            return Ok(a);
+        }
+    }
     if evs.is_empty() {
         if let Some((r, d)) = skey.as_ref().and_then(|k| ctx.session_get(k)) {
             set_repo(&mut a, &r, if r.source == "git_remote" { "git_remote" } else { r.source }, "session_memory", &d);
+            remember_turn(ctx, &r, &d);
+            return Ok(a);
+        }
+    }
+    for k in parents.iter().filter(|k| !k.starts_with("turn:")) {
+        if inherit(&mut a, ctx, k) {
             return Ok(a);
         }
     }
@@ -2047,9 +2115,7 @@ fn finish(doc: &Doc, ctx: &mut dyn Ctx, codex_md: Option<&Doc>, an: &Analysis) -
         if let Some(cwd) = ctx.calling_process(&mut a) {
             if let Some(r) = resolver.resolve(&cwd) {
                 set_repo(&mut a, &r, r.source, "client_process_cwd", &cwd);
-                if let Some(k) = &skey {
-                    ctx.session_put(k, (r, cwd));
-                }
+                remember(ctx, &r, &cwd);
                 return Ok(a);
             }
         }

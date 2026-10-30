@@ -11,6 +11,7 @@ import os
 import sqlite3
 import stat
 import subprocess
+import sys
 import tomllib
 from contextlib import contextmanager
 from decimal import Decimal
@@ -6338,6 +6339,98 @@ web_search = true
     assert "https://stale.example.com" not in first_content
     assert first_content.count("[model_providers.ramp-router]") == 1
     assert "[features]\nweb_search = true" in first_content
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Uses a POSIX executable test shim")
+@pytest.mark.parametrize("existing", [False, True])
+def test_configure_codex_uses_utf8_with_ascii_defaults(tmp_path, monkeypatch, existing):
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    comment = "# Préférences 日本語\n"
+    if existing:
+        config_path.write_text(
+            comment + 'model_provider = "custom"\n', encoding="utf-8"
+        )
+    prompt = "Use UTF-8 — café 日本語"
+    catalog = {"models": [{"slug": "gpt-5.4", "base_instructions": prompt}]}
+    # A real child process emits UTF-8 bytes, not a mocked decoded string.
+    executable = tmp_path / "codex-bin"
+    payload = json.dumps(catalog, ensure_ascii=False).encode("utf-8")
+    executable.write_text(
+        f"#!{sys.executable}\nimport os\nos.write(1, {payload!r})\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    monkeypatch.setattr(
+        router_module.shutil,
+        "which",
+        lambda name: str(executable) if name == "codex" else sys.executable,
+    )
+    _mock_models(monkeypatch, cost_hook=None)
+    # Force both pathlib's implicit text reads and subprocess's default decode
+    # to ASCII, independently of the test runner's host locale.
+    monkeypatch.setattr(io, "text_encoding", lambda encoding, *_: encoding or "ascii")
+    monkeypatch.setattr(subprocess, "_text_encoding", lambda: "ascii")
+    runner = CliRunner()
+
+    for _ in range(2):
+        monkeypatch.setenv("RAMP_ROUTER_CONFIGURE_API_KEY", "router-secret")
+        result = runner.invoke(cli, ["--no-input", "router", "configure", "codex"])
+        assert result.exit_code == 0, result.output
+        assert "Skipping the Codex Router cost hook" in result.output
+        config_text = config_path.read_text(encoding="utf-8")
+        assert tomllib.loads(config_text)["model_provider"] == "ramp-router"
+        if existing:
+            assert comment in config_text
+        assert (codex_home / "ramp-router-instructions.md").read_text(
+            encoding="utf-8"
+        ) == prompt
+        # Exercise every rollback snapshot with non-ASCII content on repeat.
+        (codex_home / "ramp-router-key").write_text("old-key-é", encoding="utf-8")
+        catalog_path = codex_home / "ramp-router-models.json"
+        saved = json.loads(catalog_path.read_text(encoding="utf-8"))
+        saved["models"][0]["display_name"] = "Modèle 日本語"
+        catalog_path.write_text(json.dumps(saved, ensure_ascii=False), encoding="utf-8")
+
+
+def test_configure_codex_reports_unreadable_snapshot(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    instructions = codex_home / "ramp-router-instructions.md"
+    instructions.write_bytes(b"\xff")
+    _mock_models(monkeypatch)
+    _mock_codex_catalog(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--no-input", "router", "configure", "codex", "--api-key", "router-secret"],
+    )
+
+    assert result.exit_code != 0
+    assert f"Could not read Codex setup snapshot {instructions}" in result.output
+    assert "internal error" not in result.output
+    assert not (codex_home / "config.toml").exists()
+    assert instructions.read_bytes() == b"\xff"
+
+
+@pytest.mark.parametrize("original_provider", [False, True])
+def test_codex_catalog_decode_error_identifies_operation(
+    monkeypatch, original_provider
+):
+    def invalid_output(*_args, **_kwargs):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(router_module.shutil, "which", lambda _: "/bin/codex")
+    monkeypatch.setattr(router_module.subprocess, "run", invalid_output)
+
+    with pytest.raises(
+        click.ClickException, match="Could not decode Codex model catalog"
+    ):
+        if original_provider:
+            router_module._codex_original_catalog({"model_provider": "custom"})
+        else:
+            router_module._codex_catalog_from("/bin/codex")
 
 
 def test_configure_codex_reads_config_after_catalog_discovery(tmp_path, monkeypatch):
