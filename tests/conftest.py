@@ -102,6 +102,7 @@ def isolated_config(tmp_path: Path, request: pytest.FixtureRequest):
     ):
         monkeypatch.delenv(leaked, raising=False)
     monkeypatch.setenv("RAMP_NO_TOOL_AVAILABILITY", "1")
+    monkeypatch.setattr("ramp_cli.tools.availability._cache", {})
     # Configure/refresh/unconfigure manage an OS scheduled job (launchd or
     # systemd); tests must never install one on the developer's machine.
     monkeypatch.setattr(

@@ -2381,11 +2381,33 @@ def _run_configure(
                 )
                 continue
             if item == CURSOR_CLIENT:
-                # Cursor holds its settings in its own account-synced UI, so
-                # there is no file to write: the credential is provisioned and
-                # the two fields to paste are reported instead.
+                # Write Cursor's local settings while it is quit. A running
+                # Cursor would overwrite them on quit, so it gets the values
+                # to paste instead.
                 suggested = _cursor_suggested_model(models)
                 claude_aliases = _ensure_claude_aliases(api_key, base_url, models)
+                written = _write_cursor_settings(
+                    api_key,
+                    base_url,
+                    models,
+                    claude_aliases,
+                    announce=not ctx.obj["quiet"],
+                    prompt=_can_prompt(ctx, fmt),
+                )
+                if written is not None:
+                    results.append(
+                        {
+                            "client": item,
+                            "provider": ROUTER_PROVIDER,
+                            "settings_written": True,
+                            "models_available": len(models),
+                            "api_key_on_clipboard": False,
+                            "models_added": len(written["models_added"]),
+                            "config_path": str(cursor.state_db_path()),
+                            "setup_file_deleted": setup_file is not None,
+                        }
+                    )
+                    continue
                 results.append(
                     {
                         "client": item,
@@ -2495,7 +2517,10 @@ def _run_configure(
         setup_file_holds_the_only_key = (
             bool(results)
             and all(result["client"] == CURSOR_CLIENT for result in results)
-            and not any(result["api_key_on_clipboard"] for result in results)
+            and not any(
+                result["api_key_on_clipboard"] or result.get("settings_written")
+                for result in results
+            )
         )
         if setup_file is not None and not failures and setup_file_holds_the_only_key:
             for result in results:
@@ -2629,7 +2654,13 @@ def _run_configure(
         cursor_result = next(
             (result for result in results if result["client"] == CURSOR_CLIENT), None
         )
-        if cursor_result:
+        if cursor_result and cursor_result.get("settings_written"):
+            click.echo(
+                "Cursor: Router is set up. Reopen Cursor, run the chat on "
+                "This Mac, and pick a Router model. Run this again after "
+                "signing in to a different Cursor account."
+            )
+        elif cursor_result:
             click.echo()
             if cursor_result["api_key_on_clipboard"]:
                 click.echo("Cursor: your Router API key is on the clipboard.")
@@ -3445,6 +3476,45 @@ def _echo_cursor_guidance(steps: list[str]) -> None:
     click.echo("Cursor keeps these settings in its own UI, so finish there:")
     for number, step in enumerate(steps, start=1):
         click.echo(f"  {number}. {step}")
+
+
+_CURSOR_KEYCHAIN_NOTE = (
+    'Cursor: macOS will ask to let "{program}" (the Ramp CLI) use "Cursor Safe '
+    "Storage\" in your keychain. That is Cursor's own encryption key; Ramp uses "
+    "it only to save your Router key in Cursor's encrypted format. Click Allow, "
+    "or Deny to get paste-in steps instead."
+)
+
+
+def _write_cursor_settings(
+    api_key: str,
+    base_url: str,
+    models: list[RouterModel],
+    claude_aliases: dict[str, str],
+    *,
+    announce: bool = False,
+    prompt: bool = True,
+) -> dict | None:
+    """Write Cursor's settings, or return None so the caller falls back."""
+    if sys.platform != "darwin":
+        return None
+    if cursor.is_running() or not cursor.state_db_path().is_file():
+        return None
+    if announce and prompt:
+        # Say why the macOS permission dialog is about to appear.
+        # The leading \r and clear-line move past the spinner's line.
+        # macOS names the real executable, not the `ramp` symlink.
+        note = _CURSOR_KEYCHAIN_NOTE.format(
+            program=os.path.basename(os.path.realpath(sys.executable))
+        )
+        click.echo("\r\033[K" + note if sys.stderr.isatty() else note, err=True)
+    names = cursor.model_names_to_add(
+        [model.metadata.request_name for model in models], claude_aliases
+    )
+    try:
+        return cursor.configure(api_key, base_url, names, prompt=prompt)
+    except cursor.CursorSettingsError:
+        return None
 
 
 @router_group.command(
@@ -5762,6 +5832,8 @@ def _run_unconfigure(
         # exist. With none, the list would be empty and the command falls
         # through to saying Router is not configured anywhere.
         receipted = _clients_with_a_receipt()
+        if cursor.has_receipt():
+            receipted = (*receipted, CURSOR_CLIENT)
         candidates = receipted
         if cowork_configured and "claude-code" not in candidates:
             # A Cowork receipt is the same kind of evidence: this CLI set
@@ -5783,6 +5855,10 @@ def _run_unconfigure(
                 titles=titles,
             )
     clients = requested_clients or tuple(CLIENT_NAMES)
+    if not requested_clients and cursor.has_receipt():
+        # Cursor's restore record lives in Cursor's own directory, not with
+        # the other agents' receipts, so a bare run adds it here.
+        clients = (*clients, CURSOR_CLIENT)
     if cowork_configured and "claude-code" in clients:
         # Unconfiguring Claude Code always unconfigures both Claude apps,
         # whether Claude was picked from the menu, named on the command line,
@@ -5822,8 +5898,15 @@ def _run_unconfigure(
     try:
         for item in clients:
             if item == CURSOR_CLIENT:
-                # Nothing on disk to restore: Cursor holds its settings in its
-                # own account-synced UI, so removal is guided like setup was.
+                # Restore what configure wrote; a setup that was pasted by
+                # hand can only be undone in Cursor.
+                try:
+                    if cursor.unconfigure():
+                        results.append({"client": item, "removed": True})
+                        continue
+                except cursor.CursorSettingsError as exc:
+                    failures.append(f"{AGENT_NAMES[item]}: {exc}")
+                    continue
                 results.append(
                     {
                         "client": item,
@@ -5913,7 +5996,11 @@ def _run_unconfigure(
             payload = {"clients": results}
         print_agent_json(payload, pagination=None)
     elif results:
-        restored = [result for result in results if result["client"] != CURSOR_CLIENT]
+        restored = [
+            result
+            for result in results
+            if result["client"] != CURSOR_CLIENT or result["removed"]
+        ]
         if restored:
             restored_names = _human_join(
                 [AGENT_NAMES[result["client"]] for result in restored]
@@ -5927,7 +6014,7 @@ def _run_unconfigure(
         cursor_result = next(
             (result for result in results if result["client"] == CURSOR_CLIENT), None
         )
-        if cursor_result:
+        if cursor_result and not cursor_result["removed"]:
             click.echo("Cursor keeps its settings in its own UI, so undo it there:")
             for number, step in enumerate(cursor_result["instructions"], start=1):
                 click.echo(f"  {number}. {step}")

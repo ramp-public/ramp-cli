@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import click
 import httpx
@@ -46,12 +47,24 @@ def _fetch_user_context(env: str, profile: str | None = None) -> tuple[str, str]
         return "", ""
 
 
+def _sanitize_feedback(text: str) -> str:
+    """Flatten feedback to one line so the query string passes Cloudflare WAF.
+
+    Cloudflare challenges query strings containing CR, LF, or NUL, which the
+    CLI cannot pass. Line breaks become " / " and other control characters
+    become spaces, then whitespace runs collapse to a single space.
+    """
+    text = re.sub(r"\s*[\r\n]+\s*", " / ", text.strip())
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 @click.command("feedback", help="Submit feedback about the CLI")
 @click.argument("text")
 @click.pass_context
 def feedback_cmd(ctx: click.Context, text: str) -> None:
     """Submit feedback about the Ramp Developer API or CLI."""
-    text = text.strip()
+    text = _sanitize_feedback(text)
     if len(text) < 10:
         raise click.ClickException("Feedback must be at least 10 characters.")
     if len(text) > 1000:
@@ -106,9 +119,18 @@ def feedback_cmd(ctx: click.Context, text: str) -> None:
     except httpx.TimeoutException:
         raise click.ClickException("Request timed out. Please try again.")
     except httpx.HTTPStatusError as e:
-        raise click.ClickException(
-            f"Server returned {e.response.status_code}. Please try again."
-        )
+        status = e.response.status_code
+        ray_id = e.response.headers.get("cf-ray")
+        if ray_id and status == 403:
+            raise click.ClickException(
+                f"Feedback was blocked by Ramp's firewall (Ray ID: {ray_id}). "
+                "Share this ID with Ramp support."
+            )
+        if ray_id:
+            raise click.ClickException(
+                f"Server returned {status} (Ray ID: {ray_id}). Please try again."
+            )
+        raise click.ClickException(f"Server returned {status}. Please try again.")
     except httpx.HTTPError:
         raise click.ClickException(
             "Network error. Please check your connection and try again."

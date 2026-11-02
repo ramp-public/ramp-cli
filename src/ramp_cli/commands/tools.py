@@ -11,7 +11,7 @@ from ramp_cli.output.formatter import print_agent_json, print_json, resolve_form
 from ramp_cli.output.help import BoxHelpFormatter
 from ramp_cli.specs import AGENT_TOOL_DEFINITION
 from ramp_cli.specs.sync import fetch_spec, maybe_sync
-from ramp_cli.tools.availability import fetch_availability
+from ramp_cli.tools.availability import get_availability, is_business_disabled
 from ramp_cli.tools.commands import (
     cli_category_name,
     resolve_cli_tool_groups,
@@ -66,13 +66,7 @@ def tools_list(ctx: click.Context) -> None:
         else get_known_granted_scopes(env)
     )
     # Best-effort effective-availability overlay; None preserves current output.
-    snapshot = (
-        fetch_availability(env, profile=profile) if profile else fetch_availability(env)
-    )
-
-    def _is_business_disabled(tool) -> bool:
-        entry = snapshot.lookup(tool) if snapshot else None
-        return bool(entry and "disabled_for_business" in entry.unavailable_reasons)
+    snapshot = get_availability(env, profile=profile)
 
     if fmt == "json":
         records = []
@@ -80,7 +74,7 @@ def tools_list(ctx: click.Context) -> None:
             for name, tool in resolve_tool_command_names(
                 cat, tools, granted_scopes=granted_scopes
             ):
-                if _is_business_disabled(tool):
+                if is_business_disabled(snapshot, tool):
                     continue
                 raw_category = tool.category or "general"
                 record = {
@@ -131,7 +125,7 @@ def tools_list(ctx: click.Context) -> None:
                 for name, tool in resolve_tool_command_names(
                     cat, tools, granted_scopes=granted_scopes
                 )
-                if not _is_business_disabled(tool)
+                if not is_business_disabled(snapshot, tool)
             ]
             if not dl_rows:
                 continue

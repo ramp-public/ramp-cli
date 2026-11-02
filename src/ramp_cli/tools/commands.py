@@ -25,7 +25,7 @@ from ramp_cli.client.api import RampClient
 from ramp_cli.client.session import get_session_id
 from ramp_cli.client.vault import vault_proxy_headers, vault_proxy_target
 from ramp_cli.config.constants import api_url, append_query_params
-from ramp_cli.config.profiles import AGENT_PROFILE
+from ramp_cli.config.profiles import AGENT_PROFILE, resolve_profile
 from ramp_cli.config.settings import resolve_environment
 from ramp_cli.errors import ApiError
 from ramp_cli.onboarding import maybe_show_category_tip
@@ -41,7 +41,11 @@ from ramp_cli.output.formatter import (
 from ramp_cli.output.paginator import ToolPaginator
 from ramp_cli.output.style import show_detail_card, show_table_card
 from ramp_cli.specs.sync import maybe_sync
-from ramp_cli.tools.availability import fetch_availability
+from ramp_cli.tools.availability import (
+    fetch_availability,
+    get_availability,
+    is_business_disabled,
+)
 from ramp_cli.tools.parser import JsonSchema, ParamType, ToolDef, ToolParam
 from ramp_cli.tools.registry import (
     CATEGORY_ALIAS_GROUPS,
@@ -371,9 +375,24 @@ class GeneratedToolGroup(click.Group):
             self._generated_tools(ctx),
         )
 
+    @staticmethod
+    def _resolve_profile(ctx: click.Context) -> str | None:
+        flag_profile = ctx.find_root().params.get("flag_profile") or ""
+        try:
+            return resolve_profile(flag_profile)
+        except ValueError:
+            return None
+
     def list_commands(self, ctx: click.Context) -> list[str]:
         static = set(super().list_commands(ctx))
-        generated = {name for name, _tool in self._generated_commands(ctx)}
+        snapshot = get_availability(
+            self._resolve_env(ctx), profile=self._resolve_profile(ctx)
+        )
+        generated = {
+            name
+            for name, tool in self._generated_commands(ctx)
+            if not is_business_disabled(snapshot, tool)
+        }
         return sorted(static | generated)
 
     def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:

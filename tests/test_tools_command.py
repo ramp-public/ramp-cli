@@ -376,7 +376,7 @@ class TestToolsListAvailability:
         monkeypatch.setattr("ramp_cli.commands.tools.maybe_sync", lambda env: None)
         monkeypatch.setattr("ramp_cli.main.maybe_sync", lambda env: None)
         monkeypatch.setattr(
-            "ramp_cli.commands.tools.fetch_availability", lambda env: snapshot
+            "ramp_cli.tools.availability.fetch_availability", lambda env: snapshot
         )
 
     @pytest.mark.parametrize("format_args", [["--agent"], ["--output", "json"]])

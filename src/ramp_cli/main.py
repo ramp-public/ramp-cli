@@ -42,6 +42,11 @@ from ramp_cli.output.help import (
     suppress_help_text,
 )
 from ramp_cli.specs.sync import maybe_sync
+from ramp_cli.tools.availability import (
+    cached_availability,
+    get_availability,
+    is_business_disabled,
+)
 from ramp_cli.tools.commands import (
     build_tool_command,
     cli_category_name,
@@ -222,6 +227,20 @@ def _split_root_flags(args: list[str]) -> tuple[list[str], list[str]]:
     return root, rest
 
 
+def _root_flag_values(args: list[str]) -> dict[str, str]:
+    """Values of root flags that take one, keyed by flag (last one wins)."""
+    values: dict[str, str] = {}
+    for i, arg in enumerate(args):
+        name, sep, value = arg.partition("=")
+        if name not in _FLAGS_WITH_VALUE:
+            continue
+        if sep:
+            values[name] = value
+        elif i + 1 < len(args):
+            values[name] = args[i + 1]
+    return values
+
+
 # ── Formatter patches ────────────────────────────────────────────────────────
 
 
@@ -242,6 +261,19 @@ class ToolGroup(click.Group):
 
     def format_usage(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         formatter.write_usage(ctx.command_path, "<tool> [OPTIONS]")
+
+    def list_commands(self, ctx: click.Context) -> list[str]:
+        names = super().list_commands(ctx)
+        env = getattr(self, "_env", None)
+        if not env:
+            return names
+        snapshot = get_availability(env, profile=getattr(self, "_profile", None))
+        tools = getattr(self, "_tools_by_name", {})
+        return [
+            name
+            for name in names
+            if not is_business_disabled(snapshot, tools.get(name))
+        ]
 
     def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
         if cmd := super().get_command(ctx, cmd_name):
@@ -284,6 +316,7 @@ class ToolGroup(click.Group):
                 click.echo(ctx.get_help())
 
         visible_names: set[str] = set()
+        tools_by_name = {}
         legacy_candidates = {}
         granted_scopes = None
         if env:
@@ -300,6 +333,7 @@ class ToolGroup(click.Group):
                 cmd_name,
             )
             visible_names.add(cmd_name)
+            tools_by_name[cmd_name] = tool
             if tool.alias and cmd_name != tool.name:
                 legacy_candidates[tool.name] = tool
             for legacy_name in _LEGACY_TOOL_ALIASES.get((name, tool.name), ()):
@@ -310,6 +344,9 @@ class ToolGroup(click.Group):
             for tool_name, tool in legacy_candidates.items()
             if tool_name not in visible_names
         }
+        group._tools_by_name = tools_by_name  # type: ignore[attr-defined]
+        group._env = env  # type: ignore[attr-defined]
+        group._profile = profile  # type: ignore[attr-defined]
         return group
 
 
@@ -324,13 +361,22 @@ class RampGroup(click.Group):
 
     def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
         root, rest = _split_root_flags(args)
+        # Eager --help renders before flag_env/flag_profile reach ctx.params.
+        ctx.meta["ramp_root_flags"] = _root_flag_values(root + rest)
         return super().parse_args(ctx, root + rest)
 
     def list_commands(self, ctx: click.Context) -> list[str]:
         base = set(super().list_commands(ctx))
         multi, singletons = self._split_categories(ctx)
-        resource_names = set(multi.keys())
-        if singletons:
+        snapshot = get_availability(
+            self._resolve_env(ctx), profile=self._resolve_profile(ctx)
+        )
+
+        def listed(tools: list) -> bool:
+            return not all(is_business_disabled(snapshot, tool) for tool in tools)
+
+        resource_names = {name for name, tools in multi.items() if listed(tools)}
+        if singletons and listed(singletons):
             resource_names.add(Resource.GENERAL)
         return sorted(base | resource_names)
 
@@ -354,7 +400,17 @@ class RampGroup(click.Group):
         generated_name = cli_category_name(cmd_name)
         if generated_name in multi:
             tools = multi[generated_name]
-            aliases = ", ".join(sorted(t.alias or t.name for t in tools))
+            # Root help fetched availability already; invocation never does.
+            snapshot = cached_availability(
+                self._resolve_env(ctx), profile=self._resolve_profile(ctx)
+            )
+            aliases = ", ".join(
+                sorted(
+                    t.alias or t.name
+                    for t in tools
+                    if not is_business_disabled(snapshot, t)
+                )
+            )
             fallback = f"{generated_name.replace('-', ' ').title()} \u2014 {aliases}"
             return ToolGroup.build(
                 generated_name,
@@ -406,15 +462,24 @@ class RampGroup(click.Group):
             with formatter.section("Resources"):
                 formatter.write_dl(resource_rows)
 
+    @staticmethod
+    def _flag(ctx: click.Context | None, param: str, *names: str) -> str:
+        if not ctx:
+            return ""
+        if value := ctx.params.get(param):
+            return value
+        stashed = ctx.meta.get("ramp_root_flags", {})
+        return next((stashed[n] for n in names if n in stashed), "")
+
     def _resolve_env(self, ctx: click.Context | None) -> str:
-        flag_env = (ctx.params.get("flag_env") or "") if ctx else ""
+        flag_env = self._flag(ctx, "flag_env", "--env", "-e")
         try:
             return resolve_environment(flag_env)
         except ValueError:
             return "production"
 
     def _resolve_profile(self, ctx: click.Context | None) -> str | None:
-        flag_profile = (ctx.params.get("flag_profile") or "") if ctx else ""
+        flag_profile = self._flag(ctx, "flag_profile", "--profile")
         try:
             return resolve_profile(flag_profile)
         except ValueError:

@@ -106,3 +106,36 @@ def fetch_availability(
     except Exception as exc:  # fail-open by design
         logger.debug("agent-tool availability lookup failed: %s", exc)
         return None
+
+
+# One lookup per process and credential, shared by every listing.
+_cache: dict[tuple[str, str | None], AvailabilitySnapshot | None] = {}
+
+
+def get_availability(
+    env: str, *, profile: str | None = None
+) -> AvailabilitySnapshot | None:
+    """``fetch_availability`` memoized for the life of the process."""
+    key = (env, profile)
+    if key not in _cache:
+        _cache[key] = (
+            fetch_availability(env, profile=profile)
+            if profile
+            else fetch_availability(env)
+        )
+    return _cache[key]
+
+
+def cached_availability(
+    env: str, *, profile: str | None = None
+) -> AvailabilitySnapshot | None:
+    """The snapshot if a listing already fetched one; never hits the network."""
+    return _cache.get((env, profile))
+
+
+def is_business_disabled(
+    snapshot: AvailabilitySnapshot | None, tool: ToolDef | None
+) -> bool:
+    """True when the tool's rollout flag is off for the caller's business."""
+    entry = snapshot.lookup(tool) if snapshot and tool else None
+    return bool(entry and "disabled_for_business" in entry.unavailable_reasons)
