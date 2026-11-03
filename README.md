@@ -22,12 +22,12 @@ ramp router ui --theme light         # dark, light, terminal, or auto (default)
 
 Run `npx @ramp/router@latest configure --enable-agent` to sign in, choose harnesses, and enable the Router agent.
 `RAMP_ROUTER_THEME` sets a default theme and `RAMP_ROUTER_REDUCED_MOTION=1`
-turns off animation. Interactive `router configure`, `keys`, `strategies`,
+turns off animation. Interactive `ramp router configure`, `keys`, `strategies`,
 `account`, and `subagents` open their workspace screens.
 
 Scripts never get the UI: agent mode, `--no-input`, JSON output, `--quiet`,
 redirected stdin/stdout, and `TERM=dumb` keep every command's existing
-noninteractive behavior, and `router ui` in those modes is a usage error:
+noninteractive behavior, and `ramp router ui` in those modes is a usage error:
 
 ```bash
 ramp --agent router keys list

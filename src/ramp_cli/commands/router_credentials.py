@@ -36,8 +36,9 @@ def sign_in(
             raise
         if connector_session:
             raise click.ClickException(
-                "Your connector sign-in needs renewal. Renew it with 'router login --connectors' "
-                "before setup; existing connector bindings were not changed."
+                "Your connector sign-in needs renewal. Renew it with "
+                "'ramp router login --connectors' before setup; existing connector "
+                "bindings were not changed."
             ) from None
     client.login(no_browser=no_browser)
     return client.access_token(check_session=True)

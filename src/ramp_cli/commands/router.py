@@ -1785,7 +1785,7 @@ def router_configure(
             or tagging.get("refresh_failures")
         ):
             raise click.ClickException(
-                "Router is configured, but the agent is not running or a harness could not be migrated. Check 'router agent status' and rerun configure --enable-agent."
+                "Router is configured, but the agent is not running or a harness could not be migrated. Check 'ramp router agent status' and rerun configure --enable-agent."
             )
 
 
@@ -3839,7 +3839,9 @@ def router_sync(
     if hook_mode:
         _run_hook_sync(client, event)
         return
-    raise click.UsageError("Use --hook for session-start sync or 'router refresh'.")
+    raise click.UsageError(
+        "Use --hook for session-start sync or 'ramp router refresh'."
+    )
 
 
 @dataclass(frozen=True)
