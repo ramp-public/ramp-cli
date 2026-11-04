@@ -1,3 +1,7 @@
+import { readFileSync } from "node:fs"
+import { homedir } from "node:os"
+import { join } from "node:path"
+
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -33,6 +37,18 @@ export type SessionUsage = {
   lastModel?: string
   lastModelProvider?: string
   switchyardEnabled: boolean
+}
+
+/** Reads ramp-cli's router_settings.py file: only a literal false disables. */
+export function harnessWidgetEnabled(): boolean {
+  try {
+    const settings: unknown = JSON.parse(
+      readFileSync(join(homedir(), ".config", "ramp", "router-settings.json"), "utf8"),
+    )
+    return (settings as { harness_widget_enabled?: unknown } | null)?.harness_widget_enabled !== false
+  } catch {
+    return true
+  }
 }
 
 export function usageOriginFromBaseURL(baseURL: string): string {
@@ -234,7 +250,8 @@ export function registerUsageWidget(
     if (
       process.env.PI_OFFLINE !== undefined ||
       ctx.mode !== "tui" ||
-      ctx.model?.provider !== "ramp-router"
+      ctx.model?.provider !== "ramp-router" ||
+      !harnessWidgetEnabled()
     ) return undefined
     const sessionID = ctx.sessionManager.getSessionId()
     return typeof sessionID === "string" && sessionID ? sessionID : undefined

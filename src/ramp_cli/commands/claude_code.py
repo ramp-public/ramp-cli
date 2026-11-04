@@ -520,6 +520,37 @@ def _statusline_slot_is_ours(settings: dict, path: Path) -> bool:
     }
 
 
+def without_router_statusline(settings: dict, path: Path) -> dict:
+    """Drop Router's status line, leaving a user's own in place."""
+    if settings.get("statusLine") is None or not _statusline_slot_is_ours(
+        settings, path
+    ):
+        return settings
+    return {key: value for key, value in settings.items() if key != "statusLine"}
+
+
+def plan_statusline_restore(
+    settings: dict, state: dict, path: Path, command: str
+) -> tuple[dict, dict]:
+    """Put Router's status line back, advancing the receipt's record of it."""
+    if not _statusline_slot_is_ours(settings, path):
+        return settings, state
+    written = {"type": "command", "command": command}
+    record = state.get("statusLine")
+    return {**settings, "statusLine": written}, {
+        **state,
+        "statusLine": (
+            {**record, "written": written}
+            if isinstance(record, dict)
+            else {
+                "present": "statusLine" in settings,
+                "value": settings.get("statusLine"),
+                "written": written,
+            }
+        ),
+    }
+
+
 # The exact SessionStart entry this CLI registered — or the user-managed
 # sentinel when a user hook already invokes the sync — so only that entry is
 # ever replaced or removed.

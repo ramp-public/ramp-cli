@@ -89,6 +89,9 @@ request and an `include` list only where Router says the upstream reads them.
 
 ## Session cost sidebar
 
+`ramp router harness-widget disable` hides this section and the Ramp CLI update
+notice.
+
 The package's `./tui` entrypoint registers a section in OpenCode's session
 sidebar, below the built-in Context/MCP/LSP/Todo sections. OpenCode's terminal
 client loads sidebar plugins only from its own config, never from

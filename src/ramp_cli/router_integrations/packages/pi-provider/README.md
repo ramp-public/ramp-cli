@@ -45,7 +45,8 @@ the Responses adapter without requiring a native Pi catalog entry.
 Router sessions also show a native widget above Pi's editor after settled
 turns. It reports Switchyard routing, Router's last routed model and provider,
 and Ramp session cost against the Claude Opus reference cost. The built-in Pi
-footer and local cost display remain unchanged.
+footer and local cost display remain unchanged. `ramp router harness-widget
+disable` hides it.
 
 The recommended installer is:
 

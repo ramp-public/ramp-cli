@@ -165,7 +165,7 @@ const RouterTuiV1: TuiPlugin = async (api, rawOptions) => {
         return (
           <RouterSection
             view={view}
-            updateNotice={updateNotice}
+            updateNotice={() => (tracker.widgetShown() ? updateNotice() : undefined)}
             text={() => ctx.theme.current.text}
             textMuted={() => ctx.theme.current.textMuted}
           />
@@ -236,7 +236,7 @@ const setupRouterTuiV2: TuiPluginV2.Definition["setup"] = (context) => {
       return (
         <RouterSection
           view={view}
-          updateNotice={updateNotice}
+          updateNotice={() => (tracker.widgetShown() ? updateNotice() : undefined)}
           text={() => context.theme.text.base}
           textMuted={() => context.theme.text.muted}
         />

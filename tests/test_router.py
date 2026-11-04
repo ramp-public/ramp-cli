@@ -8,6 +8,7 @@ import io
 import itertools
 import json
 import os
+import re
 import sqlite3
 import stat
 import subprocess
@@ -32,7 +33,7 @@ import ramp_cli.commands.router as router_module
 from ramp_cli import __version__, claude_cowork, codex_desktop
 from ramp_cli.client.router_user import RouterUserClient
 from ramp_cli.codex_desktop import restart_running
-from ramp_cli.commands import claude_code, cursor
+from ramp_cli.commands import claude_code, cursor, router_settings
 from ramp_cli.commands.router import DEFAULT_ROUTER_BASE_URL as ROUTER_BASE_URL
 from ramp_cli.config.settings import config_dir
 from ramp_cli.errors import RampCLIError
@@ -14583,3 +14584,260 @@ def test_background_refresh_keeps_an_opencode_model_off_router(tmp_path, monkeyp
     _background_refresh(monkeypatch)
 
     assert json.loads(config_path.read_text()) == config
+
+
+def _configure_claude_with_status_line(tmp_path, monkeypatch):
+    # _mock_models answers 404 for the status line; these tests need a real one.
+    def install(_url, script_path, _skip):
+        script_path.parent.mkdir(parents=True, exist_ok=True)
+        script_path.write_text("#!/usr/bin/env python3\n")
+        return True
+
+    monkeypatch.setattr(router_module, "_install_cost_script", install)
+    settings_path = _configure_claude_for_subagents(
+        monkeypatch, tmp_path, [{"id": "gpt-5.4"}]
+    )
+    settings = json.loads(settings_path.read_text())
+    assert settings["statusLine"]["type"] == "command"
+    return settings_path
+
+
+def _harness_widget(action: str):
+    result = CliRunner().invoke(cli, ["--human", "router", "harness-widget", action])
+    assert result.exit_code == 0, result.output
+    return result
+
+
+def test_harness_widget_round_trips_the_claude_code_status_line(tmp_path, monkeypatch):
+    settings_path = _configure_claude_with_status_line(tmp_path, monkeypatch)
+    original = json.loads(settings_path.read_text())
+    assert "statusLine" in original
+
+    _harness_widget("disable")
+
+    assert router_settings.harness_widget_enabled() is False
+    assert json.loads(settings_path.read_text()) == {
+        key: value for key, value in original.items() if key != "statusLine"
+    }
+
+    _harness_widget("enable")
+
+    assert router_settings.harness_widget_enabled() is True
+    assert json.loads(settings_path.read_text()) == original
+
+
+def test_harness_widget_leaves_a_users_own_status_line(tmp_path, monkeypatch):
+    settings_path = _configure_claude_with_status_line(tmp_path, monkeypatch)
+    settings = json.loads(settings_path.read_text())
+    settings["statusLine"] = {"type": "command", "command": "my-line"}
+    settings_path.write_text(json.dumps(settings))
+
+    _harness_widget("disable")
+    assert json.loads(settings_path.read_text())["statusLine"]["command"] == "my-line"
+
+    _harness_widget("enable")
+    assert json.loads(settings_path.read_text())["statusLine"]["command"] == "my-line"
+
+
+@pytest.mark.parametrize("command", ["refresh", "configure"])
+def test_a_disabled_harness_widget_stays_off_claude_code(
+    tmp_path, monkeypatch, command
+):
+    settings_path = _configure_claude_with_status_line(tmp_path, monkeypatch)
+    router_settings.set_harness_widget_enabled(False)
+    args = (
+        ["refresh"]
+        if command == "refresh"
+        else ["configure", "claude-code", "--api-key", "router-secret"]
+    )
+
+    result = CliRunner().invoke(cli, ["--human", "router", *args])
+
+    assert result.exit_code == 0, result.output
+    assert "statusLine" not in json.loads(settings_path.read_text())
+
+
+def test_background_refresh_removes_a_disabled_claude_code_status_line(
+    tmp_path, monkeypatch
+):
+    settings_path = _configure_claude_with_status_line(tmp_path, monkeypatch)
+    router_settings.set_harness_widget_enabled(False)
+
+    _background_refresh(monkeypatch)
+
+    assert "statusLine" not in json.loads(settings_path.read_text())
+
+
+def test_unconfigure_after_disable_leaves_no_status_line(tmp_path, monkeypatch):
+    settings_path = _configure_claude_with_status_line(tmp_path, monkeypatch)
+    _harness_widget("disable")
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "unconfigure", "claude-code"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "statusLine" not in json.loads(settings_path.read_text())
+
+
+def _configure_codex_for_widget(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        '[[hooks.Stop]]\nhooks = [{ type = "command", command = "/home/me/notify.sh" }]\n'
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+    assert result.exit_code == 0, result.output
+    return codex_home
+
+
+def _cost_hook_commands(codex_home):
+    return [
+        group["hooks"][0]["command"]
+        for group in _cost_hook_groups(codex_home)
+        if "notify.sh" not in group["hooks"][0]["command"]
+    ]
+
+
+def _stop_commands(codex_home):
+    config = tomllib.loads((codex_home / "config.toml").read_text())
+    return [
+        entry["command"]
+        for group in config["hooks"]["Stop"]
+        for entry in group["hooks"]
+    ]
+
+
+def test_harness_widget_round_trips_the_codex_cost_hook(tmp_path, monkeypatch):
+    codex_home = _configure_codex_for_widget(tmp_path, monkeypatch)
+    original = _cost_hook_commands(codex_home)
+    assert len(original) == 1
+    stop_before = _stop_commands(codex_home)
+
+    _harness_widget("disable")
+
+    assert _cost_hook_commands(codex_home) == []
+    # The user's hook and the sync group are not the widget.
+    assert _stop_commands(codex_home) == [
+        command for command in stop_before if command not in original
+    ]
+
+    _harness_widget("enable")
+
+    assert _cost_hook_commands(codex_home) == original
+
+
+def test_a_disabled_harness_widget_stays_off_codex(tmp_path, monkeypatch):
+    codex_home = _configure_codex_for_widget(tmp_path, monkeypatch)
+    router_settings.set_harness_widget_enabled(False)
+
+    result = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+
+    assert result.exit_code == 0, result.output
+    assert _cost_hook_commands(codex_home) == []
+
+
+def test_background_refresh_removes_a_disabled_codex_cost_hook(tmp_path, monkeypatch):
+    codex_home = _configure_codex_for_widget(tmp_path, monkeypatch)
+    router_settings.set_harness_widget_enabled(False)
+
+    _background_refresh(monkeypatch)
+
+    assert _cost_hook_commands(codex_home) == []
+
+
+def test_unconfigure_after_disable_removes_the_codex_script(tmp_path, monkeypatch):
+    codex_home = _configure_codex_for_widget(tmp_path, monkeypatch)
+    _harness_widget("disable")
+
+    result = CliRunner().invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert result.exit_code == 0, result.output
+    assert not (codex_home / "codex-cost-hook").exists()
+
+
+def test_harness_widget_reports_agent_json(tmp_path, monkeypatch):
+    codex_home = _configure_codex_for_widget(tmp_path, monkeypatch)
+    assert _cost_hook_commands(codex_home)
+
+    result = CliRunner().invoke(cli, ["--agent", "router", "harness-widget", "disable"])
+
+    assert result.exit_code == 0, result.output
+    (data,) = json.loads(result.stdout)["data"]
+    assert data["harness_widget_enabled"] is False
+    assert data["updated_clients"] == ["codex"]
+
+
+@pytest.mark.parametrize(
+    "content,expected",
+    [
+        (None, True),
+        ("not json", True),
+        ("[]", True),
+        ('{"harness_widget_enabled": "false"}', True),
+        ('{"harness_widget_enabled": true}', True),
+        ('{"harness_widget_enabled": false}', False),
+    ],
+)
+def test_harness_widget_setting_only_disables_on_literal_false(content, expected):
+    path = router_settings.settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if content is not None:
+        path.write_text(content)
+    assert router_settings.harness_widget_enabled() is expected
+
+
+def test_harness_widget_write_keeps_other_settings():
+    path = router_settings.settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"other": 1}')
+
+    router_settings.set_harness_widget_enabled(False)
+
+    assert json.loads(path.read_text()) == {
+        "other": 1,
+        "harness_widget_enabled": False,
+    }
+
+
+def test_background_refresh_moves_the_codex_model_while_removing_the_cost_hook(
+    tmp_path, monkeypatch
+):
+    codex_home = _configure_codex_for_widget(tmp_path, monkeypatch)
+    config_path = codex_home / "config.toml"
+    config_path.write_text(
+        re.sub(
+            r'(?m)^model = ".*"$',
+            'model = "retired"',
+            config_path.read_text(),
+            count=1,
+        )
+    )
+    assert tomllib.loads(config_path.read_text())["model"] == "retired"
+    router_settings.set_harness_widget_enabled(False)
+
+    _background_refresh(monkeypatch)
+
+    assert _cost_hook_commands(codex_home) == []
+    assert tomllib.loads(config_path.read_text())["model"] == "gpt-5.4"
+
+
+def test_a_disable_during_the_cost_hook_download_still_wins(tmp_path, monkeypatch):
+    codex_home = _configure_codex_for_widget(tmp_path, monkeypatch)
+    download = router_module._install_codex_cost_hook
+
+    def disable_mid_download(path, base_url=None):
+        command = download(path, base_url)
+        router_settings.set_harness_widget_enabled(False)
+        return command
+
+    monkeypatch.setattr(router_module, "_install_codex_cost_hook", disable_mid_download)
+
+    result = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+
+    assert result.exit_code == 0, result.output
+    assert _cost_hook_commands(codex_home) == []

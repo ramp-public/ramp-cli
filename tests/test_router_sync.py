@@ -14,6 +14,7 @@ import pytest
 from click.testing import CliRunner
 
 import ramp_cli.commands.router as router_module
+import ramp_cli.commands.router_settings as router_settings
 import ramp_cli.commands.router_sync as sync_module
 import ramp_cli.main as main_module
 from ramp_cli import __version__
@@ -423,6 +424,19 @@ def test_opencode_hook_emits_its_tui_notice_contract(monkeypatch):
     assert json.loads(pending.stdout) == {"updateNotice": _NOTICE}
     assert "systemMessage" not in pending.stdout
     assert current.output == ""
+
+
+@pytest.mark.parametrize("client", ["opencode", "codex"])
+def test_a_disabled_harness_widget_hides_the_update_notice(monkeypatch, client):
+    _write_cooldown()
+    _cache_update()
+    _record_spawns(monkeypatch)
+    router_settings.set_harness_widget_enabled(False)
+
+    result = _sync("--hook", "--client", client)
+
+    assert result.exit_code == 0
+    assert result.output == ""
 
 
 def test_the_codex_notice_names_a_newer_server_recommended_version(monkeypatch):

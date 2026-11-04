@@ -1,5 +1,6 @@
 import { createSignal } from "solid-js"
 
+import { harnessWidgetEnabled } from "./harness-widget.ts"
 import { resolveUsageAPIKey, resolveRampCliVersion, resolveUsageOrigin } from "./options.ts"
 import type { RouterPluginOptions } from "./options.ts"
 import { sidebarUsageView } from "./sidebar-view.ts"
@@ -28,6 +29,7 @@ type TrackerDeps = {
   setTimer?: (callback: () => void, delayMs: number) => Timer
   clearTimer?: (timer: Timer) => void
   now?: () => number
+  widgetEnabled?: () => boolean
 }
 
 /** Usage is scoped to a session, including a bounded post-idle race recovery. */
@@ -44,6 +46,8 @@ export function createUsageTracker(host: UsageHost, deps: TrackerDeps = {}) {
   const setTimer = deps.setTimer ?? setTimeout
   const clearTimer = deps.clearTimer ?? clearTimeout
   const now = deps.now ?? Date.now
+  const widgetEnabled = deps.widgetEnabled ?? harnessWidgetEnabled
+  const [widgetShown, setWidgetShown] = createSignal(widgetEnabled())
   let disposed = false
 
   const clearUsage = (sessionID: string): void => {
@@ -64,6 +68,11 @@ export function createUsageTracker(host: UsageHost, deps: TrackerDeps = {}) {
   ): Promise<"found" | "retry" | "stale" | "settling" | "non-router"> => {
     if (disposed || !sessionID || inFlight.has(sessionID) || (!afterIdle && activeRetries.has(sessionID))) {
       return "retry"
+    }
+    setWidgetShown(widgetEnabled())
+    if (!widgetShown()) {
+      clearUsage(sessionID)
+      return "non-router"
     }
     inFlight.add(sessionID)
     try {
@@ -178,5 +187,5 @@ export function createUsageTracker(host: UsageHost, deps: TrackerDeps = {}) {
     activeRetries.clear()
   }
 
-  return { refresh, onIdle, view, dispose }
+  return { refresh, onIdle, view, widgetShown, dispose }
 }

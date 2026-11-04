@@ -27,6 +27,7 @@ def test_main_router_menu_has_short_choices_and_workspace():
         "agent",
         "configure",
         "connectors",
+        "harness-widget",
         "keys",
         "refresh",
         "strategies",

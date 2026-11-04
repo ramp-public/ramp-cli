@@ -54,6 +54,7 @@ from ramp_cli.commands import (
     router_credentials,
     router_repo,
     router_schedule,
+    router_settings,
 )
 from ramp_cli.commands import router_sync as router_sync_module
 from ramp_cli.commands.router_connectors import (
@@ -3005,6 +3006,122 @@ def router_refresh(ctx: click.Context) -> list[dict]:
     return _refresh_clients(ctx)
 
 
+def _set_claude_code_statusline(path: Path, *, enabled: bool) -> bool:
+    """Apply the widget setting to Claude Code; report whether settings changed."""
+    command = None
+    if enabled:
+        base_url = _refresh_router_base_url("claude-code", path)
+        with _pinned_usage_origin(
+            _stored_usage_origin("claude-code", path), keep_override=True
+        ):
+            command = _install_claude_code_statusline(path, base_url)
+        if command is None:
+            return False
+    with claude_code.settings_lock(path):
+        settings = claude_code.read_settings(path)
+        if command is None:
+            state = None
+            updated = claude_code.without_router_statusline(settings, path)
+        else:
+            state = claude_code.read_state(path)
+            updated, state = claude_code.plan_statusline_restore(
+                settings, state, path, command
+            )
+        if updated == settings:
+            return False
+        try:
+            if state is not None:
+                _write_private_file(
+                    claude_code.state_path(path), json.dumps(state, indent=2) + "\n"
+                )
+            _write_private_file(path, json.dumps(updated, indent=2) + "\n")
+        except OSError as exc:
+            raise click.ClickException(
+                f"Could not update Claude Code settings {path}: {exc}"
+            ) from None
+    return True
+
+
+def _set_codex_cost_hook(path: Path, *, enabled: bool) -> bool:
+    """Apply the widget setting to Codex; report whether its config changed."""
+    command = None
+    if enabled:
+        base_url = _refresh_router_base_url(CODEX_CLIENT_NAME, path)
+        with _pinned_usage_origin(
+            _stored_usage_origin(CODEX_CLIENT_NAME, path), keep_override=True
+        ):
+            command = _install_codex_cost_hook(path, base_url)
+        if command is None:
+            return False
+    state_path = path.parent / "ramp-router-state.json"
+    with codex_config_lock(path):
+        existing, _data = _read_codex_config(path)
+        receipt = _read_state_file(state_path)
+        if command is None:
+            updated = _without_managed_cost_hook(existing, receipt)
+        elif not receipt:
+            raise click.ClickException(
+                f"Could not read Ramp Router setup state from {state_path}."
+            )
+        else:
+            updated = _register_codex_cost_hook(path, existing, command)
+        if updated == existing:
+            return False
+        try:
+            if command is not None:
+                receipt[CODEX_COST_HOOK_MANAGED_KEY] = True
+                _write_private_file(state_path, json.dumps(receipt, indent=2) + "\n")
+            _write_private_file(path, updated)
+        except OSError as exc:
+            raise click.ClickException(
+                f"Could not update Codex config {path}: {exc}"
+            ) from None
+    return True
+
+
+@router_group.command(
+    "harness-widget",
+    short_help="Show or hide the usage widget.",
+    help=(
+        "Show or hide Router's cost and savings widget and update notices in "
+        "every harness."
+    ),
+)
+@click.argument("action", type=click.Choice(["enable", "disable"]))
+@click.pass_context
+def router_harness_widget(ctx: click.Context, action: str) -> None:
+    enabled = action == "enable"
+    router_settings.set_harness_widget_enabled(enabled)
+    appliers = {
+        "claude-code": _set_claude_code_statusline,
+        CODEX_CLIENT_NAME: _set_codex_cost_hook,
+    }
+    changed = []
+    failures = []
+    for client in configured_router_clients():
+        if client not in appliers:
+            continue
+        try:
+            if appliers[client](_client_config_path(client), enabled=enabled):
+                changed.append(client)
+        except click.ClickException as exc:
+            failures.append(f"{client}: {exc.message}")
+    if failures:
+        raise click.ClickException(
+            f"Saved the setting, but could not update {'; '.join(failures)}"
+        )
+    if resolve_format(ctx.obj["format"], ctx.obj["config_format"]) == "json":
+        print_agent_json(
+            {"harness_widget_enabled": enabled, "updated_clients": changed},
+            pagination=None,
+        )
+        return
+    click.echo(
+        f"Router harness widget {action}d. Pi and OpenCode follow on their next "
+        "turn; Claude Code and Codex follow in new sessions."
+    )
+
+
 def _refresh_clients(
     ctx: click.Context,
     *,
@@ -4417,6 +4534,8 @@ def _emit_hook_update_notice(client: str | None) -> None:
     # Keeps the statusline's pending-update file in step on every session
     # start, so an out-of-band upgrade clears the nudge immediately.
     sync_update_notice_file()
+    if not router_settings.harness_widget_enabled():
+        return
     notice = update_notice()
     if not notice:
         return
@@ -7628,6 +7747,8 @@ def _install_claude_code_statusline(
     installed here. A failure is a notice rather than an error: the status
     line is an extra, and it must never fail an otherwise working configure.
     """
+    if not router_settings.harness_widget_enabled():
+        return None
     url = f"{_statusline_origin(base_url)}/claude-code-statusline"
     script_path = claude_code.statusline_path(settings_file)
     if not _install_cost_script(url, script_path, _skip_statusline):
@@ -7704,6 +7825,8 @@ def _install_codex_cost_hook(path: Path, base_url: str | None = None) -> str | N
 
     Downloaded from the dashboard origin, same as the statusline installer.
     """
+    if not router_settings.harness_widget_enabled():
+        return None
     url = f"{_statusline_origin(base_url)}/codex-cost-hook"
     hook_path = path.parent / CODEX_COST_HOOK
     if not _install_cost_script(url, hook_path, _skip_codex_cost_hook):
@@ -7791,6 +7914,17 @@ def _is_owned_cost_hook_chunk(chunk: list[str]) -> bool:
     return bool(commands) and all(
         command is not None and _command_runs_cost_hook(command) for command in commands
     )
+
+
+def _without_managed_cost_hook(config: str, receipt: dict) -> str:
+    """Drop the Stop group the receipt says is ours; shared groups stay."""
+    if receipt.get(CODEX_COST_HOOK_MANAGED_KEY) is not True:
+        return config
+    chunks = _config_chunks(config)
+    kept = [chunk for chunk in chunks if not _is_owned_cost_hook_chunk(chunk)]
+    if len(kept) == len(chunks):
+        return config
+    return "".join("".join(chunk) for chunk in kept).rstrip() + "\n"
 
 
 def _codex_cost_hook_registered(config: dict) -> bool:
@@ -8048,6 +8182,8 @@ def _configure_claude_code(
             model_view_all=model_view == "all",
             shell_environment=os.environ,
         )
+        if not router_settings.harness_widget_enabled():
+            updated = claude_code.without_router_statusline(updated, path)
         path.parent.mkdir(parents=True, exist_ok=True)
         if previous_state is not None:
             # Keep the original snapshot, but advance the values that identify
@@ -9620,6 +9756,8 @@ def _refresh_claude_code_model(
             updated, new_state = claude_code.plan_automatic_subagent_cleanup(
                 updated, path, new_state
             )
+        if not router_settings.harness_widget_enabled():
+            updated = claude_code.without_router_statusline(updated, path)
         if updated == settings and new_state == state:
             return model
         state_path = claude_code.state_path(path)
@@ -9777,10 +9915,18 @@ def _refresh_codex_models(
         catalog_path = path.parent / CODEX_ROUTER_CATALOG
         if _changed(catalog_path, catalog_body):
             writes.append((catalog_path, catalog_body))
+        config = (
+            existing
+            if router_settings.harness_widget_enabled()
+            else _without_managed_cost_hook(existing, receipt)
+        )
         if existing_data.get("model") != default_model:
-            writes.append(
-                (path, _with_root_model(path, existing, existing_data, default_model))
+            config = _with_root_model(
+                path, config, tomllib.loads(config), default_model
             )
+        if config != existing:
+            writes.append((path, config))
+        if existing_data.get("model") != default_model:
             instructions_path = path.parent / "ramp-router-instructions.md"
             if existing_data.get("model_instructions_file") == str(
                 instructions_path.resolve()
@@ -11353,6 +11499,9 @@ def _configure_codex_in_lock(
     compact_models: list[RouterModel] | None = None,
     native_windows: dict[str, int] | None = None,
 ) -> tuple[str, bool]:
+    # Rechecked under the lock: a disable may have landed during the download.
+    if not router_settings.harness_widget_enabled():
+        cost_hook_command = None
     existing, existing_data = _read_codex_config(path)
     if selected_model is None:
         # A picker preference is not a request to reset the current model.
@@ -11652,6 +11801,8 @@ def _configure_codex_in_lock(
     updated = f"{preserved}\n\n{provider}" if preserved else provider
     if cost_hook_command is not None:
         updated = _register_codex_cost_hook(path, updated, cost_hook_command)
+    elif not router_settings.harness_widget_enabled():
+        updated = _without_managed_cost_hook(updated, receipt)
     if sync_hook_command is not None:
         updated, receipt_changed = _register_codex_sync_hook(
             path, updated, sync_hook_command, receipt

@@ -1,7 +1,13 @@
 import assert from "node:assert/strict"
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { describe, it, mock } from "node:test"
 
+import { harnessWidgetEnabled } from "../src/harness-widget.ts"
 import { createUsageTracker } from "../src/usage-tracker.ts"
+
+process.env.HOME = mkdtempSync(join(tmpdir(), "router-widget-"))
 
 const usage = (requestCount = 1) => ({
   requestCount,
@@ -11,7 +17,7 @@ const usage = (requestCount = 1) => ({
   switchyardEnabled: false,
 })
 
-function harness({ routerSession = () => true, syncSession, responses = [usage()] } = {}) {
+function harness({ routerSession = () => true, syncSession, responses = [usage()], widgetEnabled } = {}) {
   const pending = new Map()
   const delays = []
   let clock = 10_000
@@ -26,6 +32,7 @@ function harness({ routerSession = () => true, syncSession, responses = [usage()
     },
     {
       fetchUsage,
+      ...(widgetEnabled ? { widgetEnabled } : {}),
       now: () => clock,
       setTimer: (callback, delay) => {
         const id = ++sequence
@@ -54,6 +61,54 @@ function harness({ routerSession = () => true, syncSession, responses = [usage()
     },
   }
 }
+
+describe("OpenCode harness widget setting", () => {
+  const write = (content) => {
+    const directory = join(process.env.HOME, ".config", "ramp")
+    mkdirSync(directory, { recursive: true })
+    writeFileSync(join(directory, "router-settings.json"), content)
+  }
+
+  it("disables only on a literal false", () => {
+    assert.equal(harnessWidgetEnabled(), true)
+    for (const content of ["not json", "null", "[]", '{"harness_widget_enabled":"false"}']) {
+      write(content)
+      assert.equal(harnessWidgetEnabled(), true, content)
+    }
+    write('{"harness_widget_enabled":false}')
+    assert.equal(harnessWidgetEnabled(), false)
+    write('{"harness_widget_enabled":true}')
+    assert.equal(harnessWidgetEnabled(), true)
+  })
+
+  it("clears a shown session and stops fetching once disabled", async () => {
+    let enabled = true
+    const { tracker, fetchUsage } = harness({ widgetEnabled: () => enabled })
+    await tracker.refresh("session")
+    assert.equal(fetchUsage.mock.callCount(), 1)
+    assert.notEqual(tracker.view("session"), undefined)
+
+    enabled = false
+    assert.equal(await tracker.refresh("session", true), "non-router")
+
+    assert.equal(fetchUsage.mock.callCount(), 1)
+    assert.equal(tracker.view("session"), undefined)
+  })
+
+  it("follows the setting so the sidebar can hide a notice already showing", async () => {
+    let enabled = true
+    const { tracker } = harness({ widgetEnabled: () => enabled })
+    assert.equal(tracker.widgetShown(), true)
+
+    enabled = false
+    await tracker.refresh("session", true)
+    assert.equal(tracker.widgetShown(), false)
+
+    enabled = true
+    await tracker.refresh("session", true)
+    assert.equal(tracker.widgetShown(), true)
+  })
+})
 
 describe("OpenCode sidebar usage tracker", () => {
   it("synchronizes v2 messages after idle when the assistant has not reached the local cache", async () => {

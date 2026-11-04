@@ -1,15 +1,27 @@
 import assert from "node:assert/strict"
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { afterEach, describe, it, mock } from "node:test"
 
 import {
   fetchSessionUsage,
+  harnessWidgetEnabled,
   registerUsageWidget,
   usageOriginFromBaseURL,
   usageWidgetLines,
 } from "../src/usage.ts"
 
+process.env.HOME = mkdtempSync(join(tmpdir(), "router-widget-"))
+const settingsDirectory = join(process.env.HOME, ".config", "ramp")
+const writeSettings = (content) => {
+  mkdirSync(settingsDirectory, { recursive: true })
+  writeFileSync(join(settingsDirectory, "router-settings.json"), content)
+}
+
 afterEach(() => {
   delete process.env.PI_OFFLINE
+  rmSync(settingsDirectory, { recursive: true, force: true })
 })
 
 function payload(overrides = {}) {
@@ -234,6 +246,35 @@ describe("registerUsageWidget", () => {
     timer.fireLatest()
     await flush()
     assert.equal(fetcher.mock.callCount(), 2)
+  })
+
+  it("disables only on a literal false", () => {
+    assert.equal(harnessWidgetEnabled(), true)
+    for (const content of ["not json", "null", "[]", '{"harness_widget_enabled":"false"}']) {
+      writeSettings(content)
+      assert.equal(harnessWidgetEnabled(), true, content)
+    }
+    writeSettings('{"harness_widget_enabled":false}')
+    assert.equal(harnessWidgetEnabled(), false)
+  })
+
+  it("clears the widget without a placeholder or fetch once disabled", async () => {
+    const fetcher = mock.fn(async () => response())
+    const { context, handlers, setWidget, timer } = fixture(fetcher)
+    emit(handlers, "session_start", context, { reason: "resume" })
+    await flush()
+    assert.equal(fetcher.mock.callCount(), 1)
+
+    writeSettings('{"harness_widget_enabled":false}')
+    emit(handlers, "agent_settled", context)
+    await flush()
+
+    assert.equal(fetcher.mock.callCount(), 1)
+    assert.equal(timer.active.size, 0)
+    assert.deepEqual(setWidget.mock.calls.at(-1).arguments, [
+      "ramp-router-usage",
+      undefined,
+    ])
   })
 
   it("uses the recorded dashboard origin over derivation", async () => {
