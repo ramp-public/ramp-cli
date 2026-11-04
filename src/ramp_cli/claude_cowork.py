@@ -248,12 +248,7 @@ _SEALED_PREFIX = "__sealed__:v1:"
 
 def _credential_receipt(api_key: str, base_url: str) -> dict:
     """Receipt fields to recognize the key, plus a local token to use it sealed."""
-    receipt: dict = {
-        "credential_marker": _credential_marker(api_key),
-        "desktop_launched_at": None,
-        "sealed_marker": None,
-        "sealed_verified": False,
-    }
+    receipt: dict = {"credential_marker": _credential_marker(api_key)}
     ref = api_key if api_key.startswith(router_local_auth.TOKEN_PREFIX) else None
     if ref is None and (health := router_repo.health_token(create=True)):
         try:
@@ -271,101 +266,53 @@ def _credential_receipt(api_key: str, base_url: str) -> dict:
 
 
 def _profile_key(api_key: object, state: dict) -> str | None:
-    """The usable key for a profile key this CLI wrote, else None."""
+    """The usable key for a profile key this CLI wrote, else None.
+
+    Desktop seals the key after launch, and only Desktop can open it. The CLI
+    owns this profile, so a seal resolves to the key this setup recorded;
+    'ramp router configure desktop' is how its key changes. The profile's
+    other fields are still checked before anything is rewritten.
+    """
     if _credential_matches(api_key, state.get("credential_marker")):
         return str(api_key)
+    if isinstance(api_key, str) and api_key.startswith(_SEALED_PREFIX):
+        return _recorded_key(state)
+    return None
+
+
+def _recorded_key(state: dict) -> str | None:
+    """The key this setup wrote, read from CLI storage instead of Desktop.
+
+    Refresh and model sync run while Desktop is closed, so they cannot ask it
+    to open a sealed key. The receipt's local token is written with its
+    marker. Older receipts lack one; for those, use a saved credential only
+    when it matches this setup's marker.
+    """
     ref = state.get("credential_ref")
-    if not (
-        isinstance(api_key, str)
-        and api_key.startswith(_SEALED_PREFIX)
-        and isinstance(ref, str)
-    ):
+    if isinstance(ref, str):
+        return ref
+    marker = state.get("credential_marker")
+    directory = router_repo.config_dir() / "router-agent-credentials"
+    try:
+        records = sorted(directory.glob("*.json"))
+    except OSError:
         return None
-    # Launch/file timestamps cannot prove which plaintext Desktop encrypted.
-    # Only cache a seal after the native app decrypted it and the CLI matched
-    # its plaintext against the original receipt. Old timing-only seals must
-    # be verified once, too. Background reads never request Keychain access.
-    return (
-        ref
-        if state.get("sealed_verified") is True
-        and _credential_matches(api_key, state.get("sealed_marker"))
-        else None
-    )
-
-
-def desktop_credential_request() -> dict:
-    """Versioned native-app handshake; no Keychain reads or app launches."""
-    with transaction_lock():
-        return _desktop_credential_request()
-
-
-def _desktop_credential_request() -> dict:
-    state = _read_state()
-    if state is None:
-        return {"version": 1, "status": "not_configured"}
-    profile, exists = _read_object(
-        _profile_path(state["profile_id"]), "Claude Desktop Router profile"
-    )
-    if not exists:
-        # An interrupted setup may leave a receipt without its profile. Let
-        # disconnect restore the saved mode instead of leaving Desktop in 3P.
-        return {"version": 1, "status": "ready"}
-    _validate_owned_profile_fields(profile, state)
-    key = profile.get("inferenceGatewayApiKey")
-    if _profile_key(key, state) is not None:
-        _owned_profile(state)  # check endpoint and the other owned fields too
-        return {"version": 1, "status": "ready"}
-    if not isinstance(key, str) or not key.startswith(_SEALED_PREFIX):
-        raise click.ClickException(
-            "The Claude Desktop credential changed after setup; reconnect explicitly."
-        )
-    # Bind approval to the entire receipt and profile, not just the key. A
-    # profile edited or reconfigured while the dialog is open must be retried.
-    challenge = hashlib.sha256(
-        json.dumps([state, profile], sort_keys=True).encode()
-    ).hexdigest()
-    return {
-        "version": 1,
-        "status": "verification_required",
-        "sealed_key": key,
-        "challenge": challenge,
-    }
-
-
-def verify_desktop_credential(proof: dict) -> dict:
-    """Accept plaintext over a private stdin pipe, never argv or a temp file."""
-    with transaction_lock():
-        request = _desktop_credential_request()
-        if request.get("status") != "verification_required" or not hmac.compare_digest(
-            str(proof.get("challenge", "")).encode(), request["challenge"].encode()
-        ):
-            raise click.ClickException(
-                "Claude Desktop changed during verification. Try again."
+    for path in records:
+        try:
+            record = json.loads(router_local_auth.read_private(path))
+            token_path = path.with_suffix(".token")
+            token = (
+                router_local_auth.read_private(token_path).strip()
+                if token_path.exists()
+                else None
             )
-        state = _read_state()
-        key = proof.get("key")
-        if state is None or not _credential_matches(
-            key, state.get("credential_marker")
-        ):
-            raise click.ClickException(
-                "The Claude Desktop credential changed after setup; no changes were made."
-            )
-        # If the profile contains a local token and its backing secret was
-        # removed by a clean uninstall, decryption cannot recreate that secret.
-        router_repo.upstream_api_key(key, state["gateway_base_url"])
-        # Recover missing references from pre-sealing receipts. Keep the
-        # restore snapshots intact and never persist the plaintext here.
-        receipt = _credential_receipt(key, state["gateway_base_url"])
-        if not isinstance(receipt.get("credential_ref"), str):
-            raise click.ClickException(
-                "Could not save the local credential reference. Try again."
-            )
-        state.update(receipt)
-        state["sealed_marker"] = _credential_marker(request["sealed_key"])
-        state["sealed_verified"] = True
-        _owned_profile(state)
-        _write_private_json(state_path(), state)
-        return {"version": 1, "status": "ready"}
+        except (OSError, ValueError):
+            continue
+        api_key = record.get("api_key") if isinstance(record, dict) else None
+        for candidate in (token, api_key):
+            if isinstance(candidate, str) and _credential_matches(candidate, marker):
+                return candidate
+    return None
 
 
 def _credential_matches(api_key: object, marker: object) -> bool:
@@ -475,15 +422,31 @@ def _profile(api_key: str, router_base_url: str) -> dict:
     }
 
 
-def _owned_custom_headers(headers: object) -> bool:
-    # A profile written by an earlier CLI carries that CLI's version, or none
-    # at all; neither is a user edit that should block unconfigure.
-    if not isinstance(headers, dict):
-        return False
-    return (
-        headers.keys() <= {GATEWAY_CLIENT_HEADER, RAMP_CLI_VERSION_HEADER}
-        and headers.get(GATEWAY_CLIENT_HEADER) == GATEWAY_CLIENT
-        and isinstance(headers.get(RAMP_CLI_VERSION_HEADER, ""), str)
+def _merge_profile(existing: dict, written: dict) -> dict:
+    """The CLI's fields written over a profile Desktop or the user extended.
+
+    Fields Desktop adds in newer versions, and headers someone added, are
+    kept; the CLI's own fields and headers always take the written values.
+    """
+    merged = {**existing, **written}
+    headers = existing.get("inferenceCustomHeaders")
+    if isinstance(headers, dict):
+        merged["inferenceCustomHeaders"] = {
+            **headers,
+            **written["inferenceCustomHeaders"],
+        }
+    return merged
+
+
+def _cli_settings(profile: dict) -> dict:
+    """The profile with the CLI's headers and model discovery restored."""
+    current = _profile("placeholder", "https://router.invalid/v1")
+    return _merge_profile(
+        profile,
+        {
+            "inferenceCustomHeaders": current["inferenceCustomHeaders"],
+            "modelDiscoveryEnabled": current["modelDiscoveryEnabled"],
+        },
     )
 
 
@@ -526,30 +489,6 @@ def claude_pids() -> list[int]:
 
 def _claude_is_running() -> bool:
     return bool(claude_pids())
-
-
-def _claude_started_at() -> float | None:
-    """When the running Claude Desktop launched, or None when it isn't."""
-    pids = claude_pids()
-    if not pids:
-        return None
-    try:
-        out = subprocess.run(
-            ["ps", "-o", "lstart=", "-p", ",".join(map(str, pids))],
-            capture_output=True,
-            text=True,
-            timeout=2,
-            check=False,
-            env={**os.environ, "LC_ALL": "C"},
-        ).stdout
-        starts = [
-            time.mktime(time.strptime(line.strip(), "%a %b %d %H:%M:%S %Y"))
-            for line in out.splitlines()
-            if line.strip()
-        ]
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return None
-    return min(starts, default=None)
 
 
 def _ensure_claude_installed() -> None:
@@ -606,19 +545,6 @@ def _launch_claude(
             or "Ramp Router was configured, but Claude Desktop could not be reopened. "
             "Open Claude manually to finish setup."
         )
-
-
-def _launch_after_write(**kwargs) -> None:
-    """Launch Desktop and note it: only this launch's seal is the CLI's key."""
-    launched = time.time()
-    _launch_claude(**kwargs)
-    state = _read_state()
-    if state is not None and state.get("sealed_marker") is None:
-        state["desktop_launched_at"] = launched
-        try:
-            _write_private_json(state_path(), state)
-        except OSError:
-            pass
 
 
 def _read_state() -> dict | None:
@@ -762,7 +688,10 @@ def _configure_stopped(
         # deployment mode is last so Claude never starts against a missing
         # profile or library entry.
         _write_private_json(state_path(), state)
-        _write_private_json(profile_path, profile)
+        _write_private_json(
+            profile_path,
+            _merge_profile(previous_profile, profile) if profile_existed else profile,
+        )
         _write_private_json(_config_meta_path(), meta)
         _write_private_json(_desktop_config_path(), desktop_config)
     except BaseException as exc:
@@ -1131,13 +1060,6 @@ def sync_code_sessions() -> int:
         return _sync_code_sessions(_read_state())
 
 
-def recognize_sealed_key() -> None:
-    """Validate an already verified seal without prompting in the background."""
-    if sys.platform == "darwin" and _claude_is_running():
-        with transaction_lock():
-            configured_api_key()
-
-
 def claude_is_running() -> bool:
     """Whether Claude Desktop is currently running on this host."""
     return _claude_is_running()
@@ -1216,7 +1138,7 @@ def configure(
             model_ids, still_safe=lambda: not _claude_is_running()
         )
         _sync_code_sessions(_read_state())
-        _launch_after_write(fresh_cowork=True)
+        _launch_claude(fresh_cowork=True)
         return profile_path, migrated
 
 
@@ -1276,7 +1198,7 @@ def configured_api_key() -> str:
     if api_key is None:
         raise click.ClickException(
             "The Claude Desktop Router credential changed after setup. "
-            "Open Ramp Router to verify Keychain access, or reconnect explicitly."
+            "Run 'ramp router configure desktop' to reconnect it."
         )
     return api_key
 
@@ -1303,7 +1225,7 @@ def configured_gateway_base_url() -> str:
     if profile.get("inferenceGatewayBaseUrl") != base_url:
         raise click.ClickException(
             "The Claude Desktop Router endpoint changed after setup. "
-            "Run the configure command again to adopt it."
+            "Run 'ramp router configure desktop' to reconnect it."
         )
     return base_url
 
@@ -1374,14 +1296,16 @@ def _migrate_gateway_base_url(
     if profile is None:
         raise click.ClickException(
             "The Claude Desktop Router profile is missing. "
-            "Run the configure command again to repair it."
+            "Run 'ramp router configure desktop' to repair it."
         )
     profile_path = _profile_path(state["profile_id"])
-    updated_profile = {**profile, "inferenceGatewayBaseUrl": replacement}
+    updated_profile = _cli_settings({**profile, "inferenceGatewayBaseUrl": replacement})
     updated_state = {**state, "gateway_base_url": replacement}
     if api_key is not None:
         # replacement is already normalized; _profile strips one /v1 itself.
-        updated_profile = _profile(api_key, replacement + "/v1")
+        updated_profile = _merge_profile(
+            profile, _profile(api_key, replacement + "/v1")
+        )
         updated_state.update(_credential_receipt(api_key, replacement))
     try:
         _write_private_json(profile_path, updated_profile)
@@ -1410,13 +1334,14 @@ def refresh_agent_routing(*, restart: bool = False) -> None:
         )
         # A sealed direct key reads back as its local token.
         if endpoint == previous and token in (profile_key, api_key):
+            _restore_cli_settings()
             return
         # An edited profile is rejected below; find out before quitting the app.
         state = _read_state()
         if state is None or _owned_profile(state) is None:
             raise click.ClickException(
                 "The Claude Desktop Router profile is missing. "
-                "Run the configure command again to repair it."
+                "Run 'ramp router configure desktop' to repair it."
             )
         running = _claude_is_running()
         if running and restart:
@@ -1436,7 +1361,29 @@ def refresh_agent_routing(*, restart: bool = False) -> None:
                 )
         finally:
             if running and restart:
-                _launch_after_write()
+                _launch_claude()
+
+
+def _restore_cli_settings() -> None:
+    """Put back the CLI's headers and model discovery if they drifted.
+
+    Only while Desktop is closed, so its own writes cannot race this one.
+    """
+    if _claude_is_running():
+        return
+    state = _read_state()
+    profile = _owned_profile(state) if state is not None else None
+    if profile is None:
+        return
+    updated = _cli_settings(profile)
+    if updated == profile:
+        return
+    try:
+        _write_private_json(_profile_path(state["profile_id"]), updated)
+    except OSError as exc:
+        raise click.ClickException(
+            f"Could not update the Claude Desktop Router profile: {exc}"
+        ) from None
 
 
 def _owned_profile(state: dict) -> dict | None:
@@ -1447,34 +1394,40 @@ def _owned_profile(state: dict) -> dict | None:
         return None
     _validate_owned_profile_fields(profile, state)
     if _profile_key(profile.get("inferenceGatewayApiKey"), state) is None:
-        raise click.ClickException(
-            "The Claude Desktop Router profile changed after setup, so the CLI "
-            "will not remove it automatically."
-        )
+        raise click.ClickException(_PROFILE_CHANGED)
     return profile
 
 
+_PROFILE_CHANGED = (
+    "The Claude Desktop Router profile changed after setup. "
+    "Run 'ramp router configure desktop' to reconnect it."
+)
+
+
 def _validate_owned_profile_fields(profile: dict, state: dict) -> None:
-    expected_keys = set(_profile("placeholder", "https://router.invalid/v1"))
+    """Reject edits someone made on purpose; tolerate everything else.
+
+    A different endpoint or provider is a deliberate choice that automatic
+    updates must not undo. Extra fields (Desktop adds them in new versions),
+    headers, and model discovery are not: rewrites keep the extra fields and
+    restore the CLI's own settings.
+    """
     if (
-        set(profile) != expected_keys
-        or profile.get("inferenceProvider") != "gateway"
+        profile.get("inferenceProvider") != "gateway"
         or profile.get("inferenceCredentialKind") != "static"
         or profile.get("inferenceGatewayAuthScheme") != "bearer"
-        or not _owned_custom_headers(profile.get("inferenceCustomHeaders"))
-        or profile.get("modelDiscoveryEnabled") is not True
         or profile.get("inferenceGatewayBaseUrl") != state.get("gateway_base_url")
     ):
-        raise click.ClickException(
-            "The Claude Desktop Router profile changed after setup, so the CLI "
-            "will not remove it automatically."
-        )
+        raise click.ClickException(_PROFILE_CHANGED)
 
 
 def _unconfigure_stopped(state: dict) -> None:
     """Restore the previous profile after Claude Desktop has stopped."""
-    previous_profile = _owned_profile(state)
-    profile_existed = previous_profile is not None
+    # Explicit removal trusts the recorded profile ID, not its mutable contents.
+    # Desktop encrypts credentials after setup; disconnect must not need a key.
+    previous_profile, profile_existed = _read_object(
+        _profile_path(state["profile_id"]), "Claude Desktop Router profile"
+    )
 
     meta, meta_existed = _read_object(
         _config_meta_path(), "Claude Desktop configuration library"
@@ -1588,11 +1541,7 @@ def unconfigure() -> None:
                 "Ramp Router is not configured in Claude Desktop."
             )
 
-        # Refuse unverified credentials before interrupting Desktop; check
-        # again after quit in case Desktop flushed a changed profile.
-        state = _read_state()
-        if state is not None:
-            _owned_profile(state)
+        _read_state()
         _quit_claude()
         try:
             state = _read_state()

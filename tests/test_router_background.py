@@ -218,6 +218,44 @@ def test_client_refresh_failure_saves_opt_in_and_reports_repair(
     assert router_repo.status()["refresh_failures"] == []
 
 
+def test_desktop_route_failures_are_reported_even_when_models_sync(monkeypatch):
+    monkeypatch.setattr(
+        router_module, "_scheduled_sync_connections", lambda: [object()]
+    )
+    monkeypatch.setattr(router_repo, "service_supported", lambda: True)
+    monkeypatch.setattr(router_repo, "ensure_running", lambda: True)
+    monkeypatch.setattr(router_repo, "health", lambda: {"local_auth": True})
+    monkeypatch.setattr(router_module, "clients_using_repo_helper", lambda: ["cowork"])
+    monkeypatch.setattr(router_module, "configured_router_clients", lambda: ())
+    route_error = "Claude Desktop's route was left unchanged."
+    monkeypatch.setattr(
+        router_module,
+        "_refresh_cowork_model_selections",
+        lambda **_kw: {
+            "route_error": route_error,
+            "client": "cowork",
+            "migrated_model_selections": 0,
+            "skipped_while_running": False,
+        },
+    )
+
+    enabled = invoke("enable")
+    assert enabled.exit_code == 0, enabled.output
+    failures = [{"client": "cowork", "error": route_error}]
+    assert router_repo.status()["refresh_failures"] == failures
+
+    disabled = invoke("disable")
+    assert disabled.exit_code == 0, disabled.output
+    assert f"Claude Desktop: {route_error}" in disabled.output
+    # Models still synced, so scheduled refresh does not keep retrying.
+    assert router_module._cowork_refreshed(
+        [{"client": "cowork", "route_error": route_error}]
+    )
+    assert not router_module._cowork_refreshed(
+        [{"client": "cowork", "error": "models failed"}]
+    )
+
+
 def test_timer_fallback_reports_no_tagging_and_rejects_port(monkeypatch):
     monkeypatch.setattr(
         router_module, "_scheduled_sync_connections", lambda: [object()]

@@ -2769,29 +2769,24 @@ def _refresh_cowork_model_selections(
     """
     if not claude_cowork.state_path().exists():
         return None
-    # Pick up sessions a mode switch hid. Credential checks never open Keychain;
-    # an unverified seal is surfaced as an error for an explicit recovery.
+    # Pick up sessions a mode switch hid.
     with contextlib.suppress(click.ClickException):
         claude_cowork.sync_code_sessions()
-    with contextlib.suppress(click.ClickException):
-        claude_cowork.recognize_sealed_key()
     # Background refreshes also keep the route in step (the agent setting, or
     # SSH sessions that cannot reach it), but only while Desktop is closed, so
     # they never quit it. A temporary fallback is undone the same way.
+    # A route left unchanged still has a usable credential, so model sync runs.
+    route: dict[str, str] = {}
     if not models_only or not claude_cowork.claude_is_running():
         try:
             claude_cowork.refresh_agent_routing(
                 restart=restart_desktop and not models_only
             )
         except click.ClickException as exc:
-            return {
-                "client": COWORK_CLIENT,
-                "migrated_model_selections": 0,
-                "skipped_while_running": False,
-                "error": exc.message,
-            }
+            route = {"route_error": exc.message}
     if claude_cowork.claude_is_running():
         return {
+            **route,
             "client": COWORK_CLIENT,
             "migrated_model_selections": 0,
             "skipped_while_running": True,
@@ -2815,6 +2810,7 @@ def _refresh_cowork_model_selections(
                 base_url = DEFAULT_ROUTER_BASE_URL
             elif claude_cowork.claude_is_running():
                 return {
+                    **route,
                     "client": COWORK_CLIENT,
                     "migrated_model_selections": 0,
                     "skipped_while_running": True,
@@ -2839,12 +2835,14 @@ def _refresh_cowork_model_selections(
         )
     except click.ClickException as exc:
         return {
+            **route,
             "client": COWORK_CLIENT,
             "migrated_model_selections": 0,
             "skipped_while_running": False,
             "error": exc.message,
         }
     return {
+        **route,
         "client": COWORK_CLIENT,
         "migrated_model_selections": len(outcome.migrated),
         "skipped_while_running": outcome.skipped_while_running,
@@ -2852,7 +2850,21 @@ def _refresh_cowork_model_selections(
     }
 
 
+def _cowork_failure(result: dict) -> str | None:
+    """Desktop's route and model errors, for callers that report failures."""
+    return (
+        " ".join(result[key] for key in ("route_error", "error") if result.get(key))
+        or None
+    )
+
+
 def _cowork_refresh_message(result: dict) -> str:
+    route_error = result.get("route_error")
+    message = _cowork_models_message(result)
+    return f"{route_error} {message}" if route_error else message
+
+
+def _cowork_models_message(result: dict) -> str:
     error = result.get("error")
     if error is not None:
         return f"Claude Desktop's saved model selections were not checked: {error}"
@@ -2985,8 +2997,10 @@ def router_agent_disable(ctx: click.Context) -> None:
     tagging = router_repo.enabled() or router_repo.listener_port() is not None
     if tagging or clients_using_repo_helper():
         for result in router_repo.disable(ctx)["refreshed"]:
-            if result.get("client") == COWORK_CLIENT and result.get("error"):
-                click.echo(f"Claude Desktop: {result['error']}", err=True)
+            if result.get("client") == COWORK_CLIENT and (
+                failure := _cowork_failure(result)
+            ):
+                click.echo(f"Claude Desktop: {failure}", err=True)
     _print_background_status(ctx)
     if (
         tagging
@@ -3327,10 +3341,9 @@ def _refresh_clients(
     )
     if cowork_result is not None:
         results.append(cowork_result)
-        if failures_out is not None and cowork_result.get("error"):
-            failures_out.append(
-                {"client": COWORK_CLIENT, "error": cowork_result["error"]}
-            )
+        cowork_failure = _cowork_failure(cowork_result)
+        if failures_out is not None and cowork_failure:
+            failures_out.append({"client": COWORK_CLIENT, "error": cowork_failure})
     if results:
         # Before the failure check, so one broken setup cannot keep the job
         # from the healthy ones.
@@ -4473,6 +4486,8 @@ def _scheduled_tick(
 def _cowork_refreshed(results: list[dict]) -> bool:
     cowork = next((r for r in results if r.get("client") == COWORK_CLIENT), None)
     return cowork is None or not (
+        # A route left unchanged is reported, but models synced; retrying
+        # would repeat the same pass until the user reconnects Desktop.
         cowork.get("skipped_while_running") or cowork.get("error")
     )
 
@@ -12802,10 +12817,6 @@ class ConfigureMenuGroup(click.Group):
         return super().parse_args(ctx, args)
 
 
-@click.command("desktop-credential", hidden=True)
-@click.option(
-    "--verify", is_flag=True, help="Verify a native-app proof supplied on stdin."
-)
 def router_desktop_credential(verify: bool) -> None:
     """Native app credential handshake. Never opens Keychain or prints a key."""
     if verify:
@@ -12859,7 +12870,6 @@ def _organize_router_menu() -> None:
     connect = router_group.commands.pop("configure")
     connect.short_help = "Connect coding harnesses."
     configure.add_command(connect, "connect")
-    configure.add_command(router_desktop_credential)
     configure.add_command(router_configure_list)
     configure.add_command(router_configure_models)
     configure.add_command(router_set_model)

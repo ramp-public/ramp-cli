@@ -6,7 +6,6 @@ import json
 import os
 import plistlib
 import stat
-import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -436,39 +435,30 @@ def test_interrupted_unconfigure_restores_all_router_files(cowork_host, monkeypa
     assert events == ["quit", "launch", "quit", "launch"]
 
 
-def test_unconfigure_refuses_to_delete_a_profile_the_user_changed(cowork_host):
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"custom": True},
+        {"inferenceGatewayBaseUrl": "https://different.example"},
+        {"inferenceGatewayApiKey": "__sealed__:v1:unverified"},
+        {"inferenceGatewayApiKey": "replacement-secret"},
+        {"inferenceGatewayApiKey": None},
+    ],
+)
+def test_unconfigure_removes_the_recorded_profile_despite_changes(cowork_host, changes):
     _root, events = cowork_host
     profile_path, _ = claude_cowork.configure(
         "router-secret", "https://router.example/v1"
     )
     profile = json.loads(profile_path.read_text())
-    profile["custom"] = True
+    profile.update(changes)
     profile_path.write_text(json.dumps(profile))
 
-    with pytest.raises(click.ClickException, match="changed after setup"):
-        claude_cowork.unconfigure()
+    claude_cowork.unconfigure()
 
-    assert profile_path.exists()
-    assert claude_cowork.state_path().exists()
-    # An unowned profile is rejected before interrupting Desktop.
-    assert events == ["quit", "launch"]
-
-
-def test_unconfigure_refuses_to_delete_a_profile_with_a_changed_gateway(cowork_host):
-    _root, events = cowork_host
-    profile_path, _ = claude_cowork.configure(
-        "router-secret", "https://router.example/v1"
-    )
-    profile = json.loads(profile_path.read_text())
-    profile["inferenceGatewayBaseUrl"] = "https://different.example"
-    profile_path.write_text(json.dumps(profile))
-
-    with pytest.raises(click.ClickException, match="changed after setup"):
-        claude_cowork.unconfigure()
-
-    assert profile_path.exists()
-    assert claude_cowork.state_path().exists()
-    assert events == ["quit", "launch"]
+    assert not profile_path.exists()
+    assert not claude_cowork.state_path().exists()
+    assert events == ["quit", "launch", "quit", "launch"]
 
 
 @pytest.mark.parametrize("recorded_version", ["0.1.0", None])
@@ -979,8 +969,7 @@ def test_migrate_gateway_base_url_keeps_the_original_restore_snapshot(cowork_hos
         "inferenceGatewayBaseUrl": "https://api.router.com",
     }
     state = json.loads(claude_cowork.state_path().read_text())
-    receipt = {"credential_marker", "credential_ref", "desktop_launched_at"}
-    receipt.add("sealed_marker")
+    receipt = {"credential_marker", "credential_ref"}
     assert {k: v for k, v in state.items() if k not in receipt} == {
         **{k: v for k, v in original_state.items() if k not in receipt},
         "gateway_base_url": "https://api.router.com",
@@ -1499,102 +1488,183 @@ def test_agent_routing_keeps_a_real_v1_in_the_gateway_path(tagging):
     assert claude_cowork.configured_gateway_base_url() == "https://api.router.com/v1"
 
 
-def test_a_key_sealed_by_desktop_still_belongs_to_the_cli(tagging, monkeypatch):
+def test_a_key_sealed_by_desktop_keeps_refresh_and_routing_working(
+    tagging, monkeypatch
+):
     router_repo._save_settings({"enabled": False})
     profile_path, _ = claude_cowork.configure(
-        "router-secret", "https://api.router.com/v1"
+        "router-secret", router.LEGACY_ROUTER_BASE_URL
     )
-    launched = time.time()
-    monkeypatch.setattr(claude_cowork, "_claude_started_at", lambda: launched)
-    plaintext = claude_cowork.configured_api_key()
 
-    def seal(value, after_launch=1):
-        nonlocal plaintext
-        # Desktop seals the key at rest while it launches.
+    def seal(value):
         profile = json.loads(profile_path.read_text())
-        if not profile["inferenceGatewayApiKey"].startswith("__sealed__:"):
-            plaintext = profile["inferenceGatewayApiKey"]
         profile["inferenceGatewayApiKey"] = f"__sealed__:v1:{value}"
         profile_path.write_text(json.dumps(profile))
-        os.utime(profile_path, (launched + after_launch, launched + after_launch))
 
-    # A key sealed long after launch was entered in Desktop, not written here.
-    seal("edited-later", after_launch=600)
-    with pytest.raises(click.ClickException, match="changed after setup"):
-        claude_cowork.configured_api_key()
+    # No Keychain, Router app, or Desktop launch is involved.
     seal("first")
-    # Even the expected launch timing needs proof of plaintext ownership.
-    request = claude_cowork.desktop_credential_request()
-    claude_cowork.verify_desktop_credential(
-        {"challenge": request["challenge"], "key": plaintext}
+    assert claude_cowork.configured_router_connection() == (
+        "router-secret",
+        "https://router-api.ramp.com",
     )
-    connection = ("router-secret", "https://api.router.com")
-    assert claude_cowork.configured_router_connection() == connection
+    # Automatic updates rewrite the CLI-owned profile with the setup's key.
+    assert claude_cowork.migrate_gateway_base_url(
+        "https://router-api.ramp.com", "https://api.router.com"
+    )
+    seal("second")
     router_repo._save_settings({"enabled": True})
     claude_cowork.refresh_agent_routing()
     assert router_repo.is_wrapped(claude_cowork.configured_gateway_base_url())
-    # Desktop was closed for that rewrite and opened by someone else: the
-    # profile could have been edited before this seal, so it isn't adopted.
-    launched = time.time()
-    seal("edited-while-closed")
-    with pytest.raises(click.ClickException, match="changed after setup"):
-        claude_cowork.configured_api_key()
-    claude_cowork.configure("router-secret", "https://api.router.com/v1")
-    launched = time.time()
-    seal("second")
-    request = claude_cowork.desktop_credential_request()
-    claude_cowork.verify_desktop_credential(
-        {"challenge": request["challenge"], "key": plaintext}
+    seal("third")
+    router_repo._save_settings({"enabled": False})
+    claude_cowork.refresh_agent_routing()
+    assert claude_cowork.configured_router_connection() == (
+        "router-secret",
+        "https://api.router.com",
     )
-    assert claude_cowork.configured_router_connection() == connection
-    seal("someone-elses")
-    with pytest.raises(click.ClickException, match="changed after setup"):
-        claude_cowork.configured_api_key()
-    seal("second")
+    # Reconnecting is how the key changes; refresh follows the new key.
+    claude_cowork.configure("rotated-secret", "https://api.router.com/v1")
+    seal("fourth")
+    assert claude_cowork.configured_router_connection()[0] == "rotated-secret"
     claude_cowork.unconfigure()
     assert not profile_path.exists()
 
 
+def test_a_sealed_profile_with_other_edits_is_not_rewritten(tagging):
+    router_repo._save_settings({"enabled": False})
+    profile_path, _ = claude_cowork.configure(
+        "router-secret", "https://api.router.com/v1"
+    )
+    profile = json.loads(profile_path.read_text())
+    profile["inferenceGatewayApiKey"] = "__sealed__:v1:sealed"
+    profile["inferenceGatewayBaseUrl"] = "https://other.example"
+    profile_path.write_text(json.dumps(profile))
+    before = profile_path.read_bytes()
+
+    router_repo._save_settings({"enabled": True})
+    with pytest.raises(click.ClickException, match="changed after setup"):
+        claude_cowork.refresh_agent_routing()
+    assert profile_path.read_bytes() == before
+
+
+def test_fields_desktop_adds_never_block_or_get_lost(tagging, monkeypatch):
+    router_repo._save_settings({"enabled": False})
+    profile_path, _ = claude_cowork.configure(
+        "router-secret", "https://api.router.com/v1"
+    )
+    profile = json.loads(profile_path.read_text())
+    # A newer Desktop adds a field, someone adds a header, and model discovery
+    # and the CLI version header drift. None of this is a reason to reconnect.
+    profile["inferenceGatewayApiKey"] = "__sealed__:v1:sealed"
+    profile["desktopAddedField"] = {"kept": True}
+    profile["modelDiscoveryEnabled"] = False
+    profile["inferenceCustomHeaders"] = {
+        claude_cowork.GATEWAY_CLIENT_HEADER: "something-else",
+        claude_cowork.RAMP_CLI_VERSION_HEADER: "0.0.1",
+        "X-Team": "data",
+    }
+    profile_path.write_text(json.dumps(profile))
+
+    # Desktop is open: nothing is written behind it.
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: True)
+    before = profile_path.read_bytes()
+    claude_cowork.refresh_agent_routing()
+    assert profile_path.read_bytes() == before
+
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: False)
+    claude_cowork.refresh_agent_routing()
+    repaired = json.loads(profile_path.read_text())
+    assert repaired["desktopAddedField"] == {"kept": True}
+    assert repaired["modelDiscoveryEnabled"] is True
+    assert repaired["inferenceCustomHeaders"] == {
+        claude_cowork.GATEWAY_CLIENT_HEADER: claude_cowork.GATEWAY_CLIENT,
+        claude_cowork.RAMP_CLI_VERSION_HEADER: __version__,
+        "X-Team": "data",
+    }
+    assert repaired["inferenceGatewayApiKey"] == "__sealed__:v1:sealed"
+
+    # A route change rewrites the CLI's fields and keeps the rest.
+    router_repo._save_settings({"enabled": True})
+    claude_cowork.refresh_agent_routing()
+    routed = json.loads(profile_path.read_text())
+    assert router_repo.is_wrapped(routed["inferenceGatewayBaseUrl"])
+    assert routed["desktopAddedField"] == {"kept": True}
+    assert routed["inferenceCustomHeaders"]["X-Team"] == "data"
+
+    # So does an explicit reconnect.
+    claude_cowork.configure("router-secret", "https://api.router.com/v1")
+    assert json.loads(profile_path.read_text())["desktopAddedField"] == {"kept": True}
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        {"inferenceGatewayBaseUrl": "https://qa-router.example.com"},
+        {"inferenceProvider": "bedrock"},
+        {"inferenceGatewayAuthScheme": "x-api-key"},
+    ],
+    ids=["endpoint", "provider", "auth"],
+)
+def test_a_deliberate_profile_change_still_needs_a_reconnect(tagging, edit):
+    router_repo._save_settings({"enabled": False})
+    profile_path, _ = claude_cowork.configure(
+        "router-secret", "https://api.router.com/v1"
+    )
+    profile = json.loads(profile_path.read_text())
+    profile.update(edit)
+    profile_path.write_text(json.dumps(profile))
+    before = profile_path.read_bytes()
+
+    router_repo._save_settings({"enabled": True})
+    with pytest.raises(click.ClickException, match="configure desktop"):
+        claude_cowork.refresh_agent_routing()
+    assert profile_path.read_bytes() == before
+
+
+def test_an_old_receipt_finds_its_sealed_key_in_cli_storage(tagging):
+    router_repo._save_settings({"enabled": False})
+    profile_path, _ = claude_cowork.configure(
+        "router-secret", "https://api.router.com/v1"
+    )
+    # Receipts from before local tokens were recorded keep only the marker.
+    state = json.loads(claude_cowork.state_path().read_text())
+    state.pop("credential_ref", None)
+    claude_cowork.state_path().write_text(json.dumps(state))
+    profile = json.loads(profile_path.read_text())
+    profile["inferenceGatewayApiKey"] = "__sealed__:v1:old"
+    profile_path.write_text(json.dumps(profile))
+
+    assert claude_cowork.configured_router_connection() == (
+        "router-secret",
+        "https://api.router.com",
+    )
+    # Without a matching saved credential there is nothing safe to use.
+    state["credential_marker"] = claude_cowork._credential_marker("other-secret")
+    claude_cowork.state_path().write_text(json.dumps(state))
+    with pytest.raises(click.ClickException, match="configure desktop"):
+        claude_cowork.configured_api_key()
+
+
 @pytest.mark.parametrize("changed_on_quit", [False, True])
-def test_unconfigure_revalidates_a_verified_seal_after_quitting_desktop(
+def test_unconfigure_removes_a_profile_even_if_desktop_changes_its_seal_on_quit(
     cowork_host, monkeypatch, changed_on_quit
 ):
     profile_path, _ = claude_cowork.configure(
         "router-secret", "https://router.example/v1"
     )
-    launched = time.time()
-    running = True
-    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: running)
-    monkeypatch.setattr(
-        claude_cowork, "_claude_started_at", lambda: launched if running else None
-    )
     profile = json.loads(profile_path.read_text())
     profile["inferenceGatewayApiKey"] = "__sealed__:v1:ours"
     profile_path.write_text(json.dumps(profile))
-    os.utime(profile_path, (launched + 1, launched + 1))
 
     def quit_desktop():
-        nonlocal running
-        running = False
         if changed_on_quit:
             profile["inferenceGatewayApiKey"] = "__sealed__:v1:someone-elses"
             profile_path.write_text(json.dumps(profile))
 
     monkeypatch.setattr(claude_cowork, "_quit_claude", quit_desktop)
-    assert claude_cowork._read_state()["sealed_marker"] is None
-    request = claude_cowork.desktop_credential_request()
-    claude_cowork.verify_desktop_credential(
-        {"challenge": request["challenge"], "key": "router-secret"}
-    )
-    if changed_on_quit:
-        with pytest.raises(click.ClickException, match="changed after setup"):
-            claude_cowork.unconfigure()
-        assert profile_path.exists()
-        assert claude_cowork.state_path().exists()
-    else:
-        claude_cowork.unconfigure()
-        assert not profile_path.exists()
-        assert not claude_cowork.state_path().exists()
+    claude_cowork.unconfigure()
+    assert not profile_path.exists()
+    assert not claude_cowork.state_path().exists()
 
 
 def test_a_rotated_key_never_falls_back_to_the_previous_ref(cowork_host, monkeypatch):

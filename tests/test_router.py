@@ -4501,7 +4501,9 @@ def _stale_cowork_selection(tmp_path, monkeypatch):
             }
         )
     )
-    monkeypatch.setattr(claude_cowork, "configured_api_key", lambda: "cowork-secret")
+    monkeypatch.setattr(
+        claude_cowork, "configured_api_key", lambda **_kw: "cowork-secret"
+    )
     monkeypatch.setattr(
         claude_cowork,
         "configured_gateway_base_url",
@@ -4591,7 +4593,7 @@ def test_cowork_refresh_keeps_key_and_endpoint_paired_across_reconfigure(
     monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: False)
     connection = ["legacy-key", "https://router-api.ramp.com"]
 
-    def read_connection():
+    def read_connection(**_kw):
         return tuple(connection)
 
     def migrate(_previous, _replacement):
@@ -4650,7 +4652,7 @@ def test_refresh_reports_an_unusable_cowork_setup_without_failing(
     before = settings_path.read_text()
     monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: False)
 
-    def raise_credential_changed():
+    def raise_credential_changed(**_kw):
         raise click.ClickException(
             "The Claude Desktop Router credential changed after setup."
         )
@@ -4665,6 +4667,37 @@ def test_refresh_reports_an_unusable_cowork_setup_without_failing(
         "The Claude Desktop Router credential changed after setup."
     ) in result.output
     assert settings_path.read_text() == before
+
+
+def test_refresh_syncs_cowork_models_when_its_route_cannot_change(
+    tmp_path, monkeypatch
+):
+    settings_path = _stale_cowork_selection(tmp_path, monkeypatch)
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: False)
+
+    def route_unchanged(**_kwargs):
+        raise click.ClickException("Claude Desktop's route was left unchanged.")
+
+    monkeypatch.setattr(claude_cowork, "refresh_agent_routing", route_unchanged)
+    monkeypatch.setattr(
+        router_module,
+        "_fetch_models",
+        lambda *_a, **_kw: [
+            _router_model(
+                "claude-fable-router-5-6-sol-419255[1m]",
+                request_name="gpt-5.6-sol",
+                display_name="5.6 Sol",
+            )
+        ],
+    )
+
+    result = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+
+    assert result.exit_code == 0, result.output
+    assert "Claude Desktop's route was left unchanged." in result.output
+    assert "Updated 1 saved Claude Desktop model selection" in result.output
+    selector = json.loads(settings_path.read_text())["__model_selector_state"]
+    assert selector["cowork"]["model"] == "claude-fable-router-5-6-sol-419255[1m]"
 
 
 def test_refresh_without_the_configure_environment_keeps_stored_endpoints(
