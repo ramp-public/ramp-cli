@@ -2769,6 +2769,12 @@ def _refresh_cowork_model_selections(
     """
     if not claude_cowork.state_path().exists():
         return None
+    # Pick up sessions a mode switch hid. Credential checks never open Keychain;
+    # an unverified seal is surfaced as an error for an explicit recovery.
+    with contextlib.suppress(click.ClickException):
+        claude_cowork.sync_code_sessions()
+    with contextlib.suppress(click.ClickException):
+        claude_cowork.recognize_sealed_key()
     # Background refreshes also keep the route in step (the agent setting, or
     # SSH sessions that cannot reach it), but only while Desktop is closed, so
     # they never quit it. A temporary fallback is undone the same way.
@@ -12796,6 +12802,30 @@ class ConfigureMenuGroup(click.Group):
         return super().parse_args(ctx, args)
 
 
+@click.command("desktop-credential", hidden=True)
+@click.option(
+    "--verify", is_flag=True, help="Verify a native-app proof supplied on stdin."
+)
+def router_desktop_credential(verify: bool) -> None:
+    """Native app credential handshake. Never opens Keychain or prints a key."""
+    if verify:
+        try:
+            raw = click.get_text_stream("stdin").read(65537)
+            if len(raw) > 65536:
+                raise ValueError
+            proof = json.loads(raw)
+            if not isinstance(proof, dict):
+                raise ValueError
+        except (ValueError, UnicodeError):
+            raise click.ClickException(
+                "Invalid desktop credential verification request."
+            ) from None
+        result = claude_cowork.verify_desktop_credential(proof)
+    else:
+        result = claude_cowork.desktop_credential_request()
+    print_json(result)
+
+
 def _organize_router_menu() -> None:
     """Group setup/account actions; keep refresh and subagents at the root."""
     legacy: dict[str, click.Command] = {}
@@ -12829,6 +12859,7 @@ def _organize_router_menu() -> None:
     connect = router_group.commands.pop("configure")
     connect.short_help = "Connect coding harnesses."
     configure.add_command(connect, "connect")
+    configure.add_command(router_desktop_credential)
     configure.add_command(router_configure_list)
     configure.add_command(router_configure_models)
     configure.add_command(router_set_model)

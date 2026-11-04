@@ -6,6 +6,7 @@ import json
 import os
 import plistlib
 import stat
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -449,8 +450,8 @@ def test_unconfigure_refuses_to_delete_a_profile_the_user_changed(cowork_host):
 
     assert profile_path.exists()
     assert claude_cowork.state_path().exists()
-    # The profile is read only after Claude stops, then the app is reopened.
-    assert events == ["quit", "launch", "quit", "launch"]
+    # An unowned profile is rejected before interrupting Desktop.
+    assert events == ["quit", "launch"]
 
 
 def test_unconfigure_refuses_to_delete_a_profile_with_a_changed_gateway(cowork_host):
@@ -467,7 +468,7 @@ def test_unconfigure_refuses_to_delete_a_profile_with_a_changed_gateway(cowork_h
 
     assert profile_path.exists()
     assert claude_cowork.state_path().exists()
-    assert events == ["quit", "launch", "quit", "launch"]
+    assert events == ["quit", "launch"]
 
 
 @pytest.mark.parametrize("recorded_version", ["0.1.0", None])
@@ -977,10 +978,16 @@ def test_migrate_gateway_base_url_keeps_the_original_restore_snapshot(cowork_hos
         **original_profile,
         "inferenceGatewayBaseUrl": "https://api.router.com",
     }
-    assert json.loads(claude_cowork.state_path().read_text()) == {
-        **original_state,
+    state = json.loads(claude_cowork.state_path().read_text())
+    receipt = {"credential_marker", "credential_ref", "desktop_launched_at"}
+    receipt.add("sealed_marker")
+    assert {k: v for k, v in state.items() if k not in receipt} == {
+        **{k: v for k, v in original_state.items() if k not in receipt},
         "gateway_base_url": "https://api.router.com",
     }
+    # The key's local token is re-registered for the new host.
+    assert state["credential_ref"] != original_state["credential_ref"]
+    assert claude_cowork.configured_router_connection()[0] == "router-secret"
     assert not claude_cowork.migrate_gateway_base_url(
         "https://router-api.ramp.com", "https://api.router.com"
     )
@@ -1052,6 +1059,9 @@ def _write_code_session(
 ) -> Path:
     path = root / data_dir / "claude-code-sessions" / scope / f"local_{session_id}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
+    config = root / data_dir / "config.json"
+    if not config.exists():
+        config.write_text(json.dumps({"lastKnownAccountUuid": scope.split("/")[0]}))
     path.write_text(
         json.dumps(
             {
@@ -1063,6 +1073,13 @@ def _write_code_session(
         )
     )
     return path
+
+
+def _sync_as(setup: str | None = "acct") -> int:
+    """Sync as if Router was set up from ``setup`` (None: no receipt)."""
+    return claude_cowork._sync_code_sessions(
+        {"first_party_account": setup} if setup else None
+    )
 
 
 def _code_session_titles(root: Path, data_dir: str) -> dict[str, str]:
@@ -1085,7 +1102,7 @@ def test_configure_and_unconfigure_carry_code_sessions_across_modes(cowork_host)
     _write_code_session(
         root,
         "Claude-3p",
-        "acct/org",
+        "3p/org",
         "z",
         "cli-z",
         title="Old 3p",
@@ -1098,14 +1115,14 @@ def test_configure_and_unconfigure_carry_code_sessions_across_modes(cowork_host)
         "cli-a": "Before",
         "cli-z": "Old 3p",
     }
-    copied = root / "Claude-3p/claude-code-sessions/acct/org/local_a.json"
+    copied = root / "Claude-3p/claude-code-sessions/3p/org/local_a.json"
     assert stat.S_IMODE(copied.stat().st_mode) == 0o600
 
     # Work continues in third-party mode, then Router is removed.
     _write_code_session(
         root,
         "Claude-3p",
-        "acct/org",
+        "3p/org",
         "b",
         "cli-b",
         title="During",
@@ -1114,7 +1131,7 @@ def test_configure_and_unconfigure_carry_code_sessions_across_modes(cowork_host)
     _write_code_session(
         root,
         "Claude-3p",
-        "acct/org",
+        "3p/org",
         "a",
         "cli-a",
         title="Renamed",
@@ -1126,12 +1143,66 @@ def test_configure_and_unconfigure_carry_code_sessions_across_modes(cowork_host)
     assert _code_session_titles(root, "Claude") == {
         "cli-a": "Renamed",
         "cli-b": "During",
-        "cli-z": "Old 3p",
     }
+    assert claude_cowork._session_owners()["cli-z"] == ""
     # Entries already present are updated in place rather than duplicated.
     assert (
         len(list((root / "Claude/claude-code-sessions").glob("*/*/local_a.json"))) == 1
     )
+
+
+@pytest.mark.parametrize("sync", ["refresh", "unconfigure"])
+def test_first_setup_records_empty_session_baseline_before_router_sign_in(
+    cowork_host, sync
+):
+    root, _events = cowork_host
+    (root / "Claude/claude-code-sessions/acct/org").mkdir(parents=True)
+    (root / "Claude/config.json").write_text('{"lastKnownAccountUuid": "acct"}')
+
+    claude_cowork.configure("router-secret", "https://router.example/v1")
+
+    assert not (root / "Claude-3p/config.json").exists()
+    assert claude_cowork._session_owners() == {}
+    # Desktop's first Router launch creates its account and a new session.
+    _write_code_session(
+        root, "Claude-3p", "3p/org", "n", "cli-n", title="New", last_activity_at=1
+    )
+    if sync == "refresh":
+        assert claude_cowork.sync_code_sessions() == 1
+    else:
+        claude_cowork.unconfigure()
+
+    assert _code_session_titles(root, "Claude") == {"cli-n": "New"}
+    assert claude_cowork._session_owners() == {"cli-n": "acct"}
+
+
+def test_setup_records_existing_router_sessions_without_a_router_account(cowork_host):
+    root, _events = cowork_host
+    _write_code_session(
+        root, "Claude", "acct/org", "a", "cli-a", title="Mine", last_activity_at=1
+    )
+    _write_code_session(
+        root, "Claude-3p", "3p/org", "a", "cli-a", title="Mine", last_activity_at=1
+    )
+    _write_code_session(
+        root, "Claude-3p", "3p/org", "z", "cli-z", title="Old", last_activity_at=1
+    )
+    (root / "Claude-3p/config.json").unlink()
+
+    claude_cowork.configure("router-secret", "https://router.example/v1")
+
+    assert not (root / "Claude-3p/config.json").exists()
+    assert claude_cowork._session_owners() == {"cli-a": "acct", "cli-z": ""}
+    _write_code_session(
+        root, "Claude-3p", "3p/org", "n", "cli-n", title="New", last_activity_at=2
+    )
+    assert claude_cowork.sync_code_sessions() == 1
+    assert _code_session_titles(root, "Claude") == {"cli-a": "Mine", "cli-n": "New"}
+    assert claude_cowork._session_owners() == {
+        "cli-a": "acct",
+        "cli-z": "",
+        "cli-n": "acct",
+    }
 
 
 def test_code_session_sync_keeps_the_most_recently_active_entry(cowork_host):
@@ -1140,27 +1211,166 @@ def test_code_session_sync_keeps_the_most_recently_active_entry(cowork_host):
         root, "Claude", "acct/org", "a", "cli-a", title="Newer", last_activity_at=5
     )
     _write_code_session(
-        root, "Claude-3p", "acct/org", "a", "cli-a", title="Older", last_activity_at=4
+        root, "Claude-3p", "3p/org", "a", "cli-a", title="Older", last_activity_at=4
     )
 
-    assert claude_cowork._sync_code_sessions_stopped() == 1
+    assert _sync_as() == 1
     assert json.loads(newer.read_text())["title"] == "Newer"
     assert _code_session_titles(root, "Claude-3p") == {"cli-a": "Newer"}
-    assert claude_cowork._sync_code_sessions_stopped() == 0
+    assert _sync_as() == 0
 
 
 def test_code_session_sync_needs_a_signed_in_target(cowork_host):
     root, _events = cowork_host
     _write_code_session(
-        root, "Claude-3p", "acct/org", "z", "cli-z", title="3p", last_activity_at=1
+        root, "Claude-3p", "3p/org", "z", "cli-z", title="3p", last_activity_at=1
+    )
+    claude_cowork._write_private_json(
+        claude_cowork._session_owners_path(), {"cli-z": "acct"}
     )
 
-    assert claude_cowork._sync_code_sessions_stopped() == 0
+    assert _sync_as() == 0
     assert not (root / "Claude" / "claude-code-sessions").exists()
 
     (root / "Claude/claude-code-sessions/acct/org").mkdir(parents=True)
-    assert claude_cowork._sync_code_sessions_stopped() == 1
+    (root / "Claude/config.json").write_text('{"lastKnownAccountUuid": "acct"}')
+    assert _sync_as() == 1
     assert _code_session_titles(root, "Claude") == {"cli-z": "3p"}
+
+
+def test_code_session_sync_stays_within_the_configured_account(cowork_host):
+    root, _events = cowork_host
+    account = "6ffc11fb-0c8a-4c03-81f3-76e09540b507"
+    (root / "Claude").mkdir()
+    (root / "Claude/config.json").write_text(
+        json.dumps({"lastKnownAccountUuid": account})
+    )
+    _write_code_session(
+        root, "Claude", "other/org", "o", "cli-o", title="Other", last_activity_at=9
+    )
+    _write_code_session(
+        root, "Claude", f"{account}/org", "a", "cli-a", title="Mine", last_activity_at=1
+    )
+    _write_code_session(
+        root, "Claude-3p", "3p/org", "z", "cli-z", title="3p", last_activity_at=1
+    )
+    # Mirrored while Router was configured from the other account.
+    _write_code_session(
+        root, "Claude-3p", "3p/org", "o", "cli-o", title="Other", last_activity_at=9
+    )
+
+    # Without a setup, Router sessions have no owner yet and stay put.
+    assert _sync_as(None) == 0
+    # "3p" predates any recorded owner and has no first-party copy,
+    # so its owner is unknown and it stays in Router mode.
+    assert _sync_as(account) == 1
+    assert _code_session_titles(root, "Claude-3p")["cli-a"] == "Mine"
+    # A Router session made after that belongs to the setup's account.
+    _write_code_session(
+        root, "Claude-3p", "3p/org", "n", "cli-n", title="New", last_activity_at=2
+    )
+    assert _sync_as(account) == 1
+    mine = root / f"Claude/claude-code-sessions/{account}/org"
+    assert sorted(p.name for p in mine.iterdir()) == ["local_a.json", "local_n.json"]
+
+
+@pytest.mark.parametrize("ownership_file", [None, "not json"])
+def test_older_router_only_sessions_stay_unowned_with_one_account(
+    cowork_host, ownership_file
+):
+    root, _events = cowork_host
+    # A's first-party folder is gone; only B has sessions on this Mac.
+    _write_code_session(
+        root, "Claude", "b/org", "b", "cli-b", title="B's", last_activity_at=1
+    )
+    _write_code_session(
+        root, "Claude-3p", "3p/org", "a", "cli-a", title="Under A", last_activity_at=1
+    )
+    if ownership_file is not None:
+        claude_cowork._session_owners_path().write_text(ownership_file)
+
+    assert _sync_as("b") == 1
+    assert claude_cowork._session_owners() == {"cli-a": "", "cli-b": "b"}
+    assert _code_session_titles(root, "Claude") == {"cli-b": "B's"}
+    assert _code_session_titles(root, "Claude-3p") == {
+        "cli-a": "Under A",
+        "cli-b": "B's",
+    }
+    # Recording an unknown owner keeps later passes from claiming it, too.
+    assert _sync_as("b") == 0
+    assert _sync_as(None) == 0
+    assert claude_cowork._session_owners()["cli-a"] == ""
+    assert _code_session_titles(root, "Claude") == {"cli-b": "B's"}
+
+
+def test_router_sessions_only_go_back_to_the_account_they_were_made_under(
+    cowork_host,
+):
+    root, _events = cowork_host
+    config = root / "Claude/config.json"
+    _write_code_session(
+        root, "Claude", "a/org", "x", "cli-x", title="A's", last_activity_at=1
+    )
+    (root / "Claude/claude-code-sessions/b/org").mkdir(parents=True)
+    # Establish ownership before the new Router session is made under A.
+    _write_code_session(
+        root, "Claude-3p", "3p/org", "x", "cli-x", title="A's", last_activity_at=1
+    )
+    assert _sync_as("a") == 0
+    _write_code_session(
+        root, "Claude-3p", "3p/org", "1", "cli-1", title="Under A", last_activity_at=1
+    )
+    assert _sync_as("a") == 1
+
+    # Router is set up again from B, and a new Router session is made.
+    config.write_text('{"lastKnownAccountUuid": "b"}')
+    _write_code_session(
+        root, "Claude-3p", "3p/org", "2", "cli-2", title="Under B", last_activity_at=1
+    )
+    assert _sync_as("b") == 1
+    # First-party mode signs back in to A: B's session never lands there.
+    config.write_text('{"lastKnownAccountUuid": "a"}')
+    assert _sync_as("b") == 0
+
+    def names(account):
+        folder = root / f"Claude/claude-code-sessions/{account}/org"
+        return sorted(p.name for p in folder.iterdir())
+
+    assert names("a") == ["local_1.json", "local_x.json"]
+    assert names("b") == ["local_2.json"]
+
+
+def test_reconfiguring_keeps_the_account_router_was_set_up_from(cowork_host):
+    root, _events = cowork_host
+    config = root / "Claude/config.json"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text('{"lastKnownAccountUuid": "first"}')
+    claude_cowork.configure("router-secret", "https://router.example/v1")
+    config.write_text('{"lastKnownAccountUuid": "second"}')
+    claude_cowork.configure("router-secret", "https://router.example/v1")
+
+    state = json.loads(claude_cowork.state_path().read_text())
+    assert state["first_party_account"] == "first"
+
+
+def test_code_session_sync_only_adds_while_desktop_runs(cowork_host, monkeypatch):
+    root, _events = cowork_host
+    _write_code_session(
+        root, "Claude", "acct/org", "a", "cli-a", title="Newer", last_activity_at=5
+    )
+    _write_code_session(
+        root, "Claude", "acct/org", "b", "cli-b", title="Missing", last_activity_at=1
+    )
+    _write_code_session(
+        root, "Claude-3p", "3p/org", "a", "cli-a", title="Older", last_activity_at=4
+    )
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: True)
+
+    assert _sync_as() == 1
+    assert _code_session_titles(root, "Claude-3p") == {
+        "cli-a": "Older",
+        "cli-b": "Missing",
+    }
 
 
 @pytest.mark.parametrize(
@@ -1287,6 +1497,122 @@ def test_agent_routing_keeps_a_real_v1_in_the_gateway_path(tagging):
     router_repo._save_settings({"enabled": False})
     claude_cowork.refresh_agent_routing()
     assert claude_cowork.configured_gateway_base_url() == "https://api.router.com/v1"
+
+
+def test_a_key_sealed_by_desktop_still_belongs_to_the_cli(tagging, monkeypatch):
+    router_repo._save_settings({"enabled": False})
+    profile_path, _ = claude_cowork.configure(
+        "router-secret", "https://api.router.com/v1"
+    )
+    launched = time.time()
+    monkeypatch.setattr(claude_cowork, "_claude_started_at", lambda: launched)
+    plaintext = claude_cowork.configured_api_key()
+
+    def seal(value, after_launch=1):
+        nonlocal plaintext
+        # Desktop seals the key at rest while it launches.
+        profile = json.loads(profile_path.read_text())
+        if not profile["inferenceGatewayApiKey"].startswith("__sealed__:"):
+            plaintext = profile["inferenceGatewayApiKey"]
+        profile["inferenceGatewayApiKey"] = f"__sealed__:v1:{value}"
+        profile_path.write_text(json.dumps(profile))
+        os.utime(profile_path, (launched + after_launch, launched + after_launch))
+
+    # A key sealed long after launch was entered in Desktop, not written here.
+    seal("edited-later", after_launch=600)
+    with pytest.raises(click.ClickException, match="changed after setup"):
+        claude_cowork.configured_api_key()
+    seal("first")
+    # Even the expected launch timing needs proof of plaintext ownership.
+    request = claude_cowork.desktop_credential_request()
+    claude_cowork.verify_desktop_credential(
+        {"challenge": request["challenge"], "key": plaintext}
+    )
+    connection = ("router-secret", "https://api.router.com")
+    assert claude_cowork.configured_router_connection() == connection
+    router_repo._save_settings({"enabled": True})
+    claude_cowork.refresh_agent_routing()
+    assert router_repo.is_wrapped(claude_cowork.configured_gateway_base_url())
+    # Desktop was closed for that rewrite and opened by someone else: the
+    # profile could have been edited before this seal, so it isn't adopted.
+    launched = time.time()
+    seal("edited-while-closed")
+    with pytest.raises(click.ClickException, match="changed after setup"):
+        claude_cowork.configured_api_key()
+    claude_cowork.configure("router-secret", "https://api.router.com/v1")
+    launched = time.time()
+    seal("second")
+    request = claude_cowork.desktop_credential_request()
+    claude_cowork.verify_desktop_credential(
+        {"challenge": request["challenge"], "key": plaintext}
+    )
+    assert claude_cowork.configured_router_connection() == connection
+    seal("someone-elses")
+    with pytest.raises(click.ClickException, match="changed after setup"):
+        claude_cowork.configured_api_key()
+    seal("second")
+    claude_cowork.unconfigure()
+    assert not profile_path.exists()
+
+
+@pytest.mark.parametrize("changed_on_quit", [False, True])
+def test_unconfigure_revalidates_a_verified_seal_after_quitting_desktop(
+    cowork_host, monkeypatch, changed_on_quit
+):
+    profile_path, _ = claude_cowork.configure(
+        "router-secret", "https://router.example/v1"
+    )
+    launched = time.time()
+    running = True
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: running)
+    monkeypatch.setattr(
+        claude_cowork, "_claude_started_at", lambda: launched if running else None
+    )
+    profile = json.loads(profile_path.read_text())
+    profile["inferenceGatewayApiKey"] = "__sealed__:v1:ours"
+    profile_path.write_text(json.dumps(profile))
+    os.utime(profile_path, (launched + 1, launched + 1))
+
+    def quit_desktop():
+        nonlocal running
+        running = False
+        if changed_on_quit:
+            profile["inferenceGatewayApiKey"] = "__sealed__:v1:someone-elses"
+            profile_path.write_text(json.dumps(profile))
+
+    monkeypatch.setattr(claude_cowork, "_quit_claude", quit_desktop)
+    assert claude_cowork._read_state()["sealed_marker"] is None
+    request = claude_cowork.desktop_credential_request()
+    claude_cowork.verify_desktop_credential(
+        {"challenge": request["challenge"], "key": "router-secret"}
+    )
+    if changed_on_quit:
+        with pytest.raises(click.ClickException, match="changed after setup"):
+            claude_cowork.unconfigure()
+        assert profile_path.exists()
+        assert claude_cowork.state_path().exists()
+    else:
+        claude_cowork.unconfigure()
+        assert not profile_path.exists()
+        assert not claude_cowork.state_path().exists()
+
+
+def test_a_rotated_key_never_falls_back_to_the_previous_ref(cowork_host, monkeypatch):
+    profile_path, _ = claude_cowork.configure(
+        "first-secret", "https://router.example/v1"
+    )
+
+    def fail(*_args):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(claude_cowork.router_local_auth, "register", fail)
+    claude_cowork.configure("second-secret", "https://router.example/v1")
+    profile = json.loads(profile_path.read_text())
+    profile["inferenceGatewayApiKey"] = "__sealed__:v1:second"
+    profile_path.write_text(json.dumps(profile))
+
+    with pytest.raises(click.ClickException, match="changed after setup"):
+        claude_cowork.configured_api_key()
 
 
 def test_ssh_remote_sessions_keep_desktop_on_the_direct_route(

@@ -109,6 +109,50 @@ def test_local_midnight_keeps_its_own_dst_offset(monkeypatch):
         system_time.tzset()
 
 
+@pytest.mark.parametrize(
+    ("link", "resolved", "timezone_file", "expected"),
+    [
+        (
+            "/var/db/timezone/zoneinfo/America/Los_Angeles",
+            "/usr/share/zoneinfo.default/America/Los_Angeles",
+            None,
+            "America/Los_Angeles",
+        ),
+        (
+            None,
+            "/usr/share/zoneinfo.default/America/Chicago",
+            None,
+            "America/Chicago",
+        ),
+        ("../usr/share/zoneinfo/Europe/London", "", None, "Europe/London"),
+        (None, "/etc/localtime", "Asia/Tokyo\n", "Asia/Tokyo"),
+    ],
+)
+def test_local_timezone_reads_macos_and_linux_layouts(
+    monkeypatch, tmp_path, link, resolved, timezone_file, expected
+):
+    def readlink(path):
+        assert path == operations.LOCALTIME_PATH
+        if link is None:
+            raise OSError("not a link")
+        return link
+
+    timezone_path = tmp_path / "timezone"
+    if timezone_file is not None:
+        timezone_path.write_text(timezone_file, encoding="utf-8")
+    monkeypatch.delenv("TZ", raising=False)
+    monkeypatch.setattr(operations.os, "readlink", readlink)
+    monkeypatch.setattr(operations.os.path, "realpath", lambda path: resolved)
+    monkeypatch.setattr(operations, "TIMEZONE_PATH", str(timezone_path))
+
+    assert operations.local_timezone().key == expected
+
+
+def test_local_timezone_accepts_a_zoneinfo_path_in_tz(monkeypatch):
+    monkeypatch.setenv("TZ", ":/usr/share/zoneinfo/posix/America/Denver")
+    assert operations.local_timezone().key == "America/Denver"
+
+
 def test_daily_usage_zero_fills_local_days_and_orders_other_last(monkeypatch):
     zone = operations.ZoneInfo("America/New_York")
     monkeypatch.setattr(operations, "local_timezone", lambda: zone)

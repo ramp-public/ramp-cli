@@ -7,6 +7,7 @@ the same local configuration library as Claude's own third-party inference UI.
 
 from __future__ import annotations
 
+import glob
 import hashlib
 import hmac
 import json
@@ -47,6 +48,7 @@ _APP_SUPPORT_OVERRIDE = "RAMP_CLAUDE_DESKTOP_APP_SUPPORT"
 _PREFERENCES_DOMAIN = "com.anthropic.claudefordesktop"
 _PREFERENCES_OVERRIDE = "RAMP_CLAUDE_DESKTOP_PREFERENCES"
 _STATE_FILE = "ramp-router-cowork-state.json"
+_SESSION_OWNERS_FILE = "ramp-router-session-owners.json"
 _DESKTOP_CONFIG_FILE = "claude_desktop_config.json"
 _LOCAL_AGENT_SESSIONS_DIR = "local-agent-mode-sessions"
 _ACCOUNT_SETTINGS_FILE = "cowork_account_settings.json"
@@ -240,6 +242,132 @@ def _credential_marker(api_key: str, *, salt: str | None = None) -> dict[str, st
     }
 
 
+# Desktop replaces a profile's key with a copy only it can open.
+_SEALED_PREFIX = "__sealed__:v1:"
+
+
+def _credential_receipt(api_key: str, base_url: str) -> dict:
+    """Receipt fields to recognize the key, plus a local token to use it sealed."""
+    receipt: dict = {
+        "credential_marker": _credential_marker(api_key),
+        "desktop_launched_at": None,
+        "sealed_marker": None,
+        "sealed_verified": False,
+    }
+    ref = api_key if api_key.startswith(router_local_auth.TOKEN_PREFIX) else None
+    if ref is None and (health := router_repo.health_token(create=True)):
+        try:
+            ref = router_local_auth.register(
+                router_repo.config_dir() / "router-agent-credentials",
+                health,
+                urlsplit(router_repo.unwrap_url(base_url)).netloc.lower(),
+                api_key,
+            )
+        except (OSError, ValueError):
+            pass
+    # Always set: a stale ref would hand back the previous key once sealed.
+    receipt["credential_ref"] = ref
+    return receipt
+
+
+def _profile_key(api_key: object, state: dict) -> str | None:
+    """The usable key for a profile key this CLI wrote, else None."""
+    if _credential_matches(api_key, state.get("credential_marker")):
+        return str(api_key)
+    ref = state.get("credential_ref")
+    if not (
+        isinstance(api_key, str)
+        and api_key.startswith(_SEALED_PREFIX)
+        and isinstance(ref, str)
+    ):
+        return None
+    # Launch/file timestamps cannot prove which plaintext Desktop encrypted.
+    # Only cache a seal after the native app decrypted it and the CLI matched
+    # its plaintext against the original receipt. Old timing-only seals must
+    # be verified once, too. Background reads never request Keychain access.
+    return (
+        ref
+        if state.get("sealed_verified") is True
+        and _credential_matches(api_key, state.get("sealed_marker"))
+        else None
+    )
+
+
+def desktop_credential_request() -> dict:
+    """Versioned native-app handshake; no Keychain reads or app launches."""
+    with transaction_lock():
+        return _desktop_credential_request()
+
+
+def _desktop_credential_request() -> dict:
+    state = _read_state()
+    if state is None:
+        return {"version": 1, "status": "not_configured"}
+    profile, exists = _read_object(
+        _profile_path(state["profile_id"]), "Claude Desktop Router profile"
+    )
+    if not exists:
+        # An interrupted setup may leave a receipt without its profile. Let
+        # disconnect restore the saved mode instead of leaving Desktop in 3P.
+        return {"version": 1, "status": "ready"}
+    _validate_owned_profile_fields(profile, state)
+    key = profile.get("inferenceGatewayApiKey")
+    if _profile_key(key, state) is not None:
+        _owned_profile(state)  # check endpoint and the other owned fields too
+        return {"version": 1, "status": "ready"}
+    if not isinstance(key, str) or not key.startswith(_SEALED_PREFIX):
+        raise click.ClickException(
+            "The Claude Desktop credential changed after setup; reconnect explicitly."
+        )
+    # Bind approval to the entire receipt and profile, not just the key. A
+    # profile edited or reconfigured while the dialog is open must be retried.
+    challenge = hashlib.sha256(
+        json.dumps([state, profile], sort_keys=True).encode()
+    ).hexdigest()
+    return {
+        "version": 1,
+        "status": "verification_required",
+        "sealed_key": key,
+        "challenge": challenge,
+    }
+
+
+def verify_desktop_credential(proof: dict) -> dict:
+    """Accept plaintext over a private stdin pipe, never argv or a temp file."""
+    with transaction_lock():
+        request = _desktop_credential_request()
+        if request.get("status") != "verification_required" or not hmac.compare_digest(
+            str(proof.get("challenge", "")).encode(), request["challenge"].encode()
+        ):
+            raise click.ClickException(
+                "Claude Desktop changed during verification. Try again."
+            )
+        state = _read_state()
+        key = proof.get("key")
+        if state is None or not _credential_matches(
+            key, state.get("credential_marker")
+        ):
+            raise click.ClickException(
+                "The Claude Desktop credential changed after setup; no changes were made."
+            )
+        # If the profile contains a local token and its backing secret was
+        # removed by a clean uninstall, decryption cannot recreate that secret.
+        router_repo.upstream_api_key(key, state["gateway_base_url"])
+        # Recover missing references from pre-sealing receipts. Keep the
+        # restore snapshots intact and never persist the plaintext here.
+        receipt = _credential_receipt(key, state["gateway_base_url"])
+        if not isinstance(receipt.get("credential_ref"), str):
+            raise click.ClickException(
+                "Could not save the local credential reference. Try again."
+            )
+        state.update(receipt)
+        state["sealed_marker"] = _credential_marker(request["sealed_key"])
+        state["sealed_verified"] = True
+        _owned_profile(state)
+        _write_private_json(state_path(), state)
+        return {"version": 1, "status": "ready"}
+
+
 def _credential_matches(api_key: object, marker: object) -> bool:
     if not isinstance(api_key, str) or not isinstance(marker, dict):
         return False
@@ -247,9 +375,15 @@ def _credential_matches(api_key: object, marker: object) -> bool:
     digest = marker.get("digest")
     if not isinstance(salt, str) or not isinstance(digest, str):
         return False
+    if (
+        len(salt) != 32
+        or len(digest) != 64
+        or any(c not in "0123456789abcdef" for c in salt + digest)
+    ):
+        return False
     try:
         actual = _credential_marker(api_key, salt=salt)["digest"]
-    except ValueError:
+    except (ValueError, UnicodeError):
         return False
     return hmac.compare_digest(actual, digest)
 
@@ -394,6 +528,30 @@ def _claude_is_running() -> bool:
     return bool(claude_pids())
 
 
+def _claude_started_at() -> float | None:
+    """When the running Claude Desktop launched, or None when it isn't."""
+    pids = claude_pids()
+    if not pids:
+        return None
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", ",".join(map(str, pids))],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+            env={**os.environ, "LC_ALL": "C"},
+        ).stdout
+        starts = [
+            time.mktime(time.strptime(line.strip(), "%a %b %d %H:%M:%S %Y"))
+            for line in out.splitlines()
+            if line.strip()
+        ]
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return min(starts, default=None)
+
+
 def _ensure_claude_installed() -> None:
     if _run_quiet(["open", "-Ra", "Claude"], timeout=5) != 0:
         raise click.ClickException("Claude Desktop is not installed on this Mac.")
@@ -450,6 +608,19 @@ def _launch_claude(
         )
 
 
+def _launch_after_write(**kwargs) -> None:
+    """Launch Desktop and note it: only this launch's seal is the CLI's key."""
+    launched = time.time()
+    _launch_claude(**kwargs)
+    state = _read_state()
+    if state is not None and state.get("sealed_marker") is None:
+        state["desktop_launched_at"] = launched
+        try:
+            _write_private_json(state_path(), state)
+        except OSError:
+            pass
+
+
 def _read_state() -> dict | None:
     path = state_path()
     if not path.exists():
@@ -496,7 +667,7 @@ def _new_state(api_key: str, router_base_url: str) -> dict:
     return {
         "version": STATE_VERSION,
         "profile_id": str(uuid.uuid4()),
-        "credential_marker": _credential_marker(api_key),
+        **_credential_receipt(api_key, router_base_url),
         "gateway_base_url": gateway_base_url(
             router_base_url,
             local_token=api_key.startswith(router_local_auth.TOKEN_PREFIX),
@@ -538,8 +709,12 @@ def _configure_stopped(
     else:
         # Keep the original restore snapshot across key rotations.
         state = json.loads(json.dumps(previous_state))
-        state["credential_marker"] = _credential_marker(api_key)
+        state.update(_credential_receipt(api_key, router_base_url))
         state["gateway_base_url"] = profile["inferenceGatewayBaseUrl"]
+    # The first-party account this setup's Router sessions belong to; kept
+    # across reconfigure, and rolled back with the receipt if configure fails.
+    if not state.get("first_party_account"):
+        state["first_party_account"] = _code_session_account(_first_party_root())
 
     profile_id = state["profile_id"]
     profile_path = _profile_path(profile_id)
@@ -783,17 +958,22 @@ def _code_session_activity(entry: dict) -> float:
     return value
 
 
-def _code_session_entries(
-    data_root: Path,
-) -> dict[tuple[str, str], tuple[Path, dict]]:
-    """Index one Desktop data root's Code session entries.
+def _code_session_account(data_root: Path) -> str | None:
+    """Desktop's last signed-in account folder in a mode."""
+    try:
+        config = json.loads((data_root / "config.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    account = config.get("lastKnownAccountUuid") if isinstance(config, dict) else None
+    if not isinstance(account, str) or not account or "/" in account:
+        return None
+    return None if account.startswith(".") else account
 
-    Entries live under ``<account>/<org>/``; the key keeps that scope, so an
-    entry is only ever matched with, or copied to, the same account and org.
-    """
-    entries: dict[tuple[str, str], tuple[Path, dict]] = {}
-    sessions = data_root / _CODE_SESSIONS_DIR
-    for path in sessions.glob("*/*/local_*.json"):
+
+def _code_session_index(data_root: Path) -> dict[str, dict[str, tuple[Path, dict]]]:
+    """Each account's Code session entries by transcript id, read once."""
+    index: dict[str, dict[str, tuple[Path, dict]]] = {}
+    for path in (data_root / _CODE_SESSIONS_DIR).glob("*/*/local_*.json"):
         try:
             entry = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, ValueError):
@@ -803,34 +983,51 @@ def _code_session_entries(
         session = entry.get("cliSessionId") or entry.get("sessionId")
         if not isinstance(session, str) or not session:
             continue
-        key = (path.parent.relative_to(sessions).as_posix(), session)
-        current = entries.get(key)
+        entries = index.setdefault(path.parent.parent.name, {})
+        current = entries.get(session)
         if current is None or _code_session_activity(entry) > _code_session_activity(
             current[1]
         ):
-            entries[key] = (path, entry)
-    return entries
+            entries[session] = (path, entry)
+    return index
 
 
-def _mirror_code_sessions(source_root: Path, target_root: Path) -> int:
-    """Copy Code session entries the target data root lacks or has stale.
+def _mirror_code_sessions(
+    source: dict[str, tuple[Path, dict]],
+    target_root: Path,
+    index: dict[str, dict[str, tuple[Path, dict]]],
+    account: str,
+    *,
+    add_only: bool,
+) -> int:
+    """Copy entries the target lacks or has stale into its most active org.
 
-    Each entry stays within its own account/org directory, and only goes to a
-    target that already lists sessions for that same account and org: one
-    account's or organization's sessions never appear under another's.
+    The modes' account/org folders never match: third-party mode signs in as
+    a local account. ``add_only`` leaves existing entries alone while Desktop
+    runs, since it may write its in-memory copies back on quit.
     """
-    target_sessions = target_root / _CODE_SESSIONS_DIR
-    target = _code_session_entries(target_root)
+    target = index.get(account, {})
+    # Sessions another account in the target mode already owns stay there.
+    foreign = {key for other, e in index.items() if other != account for key in e}
+    sessions = target_root / _CODE_SESSIONS_DIR / glob.escape(account)
+    scopes = [p for p in sessions.glob("*") if p.is_dir()]
+    if not scopes:
+        # Desktop hasn't signed in to that mode yet; a later pass retries.
+        return 0
+    if target:
+        newest = max(target.values(), key=lambda item: _code_session_activity(item[1]))
+        scope = newest[0].parent
+    else:
+        scope = max(scopes, key=lambda path: path.stat().st_mtime)
     copied = 0
-    for key, (path, entry) in _code_session_entries(source_root).items():
-        scope = target_sessions / key[0]
-        if not scope.is_dir():
-            # Desktop hasn't signed in to this account and org in that mode.
+    for key, (path, entry) in source.items():
+        if key in foreign:
             continue
         existing = target.get(key)
-        if existing is not None and _code_session_activity(
-            existing[1]
-        ) >= _code_session_activity(entry):
+        if existing is not None and (
+            add_only
+            or _code_session_activity(existing[1]) >= _code_session_activity(entry)
+        ):
             continue
         destination = existing[0] if existing is not None else scope / path.name
         try:
@@ -841,7 +1038,23 @@ def _mirror_code_sessions(source_root: Path, target_root: Path) -> int:
     return copied
 
 
-def _sync_code_sessions_stopped() -> int:
+def _session_owners_path() -> Path:
+    return _first_party_root() / _SESSION_OWNERS_FILE
+
+
+def _session_owners() -> dict[str, str] | None:
+    """Each Router-mode session's first-party account ("" when unknown), kept
+    across unconfigure; None before any was recorded or when unreadable."""
+    try:
+        data = json.loads(_session_owners_path().read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {key: value for key, value in data.items() if isinstance(value, str)}
+
+
+def _sync_code_sessions(state: dict | None) -> int:
     """Keep the Code sidebar continuous across Desktop deployment modes.
 
     Claude Desktop keeps a separate data root per deployment mode (``Claude``
@@ -849,14 +1062,80 @@ def _sync_code_sessions_stopped() -> int:
     lists only its own Code sessions. The transcripts themselves live in
     ``~/.claude/projects`` and are shared, so switching modes would otherwise
     hide every session started in the other mode. Mirroring the index entries
-    both ways while the app is stopped makes the switch invisible; the most
-    recently active copy of an entry wins. Best effort: never blocks setup.
+    both ways makes the switch invisible; the most recently active copy of an
+    entry wins. While Desktop runs it only adds missing entries, which Desktop
+    lists after its next launch. A Router session belongs to the account
+    Router was set up from when the sync first sees it, and is only ever
+    mirrored into that account. Best effort: never blocks setup.
     """
     try:
         first, third = _first_party_root(), _third_party_root()
-        return _mirror_code_sessions(third, first) + _mirror_code_sessions(first, third)
+        first_account = _code_session_account(first)
+        third_account = _code_session_account(third)
+        if first_account is None:
+            return 0
+        setup = (state or {}).get("first_party_account")
+        add_only = _claude_is_running()
+        firsts, thirds = _code_session_index(first), _code_session_index(third)
+        routers = thirds.get(third_account, {})
+        recorded = _session_owners()
+        owners = recorded or {}
+        new = {key: setup for key in routers if key not in owners} if setup else {}
+        if recorded is None and setup:
+            # Record the baseline before Desktop's first Router-mode launch,
+            # even when it hasn't created that mode's account/config yet.
+            # Sessions from before ownership was recorded belong to the one
+            # account that already has them. Otherwise the owner is unknown:
+            # they stay put, even if only one account has sessions here.
+            for key in {key for entries in thirds.values() for key in entries}:
+                having = [account for account, e in firsts.items() if key in e]
+                new[key] = having[0] if len(having) == 1 else ""
+        if setup == first_account:
+            # This account's own sessions, which this pass may copy over.
+            mine = firsts.get(first_account, {})
+            new.update({key: setup for key in mine if key not in owners})
+        if new or (recorded is None and setup):
+            owners.update(new)
+            try:
+                _write_private_json(_session_owners_path(), owners)
+            except OSError:
+                return 0
+        if third_account is None:
+            # Ownership is recorded; mirroring waits for Desktop to sign in.
+            return 0
+        copied = _mirror_code_sessions(
+            {k: v for k, v in routers.items() if owners.get(k) == first_account},
+            first,
+            firsts,
+            first_account,
+            add_only=add_only,
+        )
+        if setup == first_account:
+            copied += _mirror_code_sessions(
+                firsts.get(first_account, {}),
+                third,
+                thirds,
+                third_account,
+                add_only=add_only,
+            )
+        return copied
     except OSError:
         return 0
+
+
+def sync_code_sessions() -> int:
+    """Mirror Code sessions across Desktop modes; safe while Desktop runs."""
+    if sys.platform != "darwin":
+        return 0
+    with transaction_lock():
+        return _sync_code_sessions(_read_state())
+
+
+def recognize_sealed_key() -> None:
+    """Validate an already verified seal without prompting in the background."""
+    if sys.platform == "darwin" and _claude_is_running():
+        with transaction_lock():
+            configured_api_key()
 
 
 def claude_is_running() -> bool:
@@ -906,10 +1185,18 @@ def configure(
 
     with transaction_lock():
         # Select the helper under the lock so a concurrent disable sees it.
+        if os.environ.get("RAMP_ROUTER_DESKTOP_REQUIRE_OWNED") == "1":
+            state = _read_state()
+            if state is not None:
+                _owned_profile(state)
         router_base_url, api_key = _desktop_credentials(router_base_url, api_key)
         profile = _profile(api_key, router_base_url)
         _quit_claude()
         try:
+            if os.environ.get("RAMP_ROUTER_DESKTOP_REQUIRE_OWNED") == "1":
+                state = _read_state()
+                if state is not None:
+                    _owned_profile(state)
             profile_path = _configure_stopped(
                 api_key, router_base_url, profile, connector_binding=connector_binding
             )
@@ -928,8 +1215,8 @@ def configure(
         migrated, _aborted = _migrate_model_selections_stopped(
             model_ids, still_safe=lambda: not _claude_is_running()
         )
-        _sync_code_sessions_stopped()
-        _launch_claude(fresh_cowork=True)
+        _sync_code_sessions(_read_state())
+        _launch_after_write(fresh_cowork=True)
         return profile_path, migrated
 
 
@@ -985,13 +1272,13 @@ def configured_api_key() -> str:
     profile, _ = _read_object(
         _profile_path(state["profile_id"]), "Claude Desktop Router profile"
     )
-    api_key = profile.get("inferenceGatewayApiKey")
-    if not _credential_matches(api_key, state.get("credential_marker")):
+    api_key = _profile_key(profile.get("inferenceGatewayApiKey"), state)
+    if api_key is None:
         raise click.ClickException(
             "The Claude Desktop Router credential changed after setup. "
-            "Run the configure command again to adopt it."
+            "Open Ramp Router to verify Keychain access, or reconnect explicitly."
         )
-    return str(api_key)
+    return api_key
 
 
 def configured_gateway_base_url() -> str:
@@ -1095,8 +1382,7 @@ def _migrate_gateway_base_url(
     if api_key is not None:
         # replacement is already normalized; _profile strips one /v1 itself.
         updated_profile = _profile(api_key, replacement + "/v1")
-        if api_key != profile["inferenceGatewayApiKey"]:
-            updated_state["credential_marker"] = _credential_marker(api_key)
+        updated_state.update(_credential_receipt(api_key, replacement))
     try:
         _write_private_json(profile_path, updated_profile)
         _write_private_json(state_path(), updated_state)
@@ -1113,7 +1399,8 @@ def refresh_agent_routing(*, restart: bool = False) -> None:
     """Keep the owned Desktop profile on the opt-in agent's endpoint/key pair."""
     with transaction_lock():
         previous = configured_gateway_base_url()
-        api_key = router_repo.upstream_api_key(configured_api_key(), previous)
+        profile_key = configured_api_key()
+        api_key = router_repo.upstream_api_key(profile_key, previous)
         direct = router_repo.unwrap_url(previous)
         endpoint, token = _desktop_credentials(direct, api_key)
         # Already normalized: validate it without stripping a real /v1 again.
@@ -1121,7 +1408,8 @@ def refresh_agent_routing(*, restart: bool = False) -> None:
             endpoint + "/v1",
             local_token=token.startswith(router_local_auth.TOKEN_PREFIX),
         )
-        if (endpoint, token) == (previous, configured_api_key()):
+        # A sealed direct key reads back as its local token.
+        if endpoint == previous and token in (profile_key, api_key):
             return
         # An edited profile is rejected below; find out before quitting the app.
         state = _read_state()
@@ -1148,7 +1436,7 @@ def refresh_agent_routing(*, restart: bool = False) -> None:
                 )
         finally:
             if running and restart:
-                _launch_claude()
+                _launch_after_write()
 
 
 def _owned_profile(state: dict) -> dict | None:
@@ -1157,16 +1445,20 @@ def _owned_profile(state: dict) -> dict | None:
     )
     if not profile_exists:
         return None
-    expected_keys = set(_profile("placeholder", "https://router.invalid/v1"))
-    if set(profile) != expected_keys or not _credential_matches(
-        profile.get("inferenceGatewayApiKey"), state.get("credential_marker")
-    ):
+    _validate_owned_profile_fields(profile, state)
+    if _profile_key(profile.get("inferenceGatewayApiKey"), state) is None:
         raise click.ClickException(
             "The Claude Desktop Router profile changed after setup, so the CLI "
             "will not remove it automatically."
         )
+    return profile
+
+
+def _validate_owned_profile_fields(profile: dict, state: dict) -> None:
+    expected_keys = set(_profile("placeholder", "https://router.invalid/v1"))
     if (
-        profile.get("inferenceProvider") != "gateway"
+        set(profile) != expected_keys
+        or profile.get("inferenceProvider") != "gateway"
         or profile.get("inferenceCredentialKind") != "static"
         or profile.get("inferenceGatewayAuthScheme") != "bearer"
         or not _owned_custom_headers(profile.get("inferenceCustomHeaders"))
@@ -1177,7 +1469,6 @@ def _owned_profile(state: dict) -> dict | None:
             "The Claude Desktop Router profile changed after setup, so the CLI "
             "will not remove it automatically."
         )
-    return profile
 
 
 def _unconfigure_stopped(state: dict) -> None:
@@ -1297,6 +1588,11 @@ def unconfigure() -> None:
                 "Ramp Router is not configured in Claude Desktop."
             )
 
+        # Refuse unverified credentials before interrupting Desktop; check
+        # again after quit in case Desktop flushed a changed profile.
+        state = _read_state()
+        if state is not None:
+            _owned_profile(state)
         _quit_claude()
         try:
             state = _read_state()
@@ -1312,7 +1608,7 @@ def unconfigure() -> None:
                 pass
             raise
 
-        _sync_code_sessions_stopped()
+        _sync_code_sessions(state)
         _launch_claude(
             failure_message=(
                 "Ramp Router was removed and the previous Cowork settings were "

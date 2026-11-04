@@ -72,19 +72,40 @@ def client_kind(client: str) -> str:
     return CLIENT_KINDS.get(client, client)
 
 
+LOCALTIME_PATH = "/etc/localtime"
+TIMEZONE_PATH = "/etc/timezone"
+# macOS can resolve through ``zoneinfo.default``; tzdata may also add posix/right.
+ZONEINFO_PATH = re.compile(r"(?:^|/)zoneinfo(?:\.default)?/(?:(?:posix|right)/)?(.+)$")
+
+
+def _zone_key(path: str) -> str:
+    match = ZONEINFO_PATH.search(path)
+    return match.group(1) if match else ""
+
+
+def _localtime_keys() -> list[str]:
+    """Names from the local-time link and file, without assuming one OS layout."""
+    keys = []
+    for read in (os.readlink, os.path.realpath):
+        try:
+            keys.append(_zone_key(read(LOCALTIME_PATH)))
+        except OSError:
+            continue
+    try:
+        with open(TIMEZONE_PATH, encoding="utf-8") as file:
+            keys.append(file.readline().strip())
+    except (OSError, UnicodeError):
+        pass
+    return keys
+
+
 def local_timezone() -> tzinfo:
     """The IANA zone the server buckets days in; UTC when it can't be named.
 
     The UTC fallback needs no timezone database, which Windows doesn't ship.
     """
-    candidates = [os.environ.get("TZ", "").removeprefix(":")]
-    try:
-        target = os.path.realpath("/etc/localtime")
-    except OSError:
-        target = ""
-    if "zoneinfo/" in target:
-        candidates.append(target.split("zoneinfo/", 1)[1])
-    for name in candidates:
+    configured = os.environ.get("TZ", "").removeprefix(":")
+    for name in (configured, _zone_key(configured), *_localtime_keys()):
         if name:
             try:
                 return ZoneInfo(name)
