@@ -963,6 +963,15 @@ def plan_original_settings(state: dict) -> dict:
             and not (key == "model" and _is_router_model(captured.get("value")))
         ):
             overlay[key] = captured["value"]
+    picker = state.get("modelPicker")
+    if isinstance(picker, dict):
+        # An omitted key inherits Router's user-level lineup. Explicitly reset
+        # it for the previous-provider escape command instead.
+        overlay["modelPicker"] = (
+            picker["value"]
+            if picker.get("present")
+            else {"replaceBuiltInOptions": False, "options": []}
+        )
     return overlay
 
 
@@ -1083,7 +1092,7 @@ def plan_automatic_subagent_cleanup(
 def plan_model_update(settings: dict, state: dict, model: str) -> tuple[dict, dict]:
     """Set only the default model and record it as this CLI's write.
 
-    The whole Claude Code edit of a background refresh. The pre-Router
+    The saved-default portion of a background refresh. The pre-Router
     snapshot in ``state["top_level"]`` is kept, so unconfigure still restores
     the user's own model.
     """
@@ -1093,6 +1102,32 @@ def plan_model_update(settings: dict, state: dict, model: str) -> tuple[dict, di
     return {**settings, "model": model}, {
         **state,
         "written": {**written, "top_level": {**written["top_level"], "model": model}},
+    }
+
+
+def plan_model_picker_update(
+    settings: dict, state: dict, options: list[dict[str, str]]
+) -> tuple[dict, dict]:
+    """Replace only an absent or receipt-owned lineup, never the selection.
+
+    Replacement hides stale discovery rows; Claude Code retains Default and
+    the current session model itself. A user lineup (including deletion of a
+    previously managed lineup) is not ours to overwrite.
+    """
+    if not options:
+        return settings, state
+    record = state.get("modelPicker")
+    if isinstance(record, dict):
+        if settings.get("modelPicker") != record["written"]:
+            return settings, state
+    elif "modelPicker" in settings:
+        return settings, state
+    else:
+        record = {"present": False, "value": None}
+    picker = {"replaceBuiltInOptions": True, "options": options}
+    return {**settings, "modelPicker": picker}, {
+        **state,
+        "modelPicker": {**record, "written": picker},
     }
 
 
@@ -1205,6 +1240,12 @@ def plan_restoration(settings: dict, path: Path, state: dict) -> dict:
             restored["statusLine"] = record.get("value")
         else:
             restored.pop("statusLine", None)
+    picker = state.get("modelPicker")
+    if isinstance(picker, dict) and settings.get("modelPicker") == picker["written"]:
+        if picker.get("present"):
+            restored["modelPicker"] = picker["value"]
+        else:
+            restored.pop("modelPicker", None)
     return restored
 
 
@@ -1436,6 +1477,16 @@ def _valid_state(state: object) -> bool:
         and isinstance(record.get("present"), bool)
         and "value" in record
         and "written" in record
+    ):
+        return False
+    picker = state.get("modelPicker")
+    if picker is not None and not (
+        isinstance(picker, dict)
+        and isinstance(picker.get("present"), bool)
+        and "value" in picker
+        and isinstance(picker.get("written"), dict)
+        and picker["written"].get("replaceBuiltInOptions") is True
+        and isinstance(picker["written"].get("options"), list)
     ):
         return False
     return all(

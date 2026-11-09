@@ -11,6 +11,7 @@ dependencies = [
     "questionary>=2.1.1",
     "textual>=8.2,<9",
     "tomli-w>=1.0.0",
+    "websockets>=15,<17",
     "zstandard>=0.23,<1",
 ]
 dynamic = ["version"]

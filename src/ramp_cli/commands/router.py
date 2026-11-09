@@ -718,12 +718,14 @@ timeout_ms = 5000
 
 
 _TABLE_HEADER = re.compile(r"^\s*\[.*]\s*(?:#.*)?$")
+_TOML_LINE = re.compile(r"[^\n]*\n|[^\n]+")
 _OWNED_CODEX_TABLE = re.compile(
     r"^\s*\[\s*(?:model_providers|\"model_providers\"|'model_providers')\s*\.\s*"
     r"(?:ramp-router|\"ramp-router\"|'ramp-router')\s*(?:\.|])"
 )
+# Codex desktop writes quoted keys ("model" = ...), so match those too.
 _OWNED_CODEX_ROOT_KEY = re.compile(
-    r"^\s*(?:model|model_provider|model_catalog_json|model_instructions_file)\s*="
+    r"""^\s*(["']?)(?:model|model_provider|model_catalog_json|model_instructions_file)\1\s*="""
 )
 # A Stop group is not ours by header alone; see _is_owned_cost_hook_chunk.
 _CODEX_STOP_HOOK_TABLE = re.compile(
@@ -2051,8 +2053,8 @@ def _run_configure(
             _configured_claude_code_router_url(claude_path), router_base_url()
         )
     ):
-        # A repeat configure repairs the picker locally, without a new key or
-        # model request. A new deployment requires a full reconfigure.
+        # A repeat configure keeps the connection; supported clients also
+        # refresh the saved picker lineup. A new deployment needs reconfigure.
         _stored_router_api_key("claude-code", claude_path)
         current_view = claude_code.model_view(
             claude_code.read_settings(claude_path), claude_path
@@ -2078,8 +2080,7 @@ def _run_configure(
                     "config_path": str(claude_path),
                     "provider": ROUTER_PROVIDER,
                     "default_model": settings.get("model"),
-                    # A local-only preference update deliberately performs no
-                    # discovery, so the current projection count is unknown.
+                    # This shortcut does not report a projection count.
                     "models_available": None,
                     "setup_file_deleted": False,
                     "replaced_outdated_setup": False,
@@ -2087,11 +2088,14 @@ def _run_configure(
                         "claude-code", claude_path
                     ),
                     "model_view": view,
+                    "note_lines": _claude_code_picker_note_lines(claude_path),
                 },
                 pagination=None,
             )
         else:
             click.echo(f"Claude Code model list: {view}")
+            for line in _claude_code_picker_note_lines(claude_path):
+                click.echo(line)
         return
 
     if reuse_existing_key and not connectors and setup_file is None and api_key is None:
@@ -2503,6 +2507,8 @@ def _run_configure(
                     )
             if item == "opencode" and (notes := _opencode_user_model_note(path)):
                 result["note_lines"] = notes
+            if item == "claude-code":
+                result["note_lines"] = _claude_code_picker_note_lines(path)
             results.append(result)
         if confirm_browser:
             record_mdm_event(
@@ -2871,7 +2877,8 @@ def _cowork_models_message(result: dict) -> str:
     if result["skipped_while_running"]:
         return (
             "Claude Desktop's saved model selections were not checked because "
-            "Claude Desktop is running."
+            "Claude Desktop is running. Quit Claude Desktop, run 'ramp router "
+            "refresh', then reopen it; available models are discovered at launch."
         )
     migrated_gateway = result.get("migrated_gateway") is True
     count = result["migrated_model_selections"]
@@ -3330,8 +3337,15 @@ def _refresh_clients(
             "models_available": len(models),
             "switchyard_model": switchyard_model,
         }
+        if client == CODEX_CLIENT_NAME:
+            with codex_config_lock(path):
+                result["catalog_refresh"] = codex_desktop.refresh_catalog(
+                    path, path.parent / CODEX_ROUTER_CATALOG
+                )
         if client == "opencode" and (notes := _opencode_user_model_note(path)):
             result["note_lines"] = notes
+        if client == "claude-code":
+            result["note_lines"] = _claude_code_picker_note_lines(path)
         results.append(result)
 
     cowork_result = _refresh_cowork_model_selections(
@@ -3368,6 +3382,10 @@ def _refresh_clients(
                 continue
             name = CLIENT_NAMES[result["client"]]
             click.echo(f"Refreshed the Ramp Router configuration for {name}.")
+            if result.get("catalog_refresh"):
+                click.echo(
+                    codex_desktop.catalog_refresh_message(result["catalog_refresh"])
+                )
             if result["switchyard_model"]:
                 click.echo(
                     _switchyard_push_notice(
@@ -4764,8 +4782,31 @@ def _write_subagent_tiers(
 
 def _write_claude_model_view(path: Path, view: str) -> None:
     """Update Claude's model projection and prevent stale entitlement refreshes."""
+    picker_options = None
+    if _claude_code_supports_model_picker():
+        # Pair the saved key with its saved deployment, never a shell override.
+        # Keep the snapshot consistent with concurrent CLI connection changes.
+        with claude_code.settings_lock(path):
+            api_key = _stored_router_api_key("claude-code", path)
+            base_url = _stored_router_base_url("claude-code", path)
+            if base_url is None:
+                raise click.ClickException(
+                    "Could not read the saved Claude Code Router endpoint. "
+                    "Run 'ramp router configure claude-code' to repair it."
+                )
+        models = _fetch_models(
+            api_key, claude_code_view=True, model_view=view, base_url=base_url
+        )
+        picker_options = _claude_code_picker_lineup(models)
     with claude_code.settings_lock(path):
         state = claude_code.read_state(path)
+        if picker_options is not None and (
+            _stored_router_api_key("claude-code", path) != api_key
+            or _stored_router_base_url("claude-code", path) != base_url
+        ):
+            raise click.ClickException(
+                "The Claude Code connection changed during the update. Reload before saving."
+            )
         original_state = state
         settings = claude_code.read_settings(path)
         settings, state = claude_code.plan_automatic_subagent_cleanup(
@@ -4774,6 +4815,10 @@ def _write_claude_model_view(path: Path, view: str) -> None:
         updated, new_state = claude_code.plan_model_view_update(
             settings, path, state, view
         )
+        if picker_options is not None:
+            updated, new_state = claude_code.plan_model_picker_update(
+                updated, new_state, picker_options
+            )
         overlay = _prepare_claude_original_settings(path, new_state)
         state_path = claude_code.state_path(path)
         try:
@@ -7182,38 +7227,66 @@ def _same_path(left: Path, right: Path) -> bool:
         return left == right
 
 
-# Basic multiline strings may escape their own delimiter; literal ones cannot.
-_TOML_MULTILINE_DELIMITERS = (
-    ('"""', re.compile(r'(?<!\\)"""')),
-    ("'''", re.compile(r"'''")),
-)
+def _toml_lines(text: str) -> list[str]:
+    """Split TOML text into lines, keeping their endings.
 
-
-def _toml_line_without_comment(line: str) -> str:
-    """Drop a trailing TOML comment, leaving quoted text alone.
-
-    Good enough for delimiter counting: a ``#`` inside a basic or literal
-    string is content, one outside is a comment whose text — say, docs
-    quoting the multiline syntax — must not open a phantom string.
+    Only LF (and CRLF) ends a TOML line. ``str.splitlines`` also breaks on
+    U+2028, U+0085 and friends, which TOML treats as ordinary comment or
+    string content, so splitting there would desync string tracking.
     """
-    quote: str | None = None
-    escaped = False
-    for index, char in enumerate(line):
-        if quote is not None:
-            if escaped:
-                escaped = False
-            elif char == "\\" and quote == '"':
-                escaped = True
-            elif char == quote:
-                quote = None
-        elif char in ('"', "'"):
-            quote = char
+    return _TOML_LINE.findall(text)
+
+
+def _toml_line_string_state(line: str, open_string: str | None) -> str | None:
+    """Return the multiline string still open after ``line``, if any.
+
+    ``open_string`` is the triple-quote delimiter of a multiline string
+    open at the start of the line. Tracks every TOML string form, so a
+    delimiter inside another kind of string, or inside a comment, is
+    content, not a boundary.
+    """
+    index, length = 0, len(line)
+    while index < length:
+        char = line[index]
+        if open_string is not None:
+            if open_string == '"""' and char == "\\":
+                index += 2
+            elif line.startswith(open_string, index):
+                index += 3
+                # Up to two adjacent quotes belong to the content: """a"""""
+                extra = 0
+                while extra < 2 and index < length and line[index] == open_string[0]:
+                    index += 1
+                    extra += 1
+                open_string = None
+            else:
+                index += 1
         elif char == "#":
-            return line[:index]
-    return line
+            break
+        elif line.startswith('"""', index) or line.startswith("'''", index):
+            open_string = line[index : index + 3]
+            index += 3
+        elif char in ('"', "'"):
+            index += 1
+            while index < length and line[index] not in (char, "\n"):
+                index += 2 if char == '"' and line[index] == "\\" else 1
+            index += 1
+        else:
+            index += 1
+    return open_string
 
 
-def _conductor_root_span(lines: list[str]) -> tuple[list[int], int]:
+def _loads_toml_for_comparison(text: str) -> dict:
+    """Parse TOML so that an unchanged value always compares equal.
+
+    Floats keep their source text: two parses of ``nan`` are unequal as
+    floats. The tag tuple is something TOML itself never produces, so a float
+    cannot match a string that happens to spell it.
+    """
+    return tomllib.loads(text, parse_float=lambda raw: ("float", raw))
+
+
+def _toml_root_span(lines: list[str]) -> tuple[set[int], int]:
     """Locate the root-scope lines a rewrite may touch.
 
     Returns the indexes of root lines that are not inside a multiline string,
@@ -7221,21 +7294,14 @@ def _conductor_root_span(lines: list[str]) -> tuple[list[int], int]:
     user prose to the parser, so a line in it that looks like an owned key or
     a table header must neither be dropped nor end the root scope.
     """
-    editable: list[int] = []
-    open_delimiter: re.Pattern[str] | None = None
+    editable: set[int] = set()
+    open_string: str | None = None
     for index, line in enumerate(lines):
-        if open_delimiter is not None:
-            if open_delimiter.search(line):
-                open_delimiter = None
-            continue
-        if _TABLE_HEADER.match(line):
-            return editable, index
-        editable.append(index)
-        code = _toml_line_without_comment(line)
-        for _, pattern in _TOML_MULTILINE_DELIMITERS:
-            if len(pattern.findall(code)) % 2 == 1:
-                open_delimiter = pattern
-                break
+        if open_string is None:
+            if _TABLE_HEADER.match(line):
+                return editable, index
+            editable.add(index)
+        open_string = _toml_line_string_state(line, open_string)
     return editable, len(lines)
 
 
@@ -7247,8 +7313,8 @@ def _render_conductor_settings(settings_text: str, values: dict[str, str]) -> st
     contract the Codex rewrite keeps for config.toml. TOML requires root
     keys before the first table header, so the owned lines land there.
     """
-    lines = settings_text.splitlines(keepends=True)
-    editable, header_index = _conductor_root_span(lines)
+    lines = _toml_lines(settings_text)
+    editable, header_index = _toml_root_span(lines)
     root = "".join(
         line
         for index, line in enumerate(lines[:header_index])
@@ -7275,8 +7341,8 @@ def _verified_conductor_settings(
     """
     rendered = _render_conductor_settings(settings_text, values)
     try:
-        original = tomllib.loads(settings_text)
-        parsed = tomllib.loads(rendered)
+        original = _loads_toml_for_comparison(settings_text)
+        parsed = _loads_toml_for_comparison(rendered)
     except tomllib.TOMLDecodeError as exc:
         raise click.ClickException(
             f"Rewriting the Conductor settings at {path} would produce "
@@ -8148,6 +8214,9 @@ def _configure_claude_code(
     shows and a model written here must be an id it will recognize.
     """
     _require_truthful_claude_code_model_names()
+    picker_options = _claude_code_picker_options(
+        api_key, models, view=model_view, base_url=base_url
+    )
     statusline = _install_claude_code_statusline(path, base_url)
     # Router's workspace default for this connection, asked at the origin the
     # setup's session-usage calls go to. Another network read, so it stays
@@ -8177,6 +8246,12 @@ def _configure_claude_code(
         settings = claude_code.read_settings(path)
         state_path = claude_code.state_path(path)
         previous_state = claude_code.read_state(path) if state_path.exists() else None
+        if preserve_model_view_ownership:
+            current_view = claude_code.model_view(settings, path)
+            if current_view != model_view:
+                # Foreground refresh must also honor a preference edited while
+                # discovery was in flight. Fetch its lineup on the next run.
+                model_view, picker_options = current_view, None
         endpoint, client_key = router_repo.client_credentials(
             base_url or router_base_url(), api_key
         )
@@ -8217,6 +8292,10 @@ def _configure_claude_code(
                 previous_state,
                 state,
                 preserve_model_view_ownership=preserve_model_view_ownership,
+            )
+        if picker_options is not None:
+            updated, state = claude_code.plan_model_picker_update(
+                updated, state, picker_options
             )
         # Cache the enforced default for the hooks, which run without the
         # network, along with the model it displaced. A cleared default drops
@@ -8354,6 +8433,80 @@ def _claude_code_version(executable: str) -> tuple[int, int, int] | None:
     if result.returncode != 0 or match is None:
         return None
     return tuple(int(part) for part in match.groups())
+
+
+def _claude_code_supports_model_picker() -> bool:
+    # This is the documented settings minimum, not a claim about the first
+    # version to live-reload it. The terminal reopen flow was tested on 2.1.319.
+    executable = shutil.which("claude")
+    version = _claude_code_version(executable) if executable else None
+    return version is not None and version >= (2, 1, 242)
+
+
+def _claude_code_picker_options(
+    api_key: str,
+    models: list[RouterModel],
+    *,
+    view: str,
+    base_url: str | None,
+) -> list[dict[str, str]] | None:
+    if not _claude_code_supports_model_picker():
+        return None
+    # The caller's exhaustive Claude-compatible list validates defaults. Ask
+    # Router for its compact projection rather than guessing that policy here.
+    picker_models = (
+        _fetch_models(
+            api_key, claude_code_view=True, model_view="compact", base_url=base_url
+        )
+        if view == "compact"
+        else models
+    )
+    return _claude_code_picker_lineup(picker_models)
+
+
+def _claude_code_picker_lineup(models: list[RouterModel]) -> list[dict[str, str]]:
+    return [
+        {"model": model.id, "label": model.metadata.display_name}
+        for model in sorted(models, key=lambda model: model.metadata.listing_order)
+    ]
+
+
+def _claude_code_picker_note_lines(path: Path) -> list[str]:
+    """Best-effort status only; a failed read must not undo a saved refresh."""
+    try:
+        return _read_claude_code_picker_note_lines(path)
+    except Exception:
+        # Optional post-save reporting must not stop later clients. Never echo
+        # the exception: settings/state errors may contain private values.
+        # BaseException is deliberately not caught so interruption propagates.
+        return [
+            "Claude Code picker status could not be checked. "
+            "Reopen /model in the terminal to check the lineup."
+        ]
+
+
+def _read_claude_code_picker_note_lines(path: Path) -> list[str]:
+    if not claude_code.state_path(path).is_file():
+        return []
+    if not _claude_code_supports_model_picker():
+        return [
+            "Saving a modelPicker lineup requires a known Claude Code version with "
+            "settings support (2.1.242+). Update Claude Code and run 'ramp router refresh'.",
+            "Live reload was verified on 2.1.319. Gateway discovery can be unavailable "
+            "on older clients; restarting alone may not help.",
+        ]
+    settings = claude_code.read_settings(path)
+    state = claude_code.read_state(path)
+    picker = state.get("modelPicker")
+    if not isinstance(picker, dict) or settings.get("modelPicker") != picker["written"]:
+        return ["Your Claude Code modelPicker is user-managed and was left unchanged."]
+    return [
+        "Claude Code's user-settings picker lineup is saved. Reopen /model in the "
+        "terminal to see it; this does not switch the current session model.",
+        "Live reload was verified on 2.1.319 (exact minimum unknown). Managed or "
+        "--settings lineups can override it; not every running session is confirmed. "
+        "This does not refresh the outer Claude Desktop picker.",
+    ]
 
 
 def _unconfigure_claude_code(path: Path) -> None:
@@ -9346,6 +9499,7 @@ def use_router_origin(origin: str | None) -> None:
 # sort first. That means this goes stale on its own and has to be moved when a
 # better default ships.
 DEFAULT_MODEL = "gpt-5.6-sol"
+CODEX_DEFAULT_MODEL = "gpt-6.1-sol"
 
 
 def _preferred_model(
@@ -9725,7 +9879,7 @@ def _refresh_claude_code_model(
     base_url: str | None,
     selected_model: str | None,
 ) -> str:
-    """Rewrite only Claude Code's saved model; return it.
+    """Rewrite Claude Code's saved default and owned picker; return the default.
 
     The workspace default wins as it does in configure, and its cached copy
     in the receipt follows, so the hooks put back the current default. A
@@ -9739,11 +9893,23 @@ def _refresh_claude_code_model(
     # names a workspace whose default the receipt does not know, so a
     # default cached for the old one is dropped, not carried over.
     origin = _statusline_origin(base_url)
+    picker_view = "all" if _configured_claude_model_view_all(path) else "compact"
+    picker_options = _claude_code_picker_options(
+        api_key, models, view=picker_view, base_url=base_url
+    )
     harnesses = admin_defaults.coding_agent_settings(api_key, origin)
     connection = _claude_code_default_connection(api_key, origin)
     with claude_code.settings_lock(path):
         if not claude_code.state_path(path).is_file():
             raise _not_configured("claude-code")
+        if _stored_router_api_key(
+            "claude-code", path
+        ) != api_key or _refresh_router_base_url("claude-code", path) != (
+            base_url or router_base_url()
+        ):
+            raise click.ClickException(
+                "The Claude Code connection changed during the update. Reload before saving."
+            )
         state = claude_code.read_state(path)
         settings = claude_code.read_settings(path)
         current = settings.get("model")
@@ -9777,6 +9943,14 @@ def _refresh_claude_code_model(
             updated, new_state = claude_code.plan_automatic_subagent_cleanup(
                 updated, path, new_state
             )
+        # A view edited during discovery wins; the next refresh can fetch it.
+        if (
+            picker_options is not None
+            and claude_code.model_view(settings, path) == picker_view
+        ):
+            updated, new_state = claude_code.plan_model_picker_update(
+                updated, new_state, picker_options
+            )
         if not router_settings.harness_widget_enabled():
             updated = claude_code.without_router_statusline(updated, path)
         if updated == settings and new_state == state:
@@ -9784,6 +9958,7 @@ def _refresh_claude_code_model(
         state_path = claude_code.state_path(path)
         # State first, so a successful settings write is always paired with
         # the managed values needed to undo it.
+        overlay = _prepare_claude_original_settings(path, new_state)
         try:
             _write_private_file(state_path, json.dumps(new_state, indent=2) + "\n")
         except OSError as exc:
@@ -9791,6 +9966,7 @@ def _refresh_claude_code_model(
                 f"Could not save Claude Code setup state to {state_path}: {exc}"
             ) from None
         if updated == settings:
+            _save_claude_original_settings(*overlay)
             return model
         try:
             _write_private_file(path, json.dumps(updated, indent=2) + "\n")
@@ -9799,6 +9975,7 @@ def _refresh_claude_code_model(
             raise click.ClickException(
                 f"Could not update Claude Code settings {path}: {exc}"
             ) from None
+        _save_claude_original_settings(*overlay)
     return model
 
 
@@ -11425,6 +11602,17 @@ def _preferred_codex_model(
     """
     if selected_model in {model["slug"] for model in router_catalog["models"]}:
         return selected_model
+    if selected_model in {model.id for model in models}:
+        return selected_model
+    for model in models:
+        if CODEX_DEFAULT_MODEL in (
+            model.id,
+            model.metadata.request_name,
+            model.metadata.provider_model,
+        ):
+            preferred = _codex_admin_default_model(model.id, models, router_catalog)
+            if preferred is not None:
+                return preferred
     return _preferred_model(models, selected_model)
 
 
@@ -12421,15 +12609,25 @@ def _read_codex_config(path: Path) -> tuple[str, dict]:
 
 def _config_chunks(config: str) -> list[list[str]]:
     chunks: list[list[str]] = [[]]
-    for line in config.splitlines(keepends=True):
-        if _TABLE_HEADER.match(line):
+    open_string: str | None = None
+    for line in _toml_lines(config):
+        # A header-shaped line inside a multiline string is prose.
+        if open_string is None and _TABLE_HEADER.match(line):
             chunks.append([])
         chunks[-1].append(line)
+        open_string = _toml_line_string_state(line, open_string)
     return chunks
 
 
 def _render_root_config(lines: list[str], values: dict) -> str:
-    root = "".join(line for line in lines if not _OWNED_CODEX_ROOT_KEY.match(line))
+    # A line inside a multiline string (say, developer_instructions quoting
+    # a config) is user prose, not an owned key, and must survive.
+    editable, _ = _toml_root_span(lines)
+    root = "".join(
+        line
+        for index, line in enumerate(lines)
+        if index not in editable or not _OWNED_CODEX_ROOT_KEY.match(line)
+    )
     root = root.rstrip()
     settings = "\n".join(
         # A None would render as the JSON null, which is not valid TOML and
@@ -12439,10 +12637,38 @@ def _render_root_config(lines: list[str], values: dict) -> str:
         if value is not None
     )
     if root and settings:
-        return f"{root}\n{settings}\n"
-    if settings:
-        return f"{settings}\n"
-    return f"{root}\n" if root else ""
+        rendered = f"{root}\n{settings}\n"
+    elif settings:
+        rendered = f"{settings}\n"
+    else:
+        rendered = f"{root}\n" if root else ""
+    _verify_root_config("".join(lines), rendered, values)
+    return rendered
+
+
+def _verify_root_config(original: str, rendered: str, values: dict) -> None:
+    """Refuse a root rewrite that changes anything but the owned keys.
+
+    The line filter is deliberately simple; the parser is the proof. If the
+    original root parses, the rendered one must carry exactly the requested
+    owned values and every other value unchanged. An original that does not
+    parse on its own is left to the full-document validation callers run.
+    """
+    try:
+        before = _loads_toml_for_comparison(original)
+        after = _loads_toml_for_comparison(rendered)
+    except tomllib.TOMLDecodeError:
+        return
+    owned = set(_OWNED_ROOT_KEYS)
+    expected = {key: value for key, value in values.items() if value is not None}
+    if {key: after[key] for key in owned if key in after} != expected or {
+        key: value for key, value in before.items() if key not in owned
+    } != {key: value for key, value in after.items() if key not in owned}:
+        raise click.ClickException(
+            "Could not update the Codex config without changing settings Ramp "
+            "Router does not own; no changes were made. Move any unusual "
+            "root-level content below a table header and try again."
+        )
 
 
 def _write_private_file(path: Path, content: str) -> None:

@@ -963,3 +963,15 @@ def test_configure_conductor_writes_the_vendored_harness_prompt(monkeypatch):
     # instructions from the ordinary read.
     assert captured["request"] == (conductor.vendored_binary("codex"), "gpt-5.4", True)
     assert captured["models"] == ["gpt-5.4"]
+
+
+def test_conductor_settings_rewrite_keeps_unchanged_nan_values(tmp_path):
+    settings = 'threshold = nan\ncodex_executable_path = "/old"\n'
+    values = {"codex_executable_path": "/new"}
+
+    rendered = router_module._verified_conductor_settings(
+        settings, values, tmp_path / "settings.toml"
+    )
+
+    assert rendered.startswith("threshold = nan\n")
+    assert tomllib.loads(rendered)["codex_executable_path"] == "/new"

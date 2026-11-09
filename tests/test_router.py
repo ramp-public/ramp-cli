@@ -2369,16 +2369,85 @@ def test_refresh_reapplies_codex_config_and_preserves_selected_model(
     catalog_path = codex_home / router_module.CODEX_ROUTER_CATALOG
     catalog_path.write_text(json.dumps({"models": [{"slug": "openai-only"}]}) + "\n")
 
+    def refresh_backend(path, catalog):
+        # The live hook must run after, not before, successful persistence.
+        assert path == config_path
+        assert catalog == catalog_path
+        assert [row["slug"] for row in json.loads(catalog.read_text())["models"]] == [
+            "a",
+            "Claude Fable 5.1",
+        ]
+        return {"status": "backend_confirmed", "reason": "catalog_matched"}
+
+    monkeypatch.setattr(codex_desktop, "refresh_catalog", refresh_backend)
     refreshed = CliRunner().invoke(cli, ["--human", "router", "refresh"])
 
     assert refreshed.exit_code == 0
     assert "Refreshed the Ramp Router configuration for Codex." in refreshed.output
+    assert "backend confirmed the model list" in refreshed.output
+    assert "Desktop attachment and picker rendering are unverified" in refreshed.output
     config = tomllib.loads(config_path.read_text())
     assert config["model"] == "Claude Fable 5.1"
     assert config["model_providers"]["ramp-router"]["wire_api"] == "responses"
     assert [
         model["slug"] for model in json.loads(catalog_path.read_text())["models"]
     ] == ["a", "Claude Fable 5.1"]
+
+
+def test_unexpected_codex_reload_error_does_not_stop_opencode_refresh(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    opencode_path = tmp_path / "opencode" / "opencode.json"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("OPENCODE_CONFIG", str(opencode_path))
+    monkeypatch.setenv("RAMP_OPENCODE_MAJOR", "2")
+    _mock_models(monkeypatch, [{"id": "a"}])
+    runner = CliRunner()
+    configured = runner.invoke(
+        cli,
+        ["--human", "router", "configure", "codex", "opencode"],
+        input="router-secret\n",
+    )
+    assert configured.exit_code == 0, configured.output
+    assert router_module._configured_model("opencode", opencode_path) == "a"
+    monkeypatch.setattr(
+        router_module, "configured_router_clients", lambda: ["codex", "opencode"]
+    )
+    _mock_models(monkeypatch, [{"id": "b"}])
+    original_lstat = Path.lstat
+
+    def lstat(path, *args, **kwargs):
+        if path.name == "app-server-control.sock":
+            return SimpleNamespace(st_mode=stat.S_IFSOCK, st_uid=os.getuid())
+        return original_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", lstat)
+    attempts = []
+
+    async def reload_backend(_socket, config_path, _config, expected):
+        attempts.append(config_path)
+        # Codex's write succeeded, but OpenCode has not been processed yet.
+        assert expected == {"b"}
+        assert router_module._configured_model("codex", config_path) == "b"
+        assert router_module._configured_model("opencode", opencode_path) == "a"
+        raise RuntimeError("private backend detail")
+
+    monkeypatch.setattr(codex_desktop, "_refresh_catalog_backend", reload_backend)
+    refreshed = runner.invoke(cli, ["--human", "router", "refresh"])
+
+    assert refreshed.exit_code == 0, refreshed.output
+    assert attempts == [codex_home / "config.toml"]
+    assert (
+        "live backend refresh was not confirmed (unexpected_error)" in refreshed.output
+    )
+    assert "private backend detail" not in refreshed.output
+    assert "Refreshed the Ramp Router configuration for OpenCode." in refreshed.output
+    assert router_module._configured_model("opencode", opencode_path) == "b"
+    catalog_path = codex_home / router_module.CODEX_ROUTER_CATALOG
+    assert [row["slug"] for row in json.loads(catalog_path.read_text())["models"]] == [
+        "b"
+    ]
 
 
 def _codex_router_state(codex_home):
@@ -5191,6 +5260,7 @@ def test_reconfigure_claude_only_updates_model_view(tmp_path, monkeypatch):
     payload = json.loads(machine.output)["data"][0]
     original_setup_command = payload.pop("original_setup_command")
     assert original_setup_command.startswith("claude --settings ")
+    assert "2.1.242" in " ".join(payload.pop("note_lines"))
     assert payload == {
         "client": "claude-code",
         "config_path": str(settings_path),
@@ -6199,9 +6269,21 @@ def test_listing_order_does_not_choose_the_default_model():
     models = [
         model("accounts/fireworks/models/deepseek-v4-flash", 0),
         model(router_module.DEFAULT_MODEL, 40),
+        model(router_module.CODEX_DEFAULT_MODEL, 41),
     ]
 
     assert router_module._preferred_model(models) == router_module.DEFAULT_MODEL
+    catalog = {"models": [{"slug": model.id} for model in models]}
+    assert (
+        router_module._preferred_codex_model(models, catalog, None)
+        == router_module.CODEX_DEFAULT_MODEL
+    )
+    assert (
+        router_module._preferred_codex_model(
+            models, catalog, router_module.DEFAULT_MODEL
+        )
+        == router_module.DEFAULT_MODEL
+    )
 
 
 def test_a_router_without_the_default_still_configures_something():
@@ -6373,6 +6455,192 @@ web_search = true
     assert "https://stale.example.com" not in first_content
     assert first_content.count("[model_providers.ramp-router]") == 1
     assert "[features]\nweb_search = true" in first_content
+
+
+def test_configure_codex_replaces_quoted_root_keys(tmp_path, monkeypatch):
+    # The Codex desktop app and Computer Use plugin write quoted root keys.
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    notify = (
+        '"notify" = ["/Users/x/.codex/computer-use/Codex Computer Use.app/'
+        'Contents/MacOS/SkyComputerUseClient", "turn-ended"]\n'
+    )
+    original = (
+        '"model" = "gpt-5.5"\n'
+        "'model_provider' = \"openai\"\n"
+        '"model_reasoning_effort" = "high"\n'
+        + notify
+        + 'developer_instructions = """\nExample config:\n"model" = "gpt-5.5"\n'
+        'model_provider = "openai"\n"""\n'
+        "base_instructions = '''\n'model' = 'literal'\n'''\n"
+        + "\n[features]\nweb_search = true\n"
+    )
+    config_path.write_text(original)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli, ["--human", "router", "configure", "codex"], input="router-secret\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    configured = config_path.read_text()
+    config = tomllib.loads(configured)
+    assert config["model"] == "gpt-5.4"
+    assert config["model_provider"] == "ramp-router"
+    assert config["model_reasoning_effort"] == "high"
+    assert notify in configured
+    assert config["developer_instructions"] == (
+        'Example config:\n"model" = "gpt-5.5"\nmodel_provider = "openai"\n'
+    )
+    assert config["base_instructions"] == "'model' = 'literal'\n"
+    assert configured.count('"model" = "gpt-5.5"') == 1
+
+    result = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert result.exit_code == 0, result.output
+    restored = tomllib.loads(config_path.read_text())
+    assert restored == tomllib.loads(original)
+
+
+@pytest.mark.parametrize(
+    ("root", "kept"),
+    [
+        # A triple quote inside a basic string opens nothing, so the real
+        # model key after it is still replaced.
+        (
+            'developer_instructions = "Use \'\'\' for examples"\n"model" = "gpt-5.5"\n',
+            {"developer_instructions": "Use ''' for examples"},
+        ),
+        # The reverse: basic-string triple quotes inside a literal one
+        # neither close nor reopen it, so its prose survives.
+        (
+            "developer_instructions = '''\n"
+            'say """ then\n"model" = "prose"\n\'\'\'\n'
+            '"model" = "gpt-5.5"\n',
+            {"developer_instructions": 'say """ then\n"model" = "prose"\n'},
+        ),
+        # Escaped quotes and comments do not end or open strings either.
+        (
+            'note = "a \\" \'\'\' b"  # """ comment\n'
+            'body = """\nx \\""" still open\nmodel = "prose"\n"""\n'
+            "model = 'gpt-5.5'\n",
+            {"note": "a \" ''' b", "body": 'x """ still open\nmodel = "prose"\n'},
+        ),
+    ],
+)
+def test_codex_root_rewrite_tracks_toml_string_boundaries(root, kept):
+    rendered = router_module._render_root_config(
+        root.splitlines(keepends=True),
+        {"model": "router-model", "model_provider": "ramp-router"},
+    )
+
+    assert tomllib.loads(rendered) == {
+        **kept,
+        "model": "router-model",
+        "model_provider": "ramp-router",
+    }
+
+
+def test_codex_config_lines_split_only_on_newlines(tmp_path, monkeypatch):
+    # TOML allows U+2028 in a comment; str.splitlines would split there and
+    # read the trailing quotes as opening a string that swallows [features].
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    original = (
+        '"model" = "gpt-5.5"\n\n'
+        "[model_providers.ramp-router]\n"
+        'name = "Stale"  # note\u2028"""\n\n'
+        "[features]\nweb_search = true\n"
+    )
+    config_path.write_text(original, encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli, ["--human", "router", "configure", "codex"], input="router-secret\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    configured = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert configured["features"] == {"web_search": True}
+    assert configured["model_providers"]["ramp-router"]["name"] != "Stale"
+
+    result = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert result.exit_code == 0, result.output
+    restored = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert restored == tomllib.loads(original)
+    assert restored["features"] == {"web_search": True}
+
+
+def test_conductor_style_root_span_ignores_unicode_line_separators():
+    lines = router_module._toml_lines('a = 1  # x\u2028"""\n[t]\nb = 2\n')
+
+    assert lines == ['a = 1  # x\u2028"""\n', "[t]\n", "b = 2\n"]
+    assert router_module._toml_root_span(lines) == ({0}, 1)
+
+
+def test_codex_root_rewrite_keeps_unchanged_nan_values():
+    # Two parses of nan are unequal floats; the check must not call it a change.
+    root = 'custom = { v = nan }\nlimits = [nan, -inf, 1.50]\n"model" = "gpt-5.5"\n'
+
+    rendered = router_module._render_root_config(
+        root.splitlines(keepends=True), {"model": "router-model"}
+    )
+
+    assert "custom = { v = nan }\nlimits = [nan, -inf, 1.50]\n" in rendered
+    assert tomllib.loads(rendered)["model"] == "router-model"
+
+
+def test_configure_codex_ignores_table_headers_inside_multiline_strings(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    original = (
+        'model = "gpt-5.5"\n'
+        'developer_instructions = """\nPut flags under:\n[features]\n"""\n'
+        "\n[features]\nweb_search = true\n"
+    )
+    config_path.write_text(original)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli, ["--human", "router", "configure", "codex"], input="router-secret\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    config = tomllib.loads(config_path.read_text())
+    assert config["model_provider"] == "ramp-router"
+    assert config["developer_instructions"] == "Put flags under:\n[features]\n"
+
+    result = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert result.exit_code == 0, result.output
+    assert tomllib.loads(config_path.read_text()) == tomllib.loads(original)
+
+
+def test_codex_root_rewrite_refuses_to_change_unowned_values(monkeypatch):
+    root = 'body = """\nmodel = "prose"\n"""\n'
+    # Simulate a scanner miss: every line looks editable.
+    monkeypatch.setattr(
+        router_module,
+        "_toml_root_span",
+        lambda lines: (set(range(len(lines))), len(lines)),
+    )
+
+    with pytest.raises(click.ClickException, match="does not own"):
+        router_module._render_root_config(
+            root.splitlines(keepends=True), {"model": "router-model"}
+        )
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Uses a POSIX executable test shim")
@@ -9660,7 +9928,7 @@ def _notice_lines(output):
     """The text inside the NOTICE box, with its frame and padding removed."""
     lines = output.splitlines()
     start = next(i for i, line in enumerate(lines) if line.startswith("┌─── NOTICE"))
-    end = next(i for i, line in enumerate(lines) if line.startswith("└"))
+    end = next(i for i, line in enumerate(lines) if i > start and line.startswith("└"))
     return [line[1:-1].strip() for line in lines[start + 1 : end]]
 
 
