@@ -44,7 +44,7 @@ from ramp_cli.specs.sync import maybe_sync
 from ramp_cli.tools.availability import (
     fetch_availability,
     get_availability,
-    is_business_disabled,
+    is_hidden,
 )
 from ramp_cli.tools.parser import JsonSchema, ParamType, ToolDef, ToolParam
 from ramp_cli.tools.registry import (
@@ -391,7 +391,7 @@ class GeneratedToolGroup(click.Group):
         generated = {
             name
             for name, tool in self._generated_commands(ctx)
-            if not is_business_disabled(snapshot, tool)
+            if not is_hidden(snapshot, tool)
         }
         return sorted(static | generated)
 

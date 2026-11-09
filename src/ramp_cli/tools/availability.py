@@ -3,8 +3,9 @@
 Core's ``GET /developer/v1/agent-tools/availability`` endpoint collapses each
 tool's rollout flag, required OAuth scopes, platform allowlist, and
 authorization level into a per-tool answer for the calling token.  The CLI
-uses it to decorate the spec-derived tool catalog and hide tools disabled by a
-business feature flag from listings. It never blocks direct invocation.
+uses it to decorate the spec-derived tool catalog and hide tools the caller
+can't use (business flag off, wrong token type, or missing role permissions)
+from listings. It never blocks direct invocation.
 ``available: true`` means the call would be admitted, not that it is guaranteed
 to succeed.
 
@@ -35,6 +36,7 @@ _REASON_TEXT: dict[str, str] = {
     "disabled_for_business": "not enabled for your business",
     "platform_not_allowed": "not available to CLI clients",
     "authorization_level_not_allowed": "not available to this token type",
+    "missing_permissions": "your Ramp role doesn't allow it",
 }
 
 
@@ -133,9 +135,19 @@ def cached_availability(
     return _cache.get((env, profile))
 
 
-def is_business_disabled(
-    snapshot: AvailabilitySnapshot | None, tool: ToolDef | None
-) -> bool:
-    """True when the tool's rollout flag is off for the caller's business."""
+# Reasons that hide a tool from listings. Same set as ramp-mcp-remote's
+# tools/list: none of these clear up without a new token, a role change, or a
+# business setting, so listing the tool only invites a failed call.
+HIDING_REASONS = frozenset(
+    {
+        "disabled_for_business",
+        "authorization_level_not_allowed",
+        "missing_permissions",
+    }
+)
+
+
+def is_hidden(snapshot: AvailabilitySnapshot | None, tool: ToolDef | None) -> bool:
+    """True when the caller can't use the tool, so listings should omit it."""
     entry = snapshot.lookup(tool) if snapshot and tool else None
-    return bool(entry and "disabled_for_business" in entry.unavailable_reasons)
+    return bool(entry and HIDING_REASONS.intersection(entry.unavailable_reasons))

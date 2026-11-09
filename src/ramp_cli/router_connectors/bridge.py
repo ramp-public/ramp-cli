@@ -99,11 +99,15 @@ class Bridge:
         responded = [False]
         try:
             self._send(message, responded)
-        except Exception:
+        except Exception as error:
             # Worker futures are not awaited; unexpected failures must also
             # complete the request instead of leaving the harness waiting.
             # Neither transport exceptions nor auth responses are safe to print:
-            # httpx may include URLs, headers or upstream payloads in exceptions.
+            # httpx may include URLs, headers or upstream payloads in exceptions,
+            # and encoding errors quote message content. Only the class is
+            # reported, which still separates a local bridge failure from an
+            # authorization or Router transport failure.
+            failure = type(error).__name__
             if "id" in message and "method" in message and not responded[0]:
                 self.emit(
                     {
@@ -111,12 +115,12 @@ class Bridge:
                         "id": message["id"],
                         "error": {
                             "code": -32000,
-                            "message": "Router connectors unavailable. Check 'ramp router connectors status'; sign in with 'ramp router login --connectors' for the bound account and business, or explicitly re-enable to use a different identity.",
+                            "message": f"Router connectors request failed ({failure}). Check 'ramp router connectors status'; sign in with 'ramp router login --connectors' for the bound account and business, or explicitly re-enable to use a different identity.",
                         },
                     }
                 )
             click.echo(
-                "Router connectors request failed; check connector status or explicit authorization.",
+                f"Router connectors request failed ({failure}); check connector status or explicit authorization.",
                 err=True,
             )
 
@@ -200,7 +204,21 @@ class Bridge:
             responded[0] = True
 
 
+def _configure_stdio() -> None:
+    # Harnesses commonly spawn the bridge without a UTF-8 locale (GUI launches,
+    # containers, SSH), where Python's stdio falls back to ASCII and any
+    # non-ASCII connector result fails to write. stdio JSON-RPC is UTF-8
+    # regardless of locale, so the streams are pinned here instead of relying
+    # on the environment or build flags. stdin is read as bytes and needs no
+    # change; tests may substitute streams without reconfigure().
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="strict", newline="\n")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+
+
 def run(binding: str) -> None:
+    _configure_stdio()
     bridge = Bridge(binding)
     slots = BoundedSemaphore(16)
 

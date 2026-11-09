@@ -45,7 +45,7 @@ from ramp_cli.specs.sync import maybe_sync
 from ramp_cli.tools.availability import (
     cached_availability,
     get_availability,
-    is_business_disabled,
+    is_hidden,
 )
 from ramp_cli.tools.commands import (
     build_tool_command,
@@ -269,11 +269,7 @@ class ToolGroup(click.Group):
             return names
         snapshot = get_availability(env, profile=getattr(self, "_profile", None))
         tools = getattr(self, "_tools_by_name", {})
-        return [
-            name
-            for name in names
-            if not is_business_disabled(snapshot, tools.get(name))
-        ]
+        return [name for name in names if not is_hidden(snapshot, tools.get(name))]
 
     def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
         if cmd := super().get_command(ctx, cmd_name):
@@ -373,7 +369,7 @@ class RampGroup(click.Group):
         )
 
         def listed(tools: list) -> bool:
-            return not all(is_business_disabled(snapshot, tool) for tool in tools)
+            return not all(is_hidden(snapshot, tool) for tool in tools)
 
         resource_names = {name for name, tools in multi.items() if listed(tools)}
         if singletons and listed(singletons):
@@ -405,11 +401,7 @@ class RampGroup(click.Group):
                 self._resolve_env(ctx), profile=self._resolve_profile(ctx)
             )
             aliases = ", ".join(
-                sorted(
-                    t.alias or t.name
-                    for t in tools
-                    if not is_business_disabled(snapshot, t)
-                )
+                sorted(t.alias or t.name for t in tools if not is_hidden(snapshot, t))
             )
             fallback = f"{generated_name.replace('-', ' ').title()} \u2014 {aliases}"
             return ToolGroup.build(

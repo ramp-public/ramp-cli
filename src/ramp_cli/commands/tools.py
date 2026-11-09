@@ -11,7 +11,7 @@ from ramp_cli.output.formatter import print_agent_json, print_json, resolve_form
 from ramp_cli.output.help import BoxHelpFormatter
 from ramp_cli.specs import AGENT_TOOL_DEFINITION
 from ramp_cli.specs.sync import fetch_spec, maybe_sync
-from ramp_cli.tools.availability import get_availability, is_business_disabled
+from ramp_cli.tools.availability import get_availability, is_hidden
 from ramp_cli.tools.commands import (
     cli_category_name,
     resolve_cli_tool_groups,
@@ -74,7 +74,7 @@ def tools_list(ctx: click.Context) -> None:
             for name, tool in resolve_tool_command_names(
                 cat, tools, granted_scopes=granted_scopes
             ):
-                if is_business_disabled(snapshot, tool):
+                if is_hidden(snapshot, tool):
                     continue
                 raw_category = tool.category or "general"
                 record = {
@@ -125,7 +125,7 @@ def tools_list(ctx: click.Context) -> None:
                 for name, tool in resolve_tool_command_names(
                     cat, tools, granted_scopes=granted_scopes
                 )
-                if not is_business_disabled(snapshot, tool)
+                if not is_hidden(snapshot, tool)
             ]
             if not dl_rows:
                 continue

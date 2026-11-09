@@ -266,7 +266,7 @@ def register(group: click.Group) -> None:
             # The root CLI's automatic agent error envelope is not JSON-RPC.
             # Bridge startup/transport failures must never contaminate stdout.
             click.echo(
-                "Router connectors bridge stopped. Check connector status and explicit Router authorization.",
+                f"Router connectors bridge stopped ({type(error).__name__}). Check connector status and explicit Router authorization.",
                 err=True,
             )
             raise SystemExit(

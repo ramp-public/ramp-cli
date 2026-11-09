@@ -655,6 +655,44 @@ def test_worker_cache_write_failure_replies_without_disclosing_secrets(
     assert "private-token-value" not in output.out + output.err
 
 
+def test_bridge_relays_non_ascii_through_ascii_stdio(monkeypatch):
+    def handle(request):
+        if request.url.path == "/api/auth/cli/mcp-token":
+            return issued()
+        assert json.loads(request.content)["params"]["arguments"] == {"query": "café"}
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"content": [{"type": "text", "text": "Résultat 😃"}]},
+            },
+        )
+
+    client = setup(monkeypatch, handle)
+    binding = credentials.create_binding(client)
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "search", "arguments": {"query": "café"}},
+    }
+    monkeypatch.setattr(
+        "sys.stdin",
+        SimpleNamespace(
+            buffer=io.BytesIO(json.dumps(request, ensure_ascii=False).encode() + b"\n")
+        ),
+    )
+    # A harness that spawns the bridge without a UTF-8 locale hands it
+    # ASCII-encoded stdio, as the release binary does under LANG=C.
+    stdout = io.TextIOWrapper(io.BytesIO(), encoding="ascii")
+    monkeypatch.setattr("sys.stdout", stdout)
+    bridge.run(binding)
+    stdout.flush()
+    response = json.loads(stdout.buffer.getvalue().decode("utf-8"))
+    assert response["result"]["content"][0]["text"] == "Résultat 😃"
+
+
 def test_credential_files_are_private(monkeypatch):
     client = setup(monkeypatch, lambda request: issued())
     credentials.create_binding(client)
