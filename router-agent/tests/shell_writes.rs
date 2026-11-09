@@ -62,7 +62,7 @@ fn attributed(cmd_for: impl Fn(&str) -> String) -> (Option<String>, Option<Strin
     let tmp = std::env::temp_dir().join(format!(
         "rrh-shell-writes-{}-{}",
         std::process::id(),
-        rand_suffix()
+        next_tmp_id()
     ));
     let _ = std::fs::remove_dir_all(&tmp);
     let alpha = repo(&tmp, "alpha");
@@ -85,11 +85,11 @@ fn attributed(cmd_for: impl Fn(&str) -> String) -> (Option<String>, Option<Strin
     (a.repository, a.repository_source)
 }
 
-fn rand_suffix() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos()
+/// Tests run in parallel threads, and macOS clocks tick in microseconds, so a timestamp suffix can
+/// repeat and let one test delete another's repositories. A process-wide counter cannot repeat.
+fn next_tmp_id() -> usize {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 #[test]

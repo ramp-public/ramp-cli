@@ -109,6 +109,9 @@ _OWNED_ENV_KEYS = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_CUSTOM_HEADERS",
     "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+    # Native per-request classification (Claude Code >=2.1.273), not a static
+    # custom header: main turns must stay distinct from auxiliary/subagent work.
+    "CLAUDE_CODE_GATEWAY_HINT_HEADERS",
     # A saved Anthropic login can otherwise repopulate modelAccessCache with
     # denials that override Router's discovered models (Claude Code 2.1.281).
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
@@ -135,6 +138,7 @@ _OWNED_ENV_KEYS = (
 # alone, and merge_states adopts the fresh snapshot taken before this
 # configure wrote it.
 _ENV_KEYS_OWNED_LATER = (
+    "CLAUDE_CODE_GATEWAY_HINT_HEADERS",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
     "ROUTER_BASE_URL",
     "ROUTER_API_KEY",
@@ -852,6 +856,7 @@ def plan_configuration(
         "ANTHROPIC_BASE_URL": base_url,
         "ANTHROPIC_AUTH_TOKEN": api_key,
         "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+        "CLAUDE_CODE_GATEWAY_HINT_HEADERS": "1",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         _CLAUDE_AI_CONNECTORS_ENV: "false",
     }

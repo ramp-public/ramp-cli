@@ -50,6 +50,13 @@ migrates on refresh when Claude Desktop is closed. Refresh does not interrupt
 a running Desktop session; to migrate immediately, run
 `ramp router configure desktop --base-url https://api.router.com/v1`.
 
+Claude Code setup also enables native gateway hint headers with
+`CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` (Claude Code 2.1.273 or later). These let a
+gateway distinguish main conversation turns from subagent, workflow, compaction,
+and auxiliary requests such as session titles. Existing setups gain this on
+`ramp router refresh`; unconfiguring restores the previous setting. This only
+enables request metadata, not cache warming or a Router warming policy.
+
 Without a terminal (for example, during an MDM install), omitting client names
 configures all automatic integrations, including Claude Desktop/Cowork when
 installed on macOS. Claude Desktop restarts to apply its Router profile.

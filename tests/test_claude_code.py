@@ -352,6 +352,79 @@ def test_unconfigure_removes_keys_the_user_never_had(tmp_path):
     assert restored == {}
 
 
+@pytest.mark.parametrize("previous", [None, "", "0", "1"])
+def test_gateway_hints_are_enabled_and_reversible(tmp_path, previous):
+    path = tmp_path / "settings.json"
+    key = "CLAUDE_CODE_GATEWAY_HINT_HEADERS"
+    original = {"env": {key: previous}} if previous is not None else {}
+    updated, state = claude_code.plan_configuration(
+        original, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+
+    assert updated["env"][key] == "1"
+    assert claude_code.plan_original_settings(state)["env"][key] == (
+        previous if previous is not None else ""
+    )
+    assert claude_code.plan_restoration(updated, path, state) == original
+    headers = updated["env"]["ANTHROPIC_CUSTOM_HEADERS"].lower()
+    assert "x-claude-code-request-class" not in headers
+    assert "x-router-cache-keepalive" not in headers
+
+
+def test_unconfigure_preserves_user_edits_to_gateway_hints(tmp_path):
+    path = tmp_path / "settings.json"
+    key = "CLAUDE_CODE_GATEWAY_HINT_HEADERS"
+    updated, state = claude_code.plan_configuration(
+        {}, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+    updated["env"][key] = "0"
+
+    assert claude_code.plan_restoration(updated, path, state) == {"env": {key: "0"}}
+
+
+@pytest.mark.parametrize("previous", [None, "", "0", "1"])
+@pytest.mark.parametrize("command", ["configure", "refresh"])
+def test_legacy_state_adopts_gateway_hints(monkeypatch, tmp_path, previous, command):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    _mock_router_endpoints(monkeypatch)
+    path = tmp_path / "settings.json"
+    key = "CLAUDE_CODE_GATEWAY_HINT_HEADERS"
+    updated, state = claude_code.plan_configuration(
+        {}, path, "https://router-api.ramp.com", "secret", "gpt-5.4"
+    )
+    # Simulate a receipt from before hint ownership and a preference set since.
+    state["env"].pop(key)
+    state["written"]["env"].pop(key)
+    updated["env"].pop(key)
+    if previous is not None:
+        updated["env"][key] = previous
+    claude_code.state_path(path).write_text(json.dumps(state))
+    path.write_text(json.dumps(updated))
+    old_state = claude_code.read_state(path)
+    assert claude_code.plan_restoration(updated, path, old_state).get("env", {}) == (
+        {key: previous} if previous is not None else {}
+    )
+
+    args = ["--human", "router", command]
+    if command == "configure":
+        args += ["claude-code", "--api-key", "secret"]
+    runner = CliRunner()
+    result = runner.invoke(cli, args)
+    assert result.exit_code == 0, result.output
+    assert json.loads(path.read_text())["env"][key] == "1"
+    state = claude_code.read_state(path)
+    assert state["env"][key] == {
+        "present": previous is not None,
+        "value": previous,
+    }
+
+    result = runner.invoke(cli, ["--human", "router", "unconfigure", "claude-code"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(path.read_text()).get("env", {}) == (
+        {key: previous} if previous is not None else {}
+    )
+
+
 def test_configure_caps_auto_compact_below_the_provider_input_limit(tmp_path):
     # Router lists its 1M-class OpenAI models to Claude Code with the "[1m]"
     # suffix, which makes the client wait until ~967K tokens to compact, while
