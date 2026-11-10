@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 
 import click
@@ -14,19 +15,28 @@ from ramp_cli.auth.access import access_level
 from ramp_cli.auth.client_credentials import login as do_client_credentials_login
 from ramp_cli.auth.environment import (
     environment_auth_required_message,
+    extra_auth_headers,
     missing_required_environment_auth,
 )
 from ramp_cli.auth.oauth import LoginOptions, OAuthTokenError
 from ramp_cli.auth.oauth import login as do_login
+from ramp_cli.client.transport import user_agent_string
 from ramp_cli.config import profiles, settings
-from ramp_cli.config.constants import base_url, iter_environments
-from ramp_cli.errors import EnvironmentAuthRequiredError
+from ramp_cli.config.constants import (
+    REQUEST_TIMEOUT,
+    api_url,
+    base_url,
+    iter_environments,
+)
+from ramp_cli.errors import ApiError, EnvironmentAuthRequiredError, RampCLIError
 from ramp_cli.onboarding import is_first_login, record_first_login, show_welcome
-from ramp_cli.output.formatter import print_agent_json, resolve_format
+from ramp_cli.output.formatter import print_agent_json, print_json, resolve_format
 from ramp_cli.output.style import SUCCESS_GREEN, env_label, show_status_box
 from ramp_cli.specs.sync import fetch_spec
 
 CLIENT_SECRET_ENV_VAR = "RAMP_CLIENT_SECRET"
+SIGNUP_PATH = "/v1/public/developer-experience/signup"
+_EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 
 SCOPE_REMOVED_MESSAGE = """--scope is no longer supported.
 
@@ -370,6 +380,127 @@ def login_standalone_agent(
         return
 
     click.secho("\u2713 Standalone agent authenticated", fg=SUCCESS_GREEN, bold=True)
+
+
+def _signup_next_steps(env: str, email: str) -> list[dict[str, str]]:
+    return [
+        {
+            "step": "accept_invite",
+            "description": (
+                f"Check {email} for the Ramp Developer Console invite and accept "
+                "it (set your password). It usually arrives within a few minutes."
+            ),
+        },
+        {
+            "step": "login",
+            "description": "Authenticate the CLI as that user.",
+            "command": f"ramp --env {env} auth login",
+        },
+    ]
+
+
+def _validate_signup_email(
+    _ctx: click.Context, _param: click.Parameter, value: str
+) -> str:
+    email = value.strip()
+    if not _EMAIL_RE.fullmatch(email):
+        raise click.BadParameter(
+            f"{value!r} is not a valid email address.", param_hint="'--email'"
+        )
+    return email
+
+
+@auth_group.command()
+@click.option(
+    "--email",
+    required=True,
+    callback=_validate_signup_email,
+    help="Your work email. A Developer Console business is created for its domain.",
+)
+@click.option(
+    "--org",
+    help="Organization name for the Developer Console business.",
+)
+@click.option(
+    "--dry_run",
+    is_flag=True,
+    default=False,
+    help="Print the request without sending it.",
+)
+@click.pass_context
+def signup(ctx: click.Context, email: str, org: str | None, dry_run: bool) -> None:
+    """Sign up for a Ramp Developer Console account (no login required).
+
+    Creates a Developer Console business for your email's domain and emails
+    you an admin invite. Work email only; personal and disposable domains
+    are rejected.
+    """
+    env = ctx.obj["env"]
+    fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
+    url = api_url(env, SIGNUP_PATH)
+    body = {"email": email}
+    if org:
+        body["organization_name"] = org
+
+    if dry_run:
+        if fmt == "json":
+            print_agent_json(
+                {"dry_run": True, "method": "POST", "url": url, "body": body},
+                pagination=None,
+            )
+        else:
+            click.echo(f"DRY RUN: POST {url}", err=True)
+            print_json(body)
+        return
+
+    if missing_required_environment_auth(env):
+        raise EnvironmentAuthRequiredError(environment_auth_required_message(env))
+
+    headers = {
+        "User-Agent": user_agent_string(),
+        "Accept": "application/json",
+        **extra_auth_headers(env),
+    }
+    try:
+        with httpx.Client(timeout=REQUEST_TIMEOUT) as http:
+            resp = http.post(url, json=body, headers=headers)
+    except httpx.HTTPError as exc:
+        raise click.ClickException(f"Signup request failed: {exc}") from exc
+    if resp.status_code >= 400:
+        error = ApiError(resp.status_code, resp.text)
+        if error.status_code == 403 and error.error_code == "4013":
+            raise RampCLIError("Developer Console signup isn't available yet.")
+        if error.status_code == 429:
+            raise RampCLIError("Too many signup attempts. Try again in an hour.")
+        raise error
+
+    payload = resp.json()
+    submitted_email = payload["email"]
+    signup_status = payload["status"]
+    next_steps = _signup_next_steps(env, submitted_email)
+
+    if fmt == "json":
+        print_agent_json(
+            {
+                "email": submitted_email,
+                "status": signup_status,
+                "environment": env,
+                "next_steps": next_steps,
+            },
+            pagination=None,
+        )
+        return
+
+    click.secho(
+        f"\u2713 Signup submitted for {submitted_email}", fg=SUCCESS_GREEN, bold=True
+    )
+    click.echo()
+    click.echo("  Next steps:")
+    for index, step in enumerate(next_steps, start=1):
+        click.echo(f"    {index}. {step['description']}")
+        if "command" in step:
+            click.echo(f"         {step['command']}")
+    click.echo()
 
 
 @auth_group.command()

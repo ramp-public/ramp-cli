@@ -268,6 +268,233 @@ def client_credentials(base_url: str, api_key: str) -> tuple[str, str]:
         return direct, api_key
 
 
+CURSOR_BINDING_FILENAME = "router-agent-cursor.json"
+
+
+def cursor_binding_path() -> Path:
+    """Which stored credential the agent uploads Cursor's repository tags with.
+
+    Kept beside the settings, outside router-agent-credentials/, so nothing
+    reading that directory takes it for a credential.
+    """
+    return config_dir() / CURSOR_BINDING_FILENAME
+
+
+def bind_cursor(base_url: str, api_key: str, user_dir: Path) -> None:
+    """Point the agent's Cursor uploads at the key Cursor was given; never raises.
+
+    Cursor's servers call Router with the real key, so Cursor gets no local
+    token. Uploading with that same key files the tags under the same Router
+    user. This runs whether or not tagging is on, as Claude Desktop setup does:
+    enabling tagging never revisits Cursor, whose copy of the key is encrypted
+    in the Keychain. The binding names the credential file rather than its
+    local token, and carries Cursor's folder because the agent service does not
+    inherit XDG_CONFIG_HOME or RAMP_CURSOR_USER_DIR.
+    """
+    try:
+        health = health_token(create=True)
+        if health is None or api_key.startswith(router_local_auth.TOKEN_PREFIX):
+            unbind_cursor()
+            return
+        upstream = urllib.parse.urlsplit(unwrap_url(base_url)).netloc.lower()
+        directory = config_dir() / "router-agent-credentials"
+        token = router_local_auth.register(directory, health, upstream, api_key)
+        binding = {
+            "upstream": upstream,
+            "credential": router_local_auth.credential_path(directory, token).stem,
+            "user_dir": str(user_dir.expanduser().absolute()),
+        }
+        router_local_auth.write_private(cursor_binding_path(), json.dumps(binding))
+    except Exception:
+        # An earlier binding would upload with a key Cursor may no longer use.
+        unbind_cursor()
+        _log(
+            "Could not record Cursor's Router credential; Cursor repository tags stay off"
+        )
+
+
+def unbind_cursor() -> None:
+    """Stop the agent's Cursor uploads; never raises."""
+    try:
+        cursor_binding_path().unlink(missing_ok=True)
+    except OSError as exc:
+        _log(f"Could not remove the Cursor binding: {exc!r}")
+
+
+def cursor_bound_user_dir() -> Path | None:
+    """Cursor's folder as the binding names it (what the agent scans), or None."""
+    path = cursor_binding_path()
+    # No binding, no private-file checks: they need os.getuid, which Windows lacks.
+    if not path.exists() and not path.is_symlink():
+        return None
+    try:
+        binding = json.loads(router_local_auth.read_private(path))
+    except (OSError, ValueError):
+        return None
+    user = binding.get("user_dir") if isinstance(binding, dict) else None
+    return Path(user) if isinstance(user, str) and Path(user).is_absolute() else None
+
+
+CURSOR_UPLOAD_STATUS_FILENAME = "router-agent-cursor-status.json"
+CURSOR_BOUND = "bound"
+CURSOR_NEEDS_SETUP = "needs_setup"
+CURSOR_STALE = "stale"
+CURSOR_BROKEN = "broken"
+CURSOR_UNUSED = "unused"
+
+
+def cursor_upload_status_path() -> Path:
+    """The agent's last Cursor upload: when, how many records, and the outcome."""
+    return config_dir() / CURSOR_UPLOAD_STATUS_FILENAME
+
+
+def _cursor_last_upload(since: int) -> dict | None:
+    """The agent's last attempt, unless it predates the current binding."""
+    try:
+        upload = json.loads(cursor_upload_status_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(upload, dict) or not isinstance(upload.get("outcome"), str):
+        return None
+    at = upload.get("at")
+    # An attempt from before the last setup used the old key or host.
+    if type(at) is not int or not since <= at < 2**32:
+        return None
+    return upload
+
+
+def _agent_upload_base(netloc: str, extra_hosts: Collection[str]) -> str | None:
+    """Where the agent would upload for ``netloc`` (proxy.rs ``default_upstream``)."""
+    hostport = netloc.rpartition("@")[2]
+    if hostport.startswith("["):
+        host, closed, after = hostport[1:].partition("]")
+        if not closed:
+            return None
+        port = after[1:] if after.startswith(":") else ""
+    else:
+        host, colon, port = hostport.rpartition(":")
+        if not colon:
+            host, port = hostport, ""
+    if port and (not (port.isascii() and port.isdigit()) or int(port) > 65535):
+        return None
+    host = host.lower()
+    if not host or not router_host_allowed(host, extra_hosts):
+        return None
+    return f"https://{host}:{port}" if port and int(port) else f"https://{host}"
+
+
+def _authority(url: str) -> tuple[str, int] | None:
+    """Host and port Router is reached at, ignoring case, a root dot and :443."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    if not host:
+        return None
+    return host.rstrip("."), port or 443
+
+
+def _shown_authority(netloc: str) -> str:
+    """``host[:port]`` without any userinfo, for status output."""
+    return netloc.rpartition("@")[2].lower()
+
+
+def _header_safe(value: str) -> bool:
+    """What ``hyper::header::HeaderValue::from_str`` accepts."""
+    return all(c == "\t" or (" " <= c and c != "\x7f") for c in value)
+
+
+def _cursor_credential_ok(upstream: str, digest: object) -> bool:
+    """Whether the agent can load the binding's key (cursor.rs ``credential``)."""
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(c not in "0123456789abcdef" for c in digest)
+    ):
+        return False
+    path = config_dir() / "router-agent-credentials" / f"{digest}.json"
+    try:
+        record = json.loads(router_local_auth.read_private(path))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(record, dict):
+        return False
+    key = record.get("api_key")
+    return (
+        record.get("upstream") == upstream
+        and isinstance(key, str)
+        and bool(key)
+        and not key.startswith(router_local_auth.TOKEN_PREFIX)
+        and _header_safe(key)
+    )
+
+
+def cursor_tagging(
+    override_url: str | None, routes_to_router: bool, *, override_known: bool = True
+) -> dict | None:
+    """Whether the agent can upload Cursor's repository tags, for ``status``.
+
+    None when Cursor neither routes to Router nor has a binding. Reads local
+    files only, so it never touches the Keychain or the network. The checks
+    follow the agent's own, so "bound" means the agent will find the key.
+    """
+    if not routes_to_router and override_url:
+        # Any Router host the agent sends to counts, however it is spelled: a
+        # custom deployment, case or :443 variants, or the helper-wrapped form.
+        try:
+            netloc = urllib.parse.urlsplit(unwrap_url(override_url)).netloc
+        except ValueError:
+            netloc = ""
+        routes_to_router = (
+            _agent_upload_base(netloc, read_extra_hosts(settings_path())) is not None
+        )
+    path = cursor_binding_path()
+    if not path.exists() and not path.is_symlink():
+        return {"state": CURSOR_NEEDS_SETUP} if routes_to_router else None
+    try:
+        binding = json.loads(router_local_auth.read_private(path))
+    except (OSError, ValueError):
+        binding = None
+    upstream = binding.get("upstream") if isinstance(binding, dict) else None
+    if not isinstance(upstream, str) or not upstream:
+        return {"state": CURSOR_BROKEN, "reason": "binding_unreadable"}
+    result = {"upstream": _shown_authority(upstream)}
+    if _agent_upload_base(upstream, read_extra_hosts(settings_path())) is None:
+        return {**result, "state": CURSOR_BROKEN, "reason": "host_not_allowed"}
+    if not _cursor_credential_ok(upstream, binding.get("credential")):
+        return {**result, "state": CURSOR_BROKEN, "reason": "credential_missing"}
+    if not routes_to_router and override_known:
+        # Cursor no longer sends to Router (its override was cleared, as the
+        # TUI's disconnect asks, or points elsewhere), yet the agent still
+        # uploads its chats' repositories with the old key.
+        return {**result, "state": CURSOR_UNUSED}
+    if override_url:
+        # Compared the way bind_cursor derived the binding: helper URL unwrapped.
+        cursor_url = unwrap_url(override_url)
+        if _authority(cursor_url) != _authority(f"https://{upstream}"):
+            try:
+                netloc = urllib.parse.urlsplit(cursor_url).netloc
+            except ValueError:
+                netloc = cursor_url
+            return {
+                **result,
+                "state": CURSOR_STALE,
+                "cursor_upstream": _shown_authority(netloc),
+            }
+    try:
+        bound_at = path.stat().st_mtime
+    except OSError:
+        bound_at = 0.0
+    return {
+        **result,
+        "state": CURSOR_BOUND,
+        # The agent uploads only while repository tagging is on.
+        "uploading": enabled(),
+        "last_upload": _cursor_last_upload(int(bound_at)),
+    }
+
+
 def local_token_path(token: str) -> Path:
     return router_local_auth.credential_path(
         config_dir() / "router-agent-credentials", token

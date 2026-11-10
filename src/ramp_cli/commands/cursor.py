@@ -32,6 +32,10 @@ _SETTINGS_KEY = (
 _OPENAI_KEY_SECRET = "secret://cursorAuth/openAIKey"
 _SECRET_INDEX_KEY = "secret://storage"
 _RECEIPT_FILENAME = "cursor-router-state.json"
+# Rows where Cursor caches its team's admin settings as JSON. Their
+# "byokDisabled" flag means the team blocks personal API keys, and Cursor then
+# ignores the OpenAI key and base-URL override.
+_ADMIN_SETTINGS_KEYS = ("adminSettings.cached", "autorun.cachedAdminSettings")
 
 
 class CursorSettingsError(RuntimeError):
@@ -66,9 +70,19 @@ def override_base_url() -> str | None:
 
     The database is opened read-only: Cursor may be running and owns it.
     """
-    path = state_db_path()
+    return read_override_base_url()[1]
+
+
+def read_override_base_url(user: Path | None = None) -> tuple[bool, str | None]:
+    """(whether Cursor's settings were read, the override or None when unset).
+
+    Tells "Cursor has no override" from "Cursor's settings could not be read",
+    for example while a running Cursor holds the database's write lock.
+    ``user`` is Cursor's user-data directory, this process's by default.
+    """
+    path = state_db_path(user)
     if not path.is_file():
-        return None
+        return False, None
     try:
         connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=1)
         try:
@@ -79,16 +93,41 @@ def override_base_url() -> str | None:
             connection.close()
         settings = json.loads(row[0]) if row else {}
     except (sqlite3.Error, OSError, UnicodeError, ValueError, TypeError):
-        return None
+        return False, None
     value = settings.get("openAIBaseUrl") if isinstance(settings, dict) else None
     if not isinstance(value, str):
-        return None
-    return value.strip().rstrip("/") or None
+        return True, None
+    return True, value.strip().rstrip("/") or None
 
 
-def state_db_path() -> Path:
+def personal_keys_blocked(user: Path | None = None) -> bool:
+    """Whether Cursor's team blocks personal API keys, as Cursor last cached it.
+
+    Cursor refreshes the cache while it runs, so a change an admin just made
+    shows up once Cursor has been open. False when the settings can't be read.
+    """
+    path = state_db_path(user)
+    if not path.is_file():
+        return False
+    try:
+        connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=1)
+        try:
+            rows = connection.execute(
+                "SELECT value FROM ItemTable WHERE key IN (?, ?)", _ADMIN_SETTINGS_KEYS
+            ).fetchall()
+        finally:
+            connection.close()
+        settings = [json.loads(value) for (value,) in rows]
+    except (sqlite3.Error, OSError, UnicodeError, ValueError, TypeError):
+        return False
+    return any(
+        isinstance(item, dict) and item.get("byokDisabled") is True for item in settings
+    )
+
+
+def state_db_path(user: Path | None = None) -> Path:
     """Return the SQLite file holding Cursor's application settings."""
-    return user_dir() / "globalStorage" / "state.vscdb"
+    return (user or user_dir()) / "globalStorage" / "state.vscdb"
 
 
 def model_names_to_add(model_names: list[str], aliases: dict[str, str]) -> list[str]:

@@ -1,5 +1,6 @@
 pub mod attr;
 pub mod auth;
+pub mod cursor;
 pub mod git;
 pub mod json;
 pub mod log;

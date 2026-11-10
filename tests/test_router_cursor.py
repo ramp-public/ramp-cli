@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import stat
+import time
+import urllib.parse
 
 import pytest
 from click.testing import CliRunner
 
 import ramp_cli.commands.router as router_module
+from ramp_cli import claude_cowork
+from ramp_cli.commands import cursor, router_local_auth, router_repo, router_schedule
 from ramp_cli.main import cli
 
 
@@ -756,3 +762,601 @@ def test_ensure_claude_aliases_fails_open_on_older_routers(monkeypatch):
         [_router_model("claude-fable-5")],
     )
     assert aliases == {}
+
+
+def _cursor_binding():
+    path = router_repo.cursor_binding_path()
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [["router", "cursor"], ["router", "configure", "cursor"]],
+)
+def test_cursor_setup_binds_its_key_for_transcript_uploads(
+    monkeypatch, tmp_path, command
+):
+    _mock_cursor_setup(monkeypatch)
+    monkeypatch.setenv("RAMP_CLAUDE_DESKTOP_APP_SUPPORT", str(tmp_path))
+    result = CliRunner().invoke(
+        cli, ["--human", *command, "--api-key", "router-secret"]
+    )
+    assert result.exit_code == 0, result.output
+    # Tagging is off here: Cursor is never revisited when it is turned on.
+    assert not router_repo.enabled()
+    binding = _cursor_binding()
+    upstream = router_module.DEFAULT_ROUTER_BASE_URL.split("://", 1)[1].split("/")[0]
+    assert binding["upstream"] == upstream
+    assert binding["user_dir"] == str(cursor.user_dir().absolute())
+    # The binding names the credential file, never the local token or the key.
+    assert "router-secret" not in json.dumps(binding)
+    assert router_local_auth.TOKEN_PREFIX not in json.dumps(binding)
+    stored = router_repo.config_dir() / "router-agent-credentials"
+    record = json.loads((stored / f"{binding['credential']}.json").read_text())
+    assert record == {"upstream": upstream, "api_key": "router-secret"}
+    mode = router_repo.cursor_binding_path().stat().st_mode
+    assert stat.S_IMODE(mode) == 0o600
+
+
+def test_cursor_setup_replaces_the_previous_binding(monkeypatch):
+    _mock_cursor_setup(monkeypatch)
+    for key in ("first-secret", "second-secret"):
+        result = CliRunner().invoke(cli, ["router", "cursor", "--api-key", key])
+        assert result.exit_code == 0, result.output
+    binding = _cursor_binding()
+    stored = router_repo.config_dir() / "router-agent-credentials"
+    record = json.loads((stored / f"{binding['credential']}.json").read_text())
+    assert record["api_key"] == "second-secret"
+
+
+def test_a_failed_bind_drops_the_stale_binding(monkeypatch):
+    _mock_cursor_setup(monkeypatch)
+    result = CliRunner().invoke(cli, ["router", "cursor", "--api-key", "old-key"])
+    assert result.exit_code == 0, result.output
+    assert _cursor_binding() is not None
+
+    def fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(router_local_auth, "register", fail)
+    result = CliRunner().invoke(cli, ["router", "cursor", "--api-key", "new-key"])
+    # Setup still succeeds; only the uploads stay off.
+    assert result.exit_code == 0, result.output
+    assert _cursor_binding() is None
+
+
+def test_unconfigure_cursor_removes_the_binding(monkeypatch, tmp_path):
+    _mock_cursor_setup(monkeypatch)
+    monkeypatch.setenv("RAMP_CLAUDE_DESKTOP_APP_SUPPORT", str(tmp_path))
+    result = CliRunner().invoke(cli, ["router", "cursor", "--api-key", "router-secret"])
+    assert result.exit_code == 0, result.output
+    assert _cursor_binding() is not None
+    result = CliRunner().invoke(cli, ["--human", "router", "unconfigure", "cursor"])
+    assert result.exit_code == 0, result.output
+    assert _cursor_binding() is None
+
+
+def test_bare_unconfigure_removes_a_pasted_cursor_binding(monkeypatch, tmp_path):
+    _mock_cursor_setup(monkeypatch)
+    monkeypatch.setenv("RAMP_CLAUDE_DESKTOP_APP_SUPPORT", str(tmp_path))
+    # `ramp router cursor` only hands out paste-in steps: no restore record.
+    result = CliRunner().invoke(cli, ["router", "cursor", "--api-key", "router-secret"])
+    assert result.exit_code == 0, result.output
+    assert not cursor.has_receipt()
+    result = CliRunner().invoke(cli, ["--human", "router", "unconfigure"])
+    assert result.exit_code == 0, result.output
+    assert _cursor_binding() is None, result.output
+    assert 'Toggle off "OpenAI API Key"' in result.output
+
+
+def test_a_failed_cursor_restore_keeps_the_binding(monkeypatch, tmp_path):
+    _mock_cursor_setup(monkeypatch)
+    monkeypatch.setenv("RAMP_CLAUDE_DESKTOP_APP_SUPPORT", str(tmp_path))
+    result = CliRunner().invoke(cli, ["router", "cursor", "--api-key", "router-secret"])
+    assert result.exit_code == 0, result.output
+
+    def still_running():
+        raise cursor.CursorSettingsError("Quit Cursor first.")
+
+    monkeypatch.setattr(cursor, "unconfigure", still_running)
+    CliRunner().invoke(cli, ["--human", "router", "unconfigure", "cursor"])
+    # Cursor still sends to Router, so its uploads keep going.
+    assert _cursor_binding() is not None
+
+
+@pytest.mark.parametrize("written", [False, True])
+def test_setup_file_deployment_is_what_cursor_gets_and_what_is_bound(
+    monkeypatch, tmp_path, written
+):
+    _mock_cursor_setup(monkeypatch)
+    monkeypatch.setenv("RAMP_CLAUDE_DESKTOP_APP_SUPPORT", str(tmp_path))
+    seen = {}
+
+    def write(api_key, base_url, models, aliases, **kwargs):
+        seen["base_url"] = base_url
+        return {"models_added": []} if written else None
+
+    monkeypatch.setattr(router_module, "_write_cursor_settings", write)
+    setup = tmp_path / "ramp-router-setup-x.json"
+    setup.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "name": "Ramp Router",
+                "base_url": "https://QA-API.router.com/v1/",
+                "api_key": "router-secret",
+            }
+        )
+    )
+    result = CliRunner().invoke(
+        cli, ["--agent", "router", "configure", "cursor", "--setup-file", str(setup)]
+    )
+    assert result.exit_code == 0, result.output
+    assert urllib.parse.urlsplit(seen["base_url"]).netloc.lower() == "qa-api.router.com"
+    assert _cursor_binding()["upstream"] == "qa-api.router.com"
+    assert _cursor_binding()["credential"] not in result.output
+    if not written:
+        assert "https://QA-API.router.com/v1" in result.output
+
+
+def test_base_url_flag_deployment_is_bound(monkeypatch, tmp_path):
+    _mock_cursor_setup(monkeypatch)
+    monkeypatch.setenv("RAMP_CLAUDE_DESKTOP_APP_SUPPORT", str(tmp_path))
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--agent",
+            "router",
+            "configure",
+            "cursor",
+            "--base-url",
+            "https://internal-api.router.com/v1",
+            "--api-key",
+            "k",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert _cursor_binding()["upstream"] == "internal-api.router.com"
+    assert "internal-api.router.com" in result.output
+
+
+def test_router_cursor_env_deployment_is_bound(monkeypatch):
+    _mock_cursor_setup(monkeypatch)
+    monkeypatch.setenv("RAMP_ROUTER_BASE_URL", "https://router.example.com:8443/v1")
+    result = CliRunner().invoke(cli, ["--agent", "router", "cursor", "--api-key", "k"])
+    assert result.exit_code == 0, result.output
+    assert "https://router.example.com:8443/v1" in result.output
+    assert _cursor_binding()["upstream"] == "router.example.com:8443"
+
+
+def test_removing_the_last_other_client_keeps_the_agent_for_cursor(monkeypatch):
+    """Cursor's transcript uploads run in the agent, so Cursor's setup keeps it
+    installed when the last other client is removed."""
+    monkeypatch.setattr(claude_cowork, "unconfigure", lambda: None)
+    removed = []
+    monkeypatch.setattr(router_schedule, "uninstall", lambda: removed.append(1))
+    args = ["--human", "router", "unconfigure", "cowork"]
+    _mock_cursor_setup(monkeypatch)
+    setup = CliRunner().invoke(cli, ["router", "cursor", "--api-key", "k"])
+    assert setup.exit_code == 0, setup.output
+    assert CliRunner().invoke(cli, args).exit_code == 0
+    assert removed == []
+    router_repo.unbind_cursor()
+    assert CliRunner().invoke(cli, args).exit_code == 0
+    assert removed == [1]
+
+
+def _cursor_override(base_url):
+    """Write Cursor's OpenAI base-URL override where Cursor keeps it."""
+    path = cursor.state_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as db:
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value BLOB)"
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO ItemTable VALUES (?, ?)",
+            (cursor._SETTINGS_KEY, json.dumps({"openAIBaseUrl": base_url})),
+        )
+
+
+def _agent_status(monkeypatch, *, supported=True):
+    monkeypatch.setattr(router_repo, "service_supported", lambda: supported)
+    monkeypatch.setattr(router_repo, "health", lambda *a: None)
+    human = CliRunner().invoke(cli, ["--human", "router", "agent", "status"])
+    assert human.exit_code == 0, human.output
+    agent = CliRunner().invoke(cli, ["--agent", "router", "agent", "status"])
+    assert agent.exit_code == 0, agent.output
+    payload = json.loads(agent.output)["data"][0]["repository_tagging"]["cursor"]
+    return human.output, payload
+
+
+def _bind(monkeypatch, *args):
+    _mock_cursor_setup(monkeypatch)
+    result = CliRunner().invoke(cli, ["router", "cursor", "--api-key", "k", *args])
+    assert result.exit_code == 0, result.output
+
+
+def test_status_says_nothing_about_cursor_when_it_is_not_on_router(monkeypatch):
+    _cursor_override("https://api.openai.com/v1")
+    output, payload = _agent_status(monkeypatch)
+    assert payload is None
+    assert "Cursor" not in output
+
+
+def test_status_asks_cursor_users_from_before_the_binding_to_rerun_setup(
+    monkeypatch,
+):
+    _cursor_override(router_module.DEFAULT_ROUTER_BASE_URL)
+    output, payload = _agent_status(monkeypatch)
+    assert payload == {"state": "needs_setup"}
+    assert "Cursor repository tagging: not set up" in output
+    assert "ramp router configure cursor" in output
+
+
+def test_status_reports_a_bound_cursor_and_when_uploads_start(monkeypatch):
+    _bind(monkeypatch)
+    _cursor_override(router_module.DEFAULT_ROUTER_BASE_URL)
+    output, payload = _agent_status(monkeypatch)
+    assert payload["state"] == "bound"
+    assert payload["uploading"] is False
+    assert "uploads start once repository tagging is enabled" in output
+
+    router_repo._save_settings({"enabled": True})
+    output, payload = _agent_status(monkeypatch)
+    assert payload["uploading"] is True
+    assert payload["last_upload"] is None
+    assert "Cursor repository tagging: set up." in output
+    assert "Last Cursor upload" not in output
+
+    # The agent records each upload attempt (cursor.rs record_upload).
+    router_repo.cursor_upload_status_path().write_text(
+        json.dumps(
+            {
+                "at": int(time.time()),
+                "records": 2,
+                "outcome": "rejected",
+                "http_status": 401,
+            }
+        )
+    )
+    output, payload = _agent_status(monkeypatch)
+    assert payload["last_upload"]["outcome"] == "rejected"
+    assert "(not accepted, HTTP 401)" in output
+
+
+def test_a_binding_without_a_cursor_override_still_reports_bound(monkeypatch):
+    # Cursor's settings can be unreadable; the binding alone still earns a line.
+    _bind(monkeypatch)
+    _, payload = _agent_status(monkeypatch)
+    assert payload["state"] == "bound"
+
+
+def test_status_flags_a_binding_for_another_deployment_as_stale(monkeypatch):
+    _bind(monkeypatch)
+    _cursor_override("https://qa-api.router.com/v1")
+    output, payload = _agent_status(monkeypatch)
+    assert payload["state"] == "stale"
+    assert payload["cursor_upstream"] == "qa-api.router.com"
+    assert "out of date" in output
+    assert "ramp router configure cursor" in output
+
+
+def test_status_flags_a_missing_credential_as_broken(monkeypatch):
+    _bind(monkeypatch)
+    binding = _cursor_binding()
+    stored = router_repo.config_dir() / "router-agent-credentials"
+    (stored / f"{binding['credential']}.json").unlink()
+    output, payload = _agent_status(monkeypatch)
+    assert payload["state"] == "broken"
+    assert payload["reason"] == "credential_missing"
+    assert "the Router key it uploads with is missing" in output
+
+
+@pytest.mark.parametrize("contents", ["not json", "{}", '{"upstream": 3}'])
+def test_status_flags_an_unreadable_binding_as_broken(monkeypatch, contents):
+    _bind(monkeypatch)
+    router_local_auth.write_private(router_repo.cursor_binding_path(), contents)
+    _, payload = _agent_status(monkeypatch)
+    assert payload == {"state": "broken", "reason": "binding_unreadable"}
+
+
+def test_a_world_readable_binding_is_broken_as_the_agent_would_find_it(
+    monkeypatch,
+):
+    _bind(monkeypatch)
+    router_repo.cursor_binding_path().chmod(0o644)
+    _, payload = _agent_status(monkeypatch)
+    assert payload["reason"] == "binding_unreadable"
+
+
+def test_a_custom_deployment_needs_tagging_enabled_against_its_host(monkeypatch):
+    monkeypatch.setenv("RAMP_ROUTER_BASE_URL", "https://router.example.com:8443/v1")
+    _bind(monkeypatch)
+    output, payload = _agent_status(monkeypatch)
+    assert payload["state"] == "broken"
+    assert payload["reason"] == "host_not_allowed"
+    assert "router.example.com:8443 is not a Router host" in output
+    assert "ramp router agent enable" in output
+    # What `ramp router agent enable` records for a custom deployment.
+    router_repo._save_settings({"enabled": True, "hosts": ["router.example.com"]})
+    _, payload = _agent_status(monkeypatch)
+    assert payload["state"] == "bound"
+
+
+def test_status_skips_the_cursor_line_without_the_native_agent(monkeypatch):
+    _cursor_override(router_module.DEFAULT_ROUTER_BASE_URL)
+    output, payload = _agent_status(monkeypatch, supported=False)
+    assert payload == {"state": "needs_setup"}
+    assert "Cursor" not in output
+
+
+def _stored_credential(binding):
+    directory = router_repo.config_dir() / "router-agent-credentials"
+    return directory / f"{binding['credential']}.json"
+
+
+@pytest.mark.parametrize("contents", ["[]", "null", '"k"'])
+def test_a_credential_that_is_not_an_object_is_broken(monkeypatch, contents):
+    _bind(monkeypatch)
+    router_local_auth.write_private(_stored_credential(_cursor_binding()), contents)
+    _, payload = _agent_status(monkeypatch)
+    assert payload["reason"] == "credential_missing"
+
+
+def test_a_key_that_cannot_be_a_header_is_broken(monkeypatch):
+    # cursor.rs credential() drops it: every upload would fail to build.
+    _bind(monkeypatch)
+    binding = _cursor_binding()
+    router_local_auth.write_private(
+        _stored_credential(binding),
+        json.dumps({"upstream": binding["upstream"], "api_key": "sk-\ncursor"}),
+    )
+    _, payload = _agent_status(monkeypatch)
+    assert payload["reason"] == "credential_missing"
+
+
+@pytest.mark.parametrize(
+    "upstream",
+    [
+        "api.router.com:99999",
+        "api.router.com:x",
+        "api.router.com:+1",
+        "[api.router.com",
+    ],
+)
+def test_an_upstream_the_agent_cannot_parse_is_not_allowed(monkeypatch, upstream):
+    # proxy.rs default_upstream refuses these, so the agent never uploads.
+    _bind(monkeypatch)
+    binding = _cursor_binding()
+    router_local_auth.write_private(
+        _stored_credential(binding),
+        json.dumps({"upstream": upstream, "api_key": "k"}),
+    )
+    router_local_auth.write_private(
+        router_repo.cursor_binding_path(), json.dumps({**binding, "upstream": upstream})
+    )
+    _, payload = _agent_status(monkeypatch)
+    assert payload["reason"] == "host_not_allowed"
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "https://API.Router.com/v1/",
+        "https://api.router.com./v1",
+        "https://api.router.com:443/v1",
+        "https://api.router.com",
+        "http://127.0.0.1:8765/u/api.router.com/v1",
+    ],
+)
+def test_the_same_router_spelled_differently_is_not_stale(monkeypatch, override):
+    _bind(monkeypatch)
+    _cursor_override(override)
+    _, payload = _agent_status(monkeypatch)
+    assert payload["state"] == "bound"
+
+
+def test_a_stale_line_never_shows_userinfo(monkeypatch):
+    _bind(monkeypatch)
+    _cursor_override("https://user:secret@qa-api.router.com:8443/v1")
+    output, payload = _agent_status(monkeypatch)
+    assert payload["state"] == "stale"
+    assert payload["cursor_upstream"] == "qa-api.router.com:8443"
+    assert "secret" not in output
+
+
+def test_a_port_change_is_stale(monkeypatch):
+    _bind(monkeypatch)
+    _cursor_override("https://api.router.com:8443/v1")
+    _, payload = _agent_status(monkeypatch)
+    assert payload["state"] == "stale"
+
+
+def test_an_upload_from_before_the_binding_is_not_shown(monkeypatch):
+    _bind(monkeypatch)
+    router_repo._save_settings({"enabled": True})
+    status = router_repo.cursor_upload_status_path()
+    bound_at = int(router_repo.cursor_binding_path().stat().st_mtime)
+    status.write_text(json.dumps({"at": bound_at - 60, "outcome": "rejected"}))
+    _, payload = _agent_status(monkeypatch)
+    assert payload["last_upload"] is None
+    status.write_text(json.dumps({"at": bound_at, "outcome": "ok", "records": 1}))
+    output, payload = _agent_status(monkeypatch)
+    assert payload["last_upload"]["outcome"] == "ok"
+    assert "(accepted)" in output
+
+
+@pytest.mark.parametrize("at", [10**20, -1, True, 1.5])
+def test_a_corrupt_upload_time_does_not_break_status(monkeypatch, at):
+    _bind(monkeypatch)
+    router_repo._save_settings({"enabled": True})
+    router_repo.cursor_upload_status_path().write_text(
+        json.dumps({"at": at, "outcome": "ok"})
+    )
+    _, payload = _agent_status(monkeypatch)
+    assert payload["last_upload"] is None
+
+
+def test_a_malformed_cursor_url_is_not_a_crash(monkeypatch):
+    # A URL Cursor cannot reach Router through: it no longer uses Router.
+    _bind(monkeypatch)
+    _cursor_override("https://[api.router.com/v1")
+    _, payload = _agent_status(monkeypatch)
+    assert payload["state"] == "unused"
+
+
+@pytest.mark.parametrize("override", [None, "https://api.openai.com/v1"])
+def test_a_binding_cursor_no_longer_uses_is_flagged(monkeypatch, override):
+    """After Cursor's override is cleared or moved off Router (as the TUI's
+    disconnect asks), the agent would keep uploading with the old key."""
+    _bind(monkeypatch)
+    _cursor_override(override)
+    output, payload = _agent_status(monkeypatch)
+    assert payload["state"] == "unused"
+    # Tagging is off, so nothing is being sent.
+    assert "inactive" in output and "still uploading" not in output
+    assert "finish entering the values in Cursor's settings" in output
+    assert "ramp router unconfigure cursor" in output
+    router_repo._save_settings({"enabled": True})
+    output, _ = _agent_status(monkeypatch)
+    assert "still uploading, but Cursor isn't using Router" in output
+
+
+def test_an_unreadable_cursor_database_is_not_taken_as_unused(monkeypatch):
+    _bind(monkeypatch)
+    path = cursor.state_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"not a database")
+    _, payload = _agent_status(monkeypatch)
+    assert payload["state"] == "bound"
+
+
+def test_a_custom_router_deployment_is_not_taken_as_unused(monkeypatch):
+    monkeypatch.setenv("RAMP_ROUTER_BASE_URL", "https://router.example.com/v1")
+    _bind(monkeypatch)
+    router_repo._save_settings({"hosts": ["router.example.com"]})
+    # Not one of the known deployments, and wrapped by the local helper.
+    monkeypatch.delenv("RAMP_ROUTER_BASE_URL")
+    _cursor_override("http://127.0.0.1:8765/u/router.example.com/v1")
+    _, payload = _agent_status(monkeypatch)
+    assert payload["state"] == "bound"
+
+
+@pytest.mark.parametrize(
+    "override", ["https://API.Router.com/v1", "https://api.router.com:443/v1"]
+)
+def test_a_router_url_spelled_differently_still_asks_for_setup(monkeypatch, override):
+    _cursor_override(override)
+    _, payload = _agent_status(monkeypatch)
+    assert payload == {"state": "needs_setup"}
+
+
+def test_status_reads_the_cursor_the_binding_names(monkeypatch, tmp_path):
+    _bind(monkeypatch)
+    _cursor_override(router_module.DEFAULT_ROUTER_BASE_URL)
+    # Status run without the override configure saw reads the bound Cursor,
+    # not this process's default one.
+    monkeypatch.setenv("RAMP_CURSOR_USER_DIR", str(tmp_path / "other-cursor"))
+    _cursor_override("https://api.openai.com/v1")
+    _, payload = _agent_status(monkeypatch)
+    assert payload["state"] == "bound"
+
+
+def test_status_without_a_binding_needs_no_posix_file_checks(monkeypatch):
+    """The private-file checks need os.getuid, which Windows lacks, so status
+    without a binding must never reach them."""
+    router_repo.config_dir().mkdir(parents=True, exist_ok=True)
+    _cursor_override("https://api.openai.com/v1")
+
+    def no_private_reads(path):
+        raise AssertionError(f"read_private({path}) without a binding")
+
+    monkeypatch.setattr(router_local_auth, "read_private", no_private_reads)
+    _, payload = _agent_status(monkeypatch)
+    assert payload is None
+
+
+def _cursor_team_settings(**settings):
+    """Write Cursor's cached team admin settings where Cursor keeps them."""
+    path = cursor.state_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as db:
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value BLOB)"
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO ItemTable VALUES (?, ?)",
+            ("adminSettings.cached", json.dumps(settings)),
+        )
+
+
+@pytest.mark.parametrize("key", cursor._ADMIN_SETTINGS_KEYS)
+def test_a_team_that_blocks_personal_keys_is_detected(key):
+    path = cursor.state_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB)")
+        db.execute(
+            "INSERT INTO ItemTable VALUES (?, ?)",
+            (key, json.dumps({"byokDisabled": True})),
+        )
+    assert cursor.personal_keys_blocked()
+
+
+@pytest.mark.parametrize("value", ['{"byokDisabled": false}', "{}", "not json", "[]"])
+def test_personal_keys_count_as_allowed_unless_cursor_says_so(value):
+    path = cursor.state_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB)")
+        db.execute("INSERT INTO ItemTable VALUES ('adminSettings.cached', ?)", (value,))
+    assert not cursor.personal_keys_blocked()
+    path.unlink()
+    assert not cursor.personal_keys_blocked()
+
+
+def test_router_cursor_warns_when_the_team_blocks_personal_keys(monkeypatch):
+    _mock_cursor_setup(monkeypatch)
+    _cursor_team_settings(byokDisabled=True)
+    human = CliRunner().invoke(cli, ["--human", "router", "cursor", "--api-key", "k"])
+    assert human.exit_code == 0, human.output
+    assert "Your Cursor team blocks personal API keys" in human.output
+    agent = CliRunner().invoke(cli, ["--agent", "router", "cursor", "--api-key", "k"])
+    assert json.loads(agent.output)["data"][0]["personal_keys_blocked"] is True
+
+
+def test_router_cursor_says_nothing_when_personal_keys_are_allowed(monkeypatch):
+    _mock_cursor_setup(monkeypatch)
+    _cursor_team_settings(byokDisabled=False)
+    human = CliRunner().invoke(cli, ["--human", "router", "cursor", "--api-key", "k"])
+    assert "blocks personal API keys" not in human.output
+    agent = CliRunner().invoke(cli, ["--agent", "router", "cursor", "--api-key", "k"])
+    assert "personal_keys_blocked" not in json.loads(agent.output)["data"][0]
+
+
+@pytest.mark.parametrize("written", [None, {"models_added": []}])
+def test_configure_cursor_warns_when_the_team_blocks_personal_keys(
+    monkeypatch, tmp_path, written
+):
+    _mock_cursor_setup(monkeypatch)
+    monkeypatch.setenv("RAMP_CLAUDE_DESKTOP_APP_SUPPORT", str(tmp_path))
+    monkeypatch.setattr(
+        router_module, "_write_cursor_settings", lambda *a, **k: written
+    )
+    _cursor_team_settings(byokDisabled=True)
+    args = ["router", "configure", "cursor", "--api-key", "k"]
+    human = CliRunner().invoke(cli, ["--human", *args])
+    assert human.exit_code == 0, human.output
+    assert "Your Cursor team blocks personal API keys" in human.output
+    agent = CliRunner().invoke(cli, ["--agent", *args])
+    assert json.loads(agent.output)["data"][0]["personal_keys_blocked"] is True
+
+
+def test_status_says_when_the_team_blocks_personal_keys(monkeypatch):
+    _bind(monkeypatch)
+    _cursor_override(router_module.DEFAULT_ROUTER_BASE_URL)
+    _cursor_team_settings(byokDisabled=True)
+    output, payload = _agent_status(monkeypatch)
+    assert payload["personal_keys_blocked"] is True
+    assert "Your Cursor team blocks personal API keys" in output

@@ -127,6 +127,9 @@ async fn serve(args: Vec<String>) {
     if args.iter().any(|a| a == "--shadow") {
         std::env::set_var("RRH_SHADOW", "1");
     }
+    if let Some(s) = &settings {
+        tokio::spawn(rrh::cursor::run(s.clone()));
+    }
     let server = Server::new(local_port, log, settings, version, scheduler);
     println!("ready");
     loop {

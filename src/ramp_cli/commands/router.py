@@ -1134,10 +1134,11 @@ def _cursor_routes_to_router() -> bool:
     Any known Router deployment counts, as does the one this command targets,
     so a key pasted against QA or a custom gateway still reads as connected.
     """
-    override = cursor.override_base_url()
-    if override is None:
-        return False
-    return override in {router_base_url(), *KNOWN_DEPLOYMENT_UI_URLS}
+    return _is_router_url(cursor.override_base_url())
+
+
+def _is_router_url(url: str | None) -> bool:
+    return url is not None and url in {router_base_url(), *KNOWN_DEPLOYMENT_UI_URLS}
 
 
 def _can_draw_picker(ctx: click.Context) -> bool:
@@ -2391,6 +2392,16 @@ def _run_configure(
                 # to paste instead.
                 suggested = _cursor_suggested_model(models)
                 claude_aliases = _ensure_claude_aliases(api_key, base_url, models)
+                # Written or pasted, this is the key Cursor will send, so the
+                # agent's transcript uploads use it too.
+                router_repo.bind_cursor(base_url, api_key, cursor.user_dir())
+                # The team setting makes Cursor ignore these values, so say so
+                # rather than walk the user through steps that can't work.
+                keys_blocked = (
+                    {"personal_keys_blocked": True}
+                    if cursor.personal_keys_blocked()
+                    else {}
+                )
                 written = _write_cursor_settings(
                     api_key,
                     base_url,
@@ -2410,6 +2421,7 @@ def _run_configure(
                             "models_added": len(written["models_added"]),
                             "config_path": str(cursor.state_db_path()),
                             "setup_file_deleted": setup_file is not None,
+                            **keys_blocked,
                         }
                     )
                     continue
@@ -2428,6 +2440,7 @@ def _run_configure(
                             models, claude_aliases, base_url=base_url
                         ),
                         "setup_file_deleted": setup_file is not None,
+                        **keys_blocked,
                     }
                 )
                 continue
@@ -2691,6 +2704,8 @@ def _run_configure(
                 )
             _echo_cursor_guidance(cursor_result["instructions"])
             show_notice("NOTE", cursor_result["note_lines"])
+        if cursor_result and cursor_result.get("personal_keys_blocked"):
+            show_notice("NOTICE", _CURSOR_KEYS_BLOCKED_LINES)
         for result in results:
             if result["client"] != CURSOR_CLIENT and result.get("note_lines"):
                 show_notice("NOTE", result["note_lines"])
@@ -2903,9 +2918,103 @@ def router_agent() -> None:
     pass
 
 
+def _cursor_tagging_status() -> dict | None:
+    """Cursor's repository-tagging state; interactive status only.
+
+    Reads Cursor's settings database read-only and the agent's local files,
+    never the Keychain, so it is cheap enough for every status call.
+    """
+    # The Cursor the agent scans: the folder the binding names, if any.
+    user = router_repo.cursor_bound_user_dir()
+    read, override = cursor.read_override_base_url(user)
+    info = router_repo.cursor_tagging(
+        override, _is_router_url(override), override_known=read
+    )
+    if info is not None and cursor.personal_keys_blocked(user):
+        info["personal_keys_blocked"] = True
+    return info
+
+
+_CURSOR_BROKEN_REASONS = {
+    "binding_unreadable": "the agent's record of Cursor's Router key can't be read",
+    "credential_missing": "the Router key it uploads with is missing",
+}
+_CURSOR_UPLOAD_OUTCOMES = {
+    "ok": "accepted",
+    "rejected": "not accepted",
+    "unreachable": "Router was unreachable",
+}
+
+
+def _cursor_tagging_lines(info: dict, tagging_enabled: bool) -> list[str]:
+    lines = _cursor_state_lines(info, tagging_enabled)
+    if info.get("personal_keys_blocked"):
+        # Cursor sends nothing to Router then, so no chat gets a repository.
+        lines.append(" ".join(_CURSOR_KEYS_BLOCKED_LINES))
+    return lines
+
+
+def _cursor_state_lines(info: dict, tagging_enabled: bool) -> list[str]:
+    state = info["state"]
+    fix = "Run 'ramp router configure cursor' to fix it."
+    if state == router_repo.CURSOR_NEEDS_SETUP:
+        return [
+            "Cursor repository tagging: not set up. Run 'ramp router configure "
+            "cursor' to tag Cursor chats by repository."
+        ]
+    if state == router_repo.CURSOR_UNUSED:
+        # Right after a paste-in setup Cursor is not on Router yet either, so
+        # finishing that setup is offered before removing it.
+        advice = (
+            "If you just ran setup, finish entering the values in Cursor's "
+            "settings; otherwise run 'ramp router unconfigure cursor' to "
+            "remove its setup."
+        )
+        if not tagging_enabled:
+            # The agent uploads nothing while tagging is off.
+            return [
+                f"Cursor repository tagging: inactive; Cursor isn't using Router. {advice}"
+            ]
+        return [
+            "Cursor repository tagging: still uploading, but Cursor isn't using "
+            f"Router. {advice}"
+        ]
+    if state == router_repo.CURSOR_STALE:
+        return [
+            f"Cursor repository tagging: out of date (set up for {info['upstream']}, "
+            f"but Cursor now uses {info['cursor_upstream']}). {fix}"
+        ]
+    if state == router_repo.CURSOR_BROKEN:
+        if info["reason"] == "host_not_allowed":
+            return [
+                f"Cursor repository tagging: broken ({info['upstream']} is not a "
+                "Router host the agent sends to). With Router configured for that "
+                "deployment, run 'ramp router agent enable'."
+            ]
+        return [
+            f"Cursor repository tagging: broken "
+            f"({_CURSOR_BROKEN_REASONS[info['reason']]}). {fix}"
+        ]
+    if not tagging_enabled:
+        return [
+            "Cursor repository tagging: set up; uploads start once repository "
+            "tagging is enabled ('ramp router agent enable')."
+        ]
+    lines = ["Cursor repository tagging: set up."]
+    upload = info.get("last_upload")
+    if upload:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(upload["at"]))
+        outcome = _CURSOR_UPLOAD_OUTCOMES.get(upload["outcome"], upload["outcome"])
+        if upload.get("http_status"):
+            outcome += f", HTTP {upload['http_status']}"
+        lines.append(f"Last Cursor upload: {when} ({outcome}).")
+    return lines
+
+
 def _print_background_status(ctx: click.Context) -> None:
     status = router_schedule.background_status()
     tagging = router_repo.status()
+    tagging["cursor"] = _cursor_tagging_status()
     status["repository_tagging"] = tagging
     if resolve_format(ctx.obj["format"], ctx.obj["config_format"]) == "json":
         print_agent_json(status, pagination=None)
@@ -2928,6 +3037,9 @@ def _print_background_status(ctx: click.Context) -> None:
         )
     else:
         click.echo("Repository tagging: disabled.")
+    if tagging["cursor"] is not None and tagging["service_supported"]:
+        for line in _cursor_tagging_lines(tagging["cursor"], tagging["enabled"]):
+            click.echo(line)
     if not tagging["enabled"] and tagging["clients"]:
         click.echo(
             "Some clients still use the local listener, so it remains in passthrough mode. "
@@ -3640,6 +3752,19 @@ _CURSOR_KEYCHAIN_NOTE = (
 )
 
 
+_CURSOR_KEYS_BLOCKED_LINES = [
+    "Your Cursor team blocks personal API keys, so Cursor won't use the Router",
+    "key or base URL. Ask your Cursor team admin to allow personal API keys.",
+]
+
+
+def _cursor_set_up() -> bool:
+    """Whether this CLI set Cursor up: settings it wrote, or a key it bound
+    for transcript uploads (a setup pasted in by hand leaves only the latter).
+    """
+    return cursor.has_receipt() or router_repo.cursor_binding_path().exists()
+
+
 def _write_cursor_settings(
     api_key: str,
     base_url: str,
@@ -3771,10 +3896,12 @@ def router_cursor(
         raise click.ClickException("Ramp Router did not return an API key.")
     base_url = router_base_url()
     models = _fetch_models(api_key, wait_for_key=browser_acquired_key)
+    router_repo.bind_cursor(base_url, api_key, cursor.user_dir())
     suggested_name = _cursor_suggested_model(models)
     claude_aliases = _ensure_claude_aliases(api_key, base_url, models)
     key_on_clipboard = False if show_key else _copy_to_clipboard(api_key)
     steps = _cursor_setup_steps(base_url, suggested_name, claude_aliases)
+    keys_blocked = cursor.personal_keys_blocked()
     if fmt == "json":
         payload = {
             "client": "cursor",
@@ -3785,6 +3912,8 @@ def router_cursor(
             "api_key_on_clipboard": key_on_clipboard,
             "instructions": steps,
         }
+        if keys_blocked:
+            payload["personal_keys_blocked"] = True
         if show_key:
             payload["api_key"] = api_key
         print_agent_json(payload, pagination=None)
@@ -3814,6 +3943,8 @@ def router_cursor(
         "claude- prefix works as a custom model name in Cursor."
     )
     show_notice("NOTE", _cursor_note_lines(models, claude_aliases, base_url=base_url))
+    if keys_blocked:
+        show_notice("NOTICE", _CURSOR_KEYS_BLOCKED_LINES)
     summary = _fetch_configure_summary(api_key, base_url=base_url)
     if summary is not None and summary.remaining_credits is not None:
         click.secho(
@@ -6019,7 +6150,7 @@ def _run_unconfigure(
         # exist. With none, the list would be empty and the command falls
         # through to saying Router is not configured anywhere.
         receipted = _clients_with_a_receipt()
-        if cursor.has_receipt():
+        if _cursor_set_up():
             receipted = (*receipted, CURSOR_CLIENT)
         candidates = receipted
         if cowork_configured and "claude-code" not in candidates:
@@ -6042,7 +6173,7 @@ def _run_unconfigure(
                 titles=titles,
             )
     clients = requested_clients or tuple(CLIENT_NAMES)
-    if not requested_clients and cursor.has_receipt():
+    if not requested_clients and _cursor_set_up():
         # Cursor's restore record lives in Cursor's own directory, not with
         # the other agents' receipts, so a bare run adds it here.
         clients = (*clients, CURSOR_CLIENT)
@@ -6085,14 +6216,17 @@ def _run_unconfigure(
     try:
         for item in clients:
             if item == CURSOR_CLIENT:
-                # Restore what configure wrote; a setup that was pasted by
-                # hand can only be undone in Cursor.
+                # Restore what configure wrote; a setup that was pasted by hand
+                # can only be undone in Cursor. Transcript uploads stop unless
+                # the restore failed, since Cursor then still sends to Router.
                 try:
-                    if cursor.unconfigure():
-                        results.append({"client": item, "removed": True})
-                        continue
+                    restored = cursor.unconfigure()
                 except cursor.CursorSettingsError as exc:
                     failures.append(f"{AGENT_NAMES[item]}: {exc}")
+                    continue
+                router_repo.unbind_cursor()
+                if restored:
+                    results.append({"client": item, "removed": True})
                     continue
                 results.append(
                     {
@@ -6131,8 +6265,11 @@ def _run_unconfigure(
     finally:
         stop_spinner()
 
-    setup_remains = bool(_clients_with_a_receipt()) or (
-        claude_cowork.state_path().exists()
+    # Cursor's transcript uploads need the agent too, so its setup counts.
+    setup_remains = (
+        bool(_clients_with_a_receipt())
+        or claude_cowork.state_path().exists()
+        or _cursor_set_up()
     )
     if results and not setup_remains:
         # Removes the agent too; the tagging setting stays, so a later
