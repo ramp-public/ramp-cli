@@ -11413,7 +11413,7 @@ def _saved_model_view(path: Path, key: str) -> str | None:
 def _compact_codex_catalog(
     catalog: dict, recommended: list[RouterModel], selected_model: str
 ) -> dict:
-    """Apply Router's curated discovery view to Codex's own metadata.
+    """Apply Router's curated discovery view and order to Codex's own metadata.
 
     Claude's projection carries the canonical request name and display name
     alongside its Claude-shaped id. Codex promotes unambiguous display names
@@ -11422,20 +11422,23 @@ def _compact_codex_catalog(
     Keep other entries hidden so existing chats still resolve their metadata.
     """
     by_slug = {model["slug"]: model for model in catalog["models"]}
-    names: set[str] = set()
-    for model in recommended:
+    ranks: dict[str, int] = {}
+    for rank, model in enumerate(recommended):
         request_name = model.metadata.request_name
         canonical = by_slug.get(request_name)
-        names.add(request_name)
+        ranks.setdefault(request_name, rank)
         # When the canonical row is visible, Router did not promote its
         # display name. That name may instead be another model's slug.
         if canonical is None or canonical.get("visibility", "list") == "hide":
-            names.add(model.metadata.display_name)
-    visible = [
-        model
-        for model in catalog["models"]
-        if model["slug"] in names and model.get("visibility", "list") == "list"
-    ]
+            ranks.setdefault(model.metadata.display_name, rank)
+    visible = sorted(
+        (
+            model
+            for model in catalog["models"]
+            if model["slug"] in ranks and model.get("visibility", "list") == "list"
+        ),
+        key=lambda model: ranks[model["slug"]],
+    )
     if not visible:
         raise click.ClickException(
             "Router's recommended models did not match its Codex catalog. "
@@ -11460,7 +11463,12 @@ def _compact_codex_catalog(
         if model["slug"] not in visible_slugs
     ]
     # Visible rows precede hidden rows before Desktop's catalog-size bound.
-    return {**catalog, "models": [*visible, *hidden]}
+    # Codex sorts its picker by priority, so renumber to keep this order.
+    models = [*visible, *hidden]
+    return {
+        **catalog,
+        "models": [{**model, "priority": index} for index, model in enumerate(models)],
+    }
 
 
 def _render_codex_catalog(

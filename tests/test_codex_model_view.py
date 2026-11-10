@@ -64,10 +64,14 @@ def test_compact_preserves_metadata_and_does_not_mutate_input():
     assert catalog == original
     assert result["version"] == "server-value"
     assert _visible(result) == ["recommended"]
-    assert result["models"][0] == original["models"][1]
+    assert result["models"][0] == {**original["models"][1], "priority": 0}
     by_slug = {row["slug"]: row for row in result["models"]}
-    assert by_slug["other"] == {**original["models"][0], "visibility": "hide"}
-    assert by_slug["legacy"] == original["models"][2]
+    assert by_slug["other"] == {
+        **original["models"][0],
+        "visibility": "hide",
+        "priority": 1,
+    }
+    assert by_slug["legacy"] == {**original["models"][2], "priority": 2}
 
 
 @pytest.mark.parametrize("slug", ["recommended", "Recommended"])
@@ -92,13 +96,21 @@ def test_shared_display_label_does_not_recommend_an_unrelated_route():
     assert _visible(result) == ["recommended"]
 
 
-def test_compact_keeps_visible_current_selection_outside_shortlist():
+def test_compact_orders_picker_by_recommendations_then_current_selection():
     result = router._compact_codex_catalog(
-        {"models": [_row("current"), _row("recommended"), _row("other")]},
-        [_recommended()],
+        {
+            "models": [
+                _row("current", priority=0),
+                _row("second", priority=1),
+                _row("first", priority=2),
+                _row("other", priority=3),
+            ]
+        },
+        [_recommended("first", "First"), _recommended("second", "Second")],
         "current",
     )
-    assert _visible(result) == ["recommended", "current"]
+    picker = sorted(result["models"], key=lambda row: row["priority"])
+    assert _visible({"models": picker}) == ["first", "second", "current"]
 
 
 def test_compact_does_not_unhide_selected_canonical_alias():
