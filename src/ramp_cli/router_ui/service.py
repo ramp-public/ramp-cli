@@ -52,7 +52,9 @@ from ramp_cli.router_ui.profiles import CODING_PRESETS, coding_draft, coding_pro
 
 USAGE_WINDOWS = ((1, "Today"), (3, "3 days"), (7, "7 days"), (30, "1 month"))
 USAGE_DAYS = tuple(days for days, _label in USAGE_WINDOWS)
-USAGE_GROUPS = ("model", "key")
+USAGE_GROUPS = ("model", "key", "harness")
+# The dashboard calls the harness dimension "client".
+API_GROUPS = {"harness": "client"}
 # Router tags each request with the harness that sent it. Claude Code is the
 # one harness whose tag differs from its CLI id: Router records "claude_code".
 CLIENT_KINDS = {"claude-code": "claude_code"}
@@ -217,6 +219,30 @@ def daily_series(usage: dict, dates: list, zone: tzinfo) -> dict:
             }
         )
     return {"groups": ordered, "series": rows}
+
+
+def harness_totals(groups: list[dict]) -> list[dict]:
+    """Each harness's totals from client-grouped usage, by CLI harness id.
+
+    Every harness with a request tag is listed, at zero when it sent nothing,
+    so one read answers for all of them. Harnesses without their own tag are
+    left out: their usage is unavailable, not zero.
+    """
+    by_kind = {group["id"]: group for group in groups}
+    totals = []
+    for name in router.AGENT_NAMES:
+        if name in UNTAGGED_CLIENTS:
+            continue
+        group = by_kind.get(client_kind(name), {})
+        totals.append(
+            {
+                "harness": name,
+                "spend_usd": group.get("spend_usd", Decimal(0)),
+                "request_count": group.get("request_count", 0),
+                "total_tokens": group.get("total_tokens", 0),
+            }
+        )
+    return totals
 
 
 def history_days(usage: dict) -> int:
@@ -477,7 +503,7 @@ class RouterService:
         if days not in USAGE_DAYS:
             raise click.BadParameter(f"Choose {', '.join(map(str, USAGE_DAYS))} days.")
         if group_by not in USAGE_GROUPS:
-            raise click.BadParameter("Break usage down by model or key.")
+            raise click.BadParameter("Break usage down by model, key, or harness.")
         if client in UNTAGGED_CLIENTS:
             raise RampCLIError("Usage analytics are unavailable for this harness.")
         zone = local_timezone()
@@ -485,7 +511,7 @@ class RouterService:
         params = {
             "start_at": start.isoformat(),
             "end_at": end.isoformat(),
-            "group_by": group_by,
+            "group_by": API_GROUPS.get(group_by, group_by),
             "timezone": zone_name(zone),
             "include_summary_stats": "true",
         }
@@ -494,11 +520,13 @@ class RouterService:
         usage = self.client.get("/client/usage/dashboard", params=params, timeout=15)
         if not isinstance(usage, dict):
             raise RampCLIError("Usage analytics are unavailable.")
+        series = daily_series(usage, dates, zone)
         harness_fields = {}
         if client is not None:
-            harness_fields = {"harness": client}
+            harness_fields["harness"] = client
+        if group_by == "harness":
+            harness_fields["harnesses"] = harness_totals(series["groups"])
         return {
-            **harness_fields,
             "days": days,
             "group_by": group_by,
             "timezone": zone_name(zone),
@@ -516,7 +544,8 @@ class RouterService:
                 )
                 for name in ("input_tokens", "cached_input_tokens")
             },
-            **daily_series(usage, dates, zone),
+            **series,
+            **harness_fields,
         }
 
     @mutation

@@ -654,6 +654,20 @@ def _installed_agent_manifest() -> Path | None:
         return None
 
 
+def _serves_another_root() -> bool:
+    """Whether the installed agent reads another, still existing, config root.
+
+    It finds its local credentials there; re-rendering it for this root would
+    make every request from that root's setups fail with 401.
+    """
+    arguments = _installed_agent_arguments()
+    try:
+        root = Path(arguments[arguments.index("--sync-env-file") + 1]).parent
+    except (ValueError, IndexError):
+        return False
+    return root.is_dir() and not root.samefile(config_dir())
+
+
 def _install_agent(agent: Path, ramp: Path, listen: int | None) -> None:
     if sys.platform == "darwin":
         _install_agent_launchd(render_agent_plist(agent, ramp, listen))
@@ -785,6 +799,9 @@ def _install_service() -> None:
     ramp = ramp_executable()
     agent = agent_executable(ramp)
     if ramp is None or not _service_manager():
+        return
+    if _serves_another_root():
+        log_failure("the Ramp Router agent serves another config root; left as is")
         return
     if agent is None:
         if agent_installed():

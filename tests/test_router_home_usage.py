@@ -282,6 +282,42 @@ def test_usage_is_unavailable_rather_than_a_zero_without_a_request_tag(
     assert [path for path, _ in calls] == ["/client/billing"]
 
 
+def test_usage_by_harness_answers_for_every_tagged_harness_in_one_read(monkeypatch):
+    zone = operations.ZoneInfo("America/New_York")
+    monkeypatch.setattr(operations, "local_timezone", lambda: zone)
+    today = datetime.now(zone).replace(hour=12).astimezone(timezone.utc).isoformat()
+    calls = []
+
+    def get(path, **kwargs):
+        calls.append((path, kwargs.get("params")))
+        if path == "/client/billing":
+            return {}
+        point = {"period_start_at": today, "request_count": 2, "total_tokens": 10}
+        return {
+            "summary": {"spend_usd": "3.5"},
+            "series": [
+                {**point, "group": "claude_code", "spend_usd": "1.25"},
+                {**point, "group": "codex", "spend_usd": "2"},
+                {**point, "group": "claude_code", "spend_usd": "0.25"},
+            ],
+        }
+
+    service = RouterService({})
+    service._client = SimpleNamespace(
+        origin="https://router.invalid", status=lambda: {"authenticated": True}, get=get
+    )
+    usage = service.account(1, "harness")["usage"]
+    dashboard = [params for path, params in calls if path == "/client/usage/dashboard"]
+    assert len(dashboard) == 1 and dashboard[0]["group_by"] == "client"
+    totals = {row["harness"]: row for row in usage["harnesses"]}
+    assert totals["claude-code"]["spend_usd"] == Decimal("1.5")
+    assert totals["claude-code"]["request_count"] == 4
+    assert totals["codex"]["spend_usd"] == Decimal("2")
+    # Tagged but idle reads as zero; untagged harnesses are left out, not zeroed.
+    assert totals["pi"]["spend_usd"] == 0 and totals["pi"]["total_tokens"] == 0
+    assert not {"conductor", "cowork", "cursor"} & totals.keys()
+
+
 def test_account_usage_without_a_harness_is_unchanged(monkeypatch):
     service, calls = _harness_service(monkeypatch)
     usage = service.account(1)["usage"]

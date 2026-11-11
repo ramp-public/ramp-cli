@@ -1094,10 +1094,11 @@ def register_router_user_commands(
     @click.option(
         "--by",
         "group_by",
-        type=click.Choice(["model", "key"]),
+        type=click.Choice(["model", "key", "harness"]),
         default="model",
         show_default=True,
-        help="Break daily usage down by model or API key.",
+        help="Break daily usage down by model, API key, or harness. With harness, "
+        "the JSON adds 'harnesses': every tagged harness's totals in one read.",
     )
     @click.option(
         "--harness",

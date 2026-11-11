@@ -327,11 +327,10 @@ def test_install_without_the_agent_falls_back_to_the_plain_job(
     assert "com.ramp.router" in launchd.loaded
 
     # Another ramp without the agent (a dev checkout) keeps the installed agent
-    # but points its sync at this ramp and this configuration root.
+    # but points its sync at this ramp.
     agent = schedule.agent_executable()
     other = _executable(tmp_path / "dev/ramp")
     monkeypatch.setattr(schedule, "ramp_executable", lambda: other)
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "other-config"))
     _REAL_INSTALL()
     arguments = _plist(tmp_path)["ProgramArguments"]
     assert launchd.loaded == {"com.ramp.router"}
@@ -347,7 +346,6 @@ def test_install_without_the_agent_falls_back_to_the_plain_job(
     _REAL_INSTALL()
     assert launchd.loaded == {"com.ramp.router"}
     monkeypatch.setattr(schedule, "ramp_executable", lambda: tmp_path / "bin/ramp")
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
 
     # An install that no longer ships the agent: the plain job replaces it.
     (tmp_path / "lib/ramp-cli" / schedule.AGENT_BINARY).unlink()
@@ -1042,3 +1040,15 @@ def test_a_truncated_agent_plist_does_not_block_reconciliation(
     schedule.clear_manifest()
     _REAL_INSTALL()
     assert "serve" in _plist(tmp_path)["ProgramArguments"]
+
+
+def test_another_config_root_never_replaces_the_installed_agent(
+    monkeypatch, tmp_path, launchd
+):
+    _REAL_INSTALL()
+    plist = tmp_path / "Library/LaunchAgents/com.ramp.router.plist"
+    installed = plist.read_bytes()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "scratch"))
+    _tagging(True)
+    _REAL_UPDATE_AGENT()
+    assert plist.read_bytes() == installed
