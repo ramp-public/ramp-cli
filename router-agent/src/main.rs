@@ -111,15 +111,28 @@ async fn serve(args: Vec<String>) {
     }
     let settings = arg(&args, "--settings").map(PathBuf::from);
     let version = arg(&args, "--reported-version").or_else(|| std::env::var("RAMP_CLI_VERSION").ok()).unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
-    let std_listener = match inherited_listener() {
-        Some(l) => l,
-        None => match bind(port) {
-            Ok(l) => l,
+    // launchd hands over an unbound socket when another program held the port at load.
+    let inherited = inherited_listener().filter(|l| l.local_addr().is_ok_and(|a| a.port() != 0));
+    let mut inherited = inherited.map(Ok);
+    let mut down = false;
+    let std_listener = loop {
+        match inherited.take().unwrap_or_else(|| bind(port)) {
+            Ok(l) => break l,
             Err(e) => {
-                eprintln!("ramp-router-agent: cannot listen on 127.0.0.1:{port}: {e}");
-                std::process::exit(98);
+                let Some(s) = &scheduler else {
+                    eprintln!("ramp-router-agent: cannot listen on 127.0.0.1:{port}: {e}");
+                    std::process::exit(98);
+                };
+                if !down {
+                    eprintln!("ramp-router-agent: cannot listen on 127.0.0.1:{port}: {e}; retrying each sync interval");
+                    down = true;
+                }
+                // Keep syncing, and have ramp point coding agents at Router directly. Asked on
+                // every retry: a run that found the sync lock busy reconciled nothing.
+                s.refresh_now("listener_down");
+                tokio::time::sleep(s.interval()).await;
             }
-        },
+        }
     };
     std_listener.set_nonblocking(true).expect("nonblocking");
     let local_port = std_listener.local_addr().map(|a| a.port()).unwrap_or(port);
@@ -129,6 +142,10 @@ async fn serve(args: Vec<String>) {
     }
     if let Some(s) = &settings {
         tokio::spawn(rrh::cursor::run(s.clone()));
+    }
+    if let Some(s) = &scheduler {
+        // Moves coding agents back to the listener if a down one sent them direct.
+        s.refresh_now("listener_up");
     }
     let server = Server::new(local_port, log, settings, version, scheduler);
     println!("ready");

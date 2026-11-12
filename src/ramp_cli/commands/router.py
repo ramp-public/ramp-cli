@@ -3026,10 +3026,14 @@ def _print_background_status(ctx: click.Context) -> None:
             f"Client refresh failed ({failure['client']}): {failure['error']}. "
             "Repair the client, then run 'ramp router agent enable' again."
         )
-    if tagging["enabled"]:
-        running = "running" if tagging["healthy"] else "not running"
+    if tagging["enabled"] and tagging["healthy"]:
+        click.echo(f"Repository tagging: enabled (running on port {tagging['port']}).")
+    elif tagging["enabled"]:
         click.echo(
-            f"Repository tagging: enabled ({running} on port {tagging['port']})."
+            f"Repository tagging: enabled, but nothing answers on port {tagging['port']}. "
+            "Coding agents set up through it may not reach Router. To repair it, stop "
+            "any other program using the port, then run 'ramp router agent disable' "
+            "and 'ramp router agent enable'."
         )
     elif not tagging["service_supported"]:
         click.echo(
@@ -4116,10 +4120,13 @@ def router_sync(
         # A background run: its refresh never reloads the job or undoes an
         # opt-out. It updates models and repairs missing managed plugin paths.
         os.environ[router_schedule.SCHEDULED_ENV] = "1"
-        with sync_lock() as locked:
-            if locked:
-                refresh_version_cache()
-                _refresh_clients(ctx, models_only=True)
+        try:
+            with sync_lock() as locked:
+                if locked:
+                    refresh_version_cache()
+                    _refresh_clients(ctx, models_only=True)
+        finally:
+            os.environ.pop(router_schedule.SCHEDULED_ENV, None)
         return
     if hook_mode:
         _run_hook_sync(client, event)
@@ -4467,6 +4474,8 @@ def _run_scheduled_sync(ctx: click.Context) -> None:
         with sync_lock() as locked:
             if not locked:
                 return
+            # Before the version gate: a dead helper must not wait for Router.
+            _reconcile_helper_endpoints()
             connections = _scheduled_sync_connections()
             if not connections:
                 _write_agent_manifest(connections, renew_at)
@@ -9385,6 +9394,164 @@ def clients_using_repo_helper() -> list[str]:
         except Exception:
             pass
     return clients
+
+
+def _reconcile_helper_endpoints() -> None:
+    """Point Claude Code and Codex at the path that works; never raises.
+
+    The repository helper while it answers, direct Router while it does not, so
+    a dead local listener cannot strand them. Only the endpoint and its paired
+    credential change, and only in a setup this CLI still owns.
+    """
+    healthy = router_repo.answering()
+    for client, reconcile in (
+        ("claude-code", _reconcile_claude_code_endpoint),
+        ("codex", _reconcile_codex_endpoint),
+    ):
+        try:
+            reconcile(_client_config_path(client), healthy)
+        except Exception as exc:
+            log_failure(f"{CLIENT_NAMES[client]} endpoint check failed: {exc!r}")
+
+
+def _helper_endpoint(current: str, healthy: bool) -> tuple[str, bool] | None:
+    """The direct URL and whether to use the helper; None when nothing changes."""
+    direct = router_repo.unwrap_url(current)
+    wanted = healthy and router_repo.is_wrapped(
+        router_repo.attribution_url(direct, start=False)
+    )
+    return None if router_repo.is_wrapped(current) == wanted else (direct, wanted)
+
+
+def _reconcile_claude_code_endpoint(path: Path, healthy: bool) -> None:
+    with claude_code.settings_lock(path):
+        state_path = claude_code.state_path(path)
+        if not state_path.is_file():
+            return
+        state = claude_code.read_state(path)
+        settings = claude_code.read_settings(path)
+        environment = settings.get("env")
+        current = (
+            environment.get("ANTHROPIC_BASE_URL")
+            if isinstance(environment, dict)
+            else None
+        )
+        written = state.get("written", {}).get("env", {})
+        # An endpoint or token the user edited by hand is theirs.
+        if (
+            not isinstance(current, str)
+            or written.get("ANTHROPIC_BASE_URL") != current
+            or written.get("ANTHROPIC_AUTH_TOKEN")
+            != environment.get("ANTHROPIC_AUTH_TOKEN")
+        ):
+            return
+        if (change := _helper_endpoint(current, healthy)) is None:
+            return
+        direct, wanted = change
+        api_key = _stored_router_api_key("claude-code", path)
+        endpoint, token = (
+            router_repo.client_credentials(direct, api_key)
+            if wanted
+            else (direct, api_key)
+        )
+        if router_repo.is_wrapped(endpoint) != wanted:
+            return
+        pair = {"ANTHROPIC_BASE_URL": endpoint, "ANTHROPIC_AUTH_TOKEN": token}
+        state["written"]["env"].update(pair)
+        settings["env"].update(pair)
+        # State first, as everywhere else, so the settings can always be undone.
+        previous_state = state_path.read_text(encoding="utf-8")
+        _write_private_file(state_path, json.dumps(state, indent=2) + "\n")
+        try:
+            _write_private_file(path, json.dumps(settings, indent=2) + "\n")
+        except Exception:
+            _restore_private_file(state_path, previous_state)
+            raise
+
+
+def _reconcile_codex_endpoint(path: Path, healthy: bool) -> None:
+    with codex_config_lock(path):
+        existing, data = _read_codex_config(path)
+        provider = data.get("model_providers", {}).get(ROUTER_PROVIDER)
+        current = provider.get("base_url") if isinstance(provider, dict) else None
+        if (
+            not isinstance(current, str)
+            or not (path.parent / "ramp-router-state.json").exists()
+        ):
+            return
+        if (change := _helper_endpoint(current, healthy)) is None:
+            return
+        direct, wanted = change
+        key_path = path.parent / "ramp-router-key"
+        # Authentication the user changed by hand is theirs: only the managed
+        # key file or a local token this CLI registered is swapped.
+        auth = provider.get("auth", {})
+        command, expected = _codex_key_command(key_path)
+        current_args = auth.get("args")
+        tokens = router_repo.config_dir() / "router-agent-credentials"
+        if not (
+            auth.get("command") == command
+            and isinstance(current_args, list)
+            and current_args
+            and current_args[:-1] == expected[:-1]
+            and isinstance(current_args[-1], str)
+            and (
+                Path(current_args[-1]) == key_path
+                or Path(current_args[-1]).parent == tokens
+            )
+        ):
+            return
+        endpoint, token = (
+            router_repo.client_credentials(
+                direct, key_path.read_text(encoding="utf-8").strip()
+            )
+            if wanted
+            else (direct, None)
+        )
+        if router_repo.is_wrapped(endpoint) != wanted:
+            return
+        if token is not None:
+            key_path = router_repo.local_token_path(token)
+        _, args = _codex_key_command(key_path)
+        updated = []
+        for chunk in _config_chunks(existing):
+            if chunk and _OWNED_CODEX_TABLE.match(chunk[0]) and ".auth" in chunk[0]:
+                # Rendered from the parsed table, so no hand-parsing of values.
+                auth = {**provider.get("auth", {}), "args": args}
+                blank = len(chunk) - len("".join(chunk).rstrip().splitlines())
+                chunk = [
+                    chunk[0],
+                    *(f"{key} = {_toml_value(value)}\n" for key, value in auth.items()),
+                    *["\n"] * blank,
+                ]
+            elif chunk and _OWNED_CODEX_TABLE.match(chunk[0]):
+                chunk = [
+                    f"base_url = {json.dumps(endpoint)}\n"
+                    if re.match(r"\s*base_url\s*=", line)
+                    else line
+                    for line in chunk
+                ]
+            updated.extend(chunk)
+        updated_text = "".join(updated)
+        # Only the endpoint and its credential may differ; anything else means
+        # the text rewrite touched a value it should not have, so nothing is saved.
+        auth = {**provider.get("auth", {}), "args": args}
+        expected = {**provider, "base_url": endpoint, "auth": auth}
+        providers = {**data["model_providers"], ROUTER_PROVIDER: expected}
+        if tomllib.loads(updated_text) != {**data, "model_providers": providers}:
+            raise click.ClickException("Could not rewrite the Codex Router endpoint.")
+        _write_private_file(path, updated_text)
+
+
+def _toml_value(value: object) -> str:
+    """A scalar or string array as TOML; JSON's string escapes are TOML's too."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int | str) or (
+        isinstance(value, list) and all(isinstance(item, str) for item in value)
+    ):
+        return json.dumps(value)
+    raise click.ClickException("Could not rewrite the Codex Router credential.")
 
 
 def _refresh_router_base_url(client: str, path: Path) -> str:

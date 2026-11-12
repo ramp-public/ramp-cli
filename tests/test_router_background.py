@@ -324,3 +324,12 @@ def test_os_disabled_state_does_not_claim_running(monkeypatch):
     assert "Background sync: enabled" in result.output
     assert "agent (disabled)" in result.output
     assert "System Settings" in result.output
+
+
+def test_status_says_when_the_tagging_listener_is_not_answering(monkeypatch):
+    router_repo._save_settings({"enabled": True})
+    monkeypatch.setattr(router_repo, "health", lambda *_: None)
+    result = invoke("status")
+    assert result.exit_code == 0, result.output
+    assert "nothing answers on port 47317" in result.output
+    assert "'ramp router agent disable' and 'ramp router agent enable'" in result.output

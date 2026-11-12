@@ -33,7 +33,7 @@ import ramp_cli.commands.router as router_module
 from ramp_cli import __version__, claude_cowork, codex_desktop
 from ramp_cli.client.router_user import RouterUserClient
 from ramp_cli.codex_desktop import restart_running
-from ramp_cli.commands import claude_code, cursor, router_settings
+from ramp_cli.commands import claude_code, cursor, router_repo, router_settings
 from ramp_cli.commands.router import DEFAULT_ROUTER_BASE_URL as ROUTER_BASE_URL
 from ramp_cli.config.settings import config_dir
 from ramp_cli.errors import RampCLIError
@@ -15142,3 +15142,148 @@ def test_a_disable_during_the_cost_hook_download_still_wins(tmp_path, monkeypatc
 
     assert result.exit_code == 0, result.output
     assert _cost_hook_commands(codex_home) == []
+
+
+def test_helper_endpoint_check_moves_only_the_endpoint(tmp_path, monkeypatch):
+    claude_home, codex_home = tmp_path / "claude", tmp_path / "codex"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch, [{"id": "claude-router-a"}])
+    monkeypatch.setattr(
+        router_module, "_claude_code_supports_model_picker", lambda: False
+    )
+    # Configure's real background refresh would race these rewrites.
+    monkeypatch.setattr(router_module, "spawn_detached_refresh", lambda: None)
+    helper_up = {"value": True}
+    monkeypatch.setattr(router_repo, "enabled", lambda: True)
+    monkeypatch.setattr(router_repo, "ensure_running", lambda: helper_up["value"])
+    monkeypatch.setattr(
+        router_repo, "health", lambda *_: {} if helper_up["value"] else None
+    )
+    for client in ("claude-code", "codex"):
+        configured = CliRunner().invoke(
+            cli,
+            ["--human", "router", "configure", client],
+            input="router-secret\n",
+        )
+        assert configured.exit_code == 0, configured.output
+    claude_settings = claude_home / "settings.json"
+    codex_config = codex_home / "config.toml"
+    settings = json.loads(claude_settings.read_text())
+    settings["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = "12345"
+    claude_settings.write_text(json.dumps(settings))
+    # Another provider on the helper is not Router's setup to move.
+    remote = '\n[model_providers.other]\nbase_url = "http://127.0.0.1:47317/u/x/v1"\n'
+    codex_config.write_text(codex_config.read_text() + remote)
+
+    def endpoints():
+        env = json.loads(claude_settings.read_text())["env"]
+        codex = tomllib.loads(codex_config.read_text())["model_providers"]
+        return env, codex
+
+    env, codex = endpoints()
+    assert router_repo.is_wrapped(env["ANTHROPIC_BASE_URL"])
+    assert router_repo.is_wrapped(codex["ramp-router"]["base_url"])
+    headers = codex["ramp-router"]["http_headers"]
+
+    # One slow health answer is not an outage.
+    calls = []
+    monkeypatch.setattr(
+        router_repo,
+        "health",
+        lambda *_: calls.append(1) or (None if len(calls) == 1 else {}),
+    )
+    router_module._reconcile_helper_endpoints()
+    assert router_repo.is_wrapped(endpoints()[0]["ANTHROPIC_BASE_URL"])
+    monkeypatch.setattr(
+        router_repo, "health", lambda *_: {} if helper_up["value"] else None
+    )
+
+    helper_up["value"] = False
+    router_module._reconcile_helper_endpoints()
+    env, codex = endpoints()
+    assert env["ANTHROPIC_BASE_URL"] == ROUTER_BASE_URL.removesuffix("/v1")
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "router-secret"
+    assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "12345"
+    assert codex["ramp-router"]["base_url"] == ROUTER_BASE_URL
+    assert codex["ramp-router"]["auth"]["args"][-1].endswith("ramp-router-key")
+    assert codex["ramp-router"]["http_headers"] == headers
+    assert codex["other"]["base_url"] == "http://127.0.0.1:47317/u/x/v1"
+
+    helper_up["value"] = True
+    router_module._reconcile_helper_endpoints()
+    env, codex = endpoints()
+    assert router_repo.is_wrapped(env["ANTHROPIC_BASE_URL"])
+    assert env["ANTHROPIC_AUTH_TOKEN"].startswith("ramp-local-")
+    assert router_repo.is_wrapped(codex["ramp-router"]["base_url"])
+
+    # A multiline args array, with brackets in a comment, is replaced whole.
+    config = tomllib.loads(codex_config.read_text())
+    args = config["model_providers"]["ramp-router"]["auth"]["args"]
+    multiline = (
+        'args = [\n  # see ] and "[" here\n  '
+        + ",\n  ".join(json.dumps(a) for a in args)
+        + ",\n]\n"
+    )
+    codex_config.write_text(
+        re.sub(r"(?m)^args = \[.*\]\n", lambda _: multiline, codex_config.read_text())
+    )
+    helper_up["value"] = False
+    router_module._reconcile_helper_endpoints()
+    assert endpoints()[1]["ramp-router"]["auth"]["args"][-1].endswith("ramp-router-key")
+
+    # A failed settings write puts the receipt back.
+    receipt = claude_code.state_path(claude_settings)
+    before = receipt.read_text(), claude_settings.read_text()
+    write = router_module._write_private_file
+
+    def failing_write(path, content):
+        if path == claude_settings:
+            raise OSError("disk full")
+        write(path, content)
+
+    monkeypatch.setattr(router_module, "_write_private_file", failing_write)
+    helper_up["value"] = True
+    router_module._reconcile_helper_endpoints()
+    assert (receipt.read_text(), claude_settings.read_text()) == before
+    monkeypatch.setattr(router_module, "_write_private_file", write)
+
+    # An endpoint the user edited by hand is left alone.
+    settings = json.loads(claude_settings.read_text())
+    settings["env"]["ANTHROPIC_BASE_URL"] = "https://router.example"
+    claude_settings.write_text(json.dumps(settings))
+    helper_up["value"] = False
+    router_module._reconcile_helper_endpoints()
+    assert endpoints()[0]["ANTHROPIC_BASE_URL"] == "https://router.example"
+
+    # So is a token rotated by hand, and Codex authentication the user changed.
+    written = json.loads(claude_code.state_path(claude_settings).read_text())
+    settings = json.loads(claude_settings.read_text())
+    settings["env"]["ANTHROPIC_BASE_URL"] = written["written"]["env"][
+        "ANTHROPIC_BASE_URL"
+    ]
+    settings["env"]["ANTHROPIC_AUTH_TOKEN"] = "rotated-by-hand"
+    claude_settings.write_text(json.dumps(settings))
+    codex_text = codex_config.read_text()
+    key_arg = json.dumps(str(codex_home / "ramp-router-key"))
+    assert key_arg in codex_text
+    codex_config.write_text(codex_text.replace(key_arg, '"/elsewhere/key"'))
+    before = claude_settings.read_text(), codex_config.read_text()
+    helper_up["value"] = True
+    router_module._reconcile_helper_endpoints()
+    assert (claude_settings.read_text(), codex_config.read_text()) == before
+
+    # A rewrite that would change any other value is refused.
+    multiline_name = 'name = """Ramp Router\nbase_url = "notes"\n"""\n'
+    codex_config.write_text(
+        codex_config.read_text().replace('name = "Ramp Router"\n', multiline_name, 1)
+    )
+    codex_config.write_text(
+        codex_config.read_text().replace('"/elsewhere/key"', key_arg)
+    )
+    before = codex_config.read_text()
+    helper_up["value"] = not router_repo.is_wrapped(
+        tomllib.loads(before)["model_providers"]["ramp-router"]["base_url"]
+    )
+    router_module._reconcile_helper_endpoints()
+    assert codex_config.read_text() == before

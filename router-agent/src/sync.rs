@@ -256,6 +256,17 @@ impl Scheduler {
         }
     }
 
+    pub fn interval(&self) -> Duration {
+        self.cfg.interval
+    }
+
+    /// Run `ramp router sync --scheduled` now, unless the user opted out.
+    pub fn refresh_now(self: &Arc<Self>, reason: &'static str) {
+        if !self.cfg.opt_out.exists() {
+            self.spawn_refresh(reason);
+        }
+    }
+
     fn spawn_refresh(self: &Arc<Self>, reason: &'static str) {
         if self.running.swap(true, Ordering::AcqRel) {
             return;

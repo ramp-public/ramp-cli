@@ -114,6 +114,18 @@ def _state() -> dict:
     return json.loads((config_dir() / "router-sync.json").read_text())
 
 
+def test_unchanged_version_still_checks_helper_endpoints(monkeypatch, refreshes):
+    checks: list[bool] = []
+    monkeypatch.setattr(
+        router_module, "_reconcile_helper_endpoints", lambda: checks.append(True)
+    )
+    _router(monkeypatch)
+    assert _sync().exit_code == 0
+    assert _sync().exit_code == 0
+    assert refreshes == [True]
+    assert checks == [True, True]
+
+
 def test_unchanged_version_skips_refresh_and_writes_nothing(monkeypatch, refreshes):
     _router(monkeypatch)
     assert _sync().exit_code == 0
@@ -825,6 +837,15 @@ def test_opt_out_never_removes_the_job_under_a_running_refresh(monkeypatch, tmp_
     assert _sync().exit_code == 0
     assert events == ["bootout"]
     assert not schedule.env_file_path().exists()
+
+
+def test_a_detached_sync_does_not_leave_its_run_marked_scheduled(monkeypatch):
+    monkeypatch.delenv(schedule.SCHEDULED_ENV, raising=False)
+    monkeypatch.setattr(router_module, "refresh_version_cache", lambda: None)
+    monkeypatch.setattr(router_module, "_refresh_clients", lambda *a, **k: [])
+    result = CliRunner().invoke(cli, ["router", "sync", "--detached"])
+    assert result.exit_code == 0, result.output
+    assert schedule.SCHEDULED_ENV not in os.environ
 
 
 def test_opt_out_removes_the_job_once_a_running_refresh_finishes(monkeypatch, tmp_path):

@@ -226,11 +226,12 @@ def unwrap_url(url: str) -> str:
     return f"https://{netloc}{upstream_path.rstrip('/')}"
 
 
-def attribution_url(base_url: str) -> str:
+def attribution_url(base_url: str, *, start: bool = True) -> str:
     """The URL to write into a local client setup; never raises.
 
     The helper URL only while the feature is on, the endpoint is a Router
     host, and the helper is answering. Otherwise the direct URL, as before.
+    ``start=False`` only checks that the helper answers instead of starting it.
     """
     try:
         if not enabled():
@@ -239,12 +240,17 @@ def attribution_url(base_url: str) -> str:
         extra_hosts = read_extra_hosts(settings_path())
         if not hostname or not router_host_allowed(hostname, extra_hosts):
             return base_url
-        if not ensure_running():
+        if not (ensure_running() if start else answering()):
             return base_url
         return wrap_url(base_url, port()) or base_url
     except Exception as exc:
         _log(f"attribution_url failed, keeping the direct URL: {exc!r}")
         return base_url
+
+
+def answering(attempts: int = 3) -> bool:
+    """Whether the helper answers; a few tries, so one slow reply is not an outage."""
+    return any(health() is not None for _ in range(attempts))
 
 
 def client_credentials(base_url: str, api_key: str) -> tuple[str, str]:
