@@ -10,8 +10,11 @@ repository with nothing new for the user to do or send.
 Off by default. Writing a setup is fail-open: unless the helper answers its
 health check, configured clients get the direct Router URL as before.
 
-Cursor remains out of scope because its model calls come from Cursor's cloud.
-Conductor and Hermes are out of scope for this preview.
+Cursor's model calls come from Cursor's cloud, so they never pass through the
+listener; instead the agent uploads repository tags for Cursor's chats with
+the key Cursor was set up with (``bind_cursor``). A Cursor binding alone is
+enough to turn the agent on. Conductor and Hermes are out of scope for this
+preview.
 """
 
 from __future__ import annotations
@@ -311,6 +314,14 @@ def bind_cursor(base_url: str, api_key: str, user_dir: Path) -> None:
             "user_dir": str(user_dir.expanduser().absolute()),
         }
         router_local_auth.write_private(cursor_binding_path(), json.dumps(binding))
+        if enabled():
+            # With tagging already on, a switch to a custom deployment is
+            # recorded the way enabling would, or the agent refuses the host.
+            settings = load_settings()
+            before = settings.get("hosts")
+            _allow_host(settings, urllib.parse.urlsplit(f"https://{upstream}").hostname)
+            if settings.get("hosts") != before:
+                _save_settings(settings)
     except Exception:
         # An earlier binding would upload with a key Cursor may no longer use.
         unbind_cursor()
@@ -325,6 +336,57 @@ def unbind_cursor() -> None:
         cursor_binding_path().unlink(missing_ok=True)
     except OSError as exc:
         _log(f"Could not remove the Cursor binding: {exc!r}")
+
+
+def _read_cursor_binding() -> dict | None:
+    path = cursor_binding_path()
+    # No binding, no private-file checks: they need os.getuid, which Windows lacks.
+    if not path.exists() and not path.is_symlink():
+        return None
+    try:
+        binding = json.loads(router_local_auth.read_private(path))
+    except (OSError, ValueError):
+        return None
+    return binding if isinstance(binding, dict) else None
+
+
+def cursor_bound() -> bool:
+    """Whether a Cursor binding names a key the agent can load.
+
+    The host is not checked: enabling tagging records it (``enable``). This is
+    what lets a machine where Router is set up only through Cursor turn the
+    agent on, since Cursor has no receipt a refresh could read.
+    """
+    try:
+        binding = _read_cursor_binding()
+        upstream = binding.get("upstream") if binding else None
+        return (
+            isinstance(upstream, str)
+            and bool(upstream)
+            and _cursor_credential_ok(upstream, binding.get("credential"))
+        )
+    except Exception:
+        return False
+
+
+def _cursor_bound_hostname() -> str | None:
+    binding = _read_cursor_binding()
+    upstream = binding.get("upstream") if binding else None
+    if not isinstance(upstream, str) or not upstream:
+        return None
+    try:
+        return urllib.parse.urlsplit(f"https://{upstream}").hostname
+    except ValueError:
+        return None
+
+
+def _allow_host(settings: dict, hostname: str | None) -> None:
+    """Record a custom deployment the agent may forward and upload to."""
+    if not hostname or router_host_allowed(hostname):
+        return
+    hosts = settings.get("hosts")
+    known = [h for h in hosts if isinstance(h, str)] if isinstance(hosts, list) else []
+    settings["hosts"] = sorted({*known, hostname.lower().rstrip(".")})
 
 
 def cursor_bound_user_dir() -> Path | None:
@@ -716,10 +778,14 @@ def enable(ctx: click.Context, helper_port: int | None = None) -> dict:
     settings.pop("keep_listening", None)
     if helper_port is not None:
         settings["port"] = helper_port
-    hostname = urllib.parse.urlsplit(router_module.router_base_url()).hostname
-    if hostname and not router_host_allowed(hostname):
-        # A custom deployment: the helper may forward to it from now on.
-        settings["hosts"] = sorted({*settings.get("hosts", []), hostname.lower()})
+    # A custom deployment: the helper may forward to it from now on. Cursor's
+    # binding counts too, since a Cursor-only setup may have been made with a
+    # deployment override this shell no longer carries.
+    _allow_host(
+        settings, urllib.parse.urlsplit(router_module.router_base_url()).hostname
+    )
+    with contextlib.suppress(Exception):
+        _allow_host(settings, _cursor_bound_hostname())
     _save_settings(settings)
     if not ensure_running():
         _save_settings(previous)

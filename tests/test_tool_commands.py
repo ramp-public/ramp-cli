@@ -12,6 +12,7 @@ from ramp_cli.auth import store
 from ramp_cli.main import ToolGroup, cli, main
 from ramp_cli.specs import AGENT_TOOL_SPEC
 from ramp_cli.tools.commands import (
+    GeneratedToolGroup,
     _build_body,
     build_tool_command,
 )
@@ -1304,6 +1305,22 @@ class TestErrorExampleFormat:
 
 
 class TestAliasInCategoryGroup:
+    def test_hand_written_groups_do_not_hide_their_generated_tools(self, monkeypatch):
+        _use_bundled_spec(monkeypatch)
+        monkeypatch.setattr("ramp_cli.tools.commands.maybe_sync", lambda env: None)
+        root = click.Context(cli)
+        for group in cli.commands.values():
+            if not isinstance(group, GeneratedToolGroup):
+                continue
+            hand_written = {*group.commands, *getattr(group, "_legacy_commands", {})}
+            generated = {
+                name
+                for name, _ in group._generated_commands(
+                    click.Context(group, parent=root)
+                )
+            }
+            assert not hand_written & generated, group.name
+
     def test_category_uses_alias(self):
         """Category subcommands use alias when present."""
         tool_with_alias = ToolDef(

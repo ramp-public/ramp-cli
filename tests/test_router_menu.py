@@ -8,6 +8,7 @@ from click.testing import CliRunner
 
 from ramp_cli.commands import router as router_module
 from ramp_cli.main import cli
+from ramp_cli.tools.parser import ToolDef
 
 
 @pytest.fixture(autouse=True)
@@ -17,6 +18,30 @@ def no_network(monkeypatch):
         "request",
         lambda *_a, **_kw: pytest.fail("Menu tests must not make network requests"),
     )
+    monkeypatch.setattr("ramp_cli.tools.commands.maybe_sync", lambda env: None)
+
+
+def test_router_menu_adds_generated_router_tools_in_their_own_section(monkeypatch):
+    tool = ToolDef(
+        name="list-router-api-keys",
+        path="/developer/v1/agent-tools/list-router-api-keys",
+        http_method="POST",
+        summary="List Router API keys",
+        description="List Router API keys",
+        category="router",
+        alias="api-keys",
+    )
+    monkeypatch.setattr("ramp_cli.tools.commands.list_tool_defs", lambda env: [tool])
+
+    help_result = CliRunner().invoke(cli, ["--agent", "router", "--help"])
+    run_result = CliRunner().invoke(cli, ["--agent", "router", "api-keys", "-n"])
+
+    assert help_result.exit_code == 0, help_result.output
+    setup, ramp = help_result.output.split("Manage Router in Ramp")
+    assert "  keys " in setup and "api-keys" not in setup
+    assert "  api-keys " in ramp
+    assert run_result.exit_code == 0, run_result.output
+    assert json.loads(run_result.output)["data"][0]["url"].endswith(tool.path)
 
 
 def test_main_router_menu_has_short_choices_and_workspace():

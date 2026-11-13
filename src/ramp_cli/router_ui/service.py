@@ -1247,6 +1247,7 @@ class RouterService:
         else:
             executable = [
                 sys.executable,
+                "-P",  # Never import Python from the TUI's working directory.
                 "-c",
                 "from ramp_cli.main import main; main()",
             ]

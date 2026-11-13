@@ -13,6 +13,7 @@ from pathlib import Path
 import click
 
 from ramp_cli import __version__
+from ramp_cli.commands import router_repo, router_schedule
 from ramp_cli.commands.router import CLIENT_NAMES, configured_router_clients
 from ramp_cli.install_record import (
     npm_install_record,
@@ -192,6 +193,14 @@ def _warn_if_shadowed(installed: Path) -> None:
     click.echo(f"  export PATH={shlex.quote(str(installed.parent))}:$PATH && hash -r")
 
 
+def _cursor_agent_installed() -> bool:
+    """Whether the Router agent runs for Cursor's repository tags; never raises."""
+    try:
+        return router_repo.cursor_bound() and router_schedule.agent_installed()
+    except Exception:
+        return False
+
+
 def _is_homebrew_install() -> bool:
     """Return True if the running binary lives in the ramp-cli Homebrew Cellar.
 
@@ -254,10 +263,11 @@ def update_cmd(_npm_validate: bool = False) -> None:
     click.echo(f"Update available: v{current} → v{latest}")
 
     router_clients = configured_router_clients()
+    refresh_router = bool(router_clients) or _cursor_agent_installed()
     if _is_homebrew_install():
         click.echo("This ramp was installed via Homebrew. Run:")
         command = "brew update && brew upgrade ramp-cli"
-        if router_clients:
+        if refresh_router:
             command += " && ramp router refresh"
         click.echo(f"  {command}")
         return
@@ -286,10 +296,12 @@ def update_cmd(_npm_validate: bool = False) -> None:
     )
     _warn_if_shadowed(installed_executable)
 
-    if router_clients:
+    if refresh_router:
         # Invoke the CLI after installation instead of teaching the separately
         # hosted installer a new flag. Refresh is receipt-scoped and reads the
-        # credentials already stored for each configured agent.
+        # credentials already stored for each configured agent. A Cursor-only
+        # setup has nothing to refresh, but refresh re-renders its agent so
+        # the updated binary replaces the one still running.
         refresh_command = _installed_invocation(
             installed_executable, "router", "refresh"
         )

@@ -32,6 +32,7 @@ from ramp_cli.output.formatter import (
 )
 from ramp_cli.output.style import _WIDTH_MAX, _WIDTH_MIN, show_detail_card
 from ramp_cli.router_ui import launch as router_ui
+from ramp_cli.tools.commands import GeneratedToolGroup
 
 if TYPE_CHECKING:
     from typing import TypeAlias
@@ -172,12 +173,20 @@ def _menu_footer(ctx: click.Context) -> str:
 _WORKSPACE_PARAMS = ("inline", "inline_height", "theme_mode")
 
 
-class RouterMenuGroup(click.Group):
+class RouterMenuGroup(GeneratedToolGroup):
+    commands_section = "Local Router setup"
+    tools_section = "Manage Router in Ramp (Ramp login; admins act business-wide)"
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, tool_category="router", **kwargs)
+
     def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
-        # Old paths remain callable without cluttering the visible menu.
-        return super().get_command(ctx, cmd_name) or getattr(
-            self, "_legacy_commands", {}
-        ).get(cmd_name)
+        # Hand-written commands and old paths win over generated tools.
+        return (
+            self.commands.get(cmd_name)
+            or getattr(self, "_legacy_commands", {}).get(cmd_name)
+            or super().get_command(ctx, cmd_name)
+        )
 
     def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         # Without the automatic workspace, these only matter to `router ui`.
@@ -1190,7 +1199,10 @@ def register_router_user_commands(
         "keys",
         invoke_without_command=True,
         no_args_is_help=False,
-        help="Inspect and manage your API keys, usage, and routing strategies.",
+        help=(
+            "Create, rename, and show API keys, and set a key's strategy. "
+            "Uses your Router login (ramp router account login) and calls Router directly."
+        ),
     )
     @click.option(
         "--days",

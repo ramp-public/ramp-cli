@@ -593,12 +593,15 @@ def test_command_adapter_uses_same_interpreter_noninteractive_and_env_secret(
     service = RouterService({"env": "production", "profile": "human"})
     output = service.command(["configure", "connect", "codex"], secret="test-secret")
     arguments, options = calls[0]
-    assert arguments[0] == sys.executable
+    assert arguments[:3] == [sys.executable, "-P", "-c"]
     assert "--no-input" in arguments
     assert "--human" in arguments
+    assert arguments[arguments.index("--env") + 1] == "production"
+    assert arguments[arguments.index("--profile") + 1] == "human"
     assert "test-secret" not in arguments
     assert options["env"][router.CONFIGURE_KEY_ENV] == "test-secret"
     assert options["stdin"] == subprocess.DEVNULL
+    assert "cwd" not in options
     assert "test-secret" not in output
 
 

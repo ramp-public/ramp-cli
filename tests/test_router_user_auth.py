@@ -575,6 +575,7 @@ def test_footer_hides_cached_account_when_session_check_rejects_login(
     monkeypatch.setattr(
         oauth, "_open_browser", lambda *_a: pytest.fail("Help must not open a browser")
     )
+    monkeypatch.setattr("ramp_cli.tools.commands.maybe_sync", lambda env: None)
     result = CliRunner().invoke(cli, ["router", "--help"])
     assert result.exit_code == 0, result.output
     assert "Account: Not Logged In" in result.output

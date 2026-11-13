@@ -322,8 +322,7 @@ def test_spawn_detached_refresh_reenters_the_interpreter_without_an_entrypoint(
     sync_module.spawn_detached_refresh()
 
     command = calls["command"]
-    assert command[0] == sys.executable
-    assert command[1] == "-c"
+    assert command[:3] == [sys.executable, "-P", "-c"]
     assert command[-3:] == ["router", "sync", "--detached"]
 
 

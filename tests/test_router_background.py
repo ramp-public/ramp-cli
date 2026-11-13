@@ -69,6 +69,10 @@ def test_choice_survives_refresh_and_fresh_shell(monkeypatch, tmp_path, platform
     monkeypatch.setattr(
         router_module, "_scheduled_sync_connections", lambda: [object()]
     )
+    # The setup those connections come from (without one, nothing is pending).
+    receipt = router_module._codex_config_path().parent / "ramp-router-state.json"
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    receipt.write_text("{}")
     install_service = Mock()
     monkeypatch.setattr(schedule, "_install_service", install_service)
     monkeypatch.setattr(schedule, "install", _REAL_INSTALL)
@@ -328,6 +332,10 @@ def test_os_disabled_state_does_not_claim_running(monkeypatch):
 
 def test_status_says_when_the_tagging_listener_is_not_answering(monkeypatch):
     router_repo._save_settings({"enabled": True})
+    # A setup that may depend on the listener (without one, nothing is stranded).
+    receipt = router_module._codex_config_path().parent / "ramp-router-state.json"
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    receipt.write_text("{}")
     monkeypatch.setattr(router_repo, "health", lambda *_: None)
     result = invoke("status")
     assert result.exit_code == 0, result.output

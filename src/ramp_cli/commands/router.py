@@ -1719,7 +1719,8 @@ def router_configure(
         _validate_deployment_url(ctx, click.Option(["--ui-url"]), origin)
         if origin != _router_key_origin(base):
             raise click.UsageError("Router API and sign-in deployments must match.")
-        supported = router_credentials.HARNESSES
+        # Cursor is named explicitly only: its binding is what the agent uses.
+        supported = (*router_credentials.HARNESSES, CURSOR_CLIENT)
         if any(client not in supported for client in clients):
             raise click.UsageError(
                 "--enable-agent supports only " + ", ".join(supported) + "."
@@ -2012,6 +2013,8 @@ def _run_configure(
     clients = requested_clients or all_clients
     if enable_agent:
         for client in clients:
+            if client == CURSOR_CLIENT:
+                continue  # no local config file to validate up front
             try:
                 path = (
                     connector_harnesses.config_path(client)
@@ -2706,6 +2709,8 @@ def _run_configure(
             show_notice("NOTE", cursor_result["note_lines"])
         if cursor_result and cursor_result.get("personal_keys_blocked"):
             show_notice("NOTICE", _CURSOR_KEYS_BLOCKED_LINES)
+        if cursor_result and not enable_agent and (hint := _cursor_tagging_hint()):
+            click.echo(hint)
         for result in results:
             if result["client"] != CURSOR_CLIENT and result.get("note_lines"):
                 show_notice("NOTE", result["note_lines"])
@@ -3011,6 +3016,15 @@ def _cursor_state_lines(info: dict, tagging_enabled: bool) -> list[str]:
     return lines
 
 
+def _router_setup_remains() -> bool:
+    """Whether any setup this CLI made remains, Cursor's binding included."""
+    return (
+        bool(_clients_with_a_receipt())
+        or claude_cowork.state_path().exists()
+        or _cursor_set_up()
+    )
+
+
 def _print_background_status(ctx: click.Context) -> None:
     status = router_schedule.background_status()
     tagging = router_repo.status()
@@ -3026,8 +3040,19 @@ def _print_background_status(ctx: click.Context) -> None:
             f"Client refresh failed ({failure['client']}): {failure['error']}. "
             "Repair the client, then run 'ramp router agent enable' again."
         )
+    # Removing the last setup removes the agent but keeps both preferences:
+    # nothing is stranded, and enabling again would need a setup first.
+    awaiting_setup = (
+        status["state"] == router_schedule.AGENT_NOT_INSTALLED
+        and not _router_setup_remains()
+    )
     if tagging["enabled"] and tagging["healthy"]:
         click.echo(f"Repository tagging: enabled (running on port {tagging['port']}).")
+    elif tagging["enabled"] and awaiting_setup:
+        click.echo(
+            "Repository tagging: enabled; the agent starts again with the next "
+            "Router setup."
+        )
     elif tagging["enabled"]:
         click.echo(
             f"Repository tagging: enabled, but nothing answers on port {tagging['port']}. "
@@ -3053,7 +3078,11 @@ def _print_background_status(ctx: click.Context) -> None:
         click.echo(f"{SYNC_OPT_OUT_ENV} is set; background sync is blocked.")
     if status["state"] == router_schedule.AGENT_DISABLED:
         click.echo(f"To allow the service, {router_schedule.LOGIN_ITEMS_HINT}.")
-    elif status["enabled"] and status["state"] not in ("running", "scheduled"):
+    elif (
+        status["enabled"]
+        and status["state"] not in ("running", "scheduled")
+        and not awaiting_setup
+    ):
         click.echo(
             "The preference is saved, but the service is not running. "
             "Run 'ramp router agent enable' again from a logged-in desktop session."
@@ -3091,11 +3120,20 @@ def router_agent_enable(ctx: click.Context, helper_port: int | None) -> None:
         raise click.UsageError(
             f"Unset {SYNC_OPT_OUT_ENV} before enabling background sync."
         )
-    if not _scheduled_sync_connections():
+    # Cursor has no receipt a refresh could read, but its binding is a setup
+    # the agent serves: it uploads Cursor's repository tags.
+    cursor_only = not _scheduled_sync_connections()
+    if cursor_only and not router_repo.cursor_bound():
         raise click.UsageError("Configure Router first with 'ramp router configure'.")
     tagging_supported = router_repo.service_supported()
     if helper_port is not None and not tagging_supported:
         raise click.UsageError("--port requires the native Router agent.")
+    if cursor_only and not tagging_supported:
+        # Only the agent uploads Cursor's tags; a plain timer would sync nothing.
+        raise click.ClickException(
+            "Cursor repository tagging needs the Ramp Router agent, which ships "
+            "with the ramp installers on macOS, and on Linux with systemd."
+        )
     if tagging_supported:
         # Establish a healthy listener before clients can depend on it. A failed
         # start preserves the old settings and does not opt into background sync.
@@ -3104,6 +3142,7 @@ def router_agent_enable(ctx: click.Context, helper_port: int | None) -> None:
     _print_background_status(ctx)
     if (
         tagging_supported
+        and not cursor_only
         and resolve_format(ctx.obj["format"], ctx.obj["config_format"]) != "json"
     ):
         click.echo("Restart open coding-agent sessions to pick up the local endpoint.")
@@ -3118,8 +3157,10 @@ def router_agent_disable(ctx: click.Context) -> None:
     # Stop sync first, retaining the listener until endpoint migration finishes.
     router_schedule.disable_background()
     tagging = router_repo.enabled() or router_repo.listener_port() is not None
+    refreshed: list[dict] = []
     if tagging or clients_using_repo_helper():
-        for result in router_repo.disable(ctx)["refreshed"]:
+        refreshed = router_repo.disable(ctx)["refreshed"]
+        for result in refreshed:
             if result.get("client") == COWORK_CLIENT and (
                 failure := _cowork_failure(result)
             ):
@@ -3127,6 +3168,8 @@ def router_agent_disable(ctx: click.Context) -> None:
     _print_background_status(ctx)
     if (
         tagging
+        # Cursor-only: no local agent's endpoint changed, so nothing to restart.
+        and (refreshed or not router_repo.cursor_bound())
         and resolve_format(ctx.obj["format"], ctx.obj["config_format"]) != "json"
     ):
         click.echo("Restart open coding-agent sessions to pick up the direct endpoint.")
@@ -3474,7 +3517,10 @@ def _refresh_clients(
         cowork_failure = _cowork_failure(cowork_result)
         if failures_out is not None and cowork_failure:
             failures_out.append({"client": COWORK_CLIENT, "error": cowork_failure})
-    if results:
+    # Cursor's settings live in Cursor, but its binding keeps the agent: this
+    # still reconciles the service (an updated agent binary, for one).
+    cursor_bound = not clients and cowork_result is None and router_repo.cursor_bound()
+    if results or cursor_bound:
         # Before the failure check, so one broken setup cannot keep the job
         # from the healthy ones.
         if preserve_sync_opt_out:
@@ -3485,10 +3531,19 @@ def _refresh_clients(
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     if failures and failures_out is None and fmt == "json":
         raise click.ClickException("Could not refresh " + "; ".join(failures))
-    if fmt != "json" and results and not os.environ.get(router_schedule.SCHEDULED_ENV):
+    if (
+        fmt != "json"
+        and (results or cursor_bound)
+        and not os.environ.get(router_schedule.SCHEDULED_ENV)
+    ):
         _warn_if_agent_off()
     if fmt == "json":
         print_agent_json({"clients": results}, pagination=None)
+    elif cursor_bound:
+        click.echo(
+            "Nothing to refresh: Cursor keeps its Router settings in Cursor. "
+            "Run 'ramp router cursor' to set it up again."
+        )
     elif not clients and cowork_result is None:
         click.echo("Ramp Router is not configured in any coding agent.")
     else:
@@ -3901,6 +3956,9 @@ def router_cursor(
     base_url = router_base_url()
     models = _fetch_models(api_key, wait_for_key=browser_acquired_key)
     router_repo.bind_cursor(base_url, api_key, cursor.user_dir())
+    # Reconcile the agent for the binding, as configure does: a Cursor-only
+    # machine whose agent was removed with its last setup gets it back.
+    router_schedule.install()
     suggested_name = _cursor_suggested_model(models)
     claude_aliases = _ensure_claude_aliases(api_key, base_url, models)
     key_on_clipboard = False if show_key else _copy_to_clipboard(api_key)
@@ -3956,6 +4014,27 @@ def router_cursor(
             f"{_format_credits_usd(summary.remaining_credits)}",
             fg=_RAMP_YELLOW,
         )
+    if hint := _cursor_tagging_hint():
+        click.echo(hint)
+
+
+def _cursor_tagging_hint() -> str | None:
+    """One line pointing a finished Cursor setup at repository tagging while
+    it is off and could be turned on here; never raises."""
+    try:
+        if (
+            router_repo.enabled()
+            or os.environ.get(SYNC_OPT_OUT_ENV)
+            or not router_repo.cursor_bound()
+            or not router_repo.service_supported()
+        ):
+            return None
+    except Exception:
+        return None
+    return (
+        "Repository tagging is off; run 'ramp router agent enable' to tag Cursor "
+        "chats by repository ('ramp router configure cursor --enable-agent' does both)."
+    )
 
 
 _CLIPBOARD_COMMANDS: tuple[list[str], ...] = (
@@ -4478,6 +4557,11 @@ def _run_scheduled_sync(ctx: click.Context) -> None:
             _reconcile_helper_endpoints()
             connections = _scheduled_sync_connections()
             if not connections:
+                if router_repo.cursor_bound():
+                    # Nothing to refresh, but Cursor's uploads run in the agent:
+                    # re-render it so an updated binary replaces the running one,
+                    # as a refresh does for every other setup.
+                    router_schedule.install()
                 _write_agent_manifest(connections, renew_at)
                 return
             state = router_schedule.load_state()
@@ -6138,6 +6222,24 @@ def router_unconfigure(ctx: click.Context, clients: tuple[str, ...]) -> None:
     _run_unconfigure(ctx, clients=clients)
 
 
+def _clear_agent_manifest_after_removal() -> None:
+    """Drop removed setups' keys from the manifest the kept agent checks.
+
+    A scheduled sync holds this lock from reading its connections to writing
+    the manifest, so one already running cannot write the removed key back
+    after this clears it.
+    """
+    with sync_lock(wait=router_schedule.REMOVE_WAIT_SECONDS) as acquired:
+        if not acquired:
+            raise click.ClickException(
+                "Your previous settings were restored, but the Ramp Router "
+                "agent manifest cleanup is incomplete: could not acquire "
+                "the background sync lock. A running sync may still "
+                "retain the removed Router key."
+            )
+        router_schedule.clear_manifest()
+
+
 def _run_unconfigure(
     ctx: click.Context,
     *,
@@ -6275,11 +6377,10 @@ def _run_unconfigure(
         stop_spinner()
 
     # Cursor's transcript uploads need the agent too, so its setup counts.
-    setup_remains = (
-        bool(_clients_with_a_receipt())
-        or claude_cowork.state_path().exists()
-        or _cursor_set_up()
+    receipts_remain = (
+        bool(_clients_with_a_receipt()) or claude_cowork.state_path().exists()
     )
+    setup_remains = receipts_remain or _cursor_set_up()
     if results and not setup_remains:
         # Removes the agent too; the tagging setting stays, so a later
         # configure starts its listener again. A profile this CLI did not
@@ -6287,19 +6388,13 @@ def _run_unconfigure(
         if not clients_using_repo_helper():
             router_schedule.uninstall()
         else:
-            # The kept agent must not keep syncing the removed setup's key. A
-            # scheduled sync holds this lock from reading its connections to
-            # writing the manifest, so one already running cannot write the
-            # removed key back after this clears it.
-            with sync_lock(wait=router_schedule.REMOVE_WAIT_SECONDS) as acquired:
-                if not acquired:
-                    raise click.ClickException(
-                        "Your previous settings were restored, but the Ramp Router "
-                        "agent manifest cleanup is incomplete: could not acquire "
-                        "the background sync lock. A running sync may still "
-                        "retain the removed Router key."
-                    )
-                router_schedule.clear_manifest()
+            _clear_agent_manifest_after_removal()
+    elif results and not receipts_remain:
+        # Only Cursor is left. The agent stays for its uploads, but must not
+        # keep checking Router with the removed setups' keys until its daily
+        # recheck; the sync this triggers writes an empty manifest.
+        _clear_agent_manifest_after_removal()
+    if results and not setup_remains:
         # Ramp-owned version-nudge state leaves with the last Router setup; a
         # failed removal keeps its receipt, so its state stays.
         for stale in (installed_version_path(), server_recommended_version_path()):
@@ -13453,7 +13548,7 @@ def _organize_router_menu() -> None:
         "account": "Manage your Router login.",
         "agent": "Manage the Router agent.",
         "configure": "Connect or disconnect harnesses.",
-        "keys": "View and manage API keys.",
+        "keys": "Create/edit keys (Router login).",
         "refresh": "Update connected harnesses.",
         "strategies": "Manage routing strategies.",
         "subagents": "Choose subagent models.",

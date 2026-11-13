@@ -298,6 +298,7 @@ def spawn_detached_refresh() -> None:
         # -c is the args after the program text.
         else [
             sys.executable,
+            "-P",  # The hosting agent's project is not a trusted import path.
             "-c",
             "from ramp_cli.main import main; main()",
             *arguments,

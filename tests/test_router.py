@@ -9901,7 +9901,9 @@ def test_agent_picker_escape_returns_to_router_menu(command, monkeypatch, tmp_pa
         assert "disconnect" in result.output
     else:
         assert "Usage: ramp router [OPTIONS]" in result.output
-    assert "Commands" in result.output
+    assert ("Commands" if command == "configure" else "Local Router setup") in (
+        result.output
+    )
     assert "Aborted!" not in result.output
     assert not (tmp_path / "codex" / "ramp-router-state.json").exists()
 

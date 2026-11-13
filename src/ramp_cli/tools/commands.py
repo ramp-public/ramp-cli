@@ -344,6 +344,9 @@ def build_tool_command(
 class GeneratedToolGroup(click.Group):
     """A hand-written Click group augmented by one generated tool category."""
 
+    commands_section = "Commands"
+    tools_section = "Tools"
+
     def __init__(self, *args: Any, tool_category: str, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.tool_category = tool_category
@@ -407,6 +410,26 @@ class GeneratedToolGroup(click.Group):
                     command_name=command_name,
                 )
         return None
+
+    def format_commands(
+        self, ctx: click.Context, formatter: click.HelpFormatter
+    ) -> None:
+        sections: dict[str, list[tuple[str, str]]] = {
+            self.commands_section: [],
+            self.tools_section: [],
+        }
+        for name in self.list_commands(ctx):
+            command = self.get_command(ctx, name)
+            if command is None or command.hidden:
+                continue
+            section = (
+                self.commands_section if name in self.commands else self.tools_section
+            )
+            sections[section].append((name, command.get_short_help_str(limit=150)))
+        for title, rows in sections.items():
+            if rows:
+                with formatter.section(title):
+                    formatter.write_dl(rows)
 
 
 def _json_option_help(
