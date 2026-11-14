@@ -222,6 +222,134 @@ def test_daily_usage_zero_fills_local_days_and_orders_other_last(monkeypatch):
     assert data["series"][4]["spend_usd"] == 5
 
 
+def _frozen_week(monkeypatch):
+    zone = operations.ZoneInfo("America/New_York")
+    monkeypatch.setattr(operations, "local_timezone", lambda: zone)
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 3, 2, tzinfo=timezone.utc).astimezone(tz)
+
+    monkeypatch.setattr(operations, "datetime", FrozenDatetime)
+
+
+def test_usage_reports_full_cost_where_shared_key_gpt_is_unbilled(monkeypatch):
+    _frozen_week(monkeypatch)
+    gpt = {"group": "gpt-5", "group_label": "GPT-5", "spend_usd": "0"}
+    claude = {"group": "claude-sonnet", "group_label": "Claude Sonnet"}
+    usage = {
+        "summary": {
+            "spend_usd": "1.5",
+            "estimated_usage_cost_usd": "13.5",
+            "unbilled_shared_key_cost_usd": "12",
+        },
+        "model_stats": [
+            {
+                "model": "claude-sonnet",
+                "model_display_name": "Claude Sonnet",
+                "spend_usd": "1.5",
+                "estimated_usage_cost_usd": "1.5",
+                "unbilled_shared_key_cost_usd": "0",
+            },
+            {
+                "model": "gpt-5",
+                "model_display_name": "GPT-5",
+                "spend_usd": "0",
+                "estimated_usage_cost_usd": "12",
+                "unbilled_shared_key_cost_usd": "12",
+            },
+            # A model Router reports without an estimate keeps only spend.
+            {"model": "legacy", "spend_usd": "0.1", "estimated_usage_cost_usd": None},
+        ],
+        "series": [
+            {
+                **gpt,
+                "period_start_at": "2026-10-01T04:00:00Z",
+                "estimated_usage_cost_usd": "5",
+                "unbilled_shared_key_cost_usd": "5",
+            },
+            {
+                **gpt,
+                "period_start_at": "2026-10-02T04:00:00Z",
+                "estimated_usage_cost_usd": "7",
+                "unbilled_shared_key_cost_usd": "7",
+            },
+            {
+                **claude,
+                "period_start_at": "2026-10-02T04:00:00Z",
+                "spend_usd": "1.5",
+                "estimated_usage_cost_usd": "1.5",
+                "unbilled_shared_key_cost_usd": "0",
+            },
+        ],
+    }
+    service = RouterService({})
+    service._client = SimpleNamespace(get=lambda path, **kwargs: usage)
+    data = service.daily_usage(7, "model")
+
+    assert data["summary"] == usage["summary"]
+    assert [
+        (m["id"], m["spend_usd"], m.get("estimated_usage_cost_usd"))
+        for m in data["models"]
+    ] == [
+        ("gpt-5", 0, Decimal("12")),
+        ("claude-sonnet", Decimal("1.5"), Decimal("1.5")),
+        ("legacy", Decimal("0.1"), None),
+    ]
+    assert data["models"][0]["unbilled_shared_key_cost_usd"] == Decimal("12")
+    assert not set(operations.COST_FIELDS) & data["models"][2].keys()
+
+    groups = {g["id"]: g for g in data["groups"]}
+    assert [g["id"] for g in data["groups"]] == ["gpt-5", "claude-sonnet"]
+    assert groups["gpt-5"]["spend_usd"] == 0
+    assert groups["gpt-5"]["estimated_usage_cost_usd"] == Decimal("12")
+    assert groups["gpt-5"]["unbilled_shared_key_cost_usd"] == Decimal("12")
+    assert groups["claude-sonnet"]["estimated_usage_cost_usd"] == Decimal("1.5")
+
+    days = {row["date"]: row for row in data["series"]}
+    today = days["2026-10-02"]
+    assert today["spend_usd"] == Decimal("1.5")
+    assert today["estimated_usage_cost_usd"] == Decimal("8.5")
+    assert today["unbilled_shared_key_cost_usd"] == Decimal("7")
+    assert today["groups"]["gpt-5"]["estimated_usage_cost_usd"] == Decimal("7")
+    assert today["groups"]["claude-sonnet"]["unbilled_shared_key_cost_usd"] == 0
+    yesterday = days["2026-10-01"]
+    assert yesterday["estimated_usage_cost_usd"] == Decimal("5")
+    assert yesterday["groups"]["claude-sonnet"]["estimated_usage_cost_usd"] == 0
+    # Days without usage are zero-filled like spend.
+    idle = days["2026-09-26"]
+    assert idle["estimated_usage_cost_usd"] == 0
+    assert idle["unbilled_shared_key_cost_usd"] == 0
+    assert idle["groups"]["gpt-5"]["estimated_usage_cost_usd"] == 0
+
+
+def test_usage_without_cost_fields_leaves_them_out(monkeypatch):
+    _frozen_week(monkeypatch)
+    usage = {
+        "summary": {"spend_usd": "2"},
+        "model_stats": [{"model": "claude-sonnet", "spend_usd": "2"}],
+        "series": [
+            {
+                "period_start_at": "2026-10-02T04:00:00Z",
+                "group": "claude-sonnet",
+                "spend_usd": "2",
+            }
+        ],
+    }
+    service = RouterService({})
+    service._client = SimpleNamespace(get=lambda path, **kwargs: usage)
+    data = service.daily_usage(7, "model")
+    rows = [
+        *data["models"],
+        *data["groups"],
+        *data["series"],
+        *(cell for row in data["series"] for cell in row["groups"].values()),
+    ]
+    assert rows and not any(set(operations.COST_FIELDS) & row.keys() for row in rows)
+    assert data["series"][-1]["spend_usd"] == Decimal("2")
+
+
 @pytest.mark.parametrize(
     ("account", "message"),
     [
@@ -313,9 +441,22 @@ def test_usage_by_harness_answers_for_every_tagged_harness_in_one_read(monkeypat
     assert totals["claude-code"]["spend_usd"] == Decimal("1.5")
     assert totals["claude-code"]["request_count"] == 4
     assert totals["codex"]["spend_usd"] == Decimal("2")
+    assert not set(operations.COST_FIELDS) & totals["codex"].keys()
     # Tagged but idle reads as zero; untagged harnesses are left out, not zeroed.
     assert totals["pi"]["spend_usd"] == 0 and totals["pi"]["total_tokens"] == 0
     assert not {"conductor", "cowork", "cursor"} & totals.keys()
+
+
+def test_usage_by_harness_carries_full_cost_and_zero_fills_idle_harnesses():
+    cost = {"estimated_usage_cost_usd": Decimal("9")}
+    groups = [
+        {"id": "codex", "spend_usd": Decimal(0), **cost, "request_count": 3},
+        {"id": "claude_code", "spend_usd": Decimal("1"), **cost},
+    ]
+    totals = {row["harness"]: row for row in operations.harness_totals(groups)}
+    assert totals["codex"]["estimated_usage_cost_usd"] == Decimal("9")
+    assert totals["pi"]["estimated_usage_cost_usd"] == 0
+    assert "unbilled_shared_key_cost_usd" not in totals["codex"]
 
 
 def test_account_usage_without_a_harness_is_unchanged(monkeypatch):

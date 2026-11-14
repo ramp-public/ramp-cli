@@ -145,14 +145,30 @@ def _count(value: object) -> int:
         return 0
 
 
+# Router's full usage cost and its unbilled shared-key part, beside billed
+# spend. The estimate already includes BYOK and unbilled cost.
+COST_FIELDS = ("estimated_usage_cost_usd", "unbilled_shared_key_cost_usd")
+
+
+def _cost(row: dict) -> Decimal:
+    """Full usage cost when Router reports it, else billed spend."""
+    return row.get("estimated_usage_cost_usd", row["spend_usd"])
+
+
 def daily_series(usage: dict, dates: list, zone: tzinfo) -> dict:
-    """Zero-filled day × group cells; groups by spend, the server's "other" last."""
+    """Zero-filled day × group cells; groups by cost, the server's "other" last."""
     known = set(dates)
     cells: dict[tuple, dict] = {}
     groups: dict[str, dict] = {}
-    for point in usage.get("series") or []:
-        if not isinstance(point, dict):
-            continue
+    points = [p for p in usage.get("series") or [] if isinstance(p, dict)]
+    costs = [f for f in COST_FIELDS if any(p.get(f) is not None for p in points)]
+    zero = {
+        "spend_usd": Decimal(0),
+        **{field: Decimal(0) for field in costs},
+        "request_count": 0,
+        "total_tokens": 0,
+    }
+    for point in points:
         try:
             started = datetime.fromisoformat(str(point["period_start_at"]))
         except (KeyError, ValueError):
@@ -173,24 +189,20 @@ def daily_series(usage: dict, dates: list, zone: tzinfo) -> dict:
                     or group_id
                     or "Unknown"
                 ),
-                "spend_usd": Decimal(0),
-                "request_count": 0,
-                "total_tokens": 0,
+                **zero,
             },
         )
-        cell = cells.setdefault(
-            (day, group_id),
-            {"spend_usd": Decimal(0), "request_count": 0, "total_tokens": 0},
-        )
+        cell = cells.setdefault((day, group_id), dict(zero))
         for target in (group, cell):
-            target["spend_usd"] += _decimal(point.get("spend_usd"))
+            for field in ("spend_usd", *costs):
+                target[field] += _decimal(point.get(field))
             target["request_count"] += _count(point.get("request_count"))
             target["total_tokens"] += _count(point.get("total_tokens"))
     ordered = sorted(
         groups.values(),
         key=lambda g: (
             g["id"].startswith("__other") or g["id"] == "Other models",
-            -g["spend_usd"],
+            -_cost(g),
             g["label"],
         ),
     )
@@ -203,16 +215,16 @@ def daily_series(usage: dict, dates: list, zone: tzinfo) -> dict:
     for group in ordered:
         if labels.count(group["label"]) > 1 and not group["id"].startswith("__"):
             group["label"] = f"{group['label']} · {group['id'][:8]}"
-    empty = {"spend_usd": Decimal(0), "request_count": 0, "total_tokens": 0}
     rows = []
     for day in dates:
-        by_group = {g["id"]: dict(cells.get((day, g["id"]), empty)) for g in ordered}
+        by_group = {g["id"]: dict(cells.get((day, g["id"]), zero)) for g in ordered}
         rows.append(
             {
                 "date": day.isoformat(),
-                "spend_usd": sum(
-                    (c["spend_usd"] for c in by_group.values()), Decimal(0)
-                ),
+                **{
+                    field: sum((c[field] for c in by_group.values()), Decimal(0))
+                    for field in ("spend_usd", *costs)
+                },
                 "request_count": sum(c["request_count"] for c in by_group.values()),
                 "total_tokens": sum(c["total_tokens"] for c in by_group.values()),
                 "groups": by_group,
@@ -229,6 +241,7 @@ def harness_totals(groups: list[dict]) -> list[dict]:
     left out: their usage is unavailable, not zero.
     """
     by_kind = {group["id"]: group for group in groups}
+    costs = [f for f in COST_FIELDS if any(f in group for group in groups)]
     totals = []
     for name in router.AGENT_NAMES:
         if name in UNTAGGED_CLIENTS:
@@ -238,6 +251,7 @@ def harness_totals(groups: list[dict]) -> list[dict]:
             {
                 "harness": name,
                 "spend_usd": group.get("spend_usd", Decimal(0)),
+                **{field: group.get(field, Decimal(0)) for field in costs},
                 "request_count": group.get("request_count", 0),
                 "total_tokens": group.get("total_tokens", 0),
             }
@@ -261,12 +275,17 @@ def history_days(usage: dict) -> int:
 
 
 def model_stats(usage: dict) -> list[dict]:
-    """Every model in the window by spend; unlike the series, never folded into Other."""
+    """Every model in the window by cost; unlike the series, never folded into Other."""
     models = [
         {
             "id": safe_text(item.get("model") or ""),
             "label": safe_text(item.get("model_display_name") or item.get("model")),
             "spend_usd": _decimal(item.get("spend_usd")),
+            **{
+                field: _decimal(item[field])
+                for field in COST_FIELDS
+                if item.get(field) is not None
+            },
             "request_count": _count(item.get("request_count")),
             "total_tokens": _count(item.get("total_tokens")),
             "last_used_at": item.get("last_used_at"),
@@ -274,7 +293,7 @@ def model_stats(usage: dict) -> list[dict]:
         for item in usage.get("model_stats") or []
         if isinstance(item, dict)
     ]
-    return sorted(models, key=lambda model: (-model["spend_usd"], model["label"]))
+    return sorted(models, key=lambda model: (-_cost(model), model["label"]))
 
 
 def safe_text(value: object) -> str:
