@@ -22,6 +22,7 @@ import {
   resolveUsageOrigin,
   routerPluginOptions,
 } from "./options.ts"
+import { newInAppPick } from "./in-app-pick.ts"
 import {
   type SessionDomainLike,
   workspaceDefaultApplier,
@@ -220,7 +221,14 @@ export async function setupRouterProviderV2(
   })
   defaults.prefetch()
 
-  const configuredModel = resolveDefaultModel(options)
+  // A model the user picked in OpenCode since Ramp CLI last saved one wins
+  // over the saved choice; the organization default still outranks both.
+  const picked = newInAppPick(providerID)
+  const savedModel = resolveDefaultModel(options)
+  // Both stay visible until discovery shows whether Router serves the pick.
+  const keepVisible = [picked, savedModel].filter(
+    (model): model is string => model !== undefined,
+  )
   // OpenCode cannot hide a model it can still use, so the compact view keeps
   // only the shortlist and the configured model.
   const discovered = (
@@ -229,7 +237,7 @@ export async function setupRouterProviderV2(
       apiKey,
       ...(rampCliVersion ? { rampCliVersion } : {}),
       ...(modelView ? { modelView } : {}),
-      ...(configuredModel ? { keepVisible: configuredModel } : {}),
+      ...(keepVisible.length > 0 ? { keepVisible } : {}),
     })
   ).filter((model) => !model.hidden)
   const models = discovered.map((model) => toV2Model(providerID, model))
@@ -262,7 +270,10 @@ export async function setupRouterProviderV2(
     agent: ctx.agent as unknown as Parameters<typeof workspaceDefaultApplier>[0]["agent"],
     model: ctx.model,
     session: ctx.session as unknown as SessionDomainLike,
-    configured: configuredModel,
+    configured:
+      picked && models.some((model) => model.enabled && model.id === picked)
+        ? picked
+        : savedModel,
     providerID,
     modelIDs: new Set(models.filter((model) => model.enabled).map((model) => model.id)),
     defaults,

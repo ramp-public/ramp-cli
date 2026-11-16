@@ -10,6 +10,12 @@ on:
     # artifact upload, and release jobs.
     branches:
       - main
+  # A runner image update can replace the C compiler, which invalidates every
+  # cached object; a cold Windows build then takes most of an hour. Rebuild
+  # main ahead of the 15:00 UTC daily release so the release build never pays
+  # for that itself.
+  schedule:
+    - cron: "30 13 * * 1-5"
 
 # Default to read-only: build jobs run third-party code (dependency install,
 # Nuitka + its tool downloads) and must not hold a write-capable GITHUB_TOKEN.
@@ -81,12 +87,15 @@ jobs:
         shell: bash
         run: sudo apt-get update && sudo apt-get install -y ccache
 
+      # Restore only. The cache is saved at the end of the job, and only on
+      # main: a cache saved from a tag can never be restored by another ref.
       - name: Restore Nuitka compiler cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: .nuitka-cache
-          key: nuitka-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}
+          key: nuitka-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
+            nuitka-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}-
             nuitka-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('uv.lock') }}-
             nuitka-${{ matrix.os }}-${{ matrix.arch }}-
 
@@ -94,9 +103,29 @@ jobs:
         shell: bash
         run: uv sync --frozen
 
-      - name: Build with Nuitka
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: router-agent
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The Ramp Router background agent ships beside ramp in main.dist/, so every
+      # install channel (install.sh, Homebrew, npm) carries it. Its build shares
+      # no inputs or outputs with the Nuitka build, and most of the Nuitka build
+      # runs on a single core, so the two run side by side.
+      - name: Build with Nuitka and build the Ramp Router agent
         shell: bash
         run: |
+          set -euo pipefail
+          agent_log="$RUNNER_TEMP/router-agent-build.log"
+          cargo build --release --locked --manifest-path router-agent/Cargo.toml \
+            > "$agent_log" 2>&1 &
+          agent_pid=$!
+          trap 'kill "$agent_pid" 2>/dev/null || true' EXIT
+
           uv run python -m nuitka \
             --standalone \
             --output-filename="ramp-${{ matrix.os }}-${{ matrix.arch }}" \
@@ -110,23 +139,24 @@ jobs:
             --assume-yes-for-downloads \
             src/ramp_cli/main.py
 
-      # The Ramp Router background agent ships beside ramp in main.dist/, so every
-      # install channel (install.sh, Homebrew, npm) carries it. It is built here,
-      # before the architecture check, which inspects every native file.
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@1.85.0
-
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: router-agent
-
-      - name: Build the Ramp Router agent
-        shell: bash
-        run: |
-          cargo build --release --locked --manifest-path router-agent/Cargo.toml
+          agent_status=0
+          wait "$agent_pid" || agent_status=$?
+          trap - EXIT
+          echo "::group::Ramp Router agent build"
+          cat "$agent_log"
+          echo "::endgroup::"
+          test "$agent_status" -eq 0
+          # The agent is copied in before the architecture check, which
+          # inspects every native file.
           cp router-agent/target/release/ramp-router-agent build/main.dist/ramp-router-agent
           build/main.dist/ramp-router-agent --version
+
+      - name: Save Nuitka compiler cache
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: .nuitka-cache
+          key: nuitka-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Validate release architecture
         shell: bash
@@ -136,6 +166,27 @@ jobs:
             --executable "ramp-${{ matrix.os }}-${{ matrix.arch }}" \
             --os "${{ matrix.os }}" \
             --arch "${{ matrix.arch }}"
+
+      # Run the binary on the platform it was built for before anything is
+      # packaged, so a binary that does not start can never reach a release.
+      # It runs from a copy, so nothing it writes can end up in the tarball.
+      - name: Smoke-test the built binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_dir="$RUNNER_TEMP/smoke"
+          cp -R build/main.dist "$smoke_dir"
+          binary="$smoke_dir/ramp-${{ matrix.os }}-${{ matrix.arch }}"
+          version=$(sed -n 's/^__version__ = "\([^"]*\)"$/\1/p' src/ramp_cli/__init__.py)
+          test -n "$version"
+          # Not /dev/null: the Windows binary fails with UnicodeEncodeError when
+          # its output goes to the null device.
+          output="$RUNNER_TEMP/smoke-output.txt"
+          test "$("$binary" --version | tr -d '\r')" = "ramp-cli, version $version"
+          "$binary" --help > "$output"
+          "$binary" auth --help > "$output"
+          "$binary" funds --help > "$output"
+          "$binary" tools list --agent | jq -e '.data | length >= 40' > "$output"
 
       - name: Package standalone directory
         if: startsWith(github.ref, 'refs/tags/')
@@ -177,11 +228,12 @@ jobs:
         uses: astral-sh/setup-uv@v4
 
       - name: Restore Nuitka compiler cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: .nuitka-cache
-          key: nuitka-windows-amd64-${{ hashFiles('uv.lock') }}-${{ github.sha }}
+          key: nuitka-windows-amd64-${{ hashFiles('uv.lock') }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
+            nuitka-windows-amd64-${{ hashFiles('uv.lock') }}-${{ github.sha }}-
             nuitka-windows-amd64-${{ hashFiles('uv.lock') }}-
             nuitka-windows-amd64-
 
@@ -205,6 +257,13 @@ jobs:
             --assume-yes-for-downloads \
             src/ramp_cli/main.py
 
+      - name: Save Nuitka compiler cache
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: .nuitka-cache
+          key: nuitka-windows-amd64-${{ hashFiles('uv.lock') }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+
       - name: Validate release architecture
         shell: bash
         run: |
@@ -213,6 +272,27 @@ jobs:
             --executable ramp-windows-amd64.exe \
             --os windows \
             --arch amd64
+
+      # Run the binary on the platform it was built for before anything is
+      # packaged, so a binary that does not start can never reach a release.
+      # It runs from a copy, so nothing it writes can end up in the tarball.
+      - name: Smoke-test the built binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_dir="$RUNNER_TEMP/smoke"
+          cp -R build/main.dist "$smoke_dir"
+          binary="$smoke_dir/ramp-windows-amd64.exe"
+          version=$(sed -n 's/^__version__ = "\([^"]*\)"$/\1/p' src/ramp_cli/__init__.py)
+          test -n "$version"
+          # Not /dev/null: the Windows binary fails with UnicodeEncodeError when
+          # its output goes to the null device.
+          output="$RUNNER_TEMP/smoke-output.txt"
+          test "$("$binary" --version | tr -d '\r')" = "ramp-cli, version $version"
+          "$binary" --help > "$output"
+          "$binary" auth --help > "$output"
+          "$binary" funds --help > "$output"
+          "$binary" tools list --agent | jq -e '.data | length >= 40' > "$output"
 
       - name: Package standalone directory
         if: startsWith(github.ref, 'refs/tags/')

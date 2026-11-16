@@ -590,6 +590,12 @@ ADMIN_DEFAULT_STATE_KEYS = (
     ADMIN_DEFAULT_DISPLACED_MODEL_STATE_KEY,
     ADMIN_DEFAULT_CONNECTION_STATE_KEY,
 )
+# The model Router saved on its own because nobody chose one and Claude
+# Code's built-in default isn't available through Router; None when Router
+# left the choice to Claude Code. Only a model recorded here is Router's to
+# move again: anything else saved was chosen by the user, the app, or a
+# workspace default. Receipts written before this key existed don't carry it.
+ROUTER_DEFAULT_MODEL_STATE_KEY = "router_default_model"
 
 
 def session_start_hook_entry(command: str) -> dict:
@@ -795,7 +801,7 @@ def plan_configuration(
     path: Path,
     base_url: str,
     api_key: str,
-    model: str,
+    model: str | None,
     *,
     usage_base_url: str | None = None,
     usage_api_key: str | None = None,
@@ -809,6 +815,9 @@ def plan_configuration(
     unconfiguring restores the user's values instead of deleting keys they set
     themselves. Settings-file values override the inherited shell environment,
     so a key we remove without restoring silently changes their setup.
+
+    ``model`` None leaves no saved model, so Claude Code starts new sessions
+    on its own default, the same as picking Default in ``/model``.
 
     It also records what this command wrote, so unconfiguring can tell a value
     it still owns from one the user has since changed. Restoring a key whose
@@ -876,7 +885,10 @@ def plan_configuration(
     cap_claimed = _apply_auto_compact_cap(
         settings, environment, updated["env"], inherited
     )
-    updated["model"] = model
+    if model is None:
+        updated.pop("model", None)
+    else:
+        updated["model"] = model
     if statusline is not None and _statusline_slot_is_ours(settings, path):
         updated["statusLine"] = {"type": "command", "command": statusline}
         # Recorded only when this command actually takes the slot. A status
@@ -1089,17 +1101,23 @@ def plan_automatic_subagent_cleanup(
     return {**settings, "env": environment}, updated_state
 
 
-def plan_model_update(settings: dict, state: dict, model: str) -> tuple[dict, dict]:
+def plan_model_update(
+    settings: dict, state: dict, model: str | None
+) -> tuple[dict, dict]:
     """Set only the default model and record it as this CLI's write.
 
     The saved-default portion of a background refresh. The pre-Router
     snapshot in ``state["top_level"]`` is kept, so unconfigure still restores
-    the user's own model.
+    the user's own model. None removes the saved model, leaving Claude Code
+    on its own default.
     """
     written = state["written"]
     if settings.get("model") == model and written["top_level"].get("model") == model:
         return settings, state
-    return {**settings, "model": model}, {
+    updated = {key: value for key, value in settings.items() if key != "model"}
+    if model is not None:
+        updated["model"] = model
+    return updated, {
         **state,
         "written": {**written, "top_level": {**written["top_level"], "model": model}},
     }

@@ -29,6 +29,21 @@ def isolated_config(tmp_path: Path, request: pytest.FixtureRequest):
     # tests invoking agent disable directly. Lifecycle tests supply fakes.
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr("ramp_cli.commands.router_schedule._run", lambda *_args: False)
+    # Reading Claude Code's built-in default starts the developer's real
+    # `claude`. Tests that depend on it set their own answer.
+    monkeypatch.setattr(
+        "ramp_cli.commands.claude_code_default.builtin_default_model",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "ramp_cli.commands.codex_default.builtin_default_model",
+        lambda *_args, **_kwargs: None,
+    )
+    # Router's fallback rides on the coding-agent settings read; tests that
+    # exercise it set their own answer.
+    monkeypatch.setattr(
+        "ramp_cli.admin_defaults.fallback_model", lambda *_args, **_kwargs: None
+    )
     router._bundled_codex_catalog_from.cache_clear()
     # Codex discovers personal skills in ~/.agents independently of CODEX_HOME.
     monkeypatch.setenv("HOME", str(tmp_path / "home"))

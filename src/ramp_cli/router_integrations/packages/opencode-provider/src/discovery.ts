@@ -308,7 +308,7 @@ export async function discoverRouterModels(input: {
  * A failed compact listing hides nothing.
  */
 export async function discoverRouterCatalog(
-  input: Parameters<typeof discoverRouterModels>[0] & { keepVisible?: string },
+  input: Parameters<typeof discoverRouterModels>[0] & { keepVisible?: string | string[] },
 ): Promise<RouterModel[]> {
   const { modelView, keepVisible, ...full } = input
   const [models, shortlist] = await Promise.all([
@@ -316,6 +316,7 @@ export async function discoverRouterCatalog(
     modelView ? discoverRouterModels({ ...full, modelView }).catch(() => undefined) : undefined,
   ])
   if (!shortlist) return models
-  const shown = new Set([...shortlist.map((model) => model.id), keepVisible])
+  const kept = Array.isArray(keepVisible) ? keepVisible : [keepVisible]
+  const shown = new Set([...shortlist.map((model) => model.id), ...kept])
   return models.map((model) => (shown.has(model.id) ? model : { ...model, hidden: true }))
 }

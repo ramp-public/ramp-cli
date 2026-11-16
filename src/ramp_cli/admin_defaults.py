@@ -164,6 +164,30 @@ def effective_model(harnesses: dict | None, client: str) -> str | None:
     return model.strip() if isinstance(model, str) and model.strip() else None
 
 
+def fallback_model(
+    client: str, api_key: str, origin: str, *, timeout: float = DEFAULT_TIMEOUT_SECONDS
+) -> str | None:
+    """Router's fallback model for ``client``, or None when it names none.
+
+    The model a setup starts on when no workspace default applies and neither
+    the user nor the harness itself chose one: Router's ``fallback_models``
+    entry for the harness, else its ``default`` entry. Router has already
+    dropped entries the workspace's policy does not offer that harness;
+    callers still check the model against their own ``/v1/models``. None for
+    a Router that predates the field or could not be asked, in which case
+    callers use their built-in fallback.
+    """
+    payload = _settings_payload(api_key, origin, timeout)
+    models = payload.get("fallback_models") if payload is not None else None
+    if not isinstance(models, dict):
+        return None
+    for key in (client, "default"):
+        model = models.get(key)
+        if isinstance(model, str) and model.strip():
+            return model.strip()
+    return None
+
+
 def admin_default_model(client: str, api_key: str, origin: str) -> str | None:
     """Return the admin-configured default model id for ``client``.
 

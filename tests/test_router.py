@@ -4212,11 +4212,16 @@ def test_org_defaults_still_start_new_sessions_after_the_push(tmp_path, monkeypa
 def test_claude_code_org_default_passes_over_the_switchyard_push(tmp_path, monkeypatch):
     claude_home = tmp_path / "claude"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
-    models = [*CLAUDE_VIEW_MODELS, {"id": "gpt-5.6-sol"}, SWITCHYARD, CLAUDE_SWITCHYARD]
+    models = [
+        *CLAUDE_VIEW_MODELS,
+        {"id": router_module.DEFAULT_MODEL},
+        SWITCHYARD,
+        CLAUDE_SWITCHYARD,
+    ]
     _mock_models(monkeypatch, models, coding_agent_settings=_admin_default(None))
     _configure_agent("claude-code")
     settings_path = claude_home / "settings.json"
-    assert _claude_settings(claude_home)["model"] == "gpt-5.6-sol"
+    assert _claude_settings(claude_home)["model"] == router_module.DEFAULT_MODEL
 
     _mock_models(
         monkeypatch,
@@ -4234,7 +4239,7 @@ def test_claude_code_org_default_passes_over_the_switchyard_push(tmp_path, monke
     # Clearing the default later puts the user's model back, not Switchyard.
     _mock_models(monkeypatch, models, coding_agent_settings=_admin_default(None))
     _refresh()
-    assert _claude_settings(claude_home)["model"] == "gpt-5.6-sol"
+    assert _claude_settings(claude_home)["model"] == router_module.DEFAULT_MODEL
     assert settings_path.exists()
 
 
@@ -6274,16 +6279,13 @@ def test_listing_order_does_not_choose_the_default_model():
 
     assert router_module._preferred_model(models) == router_module.DEFAULT_MODEL
     catalog = {"models": [{"slug": model.id} for model in models]}
-    assert (
-        router_module._preferred_codex_model(models, catalog, None)
-        == router_module.CODEX_DEFAULT_MODEL
+    assert router_module._preferred_codex_model(models, catalog, None) == (
+        router_module.CODEX_DEFAULT_MODEL,
+        router_module.CODEX_DEFAULT_MODEL,
     )
-    assert (
-        router_module._preferred_codex_model(
-            models, catalog, router_module.DEFAULT_MODEL
-        )
-        == router_module.DEFAULT_MODEL
-    )
+    assert router_module._preferred_codex_model(
+        models, catalog, router_module.DEFAULT_MODEL
+    ) == (router_module.DEFAULT_MODEL, None)
 
 
 def test_a_router_without_the_default_still_configures_something():
@@ -9591,7 +9593,8 @@ def test_unconfigure_opencode_v2_restores_a_router_model_it_lifted_out(
 
     assert configured.exit_code == 0
     assert "model" not in json.loads(config_path.read_text())
-    assert _opencode_default_model_option(config_path) == "a"
+    # A model the user already chose, and Router lists, stays their choice.
+    assert _opencode_default_model_option(config_path) == "hand-picked"
 
     unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "opencode"])
     assert unconfigure.exit_code == 0

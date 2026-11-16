@@ -275,6 +275,10 @@ def set_model(
         options = {"base_url": current.base_url, "selected_model": model}
         if client == "codex":
             options["strict_model"] = True
+        elif client != "claude-code":
+            # The user asked for this model, even when it is the one Router
+            # picked on its own: it becomes theirs, and isn't reconsidered.
+            options["explicit_model"] = True
         if client == "opencode":
             # The user asked for this model: a top-level ``model`` of their
             # own, which setup and refresh leave alone, gives way to it.

@@ -20,6 +20,7 @@ import {
   resolveRampCliVersion,
   routerPluginOptions,
 } from "./options.ts"
+import { newInAppPick } from "./in-app-pick.ts"
 import { applyTurnHeader } from "./turn-id.ts"
 
 type MutableProviderConfig = {
@@ -117,9 +118,18 @@ export const RouterProviderV1: Plugin = async (_input, rawOptions) => {
         )
       }
 
-      const configuredModel = config.model?.startsWith(`${providerID}/`)
+      const routerModel = config.model?.startsWith(`${providerID}/`)
         ? config.model.slice(providerID.length + 1)
         : undefined
+      // A model the user picked in OpenCode since Ramp CLI last saved one
+      // wins over the config's: OpenCode itself would put the config's
+      // `model` ahead of its recent picks. A `model` of the user's own
+      // pointing elsewhere is left alone.
+      const picked = config.model && !routerModel ? undefined : newInAppPick(providerID)
+      // Both stay visible until discovery shows whether Router serves the pick.
+      const keepVisible = [picked, routerModel].filter(
+        (model): model is string => model !== undefined,
+      )
       // OpenCode cannot hide a model it can still use, so the compact view
       // keeps only the shortlist and the configured model.
       const discovered = (
@@ -128,7 +138,7 @@ export const RouterProviderV1: Plugin = async (_input, rawOptions) => {
           apiKey,
           ...(rampCliVersion ? { rampCliVersion } : {}),
           ...(modelView ? { modelView } : {}),
-          ...(configuredModel ? { keepVisible: configuredModel } : {}),
+          ...(keepVisible.length > 0 ? { keepVisible } : {}),
         })
       ).filter((model) => !model.hidden)
       const existing = providerConfig(config, providerID)
@@ -163,6 +173,10 @@ export const RouterProviderV1: Plugin = async (_input, rawOptions) => {
           ]
         }),
       )
+
+      if (picked && discovered.some((model) => model.id === picked)) {
+        config.model = `${providerID}/${picked}`
+      }
 
       config.provider ??= {}
       const existingHeaders = existing?.options?.headers

@@ -49,9 +49,12 @@ from ramp_cli import (
 )
 from ramp_cli.commands import (
     claude_code,
+    claude_code_default,
+    codex_default,
     conductor,
     cursor,
     router_credentials,
+    router_picks,
     router_repo,
     router_schedule,
     router_settings,
@@ -2393,7 +2396,9 @@ def _run_configure(
                 # Write Cursor's local settings while it is quit. A running
                 # Cursor would overwrite them on quit, so it gets the values
                 # to paste instead.
-                suggested = _cursor_suggested_model(models)
+                suggested = _cursor_suggested_model(
+                    models, _router_fallback_model(CURSOR_CLIENT, api_key, base_url)
+                )
                 claude_aliases = _ensure_claude_aliases(api_key, base_url, models)
                 # Written or pasted, this is the key Cursor will send, so the
                 # agent's transcript uploads use it too.
@@ -3576,10 +3581,22 @@ def _refresh_clients(
     return results
 
 
-def _cursor_suggested_model(models: list[RouterModel]) -> str | None:
-    """Pick a starting model id Cursor's override can actually serve."""
+def _cursor_suggested_model(
+    models: list[RouterModel], router_fallback: str | None = None
+) -> str | None:
+    """Pick a starting model id Cursor's override can actually serve.
+
+    Router's fallback for Cursor (from its coding-agent settings), then the
+    built-in ``DEFAULT_MODEL``, while they are models the override serves.
+    """
     suggested = next(
-        (model for model in models if model.metadata.request_name == DEFAULT_MODEL),
+        (
+            model
+            for preferred in (router_fallback, DEFAULT_MODEL)
+            if preferred and not preferred.startswith("claude-")
+            for model in models
+            if preferred in (model.id, model.metadata.request_name)
+        ),
         None,
     )
     if suggested is None:
@@ -3959,7 +3976,9 @@ def router_cursor(
     # Reconcile the agent for the binding, as configure does: a Cursor-only
     # machine whose agent was removed with its last setup gets it back.
     router_schedule.install()
-    suggested_name = _cursor_suggested_model(models)
+    suggested_name = _cursor_suggested_model(
+        models, _router_fallback_model(CURSOR_CLIENT, api_key, base_url)
+    )
     claude_aliases = _ensure_claude_aliases(api_key, base_url, models)
     key_on_clipboard = False if show_key else _copy_to_clipboard(api_key)
     steps = _cursor_setup_steps(base_url, suggested_name, claude_aliases)
@@ -6451,6 +6470,9 @@ def _run_unconfigure(
 
 
 def _unconfigure_client(client: str, path: Path) -> None:
+    # Whatever Router picked is gone with the setup; recorded as "no pick"
+    # rather than deleted, so a later setup isn't read as an older one.
+    router_picks.record(client, path, None)
     if client == "claude-code":
         _unconfigure_claude_code(path)
         return
@@ -6462,6 +6484,9 @@ def _unconfigure_client(client: str, path: Path) -> None:
         return
     if client != "codex":
         _unconfigure_json_client(client, path)
+        if client == "opencode":
+            with contextlib.suppress(OSError):
+                (_opencode_state_dir() / OPENCODE_PICK_SEEN_FILE).unlink()
         return
     with codex_config_lock(path):
         _unconfigure_codex(path)
@@ -8442,7 +8467,7 @@ def _configure_claude_code(
     preserve_model_view_ownership: bool = False,
     expected_connection: tuple[str, str] | None = None,
     explicit_model: bool = False,
-) -> str:
+) -> str | None:
     """Write Claude Code's gateway settings and record how to undo them.
 
     ``expected_connection`` (key, base URL) makes a model-only edit fail
@@ -8465,6 +8490,10 @@ def _configure_claude_code(
     harnesses = admin_defaults.coding_agent_settings(
         api_key, _statusline_origin(base_url)
     )
+    # Starts the installed Claude Code once per version (cached after), so it
+    # also stays outside the lock.
+    builtin_default = claude_code_default.builtin_default_model()
+    router_fallback = _router_fallback_model("claude-code", api_key, base_url)
     # Read after the network calls, not before. The settings are rewritten as a
     # whole document, so anything Claude Code or the user changed while the
     # requests were in flight would be silently discarded by a stale snapshot.
@@ -8496,7 +8525,28 @@ def _configure_claude_code(
         endpoint, client_key = router_repo.client_credentials(
             base_url or router_base_url(), api_key
         )
-        model, default_records = _resolve_claude_code_model(
+        if not explicit_model:
+            # A repeat configure keeps the model already chosen through the
+            # app, `configure model` or `/model`; a model Router picked on its
+            # own is reconsidered instead (see _claude_code_choice).
+            current = settings.get("model")
+            router_pick_before = _router_claude_code_pick(
+                previous_state, current, models
+            )
+            # A cached workspace default isn't the user's choice either; it
+            # may belong to the connection this configure is replacing.
+            cached_default = (previous_state or {}).get(
+                claude_code.ADMIN_DEFAULT_MODEL_STATE_KEY
+            )
+            if (
+                selected_model is None
+                and current != router_pick_before
+                and current != cached_default
+            ):
+                selected_model = current if isinstance(current, str) else None
+            elif selected_model is not None and selected_model == router_pick_before:
+                selected_model = None
+        model, default_records, router_pick = _resolve_claude_code_model(
             settings,
             previous_state,
             models,
@@ -8506,6 +8556,8 @@ def _configure_claude_code(
             connection=_claude_code_default_connection(
                 api_key, _statusline_origin(base_url)
             ),
+            builtin_default=builtin_default,
+            router_fallback=router_fallback,
         )
         updated, state = claude_code.plan_configuration(
             settings,
@@ -8542,6 +8594,7 @@ def _configure_claude_code(
         # network, along with the model it displaced. A cleared default drops
         # both records so the hooks stand down.
         state = _with_claude_code_default_records(state, default_records)
+        state = {**state, claude_code.ROUTER_DEFAULT_MODEL_STATE_KEY: router_pick}
         updated, state = claude_code.plan_automatic_subagent_cleanup(
             updated, path, state
         )
@@ -8782,24 +8835,141 @@ def _unconfigure_claude_code(path: Path) -> None:
         claude_code.state_path(path).unlink(missing_ok=True)
 
 
-def _claude_code_default_model(
-    models: list[RouterModel], *, selected_model: str | None = None
-) -> str:
-    """Choose a default from the ids Claude Code itself will see.
+# Families to pin, in order, when nobody chose a model, Router cannot serve
+# Claude Code's own default, and Router's preferred default isn't in Claude
+# Code's view. Opus first, matching Claude Code's own default on API-billed
+# setups; never just the first model listed, which sorts to Fable.
+_CLAUDE_CODE_FALLBACK_FAMILIES = ("opus", "sonnet")
 
-    Claude Code sends back the exact id from its picker, so the value written
-    here must come from its own view of the list. That view publishes
-    compatibility aliases, and each entry names the canonical model behind it,
-    which is how the ordinary choice of default is matched to an alias.
+
+def _claude_code_model_key(model: str) -> str:
+    """A model id as Router and Claude Code both match it: no [1m], no case."""
+    return re.sub(r"\[1m\]$", "", model.strip(), flags=re.IGNORECASE).lower()
+
+
+def _claude_code_serves(model: str, models: list[RouterModel]) -> bool:
+    """Whether Router's Claude Code view can answer ``model``.
+
+    Claude Code sends its built-in default as a canonical id
+    (``claude-opus-5-5``), while the view lists ``claude-opus-5-5[1m]`` and
+    names the canonical model each entry serves.
+    """
+    wanted = _claude_code_model_key(model)
+    return any(
+        wanted
+        in (
+            _claude_code_model_key(entry.id),
+            _claude_code_model_key(entry.metadata.request_name),
+        )
+        for entry in models
+    )
+
+
+def _claude_code_fallback_model(
+    models: list[RouterModel], router_fallback: str | None = None
+) -> str:
+    """The model to pin when Claude Code's own default cannot be used.
+
+    Router's fallback for Claude Code (from its coding-agent settings), then
+    the built-in ``DEFAULT_MODEL``, when Claude Code's view lists them (models
+    whose ids aren't Claude-shaped appear there under compatibility aliases);
+    otherwise a Claude family's ``-latest`` alias when Router lists one, or
+    its highest version, so the pin tracks new releases.
+    """
+    for preferred in (router_fallback, DEFAULT_MODEL):
+        match = _listed_model(models, preferred)
+        if match is not None:
+            return match
+
+    def version(entry: RouterModel) -> tuple[int, ...]:
+        return tuple(
+            int(part) for part in re.findall(r"\d+", entry.metadata.request_name)
+        )
+
+    for family in _CLAUDE_CODE_FALLBACK_FAMILIES:
+        prefix = f"claude-{family}-"
+        candidates = [
+            entry for entry in models if entry.metadata.request_name.startswith(prefix)
+        ]
+        latest = next(
+            (
+                entry.id
+                for entry in candidates
+                if entry.metadata.request_name == f"{prefix}latest"
+            ),
+            None,
+        )
+        if latest is not None:
+            return latest
+        if candidates:
+            return max(candidates, key=version).id
+    return models[0].id if models else DEFAULT_MODEL
+
+
+def _claude_code_choice(
+    models: list[RouterModel],
+    selected_model: str | None,
+    builtin_default: str | None,
+    router_fallback: str | None = None,
+) -> tuple[str | None, str | None]:
+    """The model to save and, when Router picked it itself, that same model.
+
+    Claude Code sends back the exact id from its picker, so a saved model must
+    come from Router's Claude Code view of the list. A selection that view
+    still lists is kept. With none, nothing is saved, so Claude Code starts
+    on its own default (as picking Default in ``/model`` does), provided
+    Router serves that default. When it doesn't, or the installed Claude Code
+    couldn't say what it is, Router pins a Claude model and reports it as its
+    own pick, so a later refresh may move it.
     """
     if selected_model and selected_model in {model.id for model in models}:
-        return selected_model
+        return selected_model, None
+    if builtin_default is not None and _claude_code_serves(builtin_default, models):
+        return None, None
+    fallback = _claude_code_fallback_model(models, router_fallback)
+    return fallback, fallback
+
+
+def _legacy_claude_code_default(models: list[RouterModel]) -> str | None:
+    """The model older CLIs saved when nobody chose one: Router's first listing.
+
+    Kept only to recognise that write in receipts made before
+    ``ROUTER_DEFAULT_MODEL_STATE_KEY``, so those setups can move off it once.
+    """
+    if not models:
+        return None
     canonical = [model.metadata.request_name for model in models]
-    preferred = DEFAULT_MODEL if DEFAULT_MODEL in canonical else canonical[0]
-    for model in models:
-        if model.metadata.request_name == preferred:
-            return model.id
-    return preferred
+    preferred = (
+        _LEGACY_DEFAULT_MODEL if _LEGACY_DEFAULT_MODEL in canonical else canonical[0]
+    )
+    return next(
+        (model.id for model in models if model.metadata.request_name == preferred),
+        preferred,
+    )
+
+
+def _router_claude_code_pick(
+    state: dict | None, current: object, models: list[RouterModel]
+) -> str | None:
+    """The saved model when Router picked it on its own, else None.
+
+    A receipt carrying ``ROUTER_DEFAULT_MODEL_STATE_KEY`` says so directly.
+    An older receipt can't, so a saved model counts as Router's pick when
+    Router wrote it, no workspace default is cached, and it is the model the
+    old "first listed" rule would have chosen. That rule could also match a
+    user who picked that model through Router; they can pick it again.
+    """
+    if not isinstance(state, dict) or not isinstance(current, str):
+        return None
+    key = claude_code.ROUTER_DEFAULT_MODEL_STATE_KEY
+    if key in state:
+        return current if state[key] == current else None
+    if state.get(claude_code.ADMIN_DEFAULT_MODEL_STATE_KEY):
+        return None
+    written = state.get("written", {}).get("top_level", {}).get("model")
+    if current == written and current == _legacy_claude_code_default(models):
+        return current
+    return None
 
 
 def _claude_code_admin_default_model(
@@ -8889,8 +9059,11 @@ def _resolve_claude_code_model(
     explicit_model: bool,
     harnesses: dict | None,
     connection: dict[str, str],
-) -> tuple[str, dict[str, object]]:
-    """The model this write settles on, and the receipt's default records.
+    builtin_default: str | None,
+    router_fallback: str | None = None,
+) -> tuple[str | None, dict[str, object], str | None]:
+    """The model this write settles on, the receipt's default records, and
+    the model Router picked on its own (None when someone else chose).
 
     A workspace default is what every new session starts on: it wins over
     the preferred model and over whatever a session's own pick left in the
@@ -8902,14 +9075,19 @@ def _resolve_claude_code_model(
 
     The model the default displaces is recorded alongside it, so a cleared
     default puts the user's own choice back instead of leaving them on a
-    model they never picked. A model the user names explicitly is written as
-    asked and becomes that choice; the next hook run puts the default back
+    model they never picked; with no such choice, the setup goes back to
+    Claude Code's own default. A model the user names explicitly is written
+    as asked and becomes that choice; the next hook run puts the default back
     for the sessions after it. ``harnesses`` None means Router could not be
     asked: the recorded default stays in force rather than being dropped for
     a transient failure, but only when it was read under ``connection`` (see
     _claude_code_default_connection), as a default cached for another key or
     Router is another workspace's; a write onto a new connection starts from
     nothing. The records carry the connection they were read under.
+
+    Without a workspace default, a model is saved only when someone chose
+    one (see _claude_code_choice); a model ``None`` leaves Claude Code on its
+    own default.
     """
     recorded, displaced = _recorded_claude_code_default(state, connection)
     admin_default = _claude_code_admin_default_model(
@@ -8922,36 +9100,50 @@ def _resolve_claude_code_model(
     displaced_key = claude_code.ADMIN_DEFAULT_DISPLACED_MODEL_STATE_KEY
     connection_key = claude_code.ADMIN_DEFAULT_CONNECTION_STATE_KEY
     if explicit_model:
-        model = _claude_code_default_model(models, selected_model=selected_model)
+        model, router_pick = _claude_code_choice(
+            models, selected_model, builtin_default, router_fallback
+        )
         if admin_default is None:
-            return model, {}
-        return model, {
+            return model, {}, router_pick
+        records: dict[str, object] = {
             default_key: admin_default,
-            displaced_key: model,
             connection_key: connection,
         }
+        if model is not None:
+            records[displaced_key] = model
+        return model, records, router_pick
     if admin_default is not None:
         if recorded is None:
             current = settings.get("model")
-            displaced = current if isinstance(current, str) and current else None
-        records: dict[str, object] = {
+            displaced = (
+                current
+                if isinstance(current, str)
+                and current
+                and current != _router_claude_code_pick(state, current, models)
+                else None
+            )
+        records = {
             default_key: admin_default,
             connection_key: connection,
         }
         if displaced is not None:
             records[displaced_key] = displaced
-        return admin_default, records
+        return admin_default, records, None
     if recorded is not None:
         # Cleared: back to the displaced model while Router still lists it
         # (under today's id, should a Switchyard alias have been renamed
-        # meanwhile), otherwise to the ordinary choice of default.
-        return (
-            _claude_code_default_model(
-                models, selected_model=_follow_switchyard_rename(displaced, models)
-            ),
-            {},
+        # meanwhile), otherwise to Claude Code's own default.
+        model, router_pick = _claude_code_choice(
+            models,
+            _follow_switchyard_rename(displaced, models),
+            builtin_default,
+            router_fallback,
         )
-    return _claude_code_default_model(models, selected_model=selected_model), {}
+        return model, {}, router_pick
+    model, router_pick = _claude_code_choice(
+        models, selected_model, builtin_default, router_fallback
+    )
+    return model, {}, router_pick
 
 
 def _with_claude_code_default_records(state: dict, records: dict[str, object]) -> dict:
@@ -9162,6 +9354,77 @@ def _opencode_plugin_entries(config: dict) -> list[object]:
         if isinstance(value, list):
             entries.extend(value)
     return entries
+
+
+# Next to OpenCode's own model.json: the newest model picked in OpenCode that
+# Router has already accounted for. The Router OpenCode plugin reads it too.
+OPENCODE_PICK_SEEN_FILE = "ramp-router-model-pick.json"
+
+
+def _opencode_state_dir() -> Path:
+    """OpenCode's state directory, where its TUI keeps ``model.json``."""
+    configured = os.environ.get("XDG_STATE_HOME", "").strip()
+    base = Path(configured) if configured else Path.home() / ".local" / "state"
+    return base.expanduser() / "opencode"
+
+
+def _opencode_latest_pick() -> str | None:
+    """The model last picked in OpenCode, as ``provider/model``, or None.
+
+    OpenCode moves a model to the front of ``recent`` in ``model.json`` when
+    the user picks it (the model dialog, ``--model``); switching agents or a
+    model an agent names doesn't touch it.
+    """
+    try:
+        data = json.loads((_opencode_state_dir() / "model.json").read_text("utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    recent = data.get("recent") if isinstance(data, dict) else None
+    first = recent[0] if isinstance(recent, list) and recent else None
+    if not isinstance(first, dict):
+        return None
+    provider, model = first.get("providerID"), first.get("modelID")
+    if isinstance(provider, str) and provider and isinstance(model, str) and model:
+        return f"{provider}/{model}"
+    return None
+
+
+def _opencode_seen_pick() -> tuple[bool, str | None]:
+    """Whether Router has looked before, and the pick it saw then."""
+    try:
+        data = json.loads(
+            (_opencode_state_dir() / OPENCODE_PICK_SEEN_FILE).read_text("utf-8")
+        )
+    except FileNotFoundError:
+        return False, None
+    except (OSError, UnicodeError, ValueError):
+        return True, None
+    seen = data.get("seen") if isinstance(data, dict) else None
+    return True, seen if isinstance(seen, str) else None
+
+
+def _record_opencode_seen_pick(latest: str | None) -> None:
+    path = _opencode_state_dir() / OPENCODE_PICK_SEEN_FILE
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps({"seen": latest}) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+
+
+def _opencode_new_pick(latest: str | None) -> str | None:
+    """The Router model the user picked in OpenCode since Router last looked.
+
+    A setup Router hasn't looked at before (no record) takes its current pick
+    as the baseline rather than replaying older history.
+    """
+    if latest is None:
+        return None
+    looked, seen = _opencode_seen_pick()
+    if not looked or latest == seen:
+        return None
+    prefix = f"{ROUTER_PROVIDER}/"
+    return latest.removeprefix(prefix) if latest.startswith(prefix) else None
 
 
 def _opencode_plugin_options(entry: object) -> dict | None:
@@ -9897,18 +10160,84 @@ def use_router_origin(origin: str | None) -> None:
 # is the only way to avoid defaulting everybody to whichever model happens to
 # sort first. That means this goes stale on its own and has to be moved when a
 # better default ships.
-DEFAULT_MODEL = "gpt-5.6-sol"
+DEFAULT_MODEL = "gpt-6.1-sol"
+# Router's preferred default before gpt-6.1-sol; only for recognising older
+# automatic picks, so it must not follow DEFAULT_MODEL.
+_LEGACY_DEFAULT_MODEL = "gpt-5.6-sol"
 CODEX_DEFAULT_MODEL = "gpt-6.1-sol"
 
 
 def _preferred_model(
-    models: list[RouterModel], selected_model: str | None = None
+    models: list[RouterModel],
+    selected_model: str | None = None,
+    *,
+    fallback: str | None = None,
 ) -> str:
-    """Pick the model to configure as the default."""
+    """Pick the model to configure as the default.
+
+    A listed selection is kept. Otherwise Router's fallback (``fallback``,
+    from Router's coding-agent settings) when this list serves it, then the
+    built-in ``DEFAULT_MODEL``, then the first model listed.
+    """
     identifiers = [model.id for model in models]
     if selected_model in identifiers:
         return selected_model
-    return DEFAULT_MODEL if DEFAULT_MODEL in identifiers else identifiers[0]
+    for preferred in (fallback, DEFAULT_MODEL):
+        match = _listed_model(models, preferred)
+        if match is not None:
+            return match
+    return identifiers[0]
+
+
+def _listed_model(models: list[RouterModel], model: str | None) -> str | None:
+    """The listed id for ``model``, matched by id or by the model it requests."""
+    if not model:
+        return None
+    return next(
+        (
+            entry.id
+            for entry in models
+            if model in (entry.id, entry.metadata.request_name)
+        ),
+        None,
+    )
+
+
+def _router_fallback_model(
+    client: str, api_key: str, base_url: str | None
+) -> str | None:
+    """Router's fallback model for ``client``, from its coding-agent settings."""
+    return admin_defaults.fallback_model(client, api_key, _statusline_origin(base_url))
+
+
+def _harness_default_model(
+    client: str,
+    config_path: Path,
+    models: list[RouterModel],
+    selected_model: str | None,
+    *,
+    fallback: str | None,
+    explicit: bool = False,
+) -> tuple[str, str | None]:
+    """The model to save for a harness without a default of its own, and
+    Router's own pick (the same model) when nobody chose it.
+
+    A selection is kept while Router lists it, unless it is the model Router
+    picked earlier for this setup (see router_picks), which is reconsidered so
+    the setup follows Router's current fallback. An explicit selection is never
+    reconsidered: it becomes the user's, even when it matches Router's pick.
+    """
+    if (
+        not explicit
+        and selected_model is not None
+        and selected_model
+        == router_picks.router_pick(client, config_path, selected_model)
+    ):
+        selected_model = None
+    if selected_model in {model.id for model in models}:
+        return selected_model, None
+    model = _preferred_model(models, fallback=fallback)
+    return model, model
 
 
 def _codex_admin_default_model(
@@ -10133,7 +10462,9 @@ def _configure_client(
 
     ``explicit_model`` makes Codex and Claude Code write ``selected_model`` as
     given instead of re-reading their config for a selection or applying a
-    workspace default; ``strict_model`` implies it.
+    workspace default; ``strict_model`` implies it. For the other harnesses it
+    keeps ``selected_model`` as the user's choice even when it matches the model
+    Router picked on its own, so a later fallback change doesn't move it.
     For Codex, ``replace_model`` does the same, but only while its config still holds
     that selection (None for no selection) when the write happens; a selection
     changed since is kept instead.
@@ -10175,9 +10506,36 @@ def _configure_client(
         )
         return path, default_model, repaired
 
+    config_path = (
+        _client_config_path(client)
+        if client in ("hermes", "conductor")
+        else _json_config_path(client)
+    )
+    if selected_model is None and not (strict_model or explicit_model):
+        # A repeat configure keeps the model already chosen for this setup;
+        # a model Router picked on its own is reconsidered instead.
+        try:
+            selected_model = _configured_model(client, config_path)
+        except click.ClickException:
+            selected_model = None
+    explicit = strict_model or explicit_model
+    opencode_latest = _opencode_latest_pick() if client == "opencode" else None
+    picked = _opencode_new_pick(opencode_latest)
+    if not explicit and picked in {model.id for model in models}:
+        # Picked in OpenCode since Router last looked: the user's choice. A
+        # pick this setup's Router doesn't serve (OpenCode keeps one recent
+        # list for every setup) leaves the saved choice as it is.
+        selected_model, explicit = picked, True
+    default_model, router_pick = _harness_default_model(
+        client,
+        config_path,
+        models,
+        selected_model,
+        fallback=_router_fallback_model(client, api_key, base_url),
+        explicit=explicit,
+    )
     if client == "hermes":
         path = _client_config_path(client)
-        default_model = _preferred_model(models, selected_model)
         # Refresh already holds the Hermes config lock around its reads and
         # this write; the advisory flock is per open file and not reentrant,
         # so it routes around the lock-taking wrapper instead of deadlocking
@@ -10192,11 +10550,11 @@ def _configure_client(
             base_url=base_url,
             require_receipt=hermes_require_receipt,
         )
+        router_picks.record(client, path, router_pick)
         return path, default_model, False
 
     if client == "conductor":
         path = _client_config_path(client)
-        default_model = _preferred_model(models, selected_model)
         _configure_conductor(
             path,
             api_key,
@@ -10206,10 +10564,10 @@ def _configure_client(
             lock_held=conductor_lock_held,
             models=models,
         )
+        router_picks.record(client, path, router_pick)
         return path, default_model, False
 
     path = _json_config_path(client)
-    default_model = _preferred_model(models, selected_model)
     _configure_plugin_client(
         client,
         path,
@@ -10219,6 +10577,9 @@ def _configure_client(
         replace_model=replace_model is True,
         model_view=plugin_model_view,
     )
+    router_picks.record(client, path, router_pick)
+    if client == "opencode":
+        _record_opencode_seen_pick(opencode_latest)
     return path, default_model, False
 
 
@@ -10253,15 +10614,38 @@ def _refresh_client_models(
             selected_model=selected_model,
             replace_model=replace_model,
         )
-    default_model = _preferred_model(models, selected_model)
+    pick_path = path if client in ("hermes", "conductor") else _json_config_path(client)
+    opencode_latest = _opencode_latest_pick() if client == "opencode" else None
+    picked = _opencode_new_pick(opencode_latest)
+    if picked not in {model.id for model in models}:
+        # A pick this setup's Router doesn't serve leaves the saved choice.
+        picked = None
+    default_model, router_pick = _harness_default_model(
+        client,
+        pick_path,
+        models,
+        picked or selected_model,
+        fallback=_router_fallback_model(client, api_key, base_url),
+        # Picked in OpenCode since Router last looked: the user's choice.
+        explicit=picked is not None,
+    )
     if client == "hermes":
-        return _refresh_hermes_model(path, default_model)
-    if client == "conductor":
+        effective = _refresh_hermes_model(path, default_model)
+    elif client == "conductor":
         _refresh_conductor_models(
             path, api_key, default_model, models, base_url=base_url
         )
-        return default_model
-    return _refresh_plugin_model(client, _json_config_path(client), default_model)
+        effective = default_model
+    else:
+        effective = _refresh_plugin_model(
+            client, _json_config_path(client), default_model
+        )
+    # A setup the user moved off Router's provider keeps its record as it was.
+    if effective == default_model:
+        router_picks.record(client, pick_path, router_pick)
+    if client == "opencode":
+        _record_opencode_seen_pick(opencode_latest)
+    return effective
 
 
 def _not_configured(client: str) -> click.ClickException:
@@ -10277,13 +10661,15 @@ def _refresh_claude_code_model(
     *,
     base_url: str | None,
     selected_model: str | None,
-) -> str:
+) -> str | None:
     """Rewrite Claude Code's saved default and owned picker; return the default.
 
     The workspace default wins as it does in configure, and its cached copy
     in the receipt follows, so the hooks put back the current default. A
     cleared default puts the displaced model back. Without one, a model the
-    user picked outside Router's list is theirs.
+    user picked outside Router's list is theirs, and no saved model (Default
+    in ``/model``) stays that way: Claude Code's own default applies. Only a
+    model Router picked on its own is reconsidered (see _claude_code_choice).
     """
     # Discovery before the lock, as in _configure_claude_code. None when
     # Router did not answer: a background run then keeps the recorded
@@ -10298,6 +10684,8 @@ def _refresh_claude_code_model(
     )
     harnesses = admin_defaults.coding_agent_settings(api_key, origin)
     connection = _claude_code_default_connection(api_key, origin)
+    builtin_default = claude_code_default.builtin_default_model()
+    router_fallback = _router_fallback_model("claude-code", api_key, base_url)
     with claude_code.settings_lock(path):
         if not claude_code.state_path(path).is_file():
             raise _not_configured("claude-code")
@@ -10312,7 +10700,15 @@ def _refresh_claude_code_model(
         state = claude_code.read_state(path)
         settings = claude_code.read_settings(path)
         current = settings.get("model")
-        model, default_records = _resolve_claude_code_model(
+        if (
+            selected_model is not None
+            and selected_model == current
+            and current == _router_claude_code_pick(state, current, models)
+        ):
+            # Router's own pick, not a choice to keep: reconsider it, so the
+            # setup returns to Claude Code's default once Router serves it.
+            selected_model = None
+        model, default_records, router_pick = _resolve_claude_code_model(
             settings,
             state,
             models,
@@ -10320,6 +10716,8 @@ def _refresh_claude_code_model(
             explicit_model=False,
             harnesses=harnesses,
             connection=connection,
+            builtin_default=builtin_default,
+            router_fallback=router_fallback,
         )
         recorded, _displaced = _recorded_claude_code_default(state, connection)
         if (
@@ -10336,9 +10734,11 @@ def _refresh_claude_code_model(
             # connection cached, which no longer applies to this one.
             model, updated = current, settings
             new_state = _with_claude_code_default_records(state, {})
+            new_state[claude_code.ROUTER_DEFAULT_MODEL_STATE_KEY] = None
         else:
             updated, new_state = claude_code.plan_model_update(settings, state, model)
             new_state = _with_claude_code_default_records(new_state, default_records)
+            new_state[claude_code.ROUTER_DEFAULT_MODEL_STATE_KEY] = router_pick
             updated, new_state = claude_code.plan_automatic_subagent_cleanup(
                 updated, path, new_state
             )
@@ -10443,9 +10843,10 @@ def _refresh_codex_models(
     harnesses = admin_defaults.coding_agent_settings(
         api_key, _statusline_origin(base_url)
     )
-    native_windows = _codex_bundled_context_windows(
-        shutil.which("codex") or _codex_app_bundled_cli()
-    )
+    codex_executable = shutil.which("codex") or _codex_app_bundled_cli()
+    native_windows = _codex_bundled_context_windows(codex_executable)
+    builtin_default = codex_default.builtin_default_model(codex_executable)
+    router_fallback = _router_fallback_model(CODEX_CLIENT_NAME, api_key, base_url)
     with codex_config_lock(path):
         existing, existing_data = _read_codex_config(path)
         state_path = path.parent / "ramp-router-state.json"
@@ -10460,7 +10861,18 @@ def _refresh_codex_models(
         elif selected_model is not None:
             # Read again after discovery, as _configure_codex_in_lock does.
             selected_model = existing_data.get("model")
-        default_model = _preferred_codex_model(models, router_catalog, selected_model)
+            if selected_model == router_picks.router_pick(
+                CODEX_CLIENT_NAME, path, selected_model
+            ):
+                # Router's own earlier pick, not a choice to keep.
+                selected_model = None
+        default_model, router_pick = _preferred_codex_model(
+            models,
+            router_catalog,
+            selected_model,
+            builtin_default=builtin_default,
+            router_fallback=router_fallback,
+        )
         try:
             receipt = json.loads(state_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, ValueError) as exc:
@@ -10486,7 +10898,7 @@ def _refresh_codex_models(
             )
         )
         if admin_default is not None:
-            default_model = admin_default
+            default_model, router_pick = admin_default, None
         picker_catalog = router_catalog
         if receipt.get(CODEX_MODEL_VIEW_KEY) != "all":
             if compact_models is None:
@@ -10532,6 +10944,7 @@ def _refresh_codex_models(
                 if prompt:
                     writes.append((instructions_path, prompt))
         _write_model_files(writes, "codex")
+        router_picks.record(CODEX_CLIENT_NAME, path, router_pick)
     return default_model
 
 
@@ -11997,30 +12410,57 @@ def _codex_provider_is_out_of_date(existing: dict) -> bool:
 
 
 def _preferred_codex_model(
-    models: list[RouterModel], router_catalog: dict, selected_model: str | None
-) -> str:
-    """Keep a selection Codex itself made before falling back to the shared choice.
+    models: list[RouterModel],
+    router_catalog: dict,
+    selected_model: str | None,
+    *,
+    builtin_default: str | None = None,
+    router_fallback: str | None = None,
+) -> tuple[str, str | None]:
+    """The model to save for Codex, and Router's own pick when nobody chose it.
 
-    Codex writes the slug from its picker back to config.toml, and Router's
-    Codex projection names most models by display name ("Claude Fable 5.1")
-    rather than by request id ("claude-fable-5-1"). Checking that slug against
-    the generic id list alone reset such selections to DEFAULT_MODEL on every
-    refresh.
+    A selection Codex itself made is kept: Codex writes the slug from its
+    picker back to config.toml, and Router's Codex projection names most
+    models by display name ("Claude Fable 5.1") rather than by request id
+    ("claude-fable-5-1"). Checking that slug against the generic id list
+    alone reset such selections on every refresh.
+
+    With no selection, Codex's own default for the installed version
+    (``builtin_default``, see codex_default) while Router's catalog lists it,
+    so the setup follows Codex releases; then Router's fallback; then the
+    built-in ``CODEX_DEFAULT_MODEL``; then the shared choice. Any of those is
+    Router's pick, which a later refresh may move.
     """
     if selected_model in {model["slug"] for model in router_catalog["models"]}:
-        return selected_model
+        return selected_model, None
     if selected_model in {model.id for model in models}:
-        return selected_model
-    for model in models:
-        if CODEX_DEFAULT_MODEL in (
-            model.id,
-            model.metadata.request_name,
-            model.metadata.provider_model,
+        return selected_model, None
+    for candidate in (builtin_default, router_fallback, CODEX_DEFAULT_MODEL):
+        slug = _codex_catalog_slug(candidate, models, router_catalog)
+        if slug is not None:
+            return slug, slug
+    model = _preferred_model(models, fallback=router_fallback)
+    return model, model
+
+
+def _codex_catalog_slug(
+    model: str | None, models: list[RouterModel], router_catalog: dict
+) -> str | None:
+    """The slug of Router's Codex catalog that serves ``model``, if any."""
+    if not model:
+        return None
+    if model in {entry["slug"] for entry in router_catalog["models"]}:
+        return model
+    for entry in models:
+        if model in (
+            entry.id,
+            entry.metadata.request_name,
+            entry.metadata.provider_model,
         ):
-            preferred = _codex_admin_default_model(model.id, models, router_catalog)
-            if preferred is not None:
-                return preferred
-    return _preferred_model(models, selected_model)
+            slug = _codex_admin_default_model(entry.id, models, router_catalog)
+            if slug is not None:
+                return slug
+    return None
 
 
 def _configure_codex(
@@ -12069,9 +12509,11 @@ def _configure_codex(
     admin_default = admin_defaults.admin_default_model(
         CODEX_CLIENT_NAME, api_key, _statusline_origin(base_url)
     )
-    native_windows = _codex_bundled_context_windows(
-        shutil.which("codex") or _codex_app_bundled_cli()
-    )
+    codex_executable = shutil.which("codex") or _codex_app_bundled_cli()
+    native_windows = _codex_bundled_context_windows(codex_executable)
+    # Starts the installed Codex once per version (cached after).
+    builtin_default = codex_default.builtin_default_model(codex_executable)
+    router_fallback = _router_fallback_model(CODEX_CLIENT_NAME, api_key, base_url)
     with codex_config_lock(path):
         if strict_model and (
             _stored_router_api_key("codex", path) != api_key
@@ -12095,6 +12537,8 @@ def _configure_codex(
             model_view=model_view,
             compact_models=compact_models,
             native_windows=native_windows,
+            builtin_default=builtin_default,
+            router_fallback=router_fallback,
         )
 
 
@@ -12114,6 +12558,8 @@ def _configure_codex_in_lock(
     model_view: str | None = None,
     compact_models: list[RouterModel] | None = None,
     native_windows: dict[str, int] | None = None,
+    builtin_default: str | None = None,
+    router_fallback: str | None = None,
 ) -> tuple[str, bool]:
     # Rechecked under the lock: a disable may have landed during the download.
     if not router_settings.harness_widget_enabled():
@@ -12137,7 +12583,21 @@ def _configure_codex_in_lock(
         # request was in flight is preserved. A model the user just chose is
         # the change itself, so it is kept as given.
         selected_model = existing_data.get("model")
-    default_model = _preferred_codex_model(models, router_catalog, selected_model)
+    if (
+        not explicit_model
+        and selected_model is not None
+        and selected_model
+        == router_picks.router_pick(CODEX_CLIENT_NAME, path, selected_model)
+    ):
+        # Router's own earlier pick, not a choice to keep: reconsider it.
+        selected_model = None
+    default_model, router_pick = _preferred_codex_model(
+        models,
+        router_catalog,
+        selected_model,
+        builtin_default=builtin_default,
+        router_fallback=router_fallback,
+    )
     state_path = path.parent / "ramp-router-state.json"
     # An admin default is what every new session starts on: it wins over the
     # preferred model and over whatever a session's own pick left in
@@ -12150,7 +12610,7 @@ def _configure_codex_in_lock(
     # for the sessions after it.
     admin_default = _codex_admin_default_model(admin_default, models, router_catalog)
     if admin_default is not None and not explicit_model:
-        default_model = admin_default
+        default_model, router_pick = admin_default, None
     # Resolve the saved preference under the same lock as the write. An
     # explicit choice wins; refresh and model changes preserve newer choices.
     effective_view = model_view or _configured_codex_model_view(path)
@@ -12558,6 +13018,7 @@ def _configure_codex_in_lock(
         raise click.ClickException(
             f"Could not write Codex config {path}: {message}"
         ) from None
+    router_picks.record(CODEX_CLIENT_NAME, path, router_pick)
     return default_model, repaired
 
 

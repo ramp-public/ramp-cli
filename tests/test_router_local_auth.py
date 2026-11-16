@@ -146,7 +146,7 @@ def test_claude_separates_local_and_usage_keys_and_restores_direct_setup(
         router, "_require_truthful_claude_code_model_names", lambda: None
     )
     monkeypatch.setattr(
-        router, "_claude_code_default_model", lambda *a, **kw: "claude-router-a"
+        router, "_claude_code_choice", lambda *a, **kw: ("claude-router-a", None)
     )
     monkeypatch.setattr(router, "_install_claude_code_statusline", lambda *a: None)
     monkeypatch.setattr(router, "session_sync_hook_command", lambda *a: None)

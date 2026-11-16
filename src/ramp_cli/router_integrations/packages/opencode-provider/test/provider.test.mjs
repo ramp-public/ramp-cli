@@ -1,4 +1,7 @@
 import assert from "node:assert/strict"
+import { mkdtempSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { afterEach, describe, it, mock } from "node:test"
 
 import plugin, {
@@ -253,6 +256,42 @@ describe("OpenCode provider plugin", () => {
       ["recommended", "configured"],
     )
   })
+
+  for (const [pick, expected] of [
+    ["other", "ramp-router/other"],
+    ["not-served", "ramp-router/configured"],
+  ]) {
+    it(`starts on a newer OpenCode pick only when Router serves it (${pick})`, async () => {
+      mock.method(globalThis, "fetch", async (_url, init) => {
+        const ids = init.headers["X-Gateway-Model-View"] === "compact"
+          ? ["recommended"]
+          : ["recommended", "configured", "other"]
+        return new Response(
+          JSON.stringify({ object: "list", data: ids.map((id) => ({ id, router: routerMetadata(id) })) }),
+          { status: 200 },
+        )
+      })
+      const state = mkdtempSync(join(tmpdir(), "opencode-state-"))
+      const opencode = join(state, "opencode")
+      process.env.XDG_STATE_HOME = state
+      try {
+        const { mkdirSync } = await import("node:fs")
+        mkdirSync(opencode, { recursive: true })
+        writeFileSync(join(opencode, "model.json"), JSON.stringify({
+          recent: [{ providerID: "ramp-router", modelID: pick }],
+        }))
+        writeFileSync(join(opencode, "ramp-router-model-pick.json"), JSON.stringify({ seen: null }))
+        const hooks = await plugin.server({}, { apiKey: "inline-secret", modelView: "compact" })
+        const config = { model: "ramp-router/configured" }
+        await hooks.config(config)
+        assert.equal(config.model, expected)
+        // The saved model stays registered while the pick is checked.
+        assert.ok("configured" in config.provider["ramp-router"].models)
+      } finally {
+        delete process.env.XDG_STATE_HOME
+      }
+    })
+  }
 
   it("sends the recorded CLI version on every request without dropping the user's headers", async () => {
     // OpenCode spreads provider options into the @ai-sdk/openai factory, so

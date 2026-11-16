@@ -157,6 +157,23 @@ is left alone and noted. OpenCode v1 keeps the picked model client-side, so
 the default is not applied there; configure still writes the top-level
 `model` for v1.
 
+## Models picked in OpenCode
+
+OpenCode keeps no default of its own when you pick a model in the app: the
+pick only moves to the front of `recent` in its state file
+(`$XDG_STATE_HOME/opencode/model.json`, `~/.local/state` by default), and the
+config's `model` outranks that list for the next session. So a pick of a
+Router model becomes the user's default instead. Ramp CLI records the front
+entry it last accounted for in `ramp-router-model-pick.json` beside
+`model.json`. On its next configure or refresh (OpenCode's session-start sync
+runs one), it saves a newer Router pick as the user's own choice. At startup
+the plugin reads the same two files, so the very next session starts on that
+pick even before the CLI has run. A later `ramp router configure model` or
+Router app choice wins over an earlier pick, and the organization default
+still outranks both. A pick of another provider's model, or a config `model`
+of the user's own pointing elsewhere, is left alone. Picking the model already
+at the front of `recent` changes nothing OpenCode writes, so it isn't noticed.
+
 ## Layout
 
 `index.ts` and `tui.ts` at the package root forward to `src/`. OpenCode v2
