@@ -373,6 +373,8 @@ describe("discoverRouterModels", () => {
 })
 
 describe("Pi provider extension", () => {
+  // The env scenarios are what MDM's /etc/zshenv exports: the same Router's direct URL. That must
+  // not route Pi around the local agent, or its requests lose repository tags.
   for (const scenario of ["login", "direct-override", "legacy-env-override"]) {
     it(`pairs credentials and endpoints for discovery and inference after ${scenario}`, async () => {
       const home = process.env.PI_CODING_AGENT_DIR
@@ -407,9 +409,10 @@ describe("Pi provider extension", () => {
         assert.deepEqual(provider.getModels(), [])
         await provider.refreshModels({ ...refresh, allowNetwork: true })
       }
-      const expected = scenario === "login" ? credential : "saved-real-key"
+      const viaAgent = scenario !== "login"
+      const expected = viaAgent ? token : credential
       const lastDiscovery = discovery.mock.calls.at(-1).arguments
-      assert.equal(String(lastDiscovery[0]), "https://api.router.com/v1/models")
+      assert.equal(String(lastDiscovery[0]), viaAgent ? `${local}/models` : "https://api.router.com/v1/models")
       assert.equal(lastDiscovery[1].headers.authorization, `Bearer ${expected}`)
       const requests = []
       const capture = async (url, init) => {
@@ -425,7 +428,7 @@ describe("Pi provider extension", () => {
       }
       assert.equal(requests.length, 2)
       for (const request of requests) {
-        assert.equal(new URL(request.url).origin, "https://api.router.com")
+        assert.equal(new URL(request.url).origin, viaAgent ? "http://127.0.0.1:47317" : "https://api.router.com")
         assert.equal(request.headers.get("authorization"), `Bearer ${expected}`)
         assert.equal(request.headers.has("x-api-key"), false)
       }
@@ -443,8 +446,8 @@ describe("Pi provider extension", () => {
     const background = Promise.withResolvers()
     let discoveryCount = 0
     const discovery = mock.method(globalThis, "fetch", async (url, init) => {
-      assert.equal(String(url), "https://api.router.com/v1/models")
-      assert.equal(init.headers.authorization, "Bearer real-key")
+      assert.equal(String(url), "http://127.0.0.1:47317/u/api.router.com/v1/models")
+      assert.equal(init.headers.authorization, `Bearer ${token}`)
       if (++discoveryCount === 2) background.resolve()
       return new Response(JSON.stringify({ data: [{ id: "gpt-5.4", owned_by: "openai", router: routerMetadata("gpt-5.4") }] }))
     })
@@ -2925,8 +2928,8 @@ describe("Router classifiers", () => {
       const result = await provider.classify(classifier, QUESTION, { apiKey: credential, maxRetries: 0 })
       assert.equal(result.stopReason, "stop", result.errorMessage)
       assert.equal(systemOneRequests.length, 1)
-      assert.equal(new URL(systemOneRequests[0].url).origin, "https://api.router.com")
-      assert.equal(systemOneRequests[0].headers.authorization, `Bearer ${scenario === "login" ? credential : "real-key"}`)
+      assert.equal(new URL(systemOneRequests[0].url).origin, scenario === "login" ? "https://api.router.com" : "http://127.0.0.1:47317")
+      assert.equal(systemOneRequests[0].headers.authorization, `Bearer ${credential}`)
     })
   }
 

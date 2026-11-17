@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -79,12 +80,24 @@ def try_refresh(env: str, *, profile: str | None = None) -> str | None:
 
 
 @contextmanager
-def _refresh_lock(env: str, profile: str | None = None):
+def _refresh_lock(env: str, profile: str | None = None, *, wait: float | None = None):
+    """Hold the lock. With ``wait``, give up after that many seconds with TimeoutError
+    (where file locks are fcntl's; elsewhere it waits as without ``wait``)."""
     lock_path = _refresh_lock_path(env, profile)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
     with lock_path.open("a+b") as lock_file:
-        if fcntl is not None:
+        if fcntl is not None and wait is not None:
+            deadline = time.monotonic() + wait
+            while True:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Timed out waiting for the refresh lock.")
+                    time.sleep(0.05)
+        elif fcntl is not None:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         elif msvcrt is not None:
             _lock_with_msvcrt(lock_file)

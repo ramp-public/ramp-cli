@@ -119,7 +119,7 @@ def test_caps_default_window_at_the_inclusive_threshold(window):
     assert catalog == original
 
 
-def test_caps_promoted_and_hidden_slugs_and_the_retained_selection():
+def test_keeps_rows_past_desktop_limit_and_lifts_the_selection_into_it():
     catalog = {
         "models": [_row("Test Model")]
         + [_row(f"other-{n}") for n in range(router.CODEX_CATALOG_MODEL_LIMIT)]
@@ -129,12 +129,13 @@ def test_caps_promoted_and_hidden_slugs_and_the_retained_selection():
     rendered = json.loads(
         router._render_codex_catalog(catalog, "test-model", [_model()])
     )
-    assert len(rendered["models"]) == router.CODEX_CATALOG_MODEL_LIMIT
+    assert len(rendered["models"]) == len(catalog["models"])
     assert rendered["models"][0] == _row(
         "Test Model", 272_000, max_context_window=822_000
     )
+    # The selection sits past Desktop's first page, so it is lifted to the top.
     assert rendered["models"][-1] == _row(
-        window=272_000, max_context_window=822_000, visibility="hide"
+        window=272_000, max_context_window=822_000, visibility="hide", priority=-1
     )
     assert rendered["models"][1] == original["models"][1]
     assert catalog == original

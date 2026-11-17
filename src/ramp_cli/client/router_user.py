@@ -20,7 +20,7 @@ import time
 from collections.abc import Callable
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 from pathlib import Path
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 from urllib.parse import urlencode, urlsplit
 
 import click
@@ -729,6 +729,11 @@ class RouterUserClient:
             "connectors_authorized": bool(state.get("connector_authorization")),
         }
 
+    def business(self) -> str | None:
+        """The Ramp business the stored sign-in is bound to, from its access token."""
+        account = _jwt_account(self._load().get("access_token") or "")
+        return account[1] if account else None
+
     def logout(self) -> None:
         with _refresh_lock(self.namespace):
             state = self._load()
@@ -759,9 +764,16 @@ class RouterUserClient:
         recover: bool = True,
         timeout: float = 30,
         reuse_session: bool = False,
+        lock_wait: float | None = None,
+        deadline: float | None = None,
     ) -> str:
+        """``lock_wait`` bounds the wait for the refresh lock (TimeoutError past it).
+
+        A ``deadline`` (``time.monotonic()``) replaces ``timeout`` with what is
+        left of it once the lock is held.
+        """
         reason: str
-        with _refresh_lock(self.namespace):
+        with _refresh_lock(self.namespace, wait=lock_wait):
             state = self._load()
             now = int(time.time())
             access = state.get("access_token")
@@ -803,6 +815,10 @@ class RouterUserClient:
             else:
                 http = self._pool()
                 access_headers = self._access_headers()
+                if deadline is not None:
+                    timeout = deadline - time.monotonic()
+                    if timeout <= 0:
+                        raise httpx.TimeoutException("Router token renewal timed out.")
                 if cached_valid and check_session:
                     response = http.post(
                         self.origin + "/api/auth/cli/session",
@@ -884,6 +900,93 @@ class RouterUserClient:
         if not recover:
             raise RampCLIError(_RECOVERY[reason][0], code=4)
         return self.recover_login(reason)
+
+    def ai_spend(
+        self,
+        timeout: float = 20,
+        params: dict[str, str | list[str]] | None = None,
+        path: str = "",
+    ) -> httpx.Response:
+        """The signed-in user's AI spend. Router wants the refresh grant as bearer.
+
+        ``path`` is appended to Router's AI spend route (``/tags/keys`` for one);
+        a list in ``params`` repeats that parameter. ``timeout`` is one deadline
+        for renewing the token, the lock waits and the whole read; past it, this
+        raises ``httpx.TimeoutException``.
+        """
+        deadline = time.monotonic() + timeout
+        # httpx times connecting and each read, not a whole request, so work on a
+        # thread and stop waiting at the deadline. A rotation cut short is
+        # finished on the next sign-in use, as when its response is lost.
+        outcome: list = []
+
+        def run() -> None:
+            try:
+                outcome.append(self._read_ai_spend(deadline, params, path))
+            except BaseException as error:  # handed to the caller below
+                outcome.append(error)
+
+        worker = Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(timeout)
+        if not outcome:
+            raise httpx.TimeoutException("AI spend timed out.")
+        if isinstance(outcome[0], BaseException):
+            raise outcome[0]
+        return outcome[0]
+
+    def _read_ai_spend(
+        self,
+        deadline: float,
+        params: dict[str, str | list[str]] | None,
+        path: str = "",
+    ) -> httpx.Response:
+        def remaining() -> float:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise httpx.TimeoutException("AI spend timed out.")
+            return left
+
+        # Complete any pending rotation first; never open a browser to sign in.
+        self.no_input, self.interactive = True, False
+        try:
+            self.access_token(deadline=deadline, lock_wait=remaining())
+            # Under the lock, so no other process rotates the grant mid-request.
+            with _refresh_lock(self.namespace, wait=remaining()):
+                with self._pool().stream(
+                    "GET",
+                    self.origin + "/api/auth/ramp/ai-spend" + path,
+                    headers={
+                        **self._access_headers(),
+                        "Authorization": "Bearer " + self._load()["refresh_token"],
+                    },
+                    params=params or None,
+                    timeout=remaining(),
+                ) as response:
+                    body = b""
+                    for chunk in response.iter_bytes():
+                        remaining()
+                        body += chunk
+                    # The body is decoded now, so don't let the copy decode it again.
+                    headers = httpx.Headers(response.headers)
+                    for name in ("content-encoding", "content-length"):
+                        headers.pop(name, None)
+                    result = httpx.Response(
+                        response.status_code,
+                        headers=headers,
+                        content=body,
+                        request=response.request,
+                    )
+            # Router also answers 404 for a revoked grant. Before a 404 counts as
+            # "unsupported", check the session within the same deadline: a revoked
+            # sign-in raises the login instruction (exit 4) instead.
+            if result.status_code == 404:
+                self.access_token(
+                    check_session=True, deadline=deadline, lock_wait=remaining()
+                )
+            return result
+        except TimeoutError as error:  # a lock; httpx's own timeouts aren't one
+            raise httpx.TimeoutException("AI spend timed out.") from error
 
     def recover_login(self, reason: str) -> str:
         """Sign in again when a person can approve it; otherwise explain how."""

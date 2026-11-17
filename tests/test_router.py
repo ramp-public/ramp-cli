@@ -5362,12 +5362,62 @@ def test_subagent_writes_reject_old_claude_but_reset_still_works(tmp_path, monke
         ["--human", "router", "subagents", "--sonnet", "current-model"],
     )
 
-    assert result.exit_code != 0
+    assert result.exit_code == 5
     assert "2.1.118 or newer is required" in result.output
     assert settings_path.read_text() == before
 
     reset = CliRunner().invoke(cli, ["--human", "router", "subagents", "--reset"])
     assert reset.exit_code == 0, reset.output
+
+
+def test_update_harness_runs_claude_update_until_new_enough(monkeypatch):
+    version = ["2.1.117"]
+    commands = []
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        if command[1:] == ["update"]:
+            version[0] = "2.1.325"
+        return subprocess.CompletedProcess(
+            command, 0, f"{version[0]} (Claude Code)\n", ""
+        )
+
+    monkeypatch.setattr(
+        router_module.shutil, "which", lambda name: "/fake/updating-claude"
+    )
+    monkeypatch.setattr(router_module.subprocess, "run", run)
+
+    result = CliRunner().invoke(
+        cli, ["--output", "json", "router", "update-harness", "claude-code"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert ["/fake/updating-claude", "update"] in commands
+    assert json.loads(result.output)["version"] == "2.1.325"
+
+
+def test_update_harness_upgrades_the_installed_homebrew_cask(monkeypatch):
+    commands = []
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 1, "", "Error: cask not installed")
+
+    monkeypatch.setattr(router_module.shutil, "which", lambda name: "/fake/cask/claude")
+    monkeypatch.setattr(
+        router_module.os.path,
+        "realpath",
+        lambda path: "/opt/homebrew/Caskroom/claude-code@latest/2.1.325/claude",
+    )
+    monkeypatch.setattr(router_module.subprocess, "run", run)
+
+    result = CliRunner().invoke(
+        cli, ["--output", "json", "router", "update-harness", "claude-code"]
+    )
+
+    # A failed updater fails the command, even when the version is already new enough.
+    assert result.exit_code != 0
+    assert ["brew", "upgrade", "--cask", "claude-code@latest"] in commands
 
 
 def test_configure_claude_does_not_set_subagent_defaults(tmp_path, monkeypatch):
@@ -6364,7 +6414,7 @@ def test_fetch_models_reads_the_router_metadata_extension(monkeypatch):
     assert described.default_effort == "low"
 
 
-def test_codex_catalog_respects_the_desktop_limit_and_keeps_the_selected_model(
+def test_codex_catalog_keeps_every_row_and_lifts_the_selected_model(
     monkeypatch,
 ):
     models = [
@@ -6390,9 +6440,13 @@ def test_codex_catalog_respects_the_desktop_limit_and_keeps_the_selected_model(
         )
     )
 
-    assert len(catalog["models"]) == router_module.CODEX_CATALOG_MODEL_LIMIT
-    assert catalog["models"][-1]["slug"] == "model-100"
-    assert "model-099" not in {model["slug"] for model in catalog["models"]}
+    # Codex core needs rows past Desktop's limit to resolve saved chats' models.
+    assert [model["slug"] for model in catalog["models"]] == [
+        model["slug"] for model in models
+    ]
+    # Desktop reads only its first page by priority, so the selection moves up.
+    assert catalog["models"][-1]["priority"] == -1
+    assert all("priority" not in model for model in catalog["models"][:-1])
 
 
 def test_codex_catalog_refuses_a_selected_model_missing_from_its_projection(
@@ -12526,6 +12580,272 @@ def test_pi_models_json_keeps_its_required_providers_key(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     written = json.loads(models_path.read_text())
     assert written == {"providers": {}}, written
+
+
+PI_USER_OVERRIDES = {
+    "claude-opus-5-5": {
+        "contextWindow": 500000,
+        "thinkingLevelMap": {"minimal": None, "low": None},
+    }
+}
+
+
+def test_configure_pi_keeps_user_model_overrides(tmp_path, monkeypatch):
+    # modelOverrides is Pi's supported way to tune the plugin's models; only
+    # the static provider an older setup wrote is removed around it.
+    pi_home = tmp_path / "pi"
+    pi_home.mkdir()
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(pi_home))
+    models_path = pi_home / "models.json"
+    models_path.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "ramp-router": {
+                        "baseUrl": "https://stale.example/v1",
+                        "api": "openai-responses",
+                        "apiKey": "legacy-secret",
+                        "headers": {"X-Stale": "1"},
+                        "models": [{"id": "legacy-model"}],
+                        "modelOverrides": PI_USER_OVERRIDES,
+                    }
+                }
+            }
+        )
+    )
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+
+    for _ in range(2):
+        result = runner.invoke(
+            cli, ["--human", "router", "configure", "pi", "--api-key", "router-secret"]
+        )
+        assert result.exit_code == 0, result.output
+        assert json.loads(models_path.read_text()) == {
+            "providers": {"ramp-router": {"modelOverrides": PI_USER_OVERRIDES}}
+        }
+
+    refresh = runner.invoke(cli, ["--human", "router", "refresh"])
+    assert refresh.exit_code == 0, refresh.output
+    assert json.loads(models_path.read_text()) == {
+        "providers": {"ramp-router": {"modelOverrides": PI_USER_OVERRIDES}}
+    }
+
+
+def test_configure_pi_keeps_model_overrides_added_after_setup(tmp_path, monkeypatch):
+    pi_home = tmp_path / "pi"
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(pi_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    args = ["--human", "router", "configure", "pi", "--api-key", "router-secret"]
+    assert runner.invoke(cli, args).exit_code == 0
+    models_path = pi_home / "models.json"
+    models_path.write_text(
+        json.dumps(
+            {"providers": {"ramp-router": {"modelOverrides": PI_USER_OVERRIDES}}}
+        )
+    )
+
+    reconfigure = runner.invoke(cli, args)
+    assert reconfigure.exit_code == 0, reconfigure.output
+    assert json.loads(models_path.read_text()) == {
+        "providers": {"ramp-router": {"modelOverrides": PI_USER_OVERRIDES}}
+    }
+
+    unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "pi"])
+    assert unconfigure.exit_code == 0, unconfigure.output
+    # The overrides are the user's, not Router's, and outlive the setup.
+    assert json.loads(models_path.read_text()) == {
+        "providers": {"ramp-router": {"modelOverrides": PI_USER_OVERRIDES}}
+    }
+
+
+def test_unconfigure_pi_restores_legacy_provider_with_current_overrides(
+    tmp_path, monkeypatch
+):
+    pi_home = tmp_path / "pi"
+    pi_home.mkdir()
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(pi_home))
+    legacy = {
+        "baseUrl": "https://legacy.example/v1",
+        "models": [{"id": "legacy-model"}],
+        "modelOverrides": {"claude-opus-5-5": {"contextWindow": 200000}},
+    }
+    models_path = pi_home / "models.json"
+    models_path.write_text(json.dumps({"providers": {"ramp-router": legacy}}))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    configure = runner.invoke(
+        cli, ["--human", "router", "configure", "pi", "--api-key", "router-secret"]
+    )
+    assert configure.exit_code == 0, configure.output
+    config = json.loads(models_path.read_text())
+    config["providers"]["ramp-router"]["modelOverrides"] = PI_USER_OVERRIDES
+    models_path.write_text(json.dumps(config))
+
+    unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "pi"])
+
+    assert unconfigure.exit_code == 0, unconfigure.output
+    assert json.loads(models_path.read_text()) == {
+        "providers": {"ramp-router": {**legacy, "modelOverrides": PI_USER_OVERRIDES}}
+    }
+
+
+def test_unconfigure_pi_does_not_restore_overrides_the_user_deleted(
+    tmp_path, monkeypatch
+):
+    pi_home = tmp_path / "pi"
+    pi_home.mkdir()
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(pi_home))
+    legacy_static = {
+        "baseUrl": "https://legacy.example/v1",
+        "models": [{"id": "legacy-model"}],
+    }
+    models_path = pi_home / "models.json"
+    models_path.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "ramp-router": {
+                        **legacy_static,
+                        "modelOverrides": PI_USER_OVERRIDES,
+                    }
+                }
+            }
+        )
+    )
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    configure = runner.invoke(
+        cli, ["--human", "router", "configure", "pi", "--api-key", "router-secret"]
+    )
+    assert configure.exit_code == 0, configure.output
+    models_path.write_text(json.dumps({"providers": {}}))
+
+    unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "pi"])
+
+    assert unconfigure.exit_code == 0, unconfigure.output
+    assert json.loads(models_path.read_text()) == {
+        "providers": {"ramp-router": legacy_static}
+    }
+
+
+def test_unconfigure_pi_restores_provider_when_overrides_emptied(tmp_path, monkeypatch):
+    pi_home = tmp_path / "pi"
+    pi_home.mkdir()
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(pi_home))
+    legacy_static = {"baseUrl": "https://legacy.example/v1", "models": []}
+    models_path = pi_home / "models.json"
+    models_path.write_text(json.dumps({"providers": {"ramp-router": legacy_static}}))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    configure = runner.invoke(
+        cli, ["--human", "router", "configure", "pi", "--api-key", "router-secret"]
+    )
+    assert configure.exit_code == 0, configure.output
+    models_path.write_text(
+        json.dumps({"providers": {"ramp-router": {"modelOverrides": {}}}})
+    )
+
+    unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "pi"])
+
+    assert unconfigure.exit_code == 0, unconfigure.output
+    assert json.loads(models_path.read_text()) == {
+        "providers": {"ramp-router": legacy_static}
+    }
+
+
+def test_unconfigure_pi_restores_overrides_from_older_receipts(tmp_path, monkeypatch):
+    # Configure before overrides were kept live deleted them from models.json,
+    # leaving the receipt's snapshot as the only copy.
+    pi_home = tmp_path / "pi"
+    pi_home.mkdir()
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(pi_home))
+    legacy = {
+        "baseUrl": "https://legacy.example/v1",
+        "models": [],
+        "modelOverrides": PI_USER_OVERRIDES,
+    }
+    models_path = pi_home / "models.json"
+    models_path.write_text(json.dumps({"providers": {"ramp-router": legacy}}))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    configure = runner.invoke(
+        cli, ["--human", "router", "configure", "pi", "--api-key", "router-secret"]
+    )
+    assert configure.exit_code == 0, configure.output
+    state_path = pi_home / "ramp-router-state.json"
+    state = json.loads(state_path.read_text())
+    state.pop(router_module.PI_OVERRIDES_KEPT_LIVE_KEY)
+    state_path.write_text(json.dumps(state))
+    models_path.write_text(json.dumps({"providers": {}}))
+
+    unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "pi"])
+
+    assert unconfigure.exit_code == 0, unconfigure.output
+    assert json.loads(models_path.read_text()) == {"providers": {"ramp-router": legacy}}
+
+
+def test_unconfigure_pi_older_receipt_keeps_explicitly_cleared_overrides(
+    tmp_path, monkeypatch
+):
+    pi_home = tmp_path / "pi"
+    pi_home.mkdir()
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(pi_home))
+    legacy_static = {"baseUrl": "https://legacy.example/v1", "models": []}
+    models_path = pi_home / "models.json"
+    models_path.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "ramp-router": {
+                        **legacy_static,
+                        "modelOverrides": PI_USER_OVERRIDES,
+                    }
+                }
+            }
+        )
+    )
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    configure = runner.invoke(
+        cli, ["--human", "router", "configure", "pi", "--api-key", "router-secret"]
+    )
+    assert configure.exit_code == 0, configure.output
+    state_path = pi_home / "ramp-router-state.json"
+    state = json.loads(state_path.read_text())
+    state.pop(router_module.PI_OVERRIDES_KEPT_LIVE_KEY)
+    state_path.write_text(json.dumps(state))
+    models_path.write_text(
+        json.dumps({"providers": {"ramp-router": {"modelOverrides": {}}}})
+    )
+
+    unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "pi"])
+
+    assert unconfigure.exit_code == 0, unconfigure.output
+    assert json.loads(models_path.read_text()) == {
+        "providers": {"ramp-router": legacy_static}
+    }
+
+
+def test_reconfigure_keeps_older_receipt_override_semantics(tmp_path, monkeypatch):
+    pi_home = tmp_path / "pi"
+    pi_home.mkdir()
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(pi_home))
+    _mock_models(monkeypatch)
+    runner = CliRunner()
+    args = ["--human", "router", "configure", "pi", "--api-key", "router-secret"]
+    assert runner.invoke(cli, args).exit_code == 0
+    state_path = pi_home / "ramp-router-state.json"
+    state = json.loads(state_path.read_text())
+    state.pop(router_module.PI_OVERRIDES_KEPT_LIVE_KEY)
+    state_path.write_text(json.dumps(state))
+
+    assert runner.invoke(cli, args).exit_code == 0
+
+    assert router_module.PI_OVERRIDES_KEPT_LIVE_KEY not in json.loads(
+        state_path.read_text()
+    )
 
 
 def test_codex_replaces_an_old_router_catalog_with_live_discovery(

@@ -199,6 +199,56 @@ def test_configure_conductor_writes_wrappers_and_settings(monkeypatch):
     assert state["settings"]["claude_code_executable_path"] == {"present": False}
 
 
+def test_conductor_codex_uses_and_recovers_the_repository_agent(
+    monkeypatch, isolated_config
+):
+    _mock_models(monkeypatch)
+    home = conductor.conductor_home()
+    home.mkdir(parents=True)
+    monkeypatch.setattr(router_module.router_repo, "enabled", lambda: True)
+    monkeypatch.setattr(router_module.router_repo, "ensure_running", lambda: True)
+    helper_up = {"value": True}
+    monkeypatch.setattr(
+        router_module.router_repo,
+        "health",
+        lambda *_args, **_kwargs: {} if helper_up["value"] else None,
+    )
+
+    result = _configure()
+    assert result.exit_code == 0, result.output
+
+    artifacts = home / "ramp-router"
+    config_path = artifacts / "codex-home" / "config.toml"
+    key_path = artifacts / "ramp-router-key"
+    config = tomllib.loads(config_path.read_text())
+    provider = config["model_providers"]["ramp-router"]
+    assert router_module.router_repo.is_wrapped(provider["base_url"])
+    [token_arg] = provider["auth"]["args"]
+    # Codex sends a local token to the agent, never the real Router key.
+    assert token_arg != str(key_path)
+    assert Path(token_arg).read_text().startswith("ramp-local-")
+    assert "router-secret" not in config_path.read_text()
+    assert router_module.clients_using_repo_helper() == ["conductor"]
+
+    # If the local agent stops, Conductor's Codex switches back to its real
+    # Router key. When the agent returns, it switches back to its local token.
+    helper_up["value"] = False
+    router_module._reconcile_helper_endpoints()
+    config = tomllib.loads(config_path.read_text())
+    provider = config["model_providers"]["ramp-router"]
+    assert provider["base_url"] == ROUTER_BASE_URL
+    assert provider["auth"]["args"] == [str(key_path)]
+    assert router_module.clients_using_repo_helper() == []
+
+    helper_up["value"] = True
+    router_module._reconcile_helper_endpoints()
+    config = tomllib.loads(config_path.read_text())
+    provider = config["model_providers"]["ramp-router"]
+    assert router_module.router_repo.is_wrapped(provider["base_url"])
+    assert provider["auth"]["args"] == [token_arg]
+    assert router_module.clients_using_repo_helper() == ["conductor"]
+
+
 def test_unconfigure_conductor_restores_prior_launchers(monkeypatch):
     _mock_models(monkeypatch)
     home = conductor.conductor_home()

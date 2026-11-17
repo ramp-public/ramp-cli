@@ -21,7 +21,12 @@ import tempfile
 import time
 import tomllib
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import contextmanager, nullcontext, redirect_stderr
+from contextlib import (
+    AbstractContextManager,
+    contextmanager,
+    nullcontext,
+    redirect_stderr,
+)
 from copy import copy
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -125,6 +130,14 @@ PI_PLUGIN_CONFIG_FILE = "ramp-router-config.json"
 PI_PLUGIN_MODEL_CACHE_FILE = "ramp-router-model-cache.json"
 PI_PLUGIN_MODEL_CACHE_KEY_FILE = "ramp-router-model-cache-key"
 PI_PLUGIN_RUNTIME_MODELS_FILE = "ramp-router-runtime-models.json"
+# The only part of a Pi models.json Router provider entry that configure keeps.
+# Pi applies modelOverrides to the plugin's models (context window, thinking
+# levels, pricing) without adding models or changing where requests go, and
+# the plugin pins identity and destination to Router's catalog regardless.
+# Everything else in the entry (baseUrl, api, apiKey, models, headers, ...) is
+# the static provider older setups wrote, or would redirect the plugin.
+PI_PRESERVED_PROVIDER_KEYS = ("modelOverrides",)
+PI_OVERRIDES_KEPT_LIVE_KEY = "provider_overrides_kept_live"
 ROUTER_UI_URL = "https://app.router.com"
 ROUTER_UI_URL_ENV = "RAMP_ROUTER_UI_URL"
 ROUTER_BASE_URL_ENV = BASE_URL_ENVS[0]
@@ -179,6 +192,8 @@ CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY = "admin_default_model"
 # its Stop event mode; the same digest-or-user-managed contract as the
 # SessionStart group's CODEX_SYNC_HOOK_STATE_KEY.
 CODEX_STOP_SYNC_HOOK_STATE_KEY = "stop_sync_hook"
+# Codex Desktop reads only the first 100 catalog rows by priority, for its
+# picker and some per-model checks. Codex core reads every row.
 CODEX_CATALOG_MODEL_LIMIT = 100
 _GPT_MODEL_ID = re.compile(r"(?:^|[/:.])gpt-")
 CLIENT_NAMES = {
@@ -2261,6 +2276,8 @@ def _run_configure(
         raise click.ClickException("Ramp Router did not return an API key.")
     results = []
     failures = []
+    # A harness too old for Router fails with its own exit code, so the app can offer an update.
+    failure_error = click.ClickException
     cowork_note = None
     setup_messages = io.StringIO() if connectors and fmt != "json" else None
     # A push started here is owed to every harness on this machine, not
@@ -2491,6 +2508,8 @@ def _run_configure(
             except click.ClickException as exc:
                 switchyard_push.settle(written=False)
                 failures.append(f"{AGENT_NAMES[item]}: {exc.message}")
+                if isinstance(exc, HarnessOutdatedError):
+                    failure_error = HarnessOutdatedError
                 continue
             switchyard_push.settle(written=True)
             if connector_skill_available and item in (
@@ -2624,7 +2643,7 @@ def _run_configure(
         if diagnostics:
             click.echo(diagnostics, err=True, nl=False)
     if failures and fmt == "json":
-        raise click.ClickException(
+        raise failure_error(
             "Could not configure " + "; ".join(failures) + connector_undo
         )
     if fmt == "json":
@@ -2739,7 +2758,7 @@ def _run_configure(
             )
         # Configuration is written before the agent-specific steps, so a
         # partial failure is recoverable; the user has no reason to guess that.
-        raise click.ClickException(
+        raise failure_error(
             "Could not configure "
             + "; ".join(failures)
             + f". Run 'ramp router unconfigure{restore_clients}' to restore your "
@@ -7400,18 +7419,18 @@ exec {shlex.quote(str(codex))} "$@"
 
 def _conductor_codex_home_config(
     codex_home: Path,
-    key_path: Path,
+    provider: str,
     default_model: str,
-    base_url: str | None,
     instructions_path: Path | None = None,
     standalone_codex_home: Path | None = None,
 ) -> str:
     """Render the config for the Router-owned CODEX_HOME Conductor spawns.
 
-    The provider block is the same one written into a user's own Codex, so
-    Router answers with the catalog shape Codex expects; the catalog snapshot
-    keeps the picker authoritative between refreshes, exactly as it does for
-    the first-party Codex setup.
+    ``provider`` is the same block written into a user's own Codex, repository
+    agent included, so Router answers with the catalog shape Codex expects and
+    Conductor's turns get repository tags too; the catalog snapshot keeps the
+    picker authoritative between refreshes, exactly as it does for the
+    first-party Codex setup.
     """
     catalog_path = codex_home / CODEX_ROUTER_CATALOG
     root_lines = "".join(
@@ -7427,7 +7446,7 @@ def _conductor_codex_home_config(
         )
         if value is not None
     )
-    rendered = f"{root_lines}\n{_codex_provider(key_path, base_url)}"
+    rendered = f"{root_lines}\n{provider}"
     # The same session-start sync the first-party Codex setup registers: the
     # vendored Codex hosts this home, so the codex-shaped hook output is the
     # right one, and the detached refresh it spawns covers every enrolled
@@ -7699,6 +7718,12 @@ def _configure_conductor(
     artifacts = path.parent / "ramp-router"
     codex_home = artifacts / CONDUCTOR_CODEX_HOME
     key_path = artifacts / CONDUCTOR_KEY_FILENAME
+    # The repository agent's endpoint and local credential, chosen like the
+    # first-party Codex setup's. The direct endpoint and key file whenever
+    # the agent is off or not answering, so this fails open.
+    codex_provider = _codex_provider(
+        key_path, base_url, repository_attribution=True, api_key=api_key
+    )
     wrappers = {
         "claude_code_executable_path": (
             artifacts / "claude-code",
@@ -7815,9 +7840,8 @@ def _configure_conductor(
                 codex_home / "config.toml",
                 _conductor_codex_home_config(
                     codex_home,
-                    key_path,
+                    codex_provider,
                     default_model,
-                    base_url,
                     instructions_path=(
                         instructions_path if harness_prompt is not None else None
                     ),
@@ -8687,6 +8711,59 @@ def _scrub_stale_fable_verdict() -> None:
     claude_code.scrub_stale_fable_access(claude_code.user_config_path())
 
 
+class HarnessOutdatedError(click.ClickException):
+    """A harness too old for Router: `router update-harness` can update it."""
+
+    exit_code = 5
+
+
+@router_group.command("update-harness", hidden=True)
+@click.argument("harness", type=click.Choice(["claude-code"]))
+@click.pass_context
+def router_update_harness(ctx: click.Context, harness: str) -> None:
+    """Update Claude Code with the updater it was installed by."""
+    executable = shutil.which("claude")
+    if executable is None:
+        raise click.ClickException("Claude Code isn't installed.")
+    before = _claude_code_version(executable)
+    # Homebrew's casks (claude-code or claude-code@latest) can't update themselves;
+    # the native and npm installs can.
+    real = os.path.realpath(executable)
+    if "/Caskroom/" in real:
+        cask = real.split("/Caskroom/", 1)[1].split("/", 1)[0]
+        command = ["brew", "upgrade", "--cask", cask]
+    else:
+        command = [executable, "update"]
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=600, check=False
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise click.ClickException(f"Could not run {shlex.join(command)}: {error}")
+    _claude_code_version.cache_clear()
+    after = _claude_code_version(shutil.which("claude") or executable)
+    if (
+        result.returncode != 0
+        or after is None
+        or after < MINIMUM_TRUTHFUL_CLAUDE_CODE_VERSION
+    ):
+        output = (result.stderr or result.stdout).strip().splitlines()
+        raise click.ClickException(
+            f"{shlex.join(command)} did not update Claude Code"
+            + (f": {output[-1]}" if output else ".")
+        )
+    data = {
+        "harness": harness,
+        "previous_version": ".".join(map(str, before)) if before else None,
+        "version": ".".join(map(str, after)),
+        "command": command,
+    }
+    if resolve_format(ctx.obj.get("format"), ctx.obj.get("config_format")) == "json":
+        print_json(data)
+    else:
+        click.echo(f"Updated Claude Code to {data['version']}.")
+
+
 def _require_truthful_claude_code_model_names() -> None:
     """Refuse a client that would label Router models as Anthropic models."""
     executable = shutil.which("claude")
@@ -8704,7 +8781,7 @@ def _require_truthful_claude_code_model_names() -> None:
             "to show Router models by their real names."
         )
     if version < minimum:
-        raise click.ClickException(
+        raise HarnessOutdatedError(
             f"Claude Code {'.'.join(map(str, minimum))} or newer is required "
             "to show Router models by their real names. Update Claude Code, "
             "then run this command again."
@@ -9723,6 +9800,19 @@ def clients_using_repo_helper() -> list[str]:
     except Exception:
         pass
     try:
+        conductor_codex = _conductor_codex_config_path(conductor.settings_path())
+        if conductor_codex.is_file():
+            _, config = _read_codex_config(conductor_codex)
+            providers = config.get("model_providers")
+            if isinstance(providers, dict) and any(
+                isinstance(provider, dict)
+                and router_repo.is_wrapped(provider.get("base_url"))
+                for provider in providers.values()
+            ):
+                clients.append("conductor")
+    except Exception:
+        pass
+    try:
         # Any Desktop profile on the helper keeps it alive, not just ours.
         if any(map(router_repo.is_wrapped, claude_cowork.library_gateway_base_urls())):
             clients.append(COWORK_CLIENT)
@@ -9765,6 +9855,7 @@ def _reconcile_helper_endpoints() -> None:
     for client, reconcile in (
         ("claude-code", _reconcile_claude_code_endpoint),
         ("codex", _reconcile_codex_endpoint),
+        ("conductor", _reconcile_conductor_codex_endpoint),
     ):
         try:
             reconcile(_client_config_path(client), healthy)
@@ -9827,20 +9918,31 @@ def _reconcile_claude_code_endpoint(path: Path, healthy: bool) -> None:
             raise
 
 
-def _reconcile_codex_endpoint(path: Path, healthy: bool) -> None:
-    with codex_config_lock(path):
+def _reconcile_codex_endpoint(
+    path: Path,
+    healthy: bool,
+    *,
+    key_path: Path | None = None,
+    receipt: Path | None = None,
+    lock: AbstractContextManager | None = None,
+) -> None:
+    """Move Codex's Router provider between the helper and direct Router.
+
+    The defaults are the user's own Codex home; Conductor's isolated home
+    keeps its key and receipt elsewhere and has its own lock.
+    """
+    key_path = key_path or path.parent / "ramp-router-key"
+    receipt = receipt or path.parent / "ramp-router-state.json"
+    transaction = lock if lock is not None else codex_config_lock(path)
+    with transaction:
         existing, data = _read_codex_config(path)
         provider = data.get("model_providers", {}).get(ROUTER_PROVIDER)
         current = provider.get("base_url") if isinstance(provider, dict) else None
-        if (
-            not isinstance(current, str)
-            or not (path.parent / "ramp-router-state.json").exists()
-        ):
+        if not isinstance(current, str) or not receipt.exists():
             return
         if (change := _helper_endpoint(current, healthy)) is None:
             return
         direct, wanted = change
-        key_path = path.parent / "ramp-router-key"
         # Authentication the user changed by hand is theirs: only the managed
         # key file or a local token this CLI registered is swapped.
         auth = provider.get("auth", {})
@@ -9899,6 +10001,32 @@ def _reconcile_codex_endpoint(path: Path, healthy: bool) -> None:
         if tomllib.loads(updated_text) != {**data, "model_providers": providers}:
             raise click.ClickException("Could not rewrite the Codex Router endpoint.")
         _write_private_file(path, updated_text)
+
+
+def _conductor_codex_config_path(path: Path) -> Path:
+    """Conductor's isolated Codex config, beside its settings at ``path``."""
+    return path.parent / "ramp-router" / CONDUCTOR_CODEX_HOME / "config.toml"
+
+
+def _reconcile_conductor_codex_endpoint(path: Path, healthy: bool) -> None:
+    """The same move for the Codex home Conductor spawns, under its own lock.
+
+    Checked before the lock too, so a machine without Conductor gets no
+    ~/.conductor directory from this background check.
+    """
+    state_path = _conductor_state_path(path)
+    if not _conductor_receipt_enrolls(state_path):
+        return
+    with _conductor_settings_lock(path):
+        if not _conductor_receipt_enrolls(state_path):
+            return
+        _reconcile_codex_endpoint(
+            _conductor_codex_config_path(path),
+            healthy,
+            key_path=path.parent / "ramp-router" / CONDUCTOR_KEY_FILENAME,
+            receipt=state_path,
+            lock=nullcontext(),
+        )
 
 
 def _toml_value(value: object) -> str:
@@ -11612,6 +11740,9 @@ def _configure_plugin_client(
                 "package_entries": previous_packages,
                 "auth_present": ROUTER_PROVIDER in auth,
                 "auth": auth.get(ROUTER_PROVIDER),
+                # Receipts without this were written by a configure that
+                # deleted the live overrides, so only the snapshot has them.
+                PI_OVERRIDES_KEPT_LIVE_KEY: True,
             }
         # Preserve the original values across repeated configure calls, but
         # update the salted marker for the credential this invocation
@@ -11631,7 +11762,9 @@ def _configure_plugin_client(
         settings["defaultProvider"] = ROUTER_PROVIDER
         settings["defaultModel"] = default_model
         auth[ROUTER_PROVIDER] = configured_auth
-        providers.pop(ROUTER_PROVIDER, None)
+        preserved = _pi_preserved_provider(providers.pop(ROUTER_PROVIDER, None))
+        if preserved:
+            providers[ROUTER_PROVIDER] = preserved
         # Keep the key even when it empties out. Pi's schema requires
         # "providers", so dropping it leaves {} on disk, which Pi rejects
         # wholesale: it discards the file and falls back to cached models
@@ -11932,16 +12065,33 @@ def _unconfigure_json_client(client: str, path: Path) -> None:
                 f"Could not restore Pi config {models_path}: "
                 "'providers' must be an object."
             )
-        # Configure removes the legacy Router provider entry. Restore it only
-        # if that absence is still intact; a provider added afterward belongs
-        # to the user or a newer Pi flow and must survive unconfigure.
-        if ROUTER_PROVIDER not in providers:
-            _restore_json_value(
-                providers,
-                ROUTER_PROVIDER,
-                provider_present,
-                state.get("provider"),
-            )
+        # Configure removes the legacy Router provider entry, keeping only the
+        # user's modelOverrides. Restore it only if that state is still
+        # intact; a provider added afterward belongs to the user or a newer Pi
+        # flow and must survive unconfigure.
+        current = providers.get(ROUTER_PROVIDER)
+        snapshot = state.get("provider")
+        if provider_present and isinstance(snapshot, dict):
+            if current is None or (
+                isinstance(current, dict)
+                and set(current) <= set(PI_PRESERVED_PROVIDER_KEYS)
+            ):
+                restored = dict(snapshot)
+                for key in PI_PRESERVED_PROVIDER_KEYS:
+                    # Live overrides supersede the snapshot's, including an
+                    # explicitly emptied value. Receipts from a configure that
+                    # kept them live treat their absence as a deletion too.
+                    if state.get(PI_OVERRIDES_KEPT_LIVE_KEY) is True or (
+                        isinstance(current, dict) and key in current
+                    ):
+                        restored.pop(key, None)
+                restored.update(_pi_preserved_provider(current))
+                if restored:
+                    providers[ROUTER_PROVIDER] = restored
+                else:
+                    providers.pop(ROUTER_PROVIDER, None)
+        elif current is None:
+            _restore_json_value(providers, ROUTER_PROVIDER, provider_present, snapshot)
         # Keep the key even when it empties out. Pi's schema requires
         # "providers", so dropping it leaves {} on disk, which Pi rejects
         # wholesale: it discards the file and falls back to cached models
@@ -11963,6 +12113,17 @@ def _unconfigure_json_client(client: str, path: Path) -> None:
         raise click.ClickException(
             f"Could not restore {CLIENT_NAMES[client]} config {path}: {exc}"
         ) from None
+
+
+def _pi_preserved_provider(entry: object) -> dict:
+    """The part of a Pi Router provider entry that configure keeps; may be empty."""
+    if not isinstance(entry, dict):
+        return {}
+    return {
+        key: entry[key]
+        for key in PI_PRESERVED_PROVIDER_KEYS
+        if isinstance(entry.get(key), dict) and entry[key]
+    }
 
 
 def _restore_json_value(data: dict, key: str, present: object, value: object) -> None:
@@ -12290,9 +12451,13 @@ def _render_codex_catalog(
     *,
     native_windows: dict[str, int] | None = None,
 ) -> str:
-    """Bound a validated catalog while retaining Codex's current selection."""
+    """Render every catalog row, keeping Codex's selection in Desktop's page.
+
+    Hidden rows past Desktop's limit still matter: Codex core resolves saved
+    chats' models, including their context windows, against the whole file.
+    """
     models = catalog["models"]
-    limited = list(models[:CODEX_CATALOG_MODEL_LIMIT])
+    limited = list(models)
     selected = next(
         (model for model in models if model["slug"] == selected_model), None
     )
@@ -12301,8 +12466,9 @@ def _render_codex_catalog(
             f"Ramp Router's Codex catalog does not include the selected model "
             f"{selected_model!r}. Update the Ramp CLI and try again."
         )
-    if selected is not None and selected not in limited:
-        limited[-1] = selected
+    if selected not in models[:CODEX_CATALOG_MODEL_LIMIT]:
+        # Codex sorts by priority, so a lower one lifts it into Desktop's page.
+        limited[limited.index(selected)] = {**selected, "priority": -1}
 
     # Codex's projection omits pricing. Reuse discovery rather than fetching
     # it again, matching canonical names before unambiguous promoted slugs.
@@ -14001,6 +14167,7 @@ def _organize_router_menu() -> None:
         ("logout", "Sign out of this CLI."),
         ("status", "Show your account and login."),
         ("usage", "Show spend, savings, tokens, and credits."),
+        ("ai-spend", "Show your AI spend and limit."),
     ):
         move(name, account).short_help = description
     router_group.add_command(account)

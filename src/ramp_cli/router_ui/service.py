@@ -14,7 +14,7 @@ import re
 import subprocess
 import sys
 from collections.abc import Callable
-from datetime import datetime, time, timedelta, timezone, tzinfo
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from decimal import Decimal, InvalidOperation
 from threading import Event, Lock
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -55,6 +55,9 @@ USAGE_DAYS = tuple(days for days, _label in USAGE_WINDOWS)
 USAGE_GROUPS = ("model", "key", "harness")
 # The dashboard calls the harness dimension "client".
 API_GROUPS = {"harness": "client"}
+# Router's usage dashboard reads at most this many days at once; longer windows
+# are read in back-to-back chunks and merged.
+USAGE_CHUNK_DAYS = 92
 # Router tags each request with the harness that sent it. Claude Code is the
 # one harness whose tag differs from its CLI id: Router records "claude_code".
 CLIENT_KINDS = {"claude-code": "claude_code"}
@@ -121,13 +124,122 @@ def zone_name(zone: tzinfo) -> str:
     return getattr(zone, "key", None) or "UTC"
 
 
-def local_days_window(days: int, zone: tzinfo) -> tuple[datetime, datetime, list]:
-    """The last ``days`` calendar days ending today, as UTC bounds and local dates."""
-    today = datetime.now(zone).date()
+def local_days_window(
+    days: int, zone: tzinfo, last: date | None = None
+) -> tuple[datetime, datetime, list]:
+    """``days`` calendar days ending on ``last`` (today by default), as UTC bounds and local dates."""
+    today = last or datetime.now(zone).date()
     dates = [today - timedelta(days=offset) for offset in range(days - 1, -1, -1)]
     start = datetime.combine(dates[0], time.min, zone)
     end = datetime.combine(today + timedelta(days=1), time.min, zone)
     return start.astimezone(timezone.utc), end.astimezone(timezone.utc), dates
+
+
+def merge_dashboards(parts: list[dict]) -> dict:
+    """Usage dashboard reads of back-to-back windows, oldest first, as one read.
+
+    Totals add up, money sent as text included; the average per request is
+    recomputed. Latency stats can't be combined, so a merged read has none.
+    Router names the top groups of each window on its own: a group that one window
+    may have folded into "Other" joins "Other" in all of them, so every day uses the
+    same groups.
+    """
+    summary: dict = {}
+    for part in parts:
+        for name, value in (part.get("summary") or {}).items():
+            if name.endswith(("_latency_ms", "_per_request")) or isinstance(
+                value, bool
+            ):
+                continue
+            if isinstance(value, int):
+                summary[name] = summary.get(name, 0) + value
+            elif isinstance(value, (float, str, Decimal)) and _is_number(value):
+                summary[name] = summary.get(name, Decimal(0)) + _decimal(value)
+    if summary.get("request_count"):
+        summary["average_cost_per_request"] = (
+            _decimal(summary.get("spend_usd", 0)) / summary["request_count"]
+        )
+    models: dict = {}
+    for part in parts:
+        for item in part.get("model_stats") or []:
+            if not isinstance(item, dict):
+                continue
+            model = models.setdefault(
+                item.get("model"),
+                {
+                    **item,
+                    "spend_usd": Decimal(0),
+                    **{field: None for field in COST_FIELDS},
+                    "request_count": 0,
+                    "total_tokens": 0,
+                },
+            )
+            model["spend_usd"] += _decimal(item.get("spend_usd"))
+            # A cost no window reports stays absent, as model_stats expects.
+            for field in COST_FIELDS:
+                if item.get(field) is not None:
+                    model[field] = (model[field] or Decimal(0)) + _decimal(item[field])
+            model["request_count"] += _count(item.get("request_count"))
+            model["total_tokens"] += _count(item.get("total_tokens"))
+            used = [
+                t for t in (model.get("last_used_at"), item.get("last_used_at")) if t
+            ]
+            model["last_used_at"] = max(used, default=None)
+    for model in models.values():
+        for field in COST_FIELDS:
+            if model[field] is None:
+                del model[field]
+    points = [
+        [p for p in part.get("series") or [] if isinstance(p, dict)] for part in parts
+    ]
+    named = [{_group(p) for p in chunk if not _is_other(p)} for chunk in points]
+    # A window with an "Other" bucket may hold any group it doesn't name; one without
+    # names everything it had, so a group missing there simply had no usage.
+    folded = set().union(
+        *(
+            set().union(*named) - names
+            for names, chunk in zip(named, points, strict=True)
+            if any(_is_other(p) for p in chunk)
+        )
+    )
+    other = next(
+        (
+            (p.get("group"), p.get("group_label"))
+            for c in points
+            for p in c
+            if _is_other(p)
+        ),
+        ("Other models", "Other models"),
+    )
+    series = [
+        point
+        if _is_other(point) or _group(point) not in folded
+        else {**point, "group": other[0], "group_label": other[1], "model": None}
+        for chunk in points
+        for point in chunk
+    ]
+    return {
+        "effective_end_at": parts[-1].get("effective_end_at"),
+        "summary": summary,
+        "model_stats": list(models.values()),
+        "series": series,
+    }
+
+
+def _group(point: dict) -> str:
+    return str(point.get("group") or point.get("model") or "")
+
+
+def _is_other(point: dict) -> bool:
+    group = _group(point)
+    return group.startswith("__other") or group == "Other models"
+
+
+def _is_number(value: object) -> bool:
+    try:
+        return Decimal(str(value)).is_finite()
+    except (InvalidOperation, ValueError):
+        return False
 
 
 def _decimal(value: object) -> Decimal:
@@ -478,6 +590,7 @@ class RouterService:
         days: int | None = None,
         group_by: str = "model",
         client: str | None = None,
+        last: date | None = None,
     ) -> dict:
         """``days=None`` picks the longest window the usage history fills.
 
@@ -506,7 +619,7 @@ class RouterService:
                         usage = self.daily_usage(days, group_by, client)
                     result["usage"] = usage
                 else:
-                    result["usage"] = self.daily_usage(days, group_by, client)
+                    result["usage"] = self.daily_usage(days, group_by, client, last)
             except (ApiError, RampCLIError, httpx.HTTPError, ValueError):
                 result["usage_error"] = "Usage analytics are unavailable."
         return public_data(result)
@@ -517,28 +630,54 @@ class RouterService:
 
     @cached
     def daily_usage(
-        self, days: int = 7, group_by: str = "model", client: str | None = None
+        self,
+        days: int = 7,
+        group_by: str = "model",
+        client: str | None = None,
+        last: date | None = None,
     ) -> dict:
-        if days not in USAGE_DAYS:
-            raise click.BadParameter(f"Choose {', '.join(map(str, USAGE_DAYS))} days.")
+        """``days`` days ending on ``last``, today by default."""
+        if days < 1:
+            raise click.BadParameter("Choose at least 1 day.")
         if group_by not in USAGE_GROUPS:
             raise click.BadParameter("Break usage down by model, key, or harness.")
         if client in UNTAGGED_CLIENTS:
             raise RampCLIError("Usage analytics are unavailable for this harness.")
         zone = local_timezone()
-        start, end, dates = local_days_window(days, zone)
+        _start, _end, dates = local_days_window(days, zone, last)
         params = {
-            "start_at": start.isoformat(),
-            "end_at": end.isoformat(),
             "group_by": API_GROUPS.get(group_by, group_by),
             "timezone": zone_name(zone),
             "include_summary_stats": "true",
         }
         if client is not None:
             params["filters"] = json.dumps({"client": [client_kind(client)]})
-        usage = self.client.get("/client/usage/dashboard", params=params, timeout=15)
-        if not isinstance(usage, dict):
-            raise RampCLIError("Usage analytics are unavailable.")
+        parts = []
+        chunks = [
+            dates[i : i + USAGE_CHUNK_DAYS] for i in range(0, days, USAGE_CHUNK_DAYS)
+        ]
+        for index, chunk in enumerate(chunks):
+            start, end, _ = local_days_window(len(chunk), zone, chunk[-1])
+            try:
+                part = self.client.get(
+                    "/client/usage/dashboard",
+                    params={
+                        **params,
+                        "start_at": start.isoformat(),
+                        "end_at": end.isoformat(),
+                    },
+                    timeout=15,
+                )
+            except ApiError as error:
+                # Router has no usage summaries before it started keeping them; an
+                # older chunk without any is no usage, not a failed read.
+                if index < len(chunks) - 1 and "analytics_not_ready" in error.body:
+                    continue
+                raise
+            if not isinstance(part, dict):
+                raise RampCLIError("Usage analytics are unavailable.")
+            parts.append(part)
+        usage = parts[0] if len(parts) == 1 else merge_dashboards(parts)
         series = daily_series(usage, dates, zone)
         harness_fields = {}
         if client is not None:

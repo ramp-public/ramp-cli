@@ -524,14 +524,91 @@ def test_account_usage_harness_option_reaches_the_service(monkeypatch):
         ["--agent", "router", "account", "usage", "--days", "1", "--harness", "Codex"],
     )
     assert result.exit_code == 0, result.output
-    assert seen == [(1, "model", "codex")]
+    assert seen == [(1, "model", "codex", None)]
     assert json.loads(result.output)["data"][0]["harness"] == "codex"
     desktop = CliRunner().invoke(
         cli, ["router", "account", "usage", "--harness", "Desktop"]
     )
     assert "Invalid value" not in desktop.output
-    assert seen[-1] == (None, "model", "cowork")
+    assert seen[-1] == (None, "model", "cowork", None)
     bad = CliRunner().invoke(
         cli, ["router", "account", "usage", "--harness", "notepad"]
     )
     assert bad.exit_code == 2
+
+
+def test_daily_usage_reads_long_windows_in_chunks_and_merges_them(monkeypatch):
+    zone = operations.ZoneInfo("America/New_York")
+    monkeypatch.setattr(operations, "local_timezone", lambda: zone)
+    calls = []
+
+    def get(path, **kwargs):
+        start = datetime.fromisoformat(kwargs["params"]["start_at"])
+        end = datetime.fromisoformat(kwargs["params"]["end_at"])
+        calls.append((end - start).days)
+        if len(calls) == 1:
+            # The oldest chunk predates Router's usage summaries.
+            raise operations.ApiError(503, '{"code": "analytics_not_ready"}')
+        return {
+            "summary": {"spend_usd": 2, "request_count": 4, "p95_latency_ms": 9},
+            "model_stats": [{"model": "big", "spend_usd": "2", "request_count": 4}],
+            "series": [
+                {"period_start_at": start.isoformat(), "group": "big", "spend_usd": 2}
+            ],
+        }
+
+    service = RouterService({})
+    service._client = SimpleNamespace(get=get)
+    data = service.daily_usage(200, "model", last=operations.date(2026, 10, 31))
+    assert sorted(calls, reverse=True) == [92, 92, 16]
+    assert len(data["series"]) == 200
+    assert data["summary"] == {
+        "spend_usd": 4,
+        "request_count": 8,
+        "average_cost_per_request": 0.5,
+    }
+    assert [(m["id"], m["spend_usd"]) for m in data["models"]] == [("big", Decimal(4))]
+    assert sum(row["spend_usd"] for row in data["series"]) == 4
+
+
+def test_merged_reads_keep_text_money_later_costs_and_the_same_groups():
+    def part(day, groups, cost):
+        return {
+            "summary": {"spend_usd": "1.25", "request_count": 2},
+            "model_stats": [
+                {"model": "big", "spend_usd": "1", **cost},
+                {"model": "new", "spend_usd": "0.25"},
+            ],
+            "series": [
+                {"period_start_at": day, "group": group, "spend_usd": 1}
+                for group in groups
+            ],
+        }
+
+    merged = operations.merge_dashboards(
+        [
+            part("2026-07-01T04:00:00+00:00", ["big", "Other models"], {}),
+            part(
+                "2026-10-01T04:00:00+00:00",
+                ["big", "new"],
+                {"estimated_usage_cost_usd": "3"},
+            ),
+        ]
+    )
+    assert merged["summary"]["spend_usd"] == Decimal("2.5")
+    assert merged["summary"]["average_cost_per_request"] == Decimal("0.625")
+    big = next(m for m in merged["model_stats"] if m["model"] == "big")
+    assert big["estimated_usage_cost_usd"] == Decimal(3)
+    new = next(m for m in merged["model_stats"] if m["model"] == "new")
+    assert "estimated_usage_cost_usd" not in new
+    # "new" is named only in the later window, and the earlier one has an Other
+    # that may hold it, so it is Other in both.
+    assert [p["group"] for p in merged["series"]] == ["big", "Other models"] * 2
+    # A window with no Other names all it had: a group missing there had no usage.
+    idle = operations.merge_dashboards(
+        [
+            part("2026-07-01T04:00:00+00:00", [], {}),
+            part("2026-10-01T04:00:00+00:00", ["big"], {}),
+        ]
+    )
+    assert [p["group"] for p in idle["series"]] == ["big"]

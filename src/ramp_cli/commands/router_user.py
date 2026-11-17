@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
 import sys
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
@@ -20,8 +21,10 @@ import questionary
 from ramp_cli.client.router_user import (
     DEFAULT_ORIGIN,
     RouterUserClient,
+    _atomic_write,
     selected_origin,
 )
+from ramp_cli.config import settings
 from ramp_cli.errors import ApiError, RampCLIError
 from ramp_cli.output.formatter import (
     print_agent_json,
@@ -103,6 +106,248 @@ def _money(value: object) -> str:
         return f"${amount:,.2f}"
     except (InvalidOperation, ValueError, TypeError):
         return "Unavailable"
+
+
+# `ramp router account ai-spend --by` choices and the group_by Core calls them.
+AI_SPEND_GROUPS = {
+    "product": "product_or_api_key",
+    "model": "model",
+    "provider": "provider",
+}
+# Router passes these Core 403s through; neither is a rejected sign-in.
+AI_SPEND_DENIALS = {
+    "access_denied": "access_denied",
+    "feature_unavailable": "feature_disabled",
+}
+# Parameters an older Router or Core rejects as unknown.
+AI_SPEND_NEW_FIELDS = ("group_by", "model_keys", "tag_key", "tag_filters", "rollup")
+AI_SPEND_KEY = re.compile(r"[A-Za-z0-9._:/-]{1,128}")
+AI_SPEND_LIMIT = 50
+# Seconds an available: false record is reused, whatever --max-age allows.
+AI_SPEND_UNAVAILABLE_MAX_AGE = 300
+AI_SPEND_REASONS = {
+    "unsupported": "this Router doesn't support it yet",
+    "feature_disabled": "it isn't enabled for your business",
+    "access_denied": "your account can't read AI spend",
+    "unavailable": "Router couldn't provide it",
+}
+
+
+def _ai_spend_variant(
+    window: dict[str, str],
+    by: str,
+    by_given: bool,
+    models: tuple[str, ...],
+    tag: str | None,
+    tag_filters: tuple[str, ...],
+    rollup: str | None,
+    tag_keys: bool,
+) -> dict:
+    """What one `ai-spend` read asks Router for, how it is cached, and what it echoes."""
+    if tag is not None and tag_keys:
+        raise click.UsageError("--tag and --tag-keys can't be used together.")
+    if (tag is not None or tag_keys) and (by_given or models):
+        flag = "--tag" if tag is not None else "--tag-keys"
+        raise click.UsageError(f"{flag} can't be used with --by or --model.")
+    if tag is None and (tag_filters or rollup):
+        flag = "--tag-filter" if tag_filters else "--rollup"
+        raise click.UsageError(f"{flag} needs --tag.")
+    if tag_keys:
+        return {
+            "kind": "tag_keys",
+            "path": "/tags/keys",
+            "params": dict(window),
+            "echo": {},
+            "cache_key": "\n" + json.dumps(["tag_keys"]),
+            "label": "AI spend tag keys",
+        }
+    if tag is not None:
+        if not 1 <= len(tag) <= 128 or ":" in tag:
+            raise click.BadParameter(
+                "Use a tag key of 1 to 128 characters without ':'.", param_hint="--tag"
+            )
+        filters = sorted(set(tag_filters))
+        if len(filters) > AI_SPEND_LIMIT:
+            raise click.BadParameter(
+                f"Use at most {AI_SPEND_LIMIT} filters.", param_hint="--tag-filter"
+            )
+        for item in filters:
+            # Router splits at the first colon; an empty value ("repo:") is valid.
+            key, colon, _value = item.partition(":")
+            if not colon or not 1 <= len(key) <= 128:
+                raise click.BadParameter(
+                    f"Use KEY:VALUE, not {item!r}.", param_hint="--tag-filter"
+                )
+        rollup = rollup or "daily"
+        params: dict = {**window, "tag_key": tag, "rollup": rollup}
+        if filters:
+            params["tag_filters"] = filters
+        return {
+            "kind": "tag",
+            "path": "/tags/breakdown",
+            "params": params,
+            "echo": {"tag_key": tag, **({"tag_filters": filters} if filters else {})},
+            "cache_key": "\n" + json.dumps(["tag", tag, filters, rollup]),
+            "label": f"AI spend by tag {tag}",
+        }
+    keys = sorted(set(models))
+    if len(keys) > AI_SPEND_LIMIT:
+        raise click.BadParameter(
+            f"Use at most {AI_SPEND_LIMIT} models.", param_hint="--model"
+        )
+    for key in keys:
+        if not AI_SPEND_KEY.fullmatch(key):
+            raise click.BadParameter(
+                f"{key!r} isn't a model key (letters, digits and . _ : / -).",
+                param_hint="--model",
+            )
+    if by == "product" and not keys:
+        # The default read: today's request, cache file and output.
+        return {
+            "kind": "default",
+            "path": "",
+            "params": dict(window),
+            "echo": {},
+            "cache_key": "",
+            "label": "AI spend",
+        }
+    group_by = AI_SPEND_GROUPS[by]
+    params = {**window}
+    if by != "product":
+        params["group_by"] = group_by
+    if keys:
+        params["model_keys"] = keys
+    label = "AI spend" if by == "product" else f"AI spend by {by}"
+    if keys:
+        label += f" for {', '.join(keys)}"
+    return {
+        "kind": "breakdown",
+        "path": "",
+        "params": params,
+        "echo": {"group_by": group_by, **({"model_keys": keys} if keys else {})},
+        "cache_key": "\n" + json.dumps(["breakdown", by, keys]),
+        "label": label,
+    }
+
+
+def _ai_spend_reason(variant: dict, code: int, error: object, text: str) -> str | None:
+    """Why a read is unavailable, or None for a failure worth a stale copy."""
+    if code == 403 and error in AI_SPEND_DENIALS:
+        return AI_SPEND_DENIALS[error]
+    if variant["kind"] != "default":
+        # An older Router: no tag routes, and strict about unknown parameters.
+        if code == 404 and variant["kind"] in ("tag", "tag_keys"):
+            return "unsupported"
+        # An older Router says invalid_request; an older Core names the field.
+        if code == 400 and (
+            error == "invalid_request"
+            or any(field in text for field in AI_SPEND_NEW_FIELDS)
+        ):
+            return "unsupported"
+    if code == 404:
+        return "unavailable"
+    return None
+
+
+def _show_ai_spend(variant: dict, data: dict) -> None:
+    if not data.get("available"):
+        reason = AI_SPEND_REASONS.get(
+            data.get("reason"), AI_SPEND_REASONS["unavailable"]
+        )
+        click.echo(f"{variant['label']} is unavailable: {reason}.")
+        return
+    fetched = f"{data['fetched_at']}{' (stale)' if data['stale'] else ''}"
+    period = f"{data.get('start_date')} to {data.get('end_date')}"
+    if variant["kind"] == "default":
+        limit = data.get("spend_limit")
+        show_detail_card(
+            "AI spend",
+            {
+                "Window": period,
+                "Total": _money(data.get("total_cost_usd")),
+                "Fetched": fetched,
+                "Limit": f"{_money(limit.get('current_spend'))} of "
+                f"{_money(limit.get('amount'))} ({limit.get('interval')})"
+                if isinstance(limit, dict)
+                else "Not available",
+            },
+            plain=True,
+        )
+        return
+    if variant["kind"] == "tag_keys":
+        keys = [str(key) for key in data.get("tag_keys") or []]
+        show_detail_card(
+            variant["label"],
+            {
+                "Window": period,
+                "Keys": _single_line(", ".join(keys) or "None"),
+                "Fetched": fetched,
+            },
+            plain=True,
+        )
+        return
+    series = [s for s in data.get("series") or [] if isinstance(s, dict)]
+    series.sort(key=lambda s: _decimal_or_zero(s.get("total_cost_usd")), reverse=True)
+    fields = {"Window": period, "Total": _money(data.get("total_cost_usd"))}
+    if variant["kind"] == "tag":
+        filters = data.get("tag_filters") or []
+        if filters:
+            fields["Filters"] = _single_line(", ".join(map(str, filters)))
+        fields["Rollup"] = str(data.get("rollup") or "daily")
+    fields["Fetched"] = fetched
+    show_detail_card(_single_line(variant["label"]), fields, plain=True)
+    if not series:
+        return
+    if variant["kind"] == "tag":
+        rows = [
+            {
+                "Value": truncate(_single_line(_tag_value_label(s)), 48),
+                "Tokens": f"{_count(s.get('total_input_tokens')) + _count(s.get('total_output_tokens')):,}",
+                "Spend": _money(s.get("total_cost_usd")),
+            }
+            for s in series
+        ]
+        print_table(["Value", "Tokens", "Spend"], rows)
+        return
+    rows = [
+        {
+            "Series": truncate(
+                _single_line(
+                    s.get("display_label")
+                    or s.get("model_key")
+                    or s.get("product")
+                    or s.get("provider")
+                    or "Other"
+                ),
+                48,
+            ),
+            "Spend": _money(s.get("total_cost_usd")),
+        }
+        for s in series
+    ]
+    print_table(["Series", "Spend"], rows)
+
+
+def _tag_value_label(series: dict) -> str:
+    """Core's label, else the value; null is Untagged and "" a value of its own."""
+    if series.get("tag_label"):
+        return str(series["tag_label"])
+    value = series.get("tag_value")
+    if value is None:
+        return "Untagged"
+    return str(value) if value != "" else "(empty)"
+
+
+def _decimal_or_zero(value: object) -> Decimal:
+    try:
+        amount = Decimal(str(value))
+        return amount if amount.is_finite() else Decimal(0)
+    except (InvalidOperation, ValueError, TypeError):
+        return Decimal(0)
+
+
+def _count(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
 def _credits_wallet(billing: dict) -> tuple[bool, object]:
@@ -940,6 +1185,123 @@ def _harness_strategies(
 
 _ACCOUNT_DEFAULTS = "account defaults"
 
+# Router's names for the harnesses whose model `configure model` can set. Router
+# decides everything else: what applies and which workloads are offered.
+_CODING_ROUTING_CLIENTS = {
+    "claude-code": "claude-code",
+    "codex": "codex",
+    "opencode": "opencode",
+    "pi": "pi",
+    "hermes": "hermes",
+}
+
+
+def _fetch_coding_routing(api_key: str, base_url: str, client: str, model: str) -> dict:
+    """Router's own answer for what a harness's requests route by."""
+    from ramp_cli.commands import router  # noqa: PLC0415
+
+    try:
+        response = httpx.get(
+            f"{base_url.rstrip('/')}/client/coding-routing",
+            params={"client": client, "model": model},
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                **router._router_telemetry_headers(),
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        body = response.json()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            raise click.ClickException(
+                "This Ramp Router can't report coding workloads yet."
+            ) from None
+        if exc.response.status_code in (401, 403):
+            raise click.ClickException(
+                "This harness's API key wasn't accepted by Ramp Router. "
+                "Reconnect it with 'ramp router configure'."
+            ) from None
+        raise click.ClickException(
+            "Ramp Router couldn't report coding workloads. Please try again."
+        ) from None
+    except (httpx.HTTPError, ValueError):
+        raise click.ClickException(
+            "Ramp Router couldn't report coding workloads. Please try again."
+        ) from None
+    if not isinstance(body, dict) or not isinstance(body.get("options"), list):
+        raise click.ClickException(
+            "Ramp Router returned an unexpected coding workloads response."
+        )
+    return body
+
+
+def _harness_workloads(harness_client: str) -> dict:
+    """What a harness's requests route by and the workloads it can switch to.
+
+    Router answers both for the harness's key and current model; this only
+    reads the model from the harness's configuration and passes Router's
+    answer through. Choose an option with `configure model`.
+    """
+    from ramp_cli.commands import router  # noqa: PLC0415
+    from ramp_cli.router_ui import harness  # noqa: PLC0415
+
+    client = _CODING_ROUTING_CLIENTS.get(harness_client)
+    if client is None:
+        raise click.UsageError(
+            "This harness chooses models inside its app, so it can't pick a "
+            "workload here."
+        )
+    current = harness.connected(harness_client)
+    model = router._configured_model(harness_client, current.path) or ""
+    body = _fetch_coding_routing(current.key, current.base_url, client, model)
+    return {**body, "harness": harness_client}
+
+
+_WORKLOADS_PATH = "/client/routing-profiles/coding-workloads"
+
+
+def _path_id(value: str) -> str:
+    if not value or any(char in value for char in "/?#\\") or value in (".", ".."):
+        raise click.BadParameter("Invalid workload ID")
+    return value
+
+
+def _strategy_body(
+    capable_model: str | None,
+    efficient_model: str | None,
+    models: tuple[str, ...],
+    raw: str | None,
+) -> dict:
+    """The strategy as Router takes it. Router checks there is exactly one."""
+    body: dict = {}
+    if raw is not None:
+        try:
+            parsed = json.loads(raw)
+        except ValueError as error:
+            raise click.BadParameter(f"--json is not JSON: {error}") from error
+        if not isinstance(parsed, dict):
+            raise click.BadParameter("--json must be an object")
+        body.update(parsed)
+    if capable_model is not None or efficient_model is not None:
+        pair = {"capable_model": capable_model}
+        if efficient_model is not None:
+            pair["efficient_model"] = efficient_model
+        body["switchyard_settings"] = pair
+    if models:
+        body["candidate_models"] = list(models)
+    return body
+
+
+def _show_workload(client: RouterUserClient, workload_id: str, company: bool) -> dict:
+    if not company:
+        return client.get(f"{_WORKLOADS_PATH}/{workload_id}")
+    # Members read company workloads as a list; Router returns each one's settings inline.
+    for workload in client.get("/client/coding-workloads").get("data") or []:
+        if str(workload.get("id")) == workload_id:
+            return workload
+    raise RampCLIError(f"No company workload {workload_id}.", code=4)
+
 
 def _profile_title(profile: dict | None) -> str:
     if profile is None:
@@ -1019,6 +1381,30 @@ def _strategy_source(strategies: dict) -> str:
     return "Account defaults"
 
 
+def usage_payload(
+    service,
+    days: int | None,
+    group_by: str,
+    harness: str | None,
+    last: date | None = None,
+) -> dict:
+    """What `router account usage --output json` prints, read through `service`.
+
+    `router app snapshot` reads several windows through one service, which shares the
+    sign-in, the billing read and the connection pool between them.
+    """
+    result = service.account(days, group_by, harness, last)
+    if not result["session"].get("authenticated"):
+        raise RampCLIError("Not signed in to Router. Run 'ramp router login'.")
+    if "usage_error" in result:
+        raise RampCLIError(result["usage_error"])
+    return {
+        **result["usage"],
+        "credits": _credits(result.get("billing"), result.get("origin")),
+        **_credits_fields(result.get("billing")),
+    }
+
+
 def register_router_user_commands(
     group: click.Group,
     *,
@@ -1027,9 +1413,11 @@ def register_router_user_commands(
     copy_to_clipboard: Callable[[str], bool] = lambda _text: False,
 ) -> None:
     from ramp_cli.commands.router import _AgentChoice  # noqa: PLC0415
+    from ramp_cli.commands.router_app_snapshot import register as app  # noqa: PLC0415
     from ramp_cli.commands.router_connectors import register  # noqa: PLC0415
 
     register(group)
+    app(group)
 
     harness_option = click.option(
         "--harness",
@@ -1096,9 +1484,16 @@ def register_router_user_commands(
     )
     @click.option(
         "--days",
-        type=click.Choice(["1", "3", "7", "30"]),
+        type=click.IntRange(min=1),
         default=None,
-        help="Usage window in days, ending today.",
+        help="Usage window in days, ending today (or on --end).",
+    )
+    @click.option(
+        "--end",
+        "last",
+        type=click.DateTime(["%Y-%m-%d"]),
+        default=None,
+        help="Last day of the window (YYYY-MM-DD) instead of today; needs --days.",
     )
     @click.option(
         "--by",
@@ -1120,29 +1515,30 @@ def register_router_user_commands(
         "request tag: conductor, desktop, and cursor.",
     )
     @click.pass_context
-    def usage(ctx, days, group_by, harness_client):
+    def usage(ctx, days, last, group_by, harness_client):
         # The service imports router commands, so it can't load with this module.
         from ramp_cli.router_ui.service import RouterService  # noqa: PLC0415
 
-        result = RouterService(dict(ctx.obj)).account(
+        if last is not None and days is None:
+            raise click.UsageError("--end needs --days.")
+        data = usage_payload(
+            RouterService(dict(ctx.obj)),
             int(days) if days else None,
             group_by,
             harness_client.lower() if harness_client else None,
+            last.date() if last else None,
         )
-        if not result["session"].get("authenticated"):
-            raise RampCLIError("Not signed in to Router. Run 'ramp router login'.")
-        if "usage_error" in result:
-            raise RampCLIError(result["usage_error"])
-        data = {
-            **result["usage"],
-            "credits": _credits(result.get("billing"), result.get("origin")),
-            **_credits_fields(result.get("billing")),
-        }
         if not _human(ctx):
             _output(ctx, data)
             return
         summary = data["summary"]
-        window = "today" if data["days"] == 1 else f"last {data['days']} days"
+        window = (
+            f"{data['days']} days to {last:%Y-%m-%d}"
+            if last
+            else "today"
+            if data["days"] == 1
+            else f"last {data['days']} days"
+        )
         latency = [
             f"{summary[f'{name}_latency_ms']:,.0f}ms {name}"
             for name in ("p50", "p95")
@@ -1173,6 +1569,183 @@ def register_router_user_commands(
                     for model in data["models"]
                 ],
             )
+
+    @group.command(
+        "ai-spend",
+        help="Show your AI spend and spend limit, cached on disk to spare Router.",
+    )
+    @click.option(
+        "--max-age",
+        type=click.IntRange(min=120),
+        default=1800,
+        show_default=True,
+        help="Seconds a cached read stays fresh before Router is asked again.",
+    )
+    @click.option(
+        "--timeout",
+        type=click.IntRange(1, 120),
+        default=20,
+        show_default=True,
+        help="Seconds to wait for Router in all; it may also give up on Core sooner.",
+    )
+    @click.option(
+        "--start",
+        type=click.DateTime(["%Y-%m-%d"]),
+        default=None,
+        help="First day (YYYY-MM-DD); Core's default window otherwise.",
+    )
+    @click.option(
+        "--end",
+        type=click.DateTime(["%Y-%m-%d"]),
+        default=None,
+        help="Last day (YYYY-MM-DD); needs --start.",
+    )
+    @click.option(
+        "--by",
+        type=click.Choice(sorted(AI_SPEND_GROUPS)),
+        default="product",
+        show_default=True,
+        help="Break spend down by product or key, model, or provider.",
+    )
+    @click.option(
+        "--model",
+        "models",
+        multiple=True,
+        help="Only spend on this model key (repeatable).",
+    )
+    @click.option(
+        "--tag",
+        default=None,
+        help="Break Router spend down by the values of this request tag.",
+    )
+    @click.option(
+        "--tag-filter",
+        "tag_filters",
+        multiple=True,
+        help="With --tag, only requests tagged KEY:VALUE (repeatable).",
+    )
+    @click.option(
+        "--rollup",
+        type=click.Choice(["daily", "weekly", "monthly"]),
+        default=None,
+        help="With --tag, the bucket size (daily by default).",
+    )
+    @click.option(
+        "--tag-keys",
+        is_flag=True,
+        help="List the request tag keys --tag accepts.",
+    )
+    @click.pass_context
+    def ai_spend(
+        ctx,
+        max_age,
+        timeout,
+        start,
+        end,
+        by,
+        models,
+        tag,
+        tag_filters,
+        rollup,
+        tag_keys,
+    ):
+        if end is not None and start is None:
+            raise click.UsageError("--end needs --start.")
+        if start and end and end < start:
+            raise click.UsageError("--end is before --start.")
+        window = {
+            name: value.strftime("%Y-%m-%d")
+            for name, value in (("start_date", start), ("end_date", end))
+            if value
+        }
+        by_given = (
+            ctx.get_parameter_source("by") is not click.core.ParameterSource.DEFAULT
+        )
+        variant = _ai_spend_variant(
+            window, by, by_given, models, tag, tag_filters, rollup, tag_keys
+        )
+        client = _client(ctx)
+        status = client.status()
+        # Without an account id two accounts would share one cache file.
+        if not status["authenticated"] or not (status["user"] or {}).get("id"):
+            raise RampCLIError(
+                "Not signed in to Router. Run 'ramp router login'.", code=4
+            )
+        # Router scopes spend to the sign-in's Ramp business, so the business is
+        # part of the key: the same user signed into another business never sees
+        # the first one's spend. Each window and grouping has its own file.
+        business = client.business()
+        user = (
+            f"{client.namespace}\n{status['user']['id']}"
+            + (f"\n{business}" if business else "")
+            + "".join(f"\n{value}" for value in window.values())
+            + variant["cache_key"]
+        )
+        path = (
+            settings.config_dir()
+            / "router-users"
+            / f"ai-spend-{hashlib.sha256(user.encode()).hexdigest()[:32]}.json"
+        )
+        try:
+            data = json.loads(path.read_text())
+            age = (
+                datetime.now(timezone.utc)
+                - datetime.fromisoformat(data.get("checked_at") or data["fetched_at"])
+            ).total_seconds()
+        except (OSError, ValueError, KeyError, TypeError):
+            data = age = None
+        # An unavailable answer is kept briefly, so a Router or Core deploy shows
+        # up soon while an older Router still isn't asked on every run.
+        if isinstance(data, dict) and data.get("available") is False:
+            max_age = min(max_age, AI_SPEND_UNAVAILABLE_MAX_AGE)
+        if data is None or not 0 <= age < max_age:
+            fetched = {"fetched_at": datetime.now(timezone.utc).isoformat()}
+            code, body, text = 0, None, ""
+            try:
+                response = client.ai_spend(timeout, variant["params"], variant["path"])
+                code = response.status_code
+                text = response.text
+                body = response.json()
+            except ApiError as error:
+                code = error.status_code
+            except (httpx.HTTPError, ValueError, KeyError):
+                pass
+            error = body.get("error") if isinstance(body, dict) else None
+            # A sign-in Router rejects, or one that changed mid-read, is never cached.
+            if (
+                client.status()["user"] != status["user"]
+                or (business is not None and client.business() != business)
+                or code == 401
+                or (code == 403 and error not in AI_SPEND_DENIALS)
+            ):
+                raise RampCLIError(
+                    "Router sign-in changed or expired. Run 'ramp router login'.",
+                    code=4,
+                )
+            reason = _ai_spend_reason(variant, code, error, text)
+            if code == 200 and isinstance(body, dict):
+                data = {
+                    **body,
+                    **variant["echo"],
+                    "available": True,
+                    **fetched,
+                    "stale": False,
+                }
+            elif reason is not None:
+                data = {"available": False, "reason": reason, **fetched, "stale": False}
+            elif "available" not in (data or {}):
+                data = {"checked_at": fetched["fetched_at"]}
+            else:
+                # The file is this variant's own, so a stale copy is never another's.
+                data = {**data, "stale": True, "checked_at": fetched["fetched_at"]}
+            # Failures are written too: wait out --max-age before asking again.
+            _atomic_write(path, data)
+        if "available" not in data:
+            raise RampCLIError(f"{variant['label']} is unavailable.")
+        if not _human(ctx):
+            _output(ctx, data)
+            return
+        _show_ai_spend(variant, data)
 
     @group.command(
         "logout",
@@ -1473,3 +2046,111 @@ def register_router_user_commands(
         client = _client(ctx)
         _owned_key(client, key_id)
         _output(ctx, _key_strategies(client, key_id))
+
+    @keys.command(
+        "workloads",
+        help=(
+            "Show what a connected harness's requests route by (a workload, "
+            "Global settings, or the key's strategy) and the workloads it can "
+            "switch to. Pick one with 'ramp router configure model'."
+        ),
+    )
+    @click.option("--harness", "harness_client", type=_AgentChoice(), required=True)
+    @click.pass_context
+    def workloads(ctx, harness_client):
+        _output(ctx, _harness_workloads(harness_client))
+
+    # Hidden from the curated `ramp router` menu: the menu bar app is its main caller.
+    @group.group(
+        "workloads",
+        hidden=True,
+        help=(
+            "Read, create, and edit your coding workloads. Router validates "
+            "and saves them; these commands pass its answer through."
+        ),
+    )
+    def workload_group():
+        pass
+
+    strategy_options = [
+        click.option(
+            "--capable-model",
+            help="A Switchyard pair's capable model (harder turns).",
+        ),
+        click.option(
+            "--efficient-model",
+            help="A Switchyard pair's efficient model; Router's default when omitted.",
+        ),
+        click.option(
+            "--model",
+            "models",
+            multiple=True,
+            help="A model list entry, in order; repeat for fallbacks.",
+        ),
+        click.option(
+            "--json",
+            "raw",
+            help="The strategy as Router's JSON, for strategies without flags.",
+        ),
+    ]
+
+    def with_strategy(command):
+        for option in reversed(strategy_options):
+            command = option(command)
+        return command
+
+    @workload_group.command(
+        "show",
+        help="Show one workload's settings. --company for a company workload.",
+    )
+    @click.argument("workload_id")
+    @click.option("--company", is_flag=True, help="A company workload (read-only).")
+    @click.pass_context
+    def show_workload(ctx, workload_id, company):
+        _output(ctx, _show_workload(_client(ctx), _path_id(workload_id), company))
+
+    @workload_group.command(
+        "benchmarks",
+        help="List the benchmarks a benchmark workload can weight, as Router offers them.",
+    )
+    @click.pass_context
+    def workload_benchmarks(ctx):
+        _output(ctx, _client(ctx).get("/admin/benchmarks"))
+
+    @workload_group.command(
+        "switchyard-models",
+        help="List the models a Switchyard workload accepts, as Router offers them.",
+    )
+    @click.option(
+        "--capable",
+        help="Only the efficient models this capable model can be paired with.",
+    )
+    @click.pass_context
+    def workload_switchyard_models(ctx, capable):
+        params = {"capable_model": capable} if capable else None
+        path = f"{_WORKLOADS_PATH}/switchyard-models"
+        _output(ctx, _client(ctx).get(path, params=params))
+
+    @workload_group.command("create", help="Create a coding workload of your own.")
+    @click.option(
+        "--slug",
+        required=True,
+        help="What coding agents pick as the model. It can't change later.",
+    )
+    @with_strategy
+    @click.pass_context
+    def create_workload(ctx, slug, capable_model, efficient_model, models, raw):
+        body = {
+            "slug": slug,
+            **_strategy_body(capable_model, efficient_model, models, raw),
+        }
+        _output(ctx, _client(ctx).post(_WORKLOADS_PATH, json=body))
+
+    @workload_group.command("edit", help="Replace one of your workloads' strategy.")
+    @click.argument("workload_id")
+    @with_strategy
+    @click.pass_context
+    def edit_workload(ctx, workload_id, capable_model, efficient_model, models, raw):
+        body = _strategy_body(capable_model, efficient_model, models, raw)
+        path = f"{_WORKLOADS_PATH}/{_path_id(workload_id)}"
+        _output(ctx, _client(ctx).patch(path, json=body))

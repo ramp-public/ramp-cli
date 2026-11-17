@@ -1,11 +1,14 @@
 """Router-native credential lifecycle, isolated from Core and inference keys."""
 
 import base64
+import gzip
+import hashlib
 import io
 import json
 import os
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from threading import Event, Timer
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -19,6 +22,7 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
 from ramp_cli.auth import oauth
+from ramp_cli.auth.refresh import _refresh_lock
 from ramp_cli.client import router_user as auth_client
 from ramp_cli.client.router_user import (
     RouterUserClient,
@@ -30,6 +34,7 @@ from ramp_cli.client.router_user import (
 from ramp_cli.commands import router_user
 from ramp_cli.commands.router import _pick_clients
 from ramp_cli.commands.router_user import _menu_footer
+from ramp_cli.config import settings
 from ramp_cli.errors import EXIT_AUTH_REQUIRED, ApiError, RampCLIError
 from ramp_cli.main import cli
 from ramp_cli.output.style import show_detail_card
@@ -1749,3 +1754,675 @@ def test_a_pasted_callback_address_finishes_a_pending_sign_in():
         assert callback.wait_for_code(1, timeout_message="timed out") == "abc"
     finally:
         callback.shutdown()
+
+
+def _run_ai_spend(monkeypatch, replies, *args, human=False):
+    """Run `account ai-spend` with fake Router replies; returns (result, calls).
+
+    Each call is recorded as (namespace, params, path)."""
+    calls = []
+
+    def ai_spend(self, timeout=20, params=None, path=""):
+        calls.append((self.namespace, params, path))
+        reply = replies[min(len(calls), len(replies)) - 1]
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    monkeypatch.setattr(
+        RouterUserClient,
+        "status",
+        lambda self: {"authenticated": True, "user": {"id": "owner"}},
+    )
+    monkeypatch.setattr(RouterUserClient, "ai_spend", ai_spend)
+    argv = [
+        *(["--human"] if human else ["--output", "json"]),
+        "router",
+        "account",
+        "ai-spend",
+        *args,
+    ]
+    return CliRunner().invoke(cli, argv), calls
+
+
+def _ai_spend_cache():
+    (path,) = (settings.config_dir() / "router-users").glob("ai-spend-*.json")
+    return path
+
+
+def test_ai_spend_passes_core_through_and_reuses_the_private_cache(monkeypatch):
+    body = {"total_cost_usd": "12.5", "spend_limit": None}
+    replies = [httpx.Response(200, json=body)]
+    first, calls = _run_ai_spend(monkeypatch, replies)
+    second, _ = _run_ai_spend(monkeypatch, replies)
+    data = json.loads(first.output)
+    assert data["total_cost_usd"] == "12.5"
+    assert data["available"] is True and data["stale"] is False
+    assert json.loads(second.output) == data
+    assert len(calls) == 1
+    assert _ai_spend_cache().stat().st_mode & 0o777 == 0o600
+    assert _run_ai_spend(monkeypatch, replies, "--max-age", "60")[0].exit_code == 2
+    assert _run_ai_spend(monkeypatch, replies, "--timeout", "0")[0].exit_code == 2
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_ai_spend_unavailable_is_cached(monkeypatch, status):
+    replies = [httpx.Response(status, json={"error": "access_denied"})]
+    result, calls = _run_ai_spend(monkeypatch, replies)
+    assert result.exit_code == 0
+    assert json.loads(result.output)["available"] is False
+    _run_ai_spend(monkeypatch, replies)
+    assert len(calls) == 1
+
+
+def test_ai_spend_serves_a_stale_cache_when_router_fails(monkeypatch):
+    _run_ai_spend(monkeypatch, [httpx.Response(200, json={"total_cost_usd": "1"})])
+    path = _ai_spend_cache()
+    cached = json.loads(path.read_text())
+    path.write_text(json.dumps({**cached, "fetched_at": "2020-01-01T00:00:00+00:00"}))
+    result, calls = _run_ai_spend(monkeypatch, [httpx.Response(503)])
+    again, _ = _run_ai_spend(monkeypatch, [httpx.Response(503)])
+    assert len(calls) == 1  # the failed attempt is remembered for --max-age
+    data = json.loads(result.output)
+    assert data == json.loads(again.output) == json.loads(path.read_text())
+    assert data["stale"] is True and data["total_cost_usd"] == "1"
+    assert data["fetched_at"] == "2020-01-01T00:00:00+00:00"
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        httpx.Response(503),
+        httpx.Response(200, json=[]),
+        httpx.ConnectError("down"),
+        ApiError(502, "bad gateway"),
+    ],
+)
+def test_ai_spend_without_a_cache_fails_on_transient_errors(monkeypatch, reply):
+    result, _ = _run_ai_spend(monkeypatch, [reply])
+    again, calls = _run_ai_spend(monkeypatch, [reply])
+    assert result.exit_code != 0 and again.exit_code != 0
+    assert "AI spend is unavailable" in str(again.exception)
+    assert len(calls) == 0  # the failure is remembered for --max-age
+
+
+def test_ai_spend_request_sends_the_refresh_grant_and_keeps_credentials(monkeypatch):
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        if request.url.path == "/api/auth/cli/session":
+            return token_response()
+        return httpx.Response(404)
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handle), **kwargs),
+    )
+    client = RouterUserClient("http://localhost:3080", no_input=True)
+    client._save(credentials(issued_at=int(time.time())))
+    assert client.ai_spend().status_code == 404
+    # A 404 is only "unsupported" once the session checks out.
+    request, session = requests
+    assert str(request.url) == "http://localhost:3080/api/auth/ramp/ai-spend"
+    assert request.headers["authorization"] == "Bearer refresh-old"
+    assert session.url.path == "/api/auth/cli/session"
+    assert client.status()["authenticated"] is True
+
+
+def test_ai_spend_404_from_a_revoked_grant_asks_for_login(monkeypatch):
+    def handle(request):
+        if request.url.path == "/api/auth/cli/session":
+            return httpx.Response(401, json={"code": "invalid_grant"})
+        return httpx.Response(404)
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handle), **kwargs),
+    )
+    client = RouterUserClient("http://localhost:3080", no_input=True)
+    # A locally fresh access token: no renewal happens before the read.
+    client._save(credentials(issued_at=int(time.time())))
+    with pytest.raises(RampCLIError) as raised:
+        client.ai_spend()
+    assert raised.value.code == 4
+
+
+def test_ai_spend_keeps_each_business_apart(monkeypatch):
+    business = {"value": "biz-a"}
+    monkeypatch.setattr(RouterUserClient, "business", lambda self: business["value"])
+    replies = [httpx.Response(200, json={"total_cost_usd": "1"})]
+    _, calls = _run_ai_spend(monkeypatch, replies)
+    business["value"] = "biz-b"
+    _, calls_b = _run_ai_spend(monkeypatch, replies)
+    # The same user in another business reads again, into its own file.
+    assert len(calls) == len(calls_b) == 1
+    assert (
+        len(list((settings.config_dir() / "router-users").glob("ai-spend-*.json"))) == 2
+    )
+
+
+def test_ai_spend_business_change_mid_read_is_never_cached(monkeypatch):
+    seen = iter(["biz-a", "biz-b"])
+    monkeypatch.setattr(RouterUserClient, "business", lambda self: next(seen))
+    result, _ = _run_ai_spend(
+        monkeypatch, [httpx.Response(200, json={"total_cost_usd": "1"})]
+    )
+    assert result.exception.code == EXIT_AUTH_REQUIRED
+    assert not list((settings.config_dir() / "router-users").glob("ai-spend-*.json"))
+
+
+def test_ai_spend_timeout_is_one_budget_for_renewal_and_the_read(monkeypatch):
+    renewal_budgets = []
+
+    def handle(request):
+        if request.url.path == "/api/auth/cli/token":
+            renewal_budgets.append(request.extensions["timeout"]["read"])
+            time.sleep(0.3)
+            return token_response(issued_at=int(time.time()))
+        time.sleep(0.5)
+        return httpx.Response(200, json={"total_cost_usd": "1"})
+
+    def slow_lock(*args, **kwargs):
+        time.sleep(0.2)
+        return _refresh_lock(*args, **kwargs)
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handle), **kwargs),
+    )
+    monkeypatch.setattr(auth_client, "_refresh_lock", slow_lock)
+    client = RouterUserClient("http://localhost:3080", no_input=True)
+    client._save(credentials())
+    with pytest.raises(httpx.TimeoutException):
+        client.ai_spend(timeout=1)
+    # Renewal only gets what the lock wait left, and the read what renewal left.
+    (budget,) = renewal_budgets
+    assert budget < 0.85
+
+
+def test_ai_spend_gives_up_waiting_for_a_held_refresh_lock(monkeypatch):
+    client = RouterUserClient("http://localhost:3080", no_input=True)
+    client._save(credentials(issued_at=int(time.time())))
+    monkeypatch.setattr(client, "access_token", lambda **_: "access")
+    # Another process holds the lock (a second open file is another holder).
+    with _refresh_lock(client.namespace):
+        started = time.monotonic()
+        with pytest.raises(httpx.TimeoutException):
+            client.ai_spend(timeout=0.3)
+    assert time.monotonic() - started < 2
+
+
+def test_ai_spend_stops_reading_a_body_that_outlasts_the_timeout(monkeypatch):
+    class Drip(httpx.SyncByteStream):
+        def __iter__(self):
+            for _ in range(20):
+                time.sleep(0.05)
+                yield b" "
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(
+            transport=httpx.MockTransport(lambda r: httpx.Response(200, stream=Drip())),
+            **kwargs,
+        ),
+    )
+    client = RouterUserClient("http://localhost:3080", no_input=True)
+    client._save(credentials(issued_at=int(time.time())))
+    started = time.monotonic()
+    with pytest.raises(httpx.TimeoutException):
+        client.ai_spend(timeout=0.3)
+    assert time.monotonic() - started < 0.8
+
+
+def test_ai_spend_returns_at_the_deadline_while_a_request_hangs(monkeypatch):
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(
+            transport=httpx.MockTransport(
+                lambda r: time.sleep(2) or httpx.Response(200)
+            ),
+            **kwargs,
+        ),
+    )
+    client = RouterUserClient("http://localhost:3080", no_input=True)
+    client._save(credentials(issued_at=int(time.time())))
+    started = time.monotonic()
+    with pytest.raises(httpx.TimeoutException):
+        client.ai_spend(timeout=0.3)
+    assert time.monotonic() - started < 0.8
+
+
+def test_ai_spend_decodes_a_compressed_body_once(monkeypatch):
+    body = gzip.compress(json.dumps({"total_cost_usd": "1"}).encode())
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(
+            transport=httpx.MockTransport(
+                lambda r: httpx.Response(
+                    200, headers={"content-encoding": "gzip"}, content=body
+                )
+            ),
+            **kwargs,
+        ),
+    )
+    client = RouterUserClient("http://localhost:3080", no_input=True)
+    client._save(credentials(issued_at=int(time.time())))
+    assert client.ai_spend().json() == {"total_cost_usd": "1"}
+
+
+def test_ai_spend_never_serves_the_cache_past_a_rejected_sign_in(monkeypatch):
+    _run_ai_spend(monkeypatch, [httpx.Response(200, json={"total_cost_usd": "1"})])
+    path = _ai_spend_cache()
+    path.write_text(json.dumps({**json.loads(path.read_text()), "fetched_at": "2020"}))
+    for reply in (
+        httpx.Response(401),
+        httpx.Response(403, json={"code": "RAMP_ACCESS_REVOKED"}),
+        ApiError(401, "unauthorized"),
+        RampCLIError("signed out", code=4),
+    ):
+        result, _ = _run_ai_spend(monkeypatch, [reply])
+        assert result.exception.code == EXIT_AUTH_REQUIRED
+
+
+@pytest.mark.parametrize(
+    ("args", "params", "path", "echo"),
+    [
+        ([], {}, "", {}),
+        (["--by", "product"], {}, "", {}),
+        (
+            ["--by", "model"],
+            {"group_by": "model"},
+            "",
+            {"group_by": "model"},
+        ),
+        (
+            ["--by", "provider", "--start", "2026-10-01"],
+            {"start_date": "2026-10-01", "group_by": "provider"},
+            "",
+            {"group_by": "provider"},
+        ),
+        (
+            ["--model", "gpt-6", "--model", "claude-opus-5-5", "--model", "gpt-6"],
+            {"model_keys": ["claude-opus-5-5", "gpt-6"]},
+            "",
+            {
+                "group_by": "product_or_api_key",
+                "model_keys": ["claude-opus-5-5", "gpt-6"],
+            },
+        ),
+        (
+            ["--by", "model", "--model", "bedrock"],
+            {"group_by": "model", "model_keys": ["bedrock"]},
+            "",
+            {"group_by": "model", "model_keys": ["bedrock"]},
+        ),
+        (
+            ["--tag", "repo"],
+            {"tag_key": "repo", "rollup": "daily"},
+            "/tags/breakdown",
+            {"tag_key": "repo"},
+        ),
+        (
+            [
+                *("--tag", "repo", "--rollup", "weekly"),
+                *("--tag-filter", "harness:codex", "--tag-filter", "env:"),
+            ],
+            {
+                "tag_key": "repo",
+                "rollup": "weekly",
+                "tag_filters": ["env:", "harness:codex"],
+            },
+            "/tags/breakdown",
+            {"tag_key": "repo", "tag_filters": ["env:", "harness:codex"]},
+        ),
+        (
+            ["--tag", "repo", "--tag-filter", "url:https://x"],
+            {"tag_key": "repo", "rollup": "daily", "tag_filters": ["url:https://x"]},
+            "/tags/breakdown",
+            {"tag_key": "repo", "tag_filters": ["url:https://x"]},
+        ),
+        (["--tag-keys"], {}, "/tags/keys", {}),
+    ],
+)
+def test_ai_spend_options_pick_the_request_and_echo_it(
+    monkeypatch, args, params, path, echo
+):
+    body = {"total_cost_usd": "3", "series": []}
+    result, calls = _run_ai_spend(monkeypatch, [httpx.Response(200, json=body)], *args)
+    assert result.exit_code == 0, result.output
+    ((_ns, sent, sent_path),) = calls
+    assert (sent or {}) == params and sent_path == path
+    data = json.loads(result.output)
+    assert {k: data[k] for k in echo} == echo
+    for name in {"group_by", "model_keys", "tag_filters"} - set(echo):
+        assert name not in data
+    assert data["available"] is True and data["total_cost_usd"] == "3"
+
+
+def test_ai_spend_caches_each_variant_apart_and_keeps_the_default_file(monkeypatch):
+    replies = [httpx.Response(200, json={"total_cost_usd": "1"})]
+    variants = [
+        [],
+        ["--by", "model"],
+        ["--by", "provider"],
+        ["--model", "a"],
+        ["--model", "a", "--model", "b"],
+        ["--model", "b", "--model", "a"],  # same models, same entry
+        ["--by", "model", "--model", "a"],
+        ["--tag", "repo"],
+        ["--tag", "repo", "--rollup", "weekly"],
+        ["--tag", "repo", "--tag-filter", "a:1"],
+        ["--tag", "repo", "--tag-filter", "a:1", "--tag-filter", "b:2"],
+        ["--tag", "repo", "--tag-filter", "b:2", "--tag-filter", "a:1"],
+        ["--tag", "harness"],
+        ["--tag-keys"],
+        ["--tag-keys", "--start", "2026-10-01"],
+        ["--by", "product"],  # the default read
+    ]
+    namespaces = set()
+    for args in variants:
+        _, calls = _run_ai_spend(monkeypatch, replies, *args)
+        namespaces.update(namespace for namespace, *_ in calls)
+        _run_ai_spend(monkeypatch, replies, *args)  # served from its own cache
+    files = list((settings.config_dir() / "router-users").glob("ai-spend-*.json"))
+    assert len(files) == len(variants) - 3
+    # The default read still uses the file name #947 gave it.
+    (namespace,) = namespaces
+    digest = hashlib.sha256(f"{namespace}\nowner".encode()).hexdigest()[:32]
+    default = settings.config_dir() / "router-users" / f"ai-spend-{digest}.json"
+    assert default in files
+    assert "group_by" not in json.loads(default.read_text())
+
+
+def test_ai_spend_serves_only_the_same_variants_stale_copy(monkeypatch):
+    def age(path):
+        cached = json.loads(path.read_text())
+        path.write_text(
+            json.dumps({**cached, "fetched_at": "2020-01-01T00:00:00+00:00"})
+        )
+
+    _run_ai_spend(monkeypatch, [httpx.Response(200, json={"total_cost_usd": "1"})])
+    age(_ai_spend_cache())
+    # No copy of its own: the default read's is never served for --by model.
+    result, _ = _run_ai_spend(monkeypatch, [httpx.Response(503)], "--by", "model")
+    assert result.exit_code != 0
+    assert "AI spend by model is unavailable" in str(result.exception)
+    _run_ai_spend(
+        monkeypatch,
+        [httpx.Response(200, json={"total_cost_usd": "2"})],
+        "--tag",
+        "repo",
+        "--max-age",
+        "120",
+    )
+    (path,) = [
+        p
+        for p in (settings.config_dir() / "router-users").glob("ai-spend-*.json")
+        if json.loads(p.read_text()).get("tag_key") == "repo"
+    ]
+    age(path)
+    result, _ = _run_ai_spend(monkeypatch, [httpx.Response(503)], "--tag", "repo")
+    data = json.loads(result.output)
+    assert data["stale"] is True and data["total_cost_usd"] == "2"
+    assert data["tag_key"] == "repo"
+
+
+@pytest.mark.parametrize(
+    ("args", "reply", "reason"),
+    [
+        (["--by", "model"], (400, {"error": "invalid_request"}), "unsupported"),
+        (["--model", "a"], (400, {"error": "invalid_request"}), "unsupported"),
+        (["--tag", "repo"], (400, {"error": "invalid_request"}), "unsupported"),
+        (["--tag", "repo"], (404, {"error": "not_found"}), "unsupported"),
+        (["--tag-keys"], (404, {"error": "not_found"}), "unsupported"),
+        # An older Core rejects the field it doesn't know.
+        (
+            ["--model", "a"],
+            (400, {"error": "Extra inputs are not permitted: model_keys"}),
+            "unsupported",
+        ),
+        ([], (403, {"error": "feature_unavailable"}), "feature_disabled"),
+        (
+            ["--by", "provider"],
+            (403, {"error": "feature_unavailable"}),
+            "feature_disabled",
+        ),
+        (["--tag-keys"], (403, {"error": "feature_unavailable"}), "feature_disabled"),
+        ([], (403, {"error": "access_denied"}), "access_denied"),
+        (["--tag", "repo"], (403, {"error": "access_denied"}), "access_denied"),
+        ([], (404, {"error": "not_found"}), "unavailable"),
+        (["--by", "model"], (404, {"error": "not_found"}), "unavailable"),
+    ],
+)
+def test_ai_spend_maps_what_router_cannot_answer_to_a_reason(
+    monkeypatch, args, reply, reason
+):
+    status, body = reply
+    result, calls = _run_ai_spend(
+        monkeypatch, [httpx.Response(status, json=body)], *args
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert set(data) == {"available", "reason", "fetched_at", "stale"}
+    assert data["available"] is False and data["stale"] is False
+    assert data["reason"] == reason
+    # Remembered for --max-age like any read, under its own variant.
+    again, _ = _run_ai_spend(monkeypatch, [httpx.Response(200, json={})], *args)
+    assert json.loads(again.output) == data
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        httpx.Response(400, json={"error": "invalid_request"}),
+        httpx.Response(400, json={"error": "bad date"}),
+    ],
+)
+def test_ai_spend_default_read_keeps_treating_a_400_as_a_failure(monkeypatch, reply):
+    result, _ = _run_ai_spend(monkeypatch, [reply])
+    assert result.exit_code != 0
+    assert "AI spend is unavailable" in str(result.exception)
+
+
+def test_ai_spend_grouped_read_with_an_unrelated_400_is_a_failure(monkeypatch):
+    reply = httpx.Response(400, json={"error": "start_date is after end_date"})
+    result, _ = _run_ai_spend(monkeypatch, [reply], "--by", "model")
+    assert result.exit_code != 0
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (["--tag", "a", "--tag-keys"], "--tag and --tag-keys"),
+        (["--tag", "a", "--by", "model"], "--tag can't be used with --by"),
+        (["--tag", "a", "--by", "product"], "--tag can't be used with --by"),
+        (["--tag", "a", "--model", "x"], "--tag can't be used with --by"),
+        (["--tag-keys", "--by", "provider"], "--tag-keys can't be used with"),
+        (["--tag-keys", "--model", "x"], "--tag-keys can't be used with"),
+        (["--tag-filter", "a:b"], "--tag-filter needs --tag"),
+        (["--rollup", "weekly"], "--rollup needs --tag"),
+        (["--tag-keys", "--rollup", "weekly"], "--rollup needs --tag"),
+        (["--tag", "a", "--rollup", "all"], "rollup"),
+        (["--tag", "a:b"], "without ':'"),
+        (["--tag", ""], "1 to 128"),
+        (["--tag", "a", "--tag-filter", "nocolon"], "KEY:VALUE"),
+        (["--tag", "a", "--tag-filter", ":value"], "KEY:VALUE"),
+        (["--model", "bad key"], "isn't a model key"),
+        (["--model", "x" * 129], "isn't a model key"),
+        ([arg for i in range(51) for arg in ("--model", f"m{i}")], "at most 50"),
+        (["--by", "harness"], "--by"),
+    ],
+)
+def test_ai_spend_rejects_conflicting_or_malformed_options(monkeypatch, args, message):
+    result, calls = _run_ai_spend(monkeypatch, [httpx.Response(200, json={})], *args)
+    assert result.exit_code == 2
+    assert message in result.output
+    assert calls == []
+
+
+def test_ai_spend_sends_repeated_params_to_the_tag_route(monkeypatch):
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        return httpx.Response(200, json={"tag_key": "repo"})
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handle), **kwargs),
+    )
+    client = RouterUserClient("http://localhost:3080", no_input=True)
+    client._save(credentials(issued_at=int(time.time())))
+    params = {"tag_key": "repo", "tag_filters": ["a:1", "b:"], "rollup": "daily"}
+    assert client.ai_spend(5, params, "/tags/breakdown").json() == {"tag_key": "repo"}
+    (request,) = requests
+    assert request.url.path == "/api/auth/ramp/ai-spend/tags/breakdown"
+    assert request.url.params.get_list("tag_filters") == ["a:1", "b:"]
+    assert request.headers["authorization"] == "Bearer refresh-old"
+
+
+@pytest.mark.parametrize(
+    ("params", "path"),
+    [
+        ({"group_by": "model"}, ""),
+        ({"tag_key": "repo"}, "/tags/breakdown"),
+        ({}, "/tags/keys"),
+    ],
+)
+def test_ai_spend_variants_return_at_the_deadline(monkeypatch, params, path):
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(
+            transport=httpx.MockTransport(
+                lambda r: time.sleep(2) or httpx.Response(200)
+            ),
+            **kwargs,
+        ),
+    )
+    client = RouterUserClient("http://localhost:3080", no_input=True)
+    client._save(credentials(issued_at=int(time.time())))
+    started = time.monotonic()
+    with pytest.raises(httpx.TimeoutException):
+        client.ai_spend(0.3, params, path)
+    assert time.monotonic() - started < 0.8
+
+
+def test_ai_spend_variant_timeout_without_a_cache_fails(monkeypatch):
+    reply = httpx.TimeoutException("AI spend timed out.")
+    result, _ = _run_ai_spend(monkeypatch, [reply], "--tag-keys", "--timeout", "1")
+    assert result.exit_code != 0
+    assert "AI spend tag keys is unavailable" in str(result.exception)
+
+
+def test_ai_spend_human_output_per_variant(monkeypatch):
+    by_model = {
+        "start_date": "2026-10-15",
+        "end_date": "2026-11-13",
+        "total_cost_usd": 3,
+        "series": [
+            {"display_label": "Ramp · small", "total_cost_usd": 1},
+            {"display_label": "Ramp · big", "total_cost_usd": 2},
+        ],
+    }
+    result, _ = _run_ai_spend(
+        monkeypatch, [httpx.Response(200, json=by_model)], "--by", "model", human=True
+    )
+    assert "AI spend by model" in result.output and "$3.00" in result.output
+    assert result.output.index("Ramp · big") < result.output.index("Ramp · small")
+    tag = {
+        "tag_key": "repo",
+        "total_cost_usd": 2,
+        "series": [
+            {"tag_value": "ramp/a", "total_cost_usd": 1, "total_input_tokens": 5},
+            {"tag_value": None, "total_cost_usd": 1, "total_output_tokens": 7},
+        ],
+    }
+    result, _ = _run_ai_spend(
+        monkeypatch, [httpx.Response(200, json=tag)], "--tag", "repo", human=True
+    )
+    assert "ramp/a" in result.output and "Untagged" in result.output
+    keys = {"tag_keys": ["harness", "repo"]}
+    result, _ = _run_ai_spend(
+        monkeypatch, [httpx.Response(200, json=keys)], "--tag-keys", human=True
+    )
+    assert "harness, repo" in result.output
+    result, _ = _run_ai_spend(
+        monkeypatch,
+        [httpx.Response(400, json={"error": "invalid_request"})],
+        "--by",
+        "provider",
+        human=True,
+    )
+    assert result.output.strip() == (
+        "AI spend by provider is unavailable: this Router doesn't support it yet."
+    )
+
+
+@pytest.mark.parametrize("args", [[], ["--by", "model"], ["--tag-keys"]])
+def test_ai_spend_reuses_an_unavailable_record_for_at_most_five_minutes(
+    monkeypatch, args
+):
+    denied = [httpx.Response(403, json={"error": "feature_unavailable"})]
+    fresh = [httpx.Response(200, json={"total_cost_usd": "1"})]
+    _run_ai_spend(monkeypatch, denied, *args)
+    path = _ai_spend_cache()
+    unavailable = json.loads(path.read_text())
+    assert unavailable["available"] is False
+
+    def put(record, seconds):
+        then = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+        path.write_text(json.dumps({**record, "fetched_at": then.isoformat()}))
+
+    # Within five minutes it is reused, unless a smaller --max-age has passed.
+    put(unavailable, 250)
+    result, calls = _run_ai_spend(monkeypatch, fresh, *args, "--max-age", "3600")
+    assert calls == [] and json.loads(result.output)["available"] is False
+    put(unavailable, 250)
+    _, calls = _run_ai_spend(monkeypatch, fresh, *args, "--max-age", "200")
+    assert len(calls) == 1
+    # Past five minutes Router is asked again, even with a larger --max-age.
+    put(unavailable, 301)
+    result, calls = _run_ai_spend(monkeypatch, fresh, *args, "--max-age", "3600")
+    assert len(calls) == 1 and json.loads(result.output)["available"] is True
+    # An available record still lasts the whole --max-age.
+    put(json.loads(path.read_text()), 301)
+    _, calls = _run_ai_spend(monkeypatch, fresh, *args, "--max-age", "3600")
+    assert calls == []
+
+
+def test_ai_spend_tag_table_tells_untagged_from_an_empty_value(monkeypatch):
+    tag = {
+        "tag_key": "repo",
+        "total_cost_usd": 6,
+        "series": [
+            {"tag_value": None, "total_cost_usd": 3},
+            {"tag_value": "", "total_cost_usd": 2},
+            {"tag_value": "ramp/a", "tag_label": "Router app", "total_cost_usd": 1},
+        ],
+    }
+    result, _ = _run_ai_spend(
+        monkeypatch, [httpx.Response(200, json=tag)], "--tag", "repo", human=True
+    )
+    rows = result.output.splitlines()
+    assert sum("Untagged" in row for row in rows) == 1
+    assert sum("(empty)" in row for row in rows) == 1
+    assert "Router app" in result.output
+    assert next(r for r in rows if "Untagged" in r).endswith("$3.00")
+    assert next(r for r in rows if "(empty)" in r).endswith("$2.00")

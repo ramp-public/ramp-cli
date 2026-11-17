@@ -201,6 +201,42 @@ pub struct RepoResolver {
 
 const TTL: Duration = Duration::from_secs(600);
 
+/// Folders where coding agents and Homebrew keep their own state, such as Codex memories and
+/// Claude settings. Agents read them as bookkeeping, not project work, so they never name a
+/// repository and the turn keeps its project repository. RRH_AGENT_STATE_DIRS, colon separated,
+/// replaces the list. Project checkouts that agents create inside these folders still resolve:
+/// anything under a `worktrees` folder (Codex's and Cursor's default), and any linked Git
+/// worktree, which also covers a custom Codex `git-worktree-root`.
+static AGENT_STATE: LazyLock<Vec<String>> = LazyLock::new(|| match std::env::var("RRH_AGENT_STATE_DIRS") {
+    Ok(dirs) => dirs.split(':').filter(|d| !d.is_empty()).map(paths::normpath).collect(),
+    Err(_) => {
+        let home = paths::expanduser("~");
+        let mut dirs: Vec<String> = [".codex", ".claude", ".pi", ".cursor"].iter().map(|d| paths::join(&home, d)).collect();
+        if let Ok(codex_home) = std::env::var("CODEX_HOME") {
+            if codex_home.starts_with('/') {
+                dirs.push(paths::normpath(&codex_home));
+            }
+        }
+        dirs.extend(["/opt/homebrew", "/usr/local/Homebrew", "/home/linuxbrew/.linuxbrew"].map(String::from));
+        dirs
+    }
+});
+
+/// The agent state folder `directory` is in, unless it is in that folder's `worktrees`.
+fn agent_state<'a>(roots: &'a [String], directory: &str) -> Option<&'a str> {
+    roots.iter().map(String::as_str).find(|root| {
+        directory.strip_prefix(root).is_some_and(|rest| {
+            (rest.is_empty() || rest.starts_with('/')) && !(rest == "/worktrees" || rest.starts_with("/worktrees/"))
+        })
+    })
+}
+
+/// A checkout found from inside agent state counts only when it is a linked worktree (`.git` is
+/// a `gitdir:` file) below the state folder; the folder itself or a Homebrew tap clone does not.
+fn agent_worktree(state: &str, root: &str) -> bool {
+    root.strip_prefix(state).is_some_and(|rest| rest.starts_with('/')) && paths::isfile(&paths::join(root, ".git"))
+}
+
 fn cached(cache: &Cache, key: &str, limit: usize, compute: impl FnOnce() -> Option<Resolved>) -> Option<Resolved> {
     if let Some((t, r)) = cache.lock().unwrap().get(key) {
         if t.elapsed() < TTL {
@@ -218,11 +254,19 @@ fn cached(cache: &Cache, key: &str, limit: usize, compute: impl FnOnce() -> Opti
 
 impl RepoResolver {
     pub fn resolve(&self, directory: &str) -> Option<Resolved> {
+        self.resolve_with(&AGENT_STATE, directory)
+    }
+
+    fn resolve_with(&self, agent_roots: &[String], directory: &str) -> Option<Resolved> {
+        let state = agent_state(agent_roots, directory);
         cached(&self.dirs, directory, 50_000, || {
             if !paths::isdir(directory) {
                 return None;
             }
             let (root, git_dir) = find_git_dir(directory)?;
+            if state.is_some_and(|state| !agent_worktree(state, &root)) {
+                return None;
+            }
             cached(&self.roots, &format!("{root}\0{git_dir}"), 10_000, || Some(resolve_root(&root, &git_dir)))
         })
     }
@@ -231,6 +275,43 @@ impl RepoResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_state_excludes_bookkeeping_but_not_worktrees() {
+        let roots = ["/h/.codex".to_string(), "/h/.cursor".to_string(), "/opt/homebrew".to_string()];
+        for dir in ["/h/.codex", "/h/.codex/memories", "/h/.cursor/settings", "/opt/homebrew/Library"] {
+            assert!(agent_state(&roots, dir).is_some(), "{dir}");
+        }
+        for dir in ["/h/.codex/worktrees", "/h/.codex/worktrees/ab12/router", "/h/.cursor/worktrees/x/src", "/h/.codexx", "/h/src"] {
+            assert!(agent_state(&roots, dir).is_none(), "{dir}");
+        }
+    }
+
+    #[test]
+    fn linked_worktrees_inside_agent_state_resolve() {
+        let base = std::env::temp_dir().join(format!("rrh-agent-state-{}", std::process::id()));
+        let state = base.join(".codex");
+        let main = base.join("main");
+        // Agent state that is itself a clone (as Homebrew is) stays excluded.
+        std::fs::create_dir_all(state.join(".git")).unwrap();
+        std::fs::write(state.join(".git/config"), "[remote \"origin\"]\nurl = https://github.com/me/dotcodex\n").unwrap();
+        std::fs::create_dir_all(state.join("memories")).unwrap();
+        // A linked worktree in a custom root under the state folder resolves to its project.
+        std::fs::create_dir_all(main.join(".git/worktrees/wt")).unwrap();
+        std::fs::write(main.join(".git/config"), "[remote \"origin\"]\nurl = git@github.com:ramp/router.git\n").unwrap();
+        std::fs::write(main.join(".git/worktrees/wt/commondir"), "../..\n").unwrap();
+        let worktree = state.join("custom-root/wt");
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+        std::fs::write(worktree.join(".git"), format!("gitdir: {}\n", main.join(".git/worktrees/wt").display())).unwrap();
+
+        let roots = [state.to_str().unwrap().to_string()];
+        let resolver = RepoResolver::default();
+        assert_eq!(resolver.resolve_with(&roots, state.join("memories").to_str().unwrap()), None);
+        assert_eq!(resolver.resolve_with(&roots, state.to_str().unwrap()), None);
+        let resolved = resolver.resolve_with(&roots, worktree.join("src").to_str().unwrap()).unwrap();
+        assert_eq!(resolved.slug, "ramp/router");
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn included_origin_precedes_direct_fallback() {

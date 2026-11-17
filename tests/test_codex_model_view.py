@@ -124,16 +124,17 @@ def test_compact_does_not_unhide_selected_canonical_alias():
     assert selected["visibility"] == "hide"
 
 
-def test_compact_retains_selected_hidden_metadata_after_desktop_cap():
+def test_compact_retains_selected_hidden_metadata_past_desktop_limit():
     catalog = {
         "models": [_row(f"other-{n}") for n in range(110)]
         + [_row("recommended"), _row("saved-hidden", "hide", context_window=999999)]
     }
     compact = router._compact_codex_catalog(catalog, [_recommended()], "saved-hidden")
     bounded = json.loads(router._render_codex_catalog(compact, "saved-hidden", []))
-    assert len(bounded["models"]) == router.CODEX_CATALOG_MODEL_LIMIT
+    assert len(bounded["models"]) == len(compact["models"])
     assert _visible(bounded) == ["recommended"]
     assert bounded["models"][-1]["slug"] == "saved-hidden"
+    assert bounded["models"][-1]["priority"] == -1
     assert bounded["models"][-1]["context_window"] == 999999
     assert bounded["models"][-1]["visibility"] == "hide"
 

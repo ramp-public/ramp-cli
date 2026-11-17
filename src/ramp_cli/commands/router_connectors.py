@@ -159,6 +159,9 @@ def register(group: click.Group) -> None:
     @connectors.command("capabilities")
     @click.pass_context
     def capabilities(ctx):
+        # Connectors only work on the deployments `login --connectors` accepts. Elsewhere
+        # (a dev deploy, a local Router) report none, so callers sign in without them.
+        supported = selected_origin(profile=ctx.obj.get("profile")) in auth.RESOURCES
         _output(
             ctx,
             {
@@ -166,8 +169,10 @@ def register(group: click.Group) -> None:
                 "capabilities": [
                     "router-connectors-mcp-v1",
                     "router-connectors-catalog-v1",
-                ],
-                "harnesses": list(harnesses.HARNESSES),
+                ]
+                if supported
+                else [],
+                "harnesses": list(harnesses.HARNESSES) if supported else [],
             },
         )
 

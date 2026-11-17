@@ -293,6 +293,27 @@ function firstEnvironmentValue(names: string[]): string | undefined {
   return undefined
 }
 
+/**
+ * An environment URL overrides the saved Router only when it names another
+ * deployment. MDM exports the direct URL of the same deployment in every shell;
+ * treating that as an override sends Pi around the local Router agent.
+ */
+export function environmentOverride(
+  environmentBaseUrl: string | undefined,
+  configuredBaseUrl: string | undefined,
+): string | undefined {
+  if (!environmentBaseUrl || !configuredBaseUrl) return environmentBaseUrl
+  try {
+    const environment = normalizeBaseURL(environmentBaseUrl)
+    const configured = normalizeBaseURL(configuredBaseUrl)
+    return configured !== environment && directRouterURL(configured) === environment
+      ? undefined
+      : environmentBaseUrl
+  } catch {
+    return environmentBaseUrl
+  }
+}
+
 /** Read only a small, owner-private regular file without following symlinks. */
 function readPrivateFile(path: string, maxBytes: number): string | undefined {
   let descriptor: number | undefined
@@ -1810,8 +1831,11 @@ async function discoverModels(
 export default async function registerRouterProvider(pi: ExtensionAPI): Promise<void> {
   // The environment still wins, so a one-off run against another stack does
   // not require rewriting the file.
-  const environmentBaseUrl = firstEnvironmentValue(BASE_URL_ENVS)
   const configured = configuredRouter()
+  const environmentBaseUrl = environmentOverride(
+    firstEnvironmentValue(BASE_URL_ENVS),
+    configured.baseUrl,
+  )
   const baseUrl = normalizeBaseURL(
     environmentBaseUrl ?? configured.baseUrl ?? DEFAULT_BASE_URL,
   )
