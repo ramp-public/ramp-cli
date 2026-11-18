@@ -7,8 +7,13 @@ from pathlib import Path
 
 import pytest
 
+from ramp_cli import codex_hook_trust
 from ramp_cli.commands import router
 from ramp_cli.config.settings import config_dir
+
+
+def _codex_trust_unavailable(*_args, **_kwargs):
+    raise codex_hook_trust.TrustUnavailable("not in tests")
 
 
 @pytest.fixture(autouse=True)
@@ -38,6 +43,11 @@ def isolated_config(tmp_path: Path, request: pytest.FixtureRequest):
     monkeypatch.setattr(
         "ramp_cli.commands.codex_default.builtin_default_model",
         lambda *_args, **_kwargs: None,
+    )
+    # Trusting Router's Codex hooks starts the developer's real `codex
+    # app-server`. Tests that exercise trust supply their own Codex.
+    monkeypatch.setattr(
+        "ramp_cli.codex_hook_trust.trust_router_hooks", _codex_trust_unavailable
     )
     # Router's fallback rides on the coding-agent settings read; tests that
     # exercise it set their own answer.

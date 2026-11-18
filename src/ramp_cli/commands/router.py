@@ -49,6 +49,7 @@ from ramp_cli import (
     admin_defaults,
     claude_cowork,
     codex_desktop,
+    codex_hook_trust,
     hermes_agent,
     json5_edit,
 )
@@ -192,6 +193,13 @@ CODEX_ADMIN_DEFAULT_MODEL_STATE_KEY = "admin_default_model"
 # its Stop event mode; the same digest-or-user-managed contract as the
 # SessionStart group's CODEX_SYNC_HOOK_STATE_KEY.
 CODEX_STOP_SYNC_HOOK_STATE_KEY = "stop_sync_hook"
+# Shown in Codex's hook review list and while each hook runs.
+CODEX_COST_HOOK_LABEL = "Ramp Router: showing this turn's cost"
+CODEX_SYNC_HOOK_LABEL = "Ramp Router: refreshing model settings"
+CODEX_STOP_SYNC_HOOK_LABEL = "Ramp Router: restoring the default model"
+# The hooks.state entries configure trusted, as {key: trusted_hash}, so
+# unconfigure removes exactly those.
+CODEX_HOOK_TRUST_STATE_KEY = "trusted_hooks"
 # Codex Desktop reads only the first 100 catalog rows by priority, for its
 # picker and some per-model checks. Codex core reads every row.
 CODEX_CATALOG_MODEL_LIMIT = 100
@@ -749,6 +757,11 @@ _OWNED_CODEX_ROOT_KEY = re.compile(
 _CODEX_STOP_HOOK_TABLE = re.compile(
     r"^\s*\[\[\s*(?:hooks|\"hooks\"|'hooks')\s*\.\s*"
     r"(?:Stop|\"Stop\"|'Stop')\s*]]\s*(?:#.*)?$"
+)
+# The bare [hooks.state] header Codex writes above its trust entries.
+_CODEX_HOOK_STATE_TABLE = re.compile(
+    r"^\s*\[\s*(?:hooks|\"hooks\"|'hooks')\s*\.\s*"
+    r"(?:state|\"state\"|'state')\s*]\s*(?:#.*)?$"
 )
 # A SessionStart group is not ours by header alone; see
 # _is_recorded_sync_hook_chunk.
@@ -7158,6 +7171,8 @@ def _unconfigure_codex(path: Path) -> None:
             f"Could not read Ramp Router setup state from {state_path}."
         ) from None
 
+    # The trust configure recorded goes with the hooks it was recorded for.
+    existing = _without_codex_hook_trust(existing, _recorded_codex_hook_trust(state))
     chunks = _drop_recorded_sync_hook_chunk(
         _config_chunks(existing), recorded_sync_hook
     )
@@ -8232,7 +8247,7 @@ def _codex_cost_hook_command(home: Path, base_url: str | None = None) -> str:
 def _render_codex_cost_hook_group(command: str) -> str:
     """Render the [[hooks.Stop]] matcher group that registers the cost hook."""
     return f"""[[hooks.Stop]]
-hooks = [{{ type = "command", command = {json.dumps(command)} }}]
+hooks = [{{ type = "command", command = {json.dumps(command)}, statusMessage = {json.dumps(CODEX_COST_HOOK_LABEL)} }}]
 """
 
 
@@ -8349,7 +8364,7 @@ def _render_codex_sync_hook_group(command: str) -> str:
     """
     return f"""[[hooks.SessionStart]]
 matcher = "startup|resume"
-hooks = [{{ type = "command", command = {json.dumps(command)} }}]
+hooks = [{{ type = "command", command = {json.dumps(command)}, statusMessage = {json.dumps(CODEX_SYNC_HOOK_LABEL)} }}]
 """
 
 
@@ -8363,7 +8378,7 @@ def _render_codex_stop_sync_hook_group(command: str) -> str:
     the SessionStart group and the cost hook.
     """
     return f"""[[hooks.Stop]]
-hooks = [{{ type = "command", command = {json.dumps(command)} }}]
+hooks = [{{ type = "command", command = {json.dumps(command)}, statusMessage = {json.dumps(CODEX_STOP_SYNC_HOOK_LABEL)} }}]
 """
 
 
@@ -10524,6 +10539,8 @@ def _codex_hooks_awaiting_trust(path: Path) -> list[str]:
         return []
     state = hooks.get("state")
     state = state if isinstance(state, dict) else {}
+    # Codex keys entries by the resolved path; a symlinked home differs.
+    key_paths = dict.fromkeys((str(path), str(path.resolve())))
     awaiting = []
     for event_table, snake, event in (
         ("SessionStart", "session_start", None),
@@ -10542,10 +10559,191 @@ def _codex_hooks_awaiting_trust(path: Path) -> list[str]:
                     command, event
                 ):
                     continue
-                record = state.get(f"{path}:{snake}:{group_index}:{handler_index}")
-                if not (isinstance(record, dict) and record.get("trusted_hash")):
+                records = (
+                    state.get(f"{key_path}:{snake}:{group_index}:{handler_index}")
+                    for key_path in key_paths
+                )
+                if not any(
+                    isinstance(record, dict) and record.get("trusted_hash")
+                    for record in records
+                ):
                     awaiting.append(event_table)
     return awaiting
+
+
+def _trust_codex_router_hooks(
+    path: Path,
+    codex_executable: str | os.PathLike[str] | None,
+    cost_hook_command: str | None,
+    sync_hook_command: str | None,
+) -> None:
+    """Record Codex trust for the hooks this configure wrote. Caller holds the lock.
+
+    Choosing to configure Router for Codex is the consent to its hooks, so
+    they are trusted here rather than left for a review prompt in the Codex
+    CLI or app. Only the exact commands Router wrote are trusted, and a
+    user-authored sync group stays the user's to review. The entries are
+    recorded so unconfigure removes them with the hooks; entries a previous
+    configure recorded that no longer name a Router hook are removed now.
+    Best effort: when Codex cannot be asked, the hooks keep their current
+    trust and configure reports them as awaiting review.
+    """
+    state_path = path.parent / "ramp-router-state.json"
+    try:
+        receipt = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return
+    if not isinstance(receipt, dict):
+        return
+    commands, retained = set(), set()
+    if cost_hook_command is not None:
+        commands.add(("stop", cost_hook_command))
+    elif router_settings.harness_widget_enabled():
+        # A skipped download keeps the registered hook, and the trust already
+        # recorded for it, but grants none it did not have.
+        retained = {("stop", c) for c in _retained_codex_cost_hook_commands(path)}
+    if (
+        sync_hook_command is not None
+        and receipt.get(CODEX_SYNC_HOOK_STATE_KEY) != SYNC_HOOK_USER_MANAGED
+    ):
+        commands.add(("sessionStart", sync_hook_command))
+    stop_sync_command = session_sync_hook_command(
+        CODEX_CLIENT_NAME, SYNC_HOOK_STOP_EVENT
+    )
+    if (
+        stop_sync_command is not None
+        and receipt.get(CODEX_STOP_SYNC_HOOK_STATE_KEY) != SYNC_HOOK_USER_MANAGED
+    ):
+        commands.add(("stop", stop_sync_command))
+    recorded = _recorded_codex_hook_trust(receipt)
+    try:
+        trusted = codex_hook_trust.trust_router_hooks(
+            codex_executable, path, commands, retained, recorded
+        )
+    except codex_hook_trust.TrustUnavailable:
+        return
+    stale = {
+        key: digest for key, digest in recorded.items() if trusted.get(key) != digest
+    }
+    if stale:
+        try:
+            config = path.read_text(encoding="utf-8")
+            updated = _without_codex_hook_trust(config, stale)
+            if updated != config:
+                tomllib.loads(updated)
+                _write_private_file(path, updated)
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+            # Kept in the receipt below, so unconfigure retries the removal.
+            trusted = {**stale, **trusted}
+    if trusted != recorded:
+        receipt[CODEX_HOOK_TRUST_STATE_KEY] = trusted
+        try:
+            _write_private_file(state_path, json.dumps(receipt, indent=2) + "\n")
+        except OSError:
+            pass
+
+
+def _retained_codex_cost_hook_commands(path: Path) -> set[str]:
+    """The commands of the cost-hook Stop groups configure kept as they were."""
+    try:
+        config = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return set()
+    return {
+        command
+        for chunk in _config_chunks(config)
+        if _is_owned_cost_hook_chunk(chunk)
+        for group in tomllib.loads("".join(chunk))["hooks"]["Stop"]
+        for command in _hook_group_commands(group)
+        if command is not None
+    }
+
+
+def _recorded_codex_hook_trust(receipt: dict) -> dict[str, str]:
+    recorded = receipt.get(CODEX_HOOK_TRUST_STATE_KEY)
+    if not isinstance(recorded, dict):
+        return {}
+    return {
+        key: digest
+        for key, digest in recorded.items()
+        if isinstance(key, str) and isinstance(digest, str)
+    }
+
+
+_TRUSTED_HASH_LINE = re.compile(r"^\s*trusted_hash\s*=")
+
+
+def _without_codex_hook_trust(config: str, recorded: dict[str, str]) -> str:
+    """Drop the hooks.state tables configure trusted, and only those.
+
+    A table goes only when its key is one configure recorded and its
+    trusted_hash is still the one recorded: a hash the user re-trusted for a
+    hook they changed is theirs. Other settings in the table, such as
+    `enabled = false`, stay with just the trusted_hash removed. Codex writes
+    each entry as its own [hooks.state."<key>"] table; an emptied
+    [hooks.state] header goes too.
+    """
+    if not recorded:
+        return config
+    chunks = _config_chunks(config)
+    kept = []
+    removed = False
+    for chunk in chunks:
+        try:
+            parsed = tomllib.loads("".join(chunk)) if chunk else {}
+        except tomllib.TOMLDecodeError:
+            kept.append(chunk)
+            continue
+        hooks = parsed.get("hooks")
+        if not isinstance(hooks, dict):
+            kept.append(chunk)
+            continue
+        state = hooks.get("state")
+        if (
+            set(parsed) == {"hooks"}
+            and set(hooks) == {"state"}
+            and isinstance(state, dict)
+            and len(state) == 1
+            and all(
+                isinstance(entry, dict)
+                and key in recorded
+                and recorded[key] == entry.get("trusted_hash")
+                for key, entry in state.items()
+            )
+        ):
+            # Only the trust is ours; a user's `enabled = false` stays.
+            ((key, entry),) = state.items()
+            changed = True
+            if set(entry) != {"trusted_hash"}:
+                stripped = [
+                    line for line in chunk if not _TRUSTED_HASH_LINE.match(line)
+                ]
+                rest = {k: v for k, v in entry.items() if k != "trusted_hash"}
+                try:
+                    ok = tomllib.loads("".join(stripped)) == {
+                        "hooks": {"state": {key: rest}}
+                    }
+                except tomllib.TOMLDecodeError:
+                    ok = False
+                kept.append(stripped if ok else chunk)
+                changed = ok
+            removed = removed or changed
+            continue
+        kept.append(chunk)
+    try:
+        remaining = tomllib.loads("".join("".join(chunk) for chunk in kept) or "\n")
+    except tomllib.TOMLDecodeError:
+        return config
+    remaining_hooks = remaining.get("hooks")
+    if not (isinstance(remaining_hooks, dict) and remaining_hooks.get("state")):
+        kept = [
+            chunk
+            for chunk in kept
+            if not (chunk and _CODEX_HOOK_STATE_TABLE.match(chunk[0]))
+        ]
+    if not removed:
+        return config
+    return "".join("".join(chunk) for chunk in kept).rstrip() + "\n"
 
 
 def _codex_hook_trust_note_lines(path: Path) -> list[str]:
@@ -12688,7 +12886,7 @@ def _configure_codex(
             raise click.ClickException(
                 "The Codex connection changed during model discovery. Reload before saving."
             )
-        return _configure_codex_in_lock(
+        configured = _configure_codex_in_lock(
             path,
             api_key,
             models,
@@ -12706,6 +12904,14 @@ def _configure_codex(
             builtin_default=builtin_default,
             router_fallback=router_fallback,
         )
+        if not strict_model:
+            # A model-only change leaves Router's hooks as they were, so
+            # their trust stays as it was too. Reconciling here would see
+            # no cost or SessionStart hook and drop their trust as stale.
+            _trust_codex_router_hooks(
+                path, codex_executable, cost_hook_command, sync_hook_command
+            )
+        return configured
 
 
 def _configure_codex_in_lock(
