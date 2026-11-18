@@ -278,6 +278,9 @@ def client_credentials(base_url: str, api_key: str) -> tuple[str, str]:
 
 
 CURSOR_BINDING_FILENAME = "router-agent-cursor.json"
+# Names a key setup created but never got into Cursor, so the next Cursor
+# setup reuses it instead of creating another key.
+CURSOR_PENDING_FILENAME = "router-cursor-pending-key.json"
 
 
 def cursor_binding_path() -> Path:
@@ -305,7 +308,7 @@ def bind_cursor(base_url: str, api_key: str, user_dir: Path) -> None:
         if health is None or api_key.startswith(router_local_auth.TOKEN_PREFIX):
             unbind_cursor()
             return
-        upstream = urllib.parse.urlsplit(unwrap_url(base_url)).netloc.lower()
+        upstream = router_upstream(base_url)
         directory = config_dir() / "router-agent-credentials"
         token = router_local_auth.register(directory, health, upstream, api_key)
         binding = {
@@ -332,10 +335,79 @@ def bind_cursor(base_url: str, api_key: str, user_dir: Path) -> None:
 
 def unbind_cursor() -> None:
     """Stop the agent's Cursor uploads; never raises."""
+    clear_pending_cursor_key()
     try:
         cursor_binding_path().unlink(missing_ok=True)
     except OSError as exc:
         _log(f"Could not remove the Cursor binding: {exc!r}")
+
+
+def _cursor_pending_path() -> Path:
+    return config_dir() / CURSOR_PENDING_FILENAME
+
+
+def mark_cursor_key_pending(base_url: str, api_key: str) -> bool:
+    """Remember a key setup created that never reached Cursor; never raises.
+
+    The key is kept the way the binding keeps Cursor's, as a credential file
+    under router-agent-credentials/; the marker only names that file. No
+    binding is written, so the agent uploads nothing for Cursor with a key
+    Cursor doesn't have. Returns False when the key can't be kept.
+    """
+    try:
+        health = health_token(create=True)
+        if health is None or api_key.startswith(router_local_auth.TOKEN_PREFIX):
+            return False
+        upstream = urllib.parse.urlsplit(unwrap_url(base_url)).netloc.lower()
+        directory = config_dir() / "router-agent-credentials"
+        token = router_local_auth.register(directory, health, upstream, api_key)
+        credential = router_local_auth.credential_path(directory, token).stem
+        router_local_auth.write_private(
+            _cursor_pending_path(),
+            json.dumps({"upstream": upstream, "credential": credential}),
+        )
+        return True
+    except Exception as exc:
+        _log(f"Could not record the pending Cursor key: {exc!r}")
+        return False
+
+
+def clear_pending_cursor_key() -> None:
+    """Forget the pending Cursor key; never raises."""
+    try:
+        _cursor_pending_path().unlink(missing_ok=True)
+    except OSError as exc:
+        _log(f"Could not remove the pending Cursor key: {exc!r}")
+
+
+def pending_cursor_key(base_url: str) -> str | None:
+    """The key an unfinished Cursor setup created for this Router, or None.
+
+    Reading leaves it pending: it is forgotten once Cursor setup writes it,
+    hands it over in paste-in steps, Router rejects it, or Cursor is unbound.
+    """
+    path = _cursor_pending_path()
+    if not path.exists() and not path.is_symlink():
+        return None
+    try:
+        marker = json.loads(router_local_auth.read_private(path))
+        upstream = urllib.parse.urlsplit(unwrap_url(base_url)).netloc.lower()
+        if (
+            not isinstance(marker, dict)
+            or marker.get("upstream") != upstream
+            or not _cursor_credential_ok(upstream, marker.get("credential"))
+        ):
+            return None
+        record = json.loads(
+            router_local_auth.read_private(
+                config_dir()
+                / "router-agent-credentials"
+                / f"{marker['credential']}.json"
+            )
+        )
+        return record["api_key"]
+    except Exception:
+        return None
 
 
 def _read_cursor_binding() -> dict | None:
@@ -367,6 +439,36 @@ def cursor_bound() -> bool:
         )
     except Exception:
         return False
+
+
+def cursor_bound_api_key() -> str | None:
+    """The Router key the Cursor binding names, or None; never raises."""
+    try:
+        binding = _read_cursor_binding()
+        upstream = binding.get("upstream") if binding else None
+        digest = binding.get("credential") if binding else None
+        if not isinstance(upstream, str) or not _cursor_credential_ok(upstream, digest):
+            return None
+        path = config_dir() / "router-agent-credentials" / f"{digest}.json"
+        key = json.loads(router_local_auth.read_private(path)).get("api_key")
+    except Exception:
+        return None
+    return key if isinstance(key, str) and key else None
+
+
+def router_upstream(base_url: str) -> str:
+    """The Router host a base URL reaches, as the Cursor binding records it."""
+    return urllib.parse.urlsplit(unwrap_url(base_url)).netloc.lower()
+
+
+def cursor_bound_upstream() -> str | None:
+    """The Router host the Cursor binding's key belongs to; never raises."""
+    try:
+        binding = _read_cursor_binding()
+    except Exception:
+        return None
+    upstream = binding.get("upstream") if binding else None
+    return upstream if isinstance(upstream, str) and upstream else None
 
 
 def _cursor_bound_hostname() -> str | None:

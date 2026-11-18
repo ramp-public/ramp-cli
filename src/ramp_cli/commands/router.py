@@ -28,12 +28,14 @@ from contextlib import (
     redirect_stderr,
 )
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from dataclasses import field as dataclass_field
+from dataclasses import replace as dataclass_replace
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from functools import lru_cache
 from pathlib import Path, PurePath
-from typing import Literal
+from typing import Literal, NoReturn
 from urllib.parse import urlsplit
 from urllib.request import url2pathname
 
@@ -59,6 +61,9 @@ from ramp_cli.commands import (
     codex_default,
     conductor,
     cursor,
+    cursor_models,
+    cursor_variants,
+    router_aliases,
     router_credentials,
     router_picks,
     router_repo,
@@ -91,7 +96,7 @@ from ramp_cli.commands.router_user_strategies import (
     use_account_strategies,
 )
 from ramp_cli.config.settings import config_dir
-from ramp_cli.errors import RampCLIError
+from ramp_cli.errors import EXIT_RUNTIME, RampCLIError
 from ramp_cli.output.formatter import (
     print_agent_json,
     print_json,
@@ -330,6 +335,14 @@ class RouterModelMetadata:
     max_output_tokens: int
     tool_calls: bool | None
     long_context_token_threshold: int | None = None
+    # Set on a caller alias row (its top-level router_alias): its candidates,
+    # each as the bare model and as provider:provider_model, for
+    # router_aliases.candidate_routes_model. An alias routes models; it
+    # isn't one of its own.
+    alias_candidates: tuple[str, ...] | None = None
+    # Set on a caller alias row that pins an effort (its top-level
+    # router_alias.reasoning_effort): an effort variant, not a model.
+    pinned_effort: str = ""
 
 
 def _model_metadata(raw: object, identifier: str) -> RouterModelMetadata:
@@ -1598,11 +1611,79 @@ def _validate_deployment_url(
     return value
 
 
+@dataclass(frozen=True)
+class _CursorOptions:
+    """The Cursor model-list and effort-variant flags, as typed."""
+
+    models_view: str | None = None
+    effort_variants: tuple[tuple[str, tuple[str, ...]], ...] | None = None
+    no_effort_variants: bool = False
+
+    def given(self) -> bool:
+        return self.models_view is not None
+
+    def variants_given(self) -> bool:
+        return self.effort_variants is not None or self.no_effort_variants
+
+
+def _cursor_options(
+    cursor_models_view: str | None,
+    effort_variants: tuple[str, ...] = (),
+    no_effort_variants: bool = False,
+) -> _CursorOptions:
+    """Check the flags' shapes before any browser or network work."""
+    if effort_variants and no_effort_variants:
+        raise click.UsageError(
+            "--effort-variants cannot be combined with --no-effort-variants."
+        )
+    variants = (
+        tuple(cursor_variants.parse_variant_flags(effort_variants))
+        if effort_variants
+        else None
+    )
+    return _CursorOptions(
+        models_view=cursor_models_view.lower() if cursor_models_view else None,
+        effort_variants=variants,
+        no_effort_variants=no_effort_variants,
+    )
+
+
+def _cursor_model_options(command):
+    """The flags `configure cursor` and `ramp router cursor` share."""
+    command = click.option(
+        "--no-effort-variants",
+        is_flag=True,
+        help="Remove the effort-variant names this machine set up.",
+    )(command)
+    command = click.option(
+        "--effort-variants",
+        metavar="MODEL=LEVEL[,LEVEL]",
+        multiple=True,
+        help="Add Cursor model names that pin a higher effort, such as "
+        "ramp-opus-5-5-high, for Claude models and Router's recommended GPT "
+        "models. Repeatable; MODEL is claude-opus-5-5, ramp-opus-5-5, "
+        "opus-5-5 or gpt-6-luna. Saved for later runs.",
+    )(command)
+    return click.option(
+        "--cursor-models",
+        "cursor_models_view",
+        type=click.Choice(
+            (cursor_models.VIEW_COMPACT, cursor_models.VIEW_ALL), case_sensitive=False
+        ),
+        help="Models Cursor lists: Router's recommended list (compact) or all "
+        "models. Saved for later runs. Without it, a non-interactive run keeps "
+        "the saved choice (all models on a first run) and removes nothing; "
+        "with it, it also removes models setup added that the choice leaves "
+        "out, without asking. Models you added yourself are never removed.",
+    )(command)
+
+
 @router_group.command(
     "configure",
     help=(
         "Configure coding agents and desktop apps. Omit names to choose "
-        "interactively, or configure all automatic integrations without a terminal."
+        "interactively, or configure all automatic integrations without a terminal. "
+        "A Cursor-only run that sets nothing up says why and exits 1."
     ),
 )
 @click.argument(
@@ -1693,6 +1774,7 @@ def _validate_deployment_url(
     callback=_validate_deployment_url,
     help="Router web app origin for browser setup and dashboard links (HTTPS).",
 )
+@_cursor_model_options
 @click.pass_context
 def router_configure(
     ctx: click.Context,
@@ -1710,7 +1792,21 @@ def router_configure(
     pi_models: str | None,
     base_url: str | None,
     ui_url: str | None,
+    cursor_models_view: str | None = None,
+    effort_variants: tuple[str, ...] = (),
+    no_effort_variants: bool = False,
 ) -> None:
+    cursor_options = _cursor_options(
+        cursor_models_view, effort_variants, no_effort_variants
+    )
+    if (
+        cursor_options.given() or cursor_options.variants_given()
+    ) and CURSOR_CLIENT not in clients:
+        raise click.UsageError(
+            "--cursor-models, --effort-variants and --no-effort-variants apply "
+            "to Cursor: "
+            "'ramp router configure cursor --cursor-models compact|all'."
+        )
     if confirm_browser and no_browser:
         raise click.UsageError(
             "--confirm-browser cannot be combined with --no-browser."
@@ -1772,6 +1868,8 @@ def router_configure(
         and not confirm_browser
         and not connectors
         and not enable_agent
+        and not cursor_options.given()
+        and not cursor_options.variants_given()
         and (not clients or (api_key is None and setup_file is None))
         and router_ui.launch(
             ctx,
@@ -1807,11 +1905,13 @@ def router_configure(
         confirm_browser=confirm_browser,
         connectors=connectors,
         enable_agent=enable_agent,
+        cursor_options=cursor_options,
     )
+    results = None
     if confirm_browser:
         _run_mdm_configure(run)
     else:
-        run()
+        results = run()
     if enable_agent:
         ctx.invoke(router_agent_enable, helper_port=None)
         tagging = router_repo.status()
@@ -1823,6 +1923,99 @@ def router_configure(
             raise click.ClickException(
                 "Router is configured, but the agent is not running or a harness could not be migrated. Check 'ramp router agent status' and rerun configure --enable-agent."
             )
+        cursor_result = next(
+            (result for result in results or [] if result["client"] == CURSOR_CLIENT),
+            None,
+        )
+        if cursor_result is not None:
+            click.echo(_cursor_enable_agent_summary(cursor_result))
+
+
+def _cursor_enable_agent_summary(result: dict) -> str:
+    """The last line of configure cursor --enable-agent: done, or what's left."""
+    if result.get("settings_written"):
+        return f"{_cursor_written_line(result, tagging=True)} {_CURSOR_ACCOUNT_LINE}"
+    if result.get("steps_shown") is False:
+        return (
+            "Cursor: repository tagging is on, but Cursor isn't set up yet (see above)."
+        )
+    return (
+        "Cursor: repository tagging is on. Finish the steps above to use Router "
+        "in Cursor."
+    )
+
+
+_CURSOR_ACCOUNT_LINE = (
+    "If you sign in to a different Cursor account, run "
+    "'ramp router configure cursor' again."
+)
+
+
+def _cursor_written_line(result: dict, *, tagging: bool = False) -> str:
+    """What to do after setup wrote Cursor's settings, in one line."""
+    model = result.get("suggested_model")
+    pick = f"pick {model}" if model else "pick a Router model"
+    reopened = result.get("reopened")
+    tag = ", with repository tagging on" if tagging else ""
+    if reopened:
+        status = (
+            "force quit, set up, and reopened"
+            if result.get("quit_outcome") == cursor.QUIT_FORCED
+            else "set up and reopened"
+        )
+        return f"Cursor: {status}{tag}. In a new chat on This Mac, {pick}."
+    status = f"set up{tag}"
+    if reopened is False:
+        status += ", but it couldn't be reopened"
+    return f"Cursor: {status}. Open Cursor, and in a new chat on This Mac, {pick}."
+
+
+def _cursor_added_line(result: dict) -> str | None:
+    """Which model names this run added to Cursor; None when it added none."""
+    names = result.get("model_names_added") or []
+    if not names:
+        return None
+    if len(names) <= 4:
+        return f"Cursor: added {_human_join(names)}."
+    suggested = result.get("suggested_model")
+    example = suggested if suggested in names else names[0]
+    return f"Cursor: added {len(names)} Router models, including {example}."
+
+
+def _cursor_removed_line(result: dict) -> str | None:
+    """Which model names this run took out of Cursor; None when none."""
+    names = result.get("model_names_removed") or []
+    if not names:
+        return None
+    if len(names) <= 4:
+        return f"Cursor: removed {_human_join(names)}."
+    aliases = len(set(names) & set(result.get("alias_names_removed") or []))
+    return (
+        f"Cursor: removed {_models_and_aliases(len(names) - aliases, aliases)} "
+        "setup had added."
+    )
+
+
+def _cursor_scope_line(result: dict) -> str | None:
+    """Which model list Cursor now shows, and how many models that is."""
+    scope = result.get("model_scope")
+    count = result.get("models_in_scope")
+    if not isinstance(scope, dict) or not isinstance(count, int):
+        return None
+    label = "model" if count == 1 else "models"
+    line = f"Cursor lists {result.get('model_scope_label')}: {count} Router {label}"
+    aliases = result.get("aliases_in_scope")
+    if isinstance(aliases, int) and aliases:
+        line += f", plus {aliases} of your aliases"
+    return line + "."
+
+
+def _echo_cursor_not_set_up(result: dict) -> None:
+    """Why Cursor wasn't set up, on a run that shows no paste-in steps."""
+    click.echo(result["fallback_message"])
+    if result.get("reopened"):
+        click.echo("Cursor: reopened.")
+    click.echo(_CURSOR_BY_HAND)
 
 
 def _run_mdm_configure(run: Callable[[], None]) -> None:
@@ -1924,7 +2117,9 @@ def _run_configure(
     confirm_browser: bool = False,
     connectors: bool = False,
     enable_agent: bool = False,
-) -> None:
+    cursor_options: _CursorOptions | None = None,
+) -> list[dict] | None:
+    cursor_options = cursor_options or _CursorOptions()
     # Click has already copied any configured value into api_key. Drop the
     # secret from the environment before anything here spawns a child: the
     # workspace's detection probes, the Cowork availability probe behind the
@@ -1942,6 +2137,8 @@ def _run_configure(
         and not reuse_existing_key
         and not connectors
         and not enable_agent
+        and not cursor_options.given()
+        and not cursor_options.variants_given()
         and (
             not clients
             or api_key is None
@@ -2229,6 +2426,54 @@ def _run_configure(
         # Named on a host that cannot run Conductor: fail before a browser
         # opens or a key is created for a setup that cannot be written.
         raise click.ClickException("Conductor is only available on macOS.")
+    # Which models Cursor lists is asked before a browser opens or a key is
+    # created, so cancelling it leaves nothing behind.
+    cursor_scope = (
+        _requested_cursor_scope(
+            cursor_options,
+            ask=(lambda question: question())
+            if _can_prompt(ctx, fmt) and not confirm_browser
+            else None,
+        )
+        if CURSOR_CLIENT in clients
+        else None
+    )
+    # Cursor's settings can be written only while it is closed, so ask before
+    # a browser opens or a key is created.
+    cursor_quit = _offer_to_quit_cursor(ctx, fmt, clients, unattended=confirm_browser)
+    # A macOS terminal run shows no paste-in steps for Cursor: setup either
+    # finishes or says how to run it again.
+    cursor_quiet = (
+        CURSOR_CLIENT in clients
+        and sys.platform == "darwin"
+        and _can_prompt(ctx, fmt)
+        and not confirm_browser
+    )
+    pending_key_reused = False
+    # Models already fetched with a reused key, so they aren't fetched twice.
+    pending_key_models = None
+    if (
+        clients == (CURSOR_CLIENT,)
+        and api_key is None
+        and setup_file is None
+        and not connectors
+        and not enable_agent
+        and (pending_key := router_repo.pending_cursor_key(base_url))
+    ):
+        # The key an earlier Cursor setup created but never got into Cursor.
+        # Only a Cursor-only run takes it: other agents and --enable-agent
+        # keep their own sign-in.
+        try:
+            pending_key_models = _fetch_models(pending_key, base_url=base_url)
+        except RouterKeyRejectedError:
+            # Revoked or otherwise unusable: create a new key as usual.
+            router_repo.clear_pending_cursor_key()
+        else:
+            api_key, pending_key_reused = pending_key, True
+            if fmt != "json" and not ctx.obj["quiet"]:
+                click.echo(
+                    "Cursor: reusing the Router key from your last unfinished setup."
+                )
     connector_skill_available = (
         any(item in ("claude-code", "codex", "opencode", "pi") for item in clients)
         and connector_skill.refresh()
@@ -2298,10 +2543,31 @@ def _run_configure(
     switchyard_push = _SwitchyardPush((*clients, *configured_router_clients()))
     # Everything from here to the summary is silent work against the network
     # and each agent's files, so it is the stretch that needs to look alive.
+    spinner_shown = fmt != "json" and not ctx.obj["quiet"] and not connectors
     stop_spinner = (
         start_spinner(f"Setting up {target_phrase}")
-        if fmt != "json" and not ctx.obj["quiet"] and not connectors
+        if spinner_shown
         else (lambda: None)
+    )
+
+    def ask_with_spinner_paused(question: Callable[[], object]) -> object:
+        # A question can't share its line with the spinner, so it pauses.
+        nonlocal stop_spinner
+        stop_spinner()
+        try:
+            return question()
+        finally:
+            stop_spinner = (
+                start_spinner(f"Setting up {target_phrase}")
+                if spinner_shown
+                else (lambda: None)
+            )
+
+    cursor_plan = None
+    cursor_ask = (
+        ask_with_spinner_paused
+        if _can_prompt(ctx, fmt) and not confirm_browser
+        else None
     )
     if setup_messages is not None and not ctx.obj["quiet"]:
         click.echo("\nSetting up agents...")
@@ -2311,12 +2577,41 @@ def _run_configure(
             item for item in clients if item not in ("claude-code", COWORK_CLIENT)
         )
         if standard_clients:
-            models = _fetch_models(
+            models = pending_key_models or _fetch_models(
                 api_key,
                 base_url=base_url,
                 wait_for_key=setup_file is not None or newly_created_key,
             )
             models_by_client.update(dict.fromkeys(standard_clients, models))
+        if CURSOR_CLIENT in clients:
+            # Decided, and the flags checked against the catalog, before any
+            # agent is written or any alias created.
+            cursor_fallback = _router_fallback_model(CURSOR_CLIENT, api_key, base_url)
+            try:
+                cursor_plan = _plan_cursor_models(
+                    api_key,
+                    base_url,
+                    models_by_client[CURSOR_CLIENT],
+                    cursor_options,
+                    scope=cursor_scope,
+                    router_fallback=cursor_fallback,
+                    ask=cursor_ask,
+                    writes=sys.platform == "darwin" and not cursor_quit.get("fallback"),
+                )
+            except (click.ClickException, click.Abort) as exc:
+                # Stopped before anything was written: Cursor comes back, and
+                # the key this run created is kept for the next Cursor setup
+                # instead of being orphaned.
+                _reopen_cursor(cursor_quit)
+                if newly_created_key:
+                    stop_spinner()
+                    _keep_cancelled_cursor_key(
+                        base_url,
+                        api_key,
+                        stopped=isinstance(exc, click.ClickException),
+                    )
+                raise
+            models_by_client[CURSOR_CLIENT] = cursor_plan.models
         if COWORK_CLIENT in clients:
             # Cowork accepts the ids from its own projection, same as every
             # other client, so discovery asks for that projection by name.
@@ -2426,59 +2721,142 @@ def _run_configure(
                 # Write Cursor's local settings while it is quit. A running
                 # Cursor would overwrite them on quit, so it gets the values
                 # to paste instead.
+                assert cursor_plan is not None
+                # Variant deletes first: the alias limit was planned with
+                # the room they free.
+                _apply_cursor_variants(cursor_plan)
+                claude_aliases = cursor_plan.claude_aliases(
+                    _ensure_claude_aliases(
+                        api_key, base_url, models, listing=cursor_plan.alias_listing
+                    )
+                )
                 suggested = _cursor_suggested_model(
-                    models, _router_fallback_model(CURSOR_CLIENT, api_key, base_url)
+                    models, cursor_fallback, claude_aliases
                 )
-                claude_aliases = _ensure_claude_aliases(api_key, base_url, models)
-                # Written or pasted, this is the key Cursor will send, so the
-                # agent's transcript uploads use it too.
-                router_repo.bind_cursor(base_url, api_key, cursor.user_dir())
-                # The team setting makes Cursor ignore these values, so say so
-                # rather than walk the user through steps that can't work.
-                keys_blocked = (
-                    {"personal_keys_blocked": True}
-                    if cursor.personal_keys_blocked()
-                    else {}
-                )
-                written = _write_cursor_settings(
+                written, fallback = _write_cursor_settings(
                     api_key,
                     base_url,
                     models,
                     claude_aliases,
                     announce=not ctx.obj["quiet"],
                     prompt=_can_prompt(ctx, fmt),
+                    quit_state=cursor_quit,
+                    plan=cursor_plan,
                 )
+                # The team setting makes Cursor ignore these values, so say so
+                # rather than walk the user through steps that can't work.
+                # Read before Cursor is reopened, while the file is still ours.
+                keys_blocked = (
+                    {"personal_keys_blocked": True}
+                    if cursor.personal_keys_blocked()
+                    else {}
+                )
+                reopen_result = _reopen_cursor(cursor_quit)
+                reopened = (
+                    {"reopened": reopen_result} if reopen_result is not None else {}
+                )
+                reused = {"api_key_reused": True} if pending_key_reused else {}
                 if written is not None:
+                    _finalize_cursor_variants(cursor_plan)
+                    # Cursor sends this key now, so the agent's transcript
+                    # uploads use it too, and it is no longer pending.
+                    router_repo.bind_cursor(base_url, api_key, cursor.user_dir())
+                    router_repo.clear_pending_cursor_key()
                     results.append(
                         {
                             "client": item,
                             "provider": ROUTER_PROVIDER,
                             "settings_written": True,
-                            "models_available": len(models),
+                            "suggested_model": suggested,
                             "api_key_on_clipboard": False,
                             "models_added": len(written["models_added"]),
+                            "model_names_added": written.get("added_now", []),
+                            "model_names_removed": written.get("removed_now", []),
+                            "alias_names_removed": [
+                                name
+                                for name in written.get("removed_now", [])
+                                if name in cursor_plan.alias_names
+                            ],
+                            **cursor_plan.to_json(),
+                            "model_notes": cursor_plan.notes,
+                            "variant_lines": _cursor_variant_lines(
+                                cursor_plan, claude_aliases
+                            ),
                             "config_path": str(cursor.state_db_path()),
                             "setup_file_deleted": setup_file is not None,
+                            **(
+                                {"quit_outcome": cursor_quit["outcome"]}
+                                if "outcome" in cursor_quit
+                                else {}
+                            ),
+                            **reopened,
                             **keys_blocked,
+                            **reused,
                         }
                     )
                     continue
+                fallback = fallback or {}
+                cursor_plan = cursor_plan.unsaved()
+                # With no steps to paste from, a key only this run holds would
+                # reach nothing, so the next Cursor setup reuses it. If it
+                # can't be kept, show the steps after all.
+                key_only_here = (
+                    (newly_created_key or pending_key_reused)
+                    and clients == (CURSOR_CLIENT,)
+                    and not enable_agent
+                )
+                steps_hidden = cursor_quiet and (
+                    not key_only_here
+                    or router_repo.mark_cursor_key_pending(base_url, api_key)
+                )
+                key_copied = False if steps_hidden else _copy_to_clipboard(api_key)
+                if not steps_hidden and fallback.get("reason") == (
+                    _CURSOR_FALLBACK_PLATFORM
+                ):
+                    # Here the steps are the setup, as with 'ramp router
+                    # cursor': no later run writes Cursor's list instead.
+                    _finalize_cursor_variants(cursor_plan)
+                if not steps_hidden:
+                    # Pasted in, this is the key Cursor will send.
+                    router_repo.bind_cursor(base_url, api_key, cursor.user_dir())
+                    if pending_key_reused and key_copied:
+                        # Handed over; kept otherwise, for 'ramp router
+                        # cursor --show-key' to print.
+                        router_repo.clear_pending_cursor_key()
                 results.append(
                     {
                         "client": item,
                         "provider": ROUTER_PROVIDER,
+                        "settings_written": False,
+                        "fallback_reason": fallback.get("reason"),
+                        "fallback_message": fallback.get("message"),
+                        **{
+                            key: value
+                            for key, value in fallback.items()
+                            if key not in ("reason", "message")
+                        },
                         "suggested_model": suggested,
-                        "models_available": len(models),
                         "claude_aliases": claude_aliases,
-                        "api_key_on_clipboard": _copy_to_clipboard(api_key),
+                        **reopened,
+                        "api_key_on_clipboard": key_copied,
+                        **cursor_plan.to_json(),
                         "instructions": _cursor_setup_steps(
-                            base_url, suggested, claude_aliases
+                            base_url,
+                            suggested,
+                            claude_aliases,
+                            names=cursor_plan.listed_names(claude_aliases),
+                            variants=cursor_plan.variant_names(claude_aliases),
+                            dropped=cursor_plan.dropped_variants,
                         ),
                         "note_lines": _cursor_note_lines(
                             models, claude_aliases, base_url=base_url
-                        ),
+                        )
+                        + _cursor_variant_lines(cursor_plan, claude_aliases)
+                        + cursor_plan.notes,
                         "setup_file_deleted": setup_file is not None,
                         **keys_blocked,
+                        **reused,
+                        **({"steps_shown": False} if steps_hidden else {}),
                     }
                 )
                 continue
@@ -2652,7 +3030,8 @@ def _run_configure(
             click.echo()
             show_notice("NOTICE", notice)
             suppress_next_update_notice()
-            return
+            _exit_if_cursor_variants_undelivered(ctx, cursor_plan, fmt)
+            return results
         if diagnostics:
             click.echo(diagnostics, err=True, nl=False)
     if failures and fmt == "json":
@@ -2679,10 +3058,13 @@ def _run_configure(
             click.echo(f"Connected to: {connected_names}")
         added_models = False
         for result in results:
+            if result["client"] == CURSOR_CLIENT:
+                # Cursor names what it added below, or wasn't set up.
+                continue
             model_count = result.get("models_visible", result["models_available"])
             model_label = "model" if model_count == 1 else "models"
-            # Cowork and Cursor discover choices without adding picker rows.
-            discovered = result["client"] in (COWORK_CLIENT, CURSOR_CLIENT)
+            # Cowork discovers choices without adding picker rows.
+            discovered = result["client"] == COWORK_CLIENT
             action = "discovered" if discovered else "added"
             added_models = added_models or not discovered
             prefix = f"{AGENT_NAMES[result['client']]}: " if len(results) > 1 else ""
@@ -2715,13 +3097,27 @@ def _run_configure(
             (result for result in results if result["client"] == CURSOR_CLIENT), None
         )
         if cursor_result and cursor_result.get("settings_written"):
-            click.echo(
-                "Cursor: Router is set up. Reopen Cursor, run the chat on "
-                "This Mac, and pick a Router model. Run this again after "
-                "signing in to a different Cursor account."
-            )
+            if added := _cursor_added_line(cursor_result):
+                click.echo(added)
+            if removed := _cursor_removed_line(cursor_result):
+                click.echo(removed)
+            if scope := _cursor_scope_line(cursor_result):
+                click.echo(scope)
+            for line in cursor_result.get("variant_lines") or []:
+                click.echo(line)
+            for note in cursor_result.get("model_notes") or []:
+                click.echo(f"Cursor: {note}")
+            if not enable_agent:
+                # --enable-agent ends with one line that says this itself.
+                click.echo(_cursor_written_line(cursor_result))
+                click.echo(_CURSOR_ACCOUNT_LINE)
+        elif cursor_result and cursor_result.get("steps_shown") is False:
+            click.echo()
+            _echo_cursor_not_set_up(cursor_result)
         elif cursor_result:
             click.echo()
+            if cursor_result.get("fallback_message"):
+                click.echo(cursor_result["fallback_message"])
             if cursor_result["api_key_on_clipboard"]:
                 click.echo("Cursor: your Router API key is on the clipboard.")
             elif newly_created_key and all(
@@ -2762,6 +3158,15 @@ def _run_configure(
         cursor_result = next(
             (result for result in results if result["client"] == CURSOR_CLIENT), None
         )
+        if cursor_result is not None and fmt != "json":
+            # The summary above is skipped when another agent failed, so
+            # Cursor's own outcome is said here.
+            if cursor_result.get("settings_written"):
+                click.echo(_cursor_written_line(cursor_result))
+            elif cursor_result.get("steps_shown") is False:
+                _echo_cursor_not_set_up(cursor_result)
+            elif cursor_result.get("fallback_message"):
+                click.echo(cursor_result["fallback_message"])
         if cursor_result is not None and cursor_result["api_key_on_clipboard"]:
             # The key was copied before the failing client ran; a failed run
             # must not leave a credential on the clipboard unannounced.
@@ -2777,10 +3182,18 @@ def _run_configure(
             + f". Run 'ramp router unconfigure{restore_clients}' to restore your "
             f"previous settings.{connector_undo}"
         )
+    nothing_changed = bool(results) and all(
+        result.get("steps_shown") is False for result in results
+    )
+    if nothing_changed:
+        # A Cursor-only run that set nothing up has said why; it ends the way
+        # the checks before sign-in do. Nothing is bound for Cursor either, so
+        # --enable-agent has nothing to tag yet.
+        raise SystemExit(CURSOR_NOT_SET_UP_EXIT_CODE)
     router_schedule.install()
     if fmt != "json" and not enable_agent:
         _warn_if_agent_off()
-    if fmt != "json" and not notice:
+    if fmt != "json" and not notice and not nothing_changed:
         # The notice carries this line itself, alongside the profiles it is
         # restoring, so repeating it here would only be noise.
         click.echo(
@@ -2805,6 +3218,8 @@ def _run_configure(
                     f"{_format_credits_usd(remaining_credits)}",
                     fg=_RAMP_YELLOW,
                 )
+    _exit_if_cursor_variants_undelivered(ctx, cursor_plan, fmt)
+    return results
 
 
 def _refresh_cowork_model_selections(
@@ -3614,13 +4029,32 @@ def _refresh_clients(
 
 
 def _cursor_suggested_model(
-    models: list[RouterModel], router_fallback: str | None = None
+    models: list[RouterModel],
+    router_fallback: str | None = None,
+    claude_aliases: dict[str, str] | None = None,
 ) -> str | None:
-    """Pick a starting model id Cursor's override can actually serve.
+    """Pick a starting model name Cursor's override can actually serve.
 
     Router's fallback for Cursor (from its coding-agent settings), then the
-    built-in ``DEFAULT_MODEL``, while they are models the override serves.
+    built-in ``DEFAULT_MODEL``, while they are models the override serves. A
+    Claude fallback is suggested under the ramp- alias setup created for it.
     """
+    if router_fallback and router_fallback.startswith("claude-"):
+        request_names = {
+            model.metadata.request_name
+            for model in models
+            if router_fallback in (model.id, model.metadata.request_name)
+        } or {router_fallback}
+        alias = next(
+            (
+                alias
+                for alias, target in (claude_aliases or {}).items()
+                if target in request_names
+            ),
+            None,
+        )
+        if alias is not None:
+            return alias
     suggested = next(
         (
             model
@@ -3647,10 +4081,1142 @@ def _cursor_suggested_model(
     return suggested.metadata.request_name if suggested else None
 
 
+# Tells _ensure_claude_aliases to read the alias listing itself.
+_READ_LISTING = object()
+
+
+@dataclass
+class _CursorVariantWork:
+    """What effort-variant planning read, for carrying the plan out."""
+
+    origin: str
+    base_url: str
+    headers: dict
+    listing: router_aliases.AliasListing
+    # This machine's receipt for this Router and the key's account.
+    mine: dict[str, dict]
+    # The account the receipt is kept under, once known.
+    owner: str | None = None
+
+
+@dataclass
+class _CursorModelPlan:
+    """Which catalog models Cursor setup lists, decided before writing."""
+
+    # What Cursor lists this run.
+    scope: cursor_models.ModelScope
+    models: list[RouterModel]
+    # Names setup added earlier that this run takes back out of Cursor.
+    remove: list[str]
+    notes: list[str]
+    # The choice kept for the next run: the scope, unless this run fell back
+    # to all models because the recommended list couldn't be read.
+    saved_scope: cursor_models.ModelScope | None = None
+    # Every row of Router's catalog, as configure has always reported it.
+    catalog_size: int = 0
+    # The caller's alias names in Router's listing, for counting them apart.
+    alias_names: frozenset[str] = frozenset()
+    # Base ramp-* aliases Router's listing already shows, for Claude models
+    # in the list: Cursor lists them even when the alias lookup fails.
+    base_aliases: dict[str, str] = dataclass_field(default_factory=dict)
+    # Whether this run saves the choice: only a run that writes Cursor's
+    # settings does.
+    saves: bool = False
+    # Router's whole catalog (aliases dropped as prepare says), to explain
+    # why a variant this machine lists isn't offered now.
+    catalog: list[RouterModel] = field(default_factory=list)
+    # Effort variants: the names this run could offer and, decided before
+    # anything is written, what it does with them (then what it did).
+    offers: list[cursor_variants.Offer] = field(default_factory=list)
+    variants: cursor_variants.VariantOutcome = field(
+        default_factory=cursor_variants.VariantOutcome
+    )
+    # "flags" for --effort-variants, "none" for --no-effort-variants.
+    variant_request: str | None = None
+    variant_work: _CursorVariantWork | None = None
+    # Variant names an earlier run listed that this run takes out of Cursor.
+    dropped_variants: list[str] = field(default_factory=list)
+    # Variant names Cursor keeps listing while Router's couldn't be read.
+    kept_variants: list[str] = field(default_factory=list)
+    # The ids the chosen scope listed, before the suggested model joined
+    # them: on Recommended, Router's recommended list.
+    scope_ids: frozenset[str] = frozenset()
+    # The caller's Router aliases as planning read them (None when they
+    # couldn't be), for the base aliases; unset when planning didn't read.
+    alias_listing: object = _READ_LISTING
+
+    def cursor_list(self, claude_aliases: dict[str, str]) -> list[str]:
+        """Every name Cursor lists, each effort variant after its base name.
+
+        A row under a variant's name is an alias, never a base model: it is
+        listed as the variant when it is one, and not at all otherwise.
+        """
+        variant_space = self.variant_space()
+        base = [
+            name
+            for name in cursor.model_names_to_add(
+                [model.metadata.request_name for model in self.models], claude_aliases
+            )
+            if name not in variant_space
+        ]
+        by_model: dict[str, list[tuple[str, str]]] = {}
+        for name, (request_name, effort) in self.variants.advertised.items():
+            by_model.setdefault(request_name, []).append((name, effort))
+        names: list[str] = []
+        for name in base:
+            names.append(name)
+            for variant, _effort in sorted(
+                by_model.pop(claude_aliases.get(name, name), []),
+                key=lambda pair: cursor_variants.effort_sort_key(pair[1]),
+            ):
+                names.append(variant)
+        names.extend(
+            variant
+            for pairs in by_model.values()
+            for variant, _effort in pairs
+            if variant not in names
+        )
+        names.extend(name for name in self.kept_variants if name not in names)
+        return names
+
+    def variant_space(self) -> set[str]:
+        """Names that belong to effort variants, never to Cursor's base list."""
+        return {
+            *(offer.name for offer in self.offers),
+            *(name for name, _ in self.variants.conflicts),
+            *self.variants.advertised,
+            *self.kept_variants,
+        }
+
+    def variant_names(self, claude_aliases: dict[str, str]) -> list[str]:
+        return [
+            name
+            for name in self.cursor_list(claude_aliases)
+            if name in self.variants.advertised
+        ]
+
+    def label(self) -> str:
+        return self.scope.describe()
+
+    def narrowed(self) -> bool:
+        return self.scope.view == cursor_models.VIEW_COMPACT
+
+    def scope_to_save(self) -> cursor_models.ModelScope:
+        return self.saved_scope or self.scope
+
+    def unsaved(self) -> _CursorModelPlan:
+        """This plan once Cursor's settings weren't written: nothing was
+        saved, so it neither reports a saved choice nor says one stays."""
+        return dataclass_replace(
+            self,
+            saves=False,
+            notes=[note.removesuffix(_CURSOR_RECOMMENDED_STAYS) for note in self.notes],
+        )
+
+    def claude_aliases(self, created: dict[str, str]) -> dict[str, str]:
+        """The alias names for Claude models in the list: those the alias
+        lookup confirmed or created, plus the ones Router's listing shows."""
+        return {**self.base_aliases, **created}
+
+    def listed_names(self, claude_aliases: dict[str, str]) -> list[str] | None:
+        """The names to paste in for a narrowed list; None for all models."""
+        if not self.narrowed():
+            return None
+        return self.cursor_list(claude_aliases)
+
+    def to_json(self) -> dict:
+        count = len(cursor_models.models_only(self.models))
+        payload = {
+            "models_available": self.catalog_size,
+            "model_scope": self.scope.to_json(),
+            "model_scope_label": self.label(),
+            # An alias row routes models; it is never counted as one.
+            "models_in_scope": count,
+            # A conflicting alias under a variant's name isn't listed.
+            "aliases_in_scope": len(
+                [
+                    model
+                    for model in self.models
+                    if cursor_models.is_alias(model)
+                    and model.id not in self.variant_space()
+                ]
+            ),
+            # Names kept while Router couldn't be read are still listed.
+            "effort_variants": self.variants.to_json(self.kept_variants),
+        }
+        if self.saves and self.scope_to_save() != self.scope:
+            payload["model_scope_saved"] = self.scope_to_save().to_json()
+        return payload
+
+
+def _saved_cursor_scope() -> cursor_models.ModelScope | None:
+    """The model-list choice Cursor setup last saved.
+
+    A receipt from before the choice existed counts as all models, which is
+    what setup listed then, so a re-run never narrows it unasked.
+    """
+    saved = cursor_models.ModelScope.from_json(cursor.saved_model_scope())
+    if saved is None and cursor.has_receipt():
+        return cursor_models.ModelScope(view=cursor_models.VIEW_ALL)
+    return saved
+
+
+_CURSOR_RECOMMENDED_UNAVAILABLE = (
+    "Router's recommended list couldn't be loaded, so Cursor lists all models "
+    "this run and nothing is removed."
+)
+_CURSOR_RECOMMENDED_STAYS = " The recommended list stays your choice for the next run."
+
+
+def _cursor_scope_models(
+    api_key: str,
+    base_url: str,
+    catalog: list[RouterModel],
+    scope: cursor_models.ModelScope,
+    *,
+    saves: bool = False,
+) -> tuple[cursor_models.ModelScope, list[RouterModel], list[str], bool]:
+    """(scope, the models it keeps, notes, fell back) for one choice.
+
+    The recommended list is a second request. When it fails, this run lists
+    all models instead of failing every agent with it. ``saves`` says the
+    run keeps the choice, so the note can say the choice stays.
+    """
+    compact_ids = None
+    if scope.view == cursor_models.VIEW_COMPACT:
+        try:
+            compact_ids = {
+                model.id
+                for model in _fetch_models(
+                    api_key, model_view=cursor_models.VIEW_COMPACT, base_url=base_url
+                )
+            }
+        except click.ClickException:
+            return (
+                cursor_models.ModelScope(view=cursor_models.VIEW_ALL),
+                list(catalog),
+                [
+                    _CURSOR_RECOMMENDED_UNAVAILABLE
+                    + (_CURSOR_RECOMMENDED_STAYS if saves else "")
+                ],
+                True,
+            )
+    models = cursor_models.in_scope(catalog, scope, compact_ids)
+    if not models:
+        return (
+            cursor_models.ModelScope(view=cursor_models.VIEW_ALL),
+            list(catalog),
+            [
+                "None of Router's models matched that choice, so Cursor lists "
+                "all models."
+            ],
+            False,
+        )
+    return scope, models, [], False
+
+
+def _requested_cursor_scope(
+    options: _CursorOptions,
+    *,
+    ask: Callable[[Callable[[], object]], object] | None = None,
+) -> cursor_models.ModelScope:
+    """The model list this run asks for, decided before any sign-in.
+
+    The flag decides first. Otherwise an interactive run asks, with the
+    saved choice preselected (all models for a receipt from before the
+    choice existed, the recommended list on a first run); an unattended run
+    keeps the saved choice, or lists every model on a first run, so scripts
+    don't change silently. Needs no key or catalog, so a cancelled question
+    leaves no key behind.
+    """
+    previous = _saved_cursor_scope()
+    if options.models_view is not None:
+        return cursor_models.ModelScope(view=options.models_view)
+    if ask is not None:
+        scope = ask(lambda: _pick_cursor_model_scope(previous))
+        if scope is None:
+            raise click.Abort()
+        return scope
+    return previous or cursor_models.ModelScope(view=cursor_models.VIEW_ALL)
+
+
+def _plan_cursor_models(
+    api_key: str,
+    base_url: str,
+    catalog: list[RouterModel],
+    options: _CursorOptions,
+    *,
+    scope: cursor_models.ModelScope | None = None,
+    ask: Callable[[Callable[[], object]], object] | None = None,
+    writes: bool = False,
+    router_fallback: str | None = None,
+) -> _CursorModelPlan:
+    """Choose Cursor's model list, and what leaving models out removes.
+
+    ``scope`` is what ``_requested_cursor_scope`` returned before sign-in;
+    without it, that is decided here.
+
+    The model ``_cursor_suggested_model`` will suggest (Router's fallback for
+    Cursor, else ``DEFAULT_MODEL``) stays in the list even when the choice
+    leaves it out, so the suggestion is always a name Cursor lists and never
+    one this run removes. ``router_fallback`` is that fallback.
+
+    ``writes`` says this run writes Cursor's settings, so leaving out models
+    an earlier run added would remove them. An interactive run confirms that
+    first, and declining keeps the previous choice; an unattended run
+    removes them only when the flag asked for the new choice. A run that
+    fell back to all models removes nothing.
+
+    Router's listing includes the caller's aliases; ``cursor_models.prepare``
+    says which of them Cursor's list counts, and pinned effort variants are
+    never added or removed here.
+    """
+    catalog_size = len(catalog)
+    if scope is None:
+        scope = _requested_cursor_scope(options, ask=ask)
+    requested = scope
+    base_aliases = cursor_models.base_aliases(catalog)
+    catalog, untouched = cursor_models.prepare(catalog)
+    # A base ramp-* alias row was dropped as its Claude model, so it counts
+    # as that model; these are the caller's other aliases.
+    alias_names = frozenset(
+        [model.id for model in catalog if cursor_models.is_alias(model)] + untouched
+    )
+    # Names this machine set up never join Cursor's base list, even while
+    # Router's listing catches up with a deletion.
+    variant_names = sorted(
+        cursor_variants.receipt_names(cursor_variants.read_receipt())
+    )
+    catalog = [model for model in catalog if model.id not in variant_names]
+    previous = _saved_cursor_scope()
+    scope, models, notes, fell_back = _cursor_scope_models(
+        api_key, base_url, catalog, requested, saves=writes
+    )
+    scope_ids = {model.id for model in models}
+    models = _with_cursor_suggestion(models, catalog, router_fallback)
+    remove: list[str] = []
+    # Variant names leave Cursor through the variant reconcile, not here.
+    planned = (
+        cursor.planned_removals(
+            [*cursor_models.cursor_names(models), *untouched, *variant_names]
+        )
+        if writes and not fell_back
+        else []
+    )
+    if planned and ask is not None:
+        if ask(lambda: _confirm_cursor_removals(planned, alias_names)):
+            remove = planned
+        else:
+            requested = previous or cursor_models.ModelScope(
+                view=cursor_models.VIEW_ALL
+            )
+            scope, models, notes, _ = _cursor_scope_models(
+                api_key, base_url, catalog, requested, saves=writes
+            )
+            scope_ids = {model.id for model in models}
+            models = _with_cursor_suggestion(models, catalog, router_fallback)
+    elif planned and options.given():
+        remove = planned
+    plan = _CursorModelPlan(
+        scope=scope,
+        models=models,
+        remove=remove,
+        notes=notes,
+        saved_scope=requested,
+        catalog_size=catalog_size,
+        alias_names=alias_names,
+        base_aliases={
+            alias: target
+            for alias, target in base_aliases.items()
+            if any(model.metadata.request_name == target for model in models)
+        },
+        saves=writes,
+        catalog=catalog,
+        scope_ids=frozenset(scope_ids),
+    )
+    _plan_cursor_variants(api_key, base_url, plan, options, ask=ask)
+    return plan
+
+
+def _with_cursor_suggestion(
+    models: list[RouterModel],
+    catalog: list[RouterModel],
+    router_fallback: str | None,
+) -> list[RouterModel]:
+    """``models`` plus the catalog row for Router's fallback, else for
+    ``DEFAULT_MODEL``, the way ``_cursor_suggested_model`` prefers them."""
+    for preferred in (router_fallback, DEFAULT_MODEL):
+        row = next(
+            (
+                model
+                for model in catalog
+                if preferred and preferred in (model.id, model.metadata.request_name)
+            ),
+            None,
+        )
+        if row is None:
+            continue
+        if any(model.id == row.id for model in models):
+            return models
+        return [*models, row]
+    return models
+
+
+def _pick_cursor_model_scope(
+    previous: cursor_models.ModelScope | None,
+) -> cursor_models.ModelScope | None:
+    """Ask which models Cursor lists; None when the question was cancelled."""
+    current = previous or cursor_models.ModelScope(view=cursor_models.VIEW_COMPACT)
+    if previous is not None:
+        click.echo(f"Cursor lists {previous.describe()} now.")
+    recommended = "Recommended models"
+    if current.view == cursor_models.VIEW_COMPACT:
+        recommended += " (default)"
+    choice = questionary.select(
+        "Which models should Cursor show?",
+        choices=[
+            questionary.Choice(title=recommended, value=cursor_models.VIEW_COMPACT),
+            questionary.Choice(
+                title="All available models", value=cursor_models.VIEW_ALL
+            ),
+        ],
+        default=current.view,
+        style=_picker_style(),
+        pointer=_PICKER_POINTER,
+        instruction="(enter to confirm)",
+    ).ask()
+    if choice is None:
+        return None
+    return cursor_models.ModelScope(view=choice)
+
+
+def _keep_cancelled_cursor_key(
+    base_url: str, api_key: str, *, stopped: bool = False
+) -> None:
+    """Keep a key a cancelled Cursor setup created, for the next one to use.
+
+    ``stopped`` is a run a flag error stopped before anything was written,
+    rather than one the user cancelled.
+    """
+    what = (
+        "Cursor setup stopped before anything was written."
+        if stopped
+        else "Cursor setup was cancelled."
+    )
+    if router_repo.mark_cursor_key_pending(base_url, api_key):
+        click.echo(
+            f"{what} The Router key it created is kept, and the next "
+            "'ramp router configure cursor' uses it.",
+            err=True,
+        )
+    else:
+        click.echo(
+            f"{what} The Router key it created was not delivered and remains "
+            f"unused; manage keys at {router_ui_url()}.",
+            err=True,
+        )
+
+
+def _cursor_removal_count(names: list[str], alias_names: Iterable[str]) -> str:
+    """'112 models', '112 models and 1 alias': aliases are never models."""
+    aliases = len(set(names) & set(alias_names))
+    return _models_and_aliases(len(names) - aliases, aliases)
+
+
+def _models_and_aliases(models: int, aliases: int) -> str:
+    parts = [f"{models} model" + ("" if models == 1 else "s")] if models else []
+    if aliases:
+        parts.append(f"{aliases} alias" + ("" if aliases == 1 else "es"))
+    return " and ".join(parts) or "0 models"
+
+
+def _confirm_cursor_removals(names: list[str], alias_names: Iterable[str] = ()) -> bool:
+    """Ask before taking models setup added out of Cursor; No by default."""
+    count = len(names)
+    shown = ", ".join(names[:6]) + (f", and {count - 6} more" if count > 6 else "")
+    click.echo(
+        f"This removes {_cursor_removal_count(names, alias_names)} from Cursor: "
+        f"{shown}."
+    )
+    answer = questionary.confirm(
+        "Remove them?",
+        default=False,
+        style=_picker_style(),
+    ).ask()
+    if answer is None:
+        raise click.Abort()
+    if not answer:
+        click.echo("Cursor keeps the models it lists now; none are removed.")
+    return bool(answer)
+
+
+def _router_alias_listing(
+    api_key: str, base_url: str
+) -> router_aliases.AliasListing | None:
+    """The key owner's Router aliases, read once a run; None when unreadable."""
+    return router_aliases.list_aliases(
+        _statusline_origin(base_url), _router_alias_headers(api_key)
+    )
+
+
+def _router_alias_headers(api_key: str) -> dict:
+    return {"Authorization": f"Bearer {api_key}", **_router_telemetry_headers()}
+
+
+def _plan_cursor_variants(
+    api_key: str,
+    base_url: str,
+    plan: _CursorModelPlan,
+    options: _CursorOptions,
+    *,
+    ask: Callable[[Callable[[], object]], object] | None = None,
+) -> None:
+    """Decide effort variants for ``plan`` before anything is written.
+
+    The flags are checked first; then Router's levels and aliases are read,
+    the user picks (or the flags or the saved names decide), and the deletes
+    and creates are checked against Router's alias limit, counting the base
+    aliases still to be made. A flag run that doesn't fit stops here, before
+    any alias, key binding or agent is written. A variant follows its base
+    name: one setup no longer offers is kept, and says why, unless the user
+    unticks it, its model left Router's catalog, or this run takes its base
+    name out of Cursor.
+    """
+    found = (
+        cursor_variants.flag_models(list(options.effort_variants), plan.catalog)
+        if options.effort_variants is not None
+        else None
+    )
+    if options.no_effort_variants:
+        plan.variant_request = "none"
+    elif found is not None:
+        plan.variant_request = "flags"
+    origin = _statusline_origin(base_url)
+    headers = _router_alias_headers(api_key)
+    receipt = cursor_variants.read_receipt()
+    by_name = {model.metadata.request_name: model for model in plan.catalog}
+    here = [
+        entry
+        for account in receipt["accounts"]
+        if account["origin"] == origin
+        for entry in account["variants"].values()
+        if isinstance(entry, dict)
+    ]
+    listed_models = [
+        model for model in plan.models if cursor_variants.may_have_variants(model)
+    ]
+    flagged = [model for model, _ in found or []]
+    if not (listed_models or here or found or options.no_effort_variants):
+        _settle_dropped_variants(plan, receipt)
+        return
+
+    def keep(owner: str | None = None, **state) -> None:
+        # Router couldn't say what exists, so Cursor keeps what it lists, on
+        # the key's account. Before the key's owner is known, that is only
+        # while the key is the one Cursor already sends: another key may
+        # belong to another account, without those names.
+        plan.variants = cursor_variants.VariantOutcome(**state)
+        same_key = owner is not None or (
+            router_repo.cursor_bound_api_key() == api_key
+            and router_repo.cursor_bound_upstream()
+            == router_repo.router_upstream(base_url)
+        )
+        plan.kept_variants = sorted(
+            name
+            for account in receipt["accounts"]
+            if same_key
+            and account["origin"] == origin
+            and cursor_variants.in_cursor(account)
+            and (owner is None or account["owner"] == owner)
+            for name, entry in account["variants"].items()
+            if not isinstance(entry, dict) or cursor_variants.entry_in_cursor(entry)
+        )
+        plan.notes = [*plan.notes, *plan.variants.note_lines(f"{origin}/strategies")]
+        _settle_dropped_variants(plan, receipt)
+
+    recommended_ids = None
+    levels = cursor_variants.EffortLevels()
+    if not options.no_effort_variants:
+        if plan.scope.view == cursor_models.VIEW_COMPACT:
+            # The recommended list is the scope, read once already; the
+            # suggested model joins Cursor's list without joining it.
+            recommended_ids = set(plan.scope_ids)
+        elif plan.scope_to_save() != plan.scope:
+            # It couldn't be read this run, which lists all models instead.
+            recommended_ids = None
+        elif any(
+            cursor_variants.family(model) == "gpt"
+            for model in [*listed_models, *flagged]
+        ):
+            # GPT variants follow Router's recommended list whatever the scope.
+            try:
+                recommended_ids = {
+                    model.id
+                    for model in _fetch_models(
+                        api_key,
+                        model_view=cursor_models.VIEW_COMPACT,
+                        base_url=base_url,
+                    )
+                }
+            except click.ClickException:
+                recommended_ids = None
+        asked = {
+            model.metadata.request_name: model
+            for model in [
+                *(
+                    model
+                    for model in listed_models
+                    if cursor_variants.eligible(model, recommended_ids)
+                ),
+                *(
+                    by_name[entry["model"]]
+                    for entry in here
+                    if entry.get("model") in by_name
+                ),
+                *flagged,
+            ]
+        }
+        if asked:
+            # Asked before the prompt, so an older Router says it has no
+            # variants before anyone is asked to choose some.
+            levels = cursor_variants.fetch_effort_levels(
+                origin, headers, asked.values()
+            )
+            if levels.status == cursor_variants.LEVELS_UNSUPPORTED:
+                keep(unsupported=True)
+                return
+            if levels.status == cursor_variants.LEVELS_UNAVAILABLE:
+                keep(levels_unavailable=True)
+                return
+    listing = _router_alias_listing(api_key, base_url)
+    # Read once: base aliases are made from the same listing.
+    plan.alias_listing = listing
+    if listing is None:
+        keep(listed=False)
+        return
+    if cursor_variants.predates_variants(listing):
+        keep(listing.owner, unsupported=True)
+        return
+    mine = cursor_variants.account_variants(receipt, origin, listing.owner)
+    offers = cursor_variants.variant_offers(plan.models, recommended_ids, levels)
+    offered = {offer.name for offer in offers}
+    listed_names = {model.metadata.request_name for model in plan.models}
+    removed_bases = set(plan.remove)
+    scope_is_recommended = plan.scope.view == cursor_models.VIEW_COMPACT
+
+    def why(model, effort: str, *, listed: bool = False) -> cursor_variants.Unoffered:
+        return cursor_variants.unoffered(
+            model,
+            effort,
+            in_scope=model.metadata.request_name in listed_names,
+            scope_is_recommended=scope_is_recommended,
+            recommended_ids=recommended_ids,
+            levels=levels,
+            listed=listed,
+        )
+
+    kept: dict[str, cursor_variants.Kept] = {}
+    follow_out: set[str] = set()
+    for name, entry in mine.items():
+        if name in offered:
+            continue
+        model = by_name.get(entry.get("model"))
+        effort = entry.get("effort")
+        if model is None or effort not in cursor_variants.OFFERED_EFFORTS:
+            # Its model left Router's catalog.
+            follow_out.add(name)
+            continue
+        request_name = model.metadata.request_name
+        if (
+            router_aliases.base_alias_name(request_name) or request_name
+        ) in removed_bases:
+            # This run takes its base name out of Cursor; it goes with it.
+            follow_out.add(name)
+            continue
+        kept[name] = cursor_variants.Kept(
+            cursor_variants.Offer(model, effort, levels.candidates.get(request_name)),
+            why(model, effort, listed=True),
+        )
+    skipped: list[tuple[str, cursor_variants.Unoffered]] = []
+    desired: set[str] | None
+    if options.no_effort_variants:
+        desired = set()
+    elif found is not None:
+        desired, skipped = cursor_variants.resolve_variant_flags(
+            found, offers, mine, why, present=listing.aliases, leaving=follow_out
+        )
+    elif ask is not None and (offers or kept):
+        saved = cursor_variants.saved_selection(listing, offers, mine)
+        on_account = {
+            offer.name
+            for offer in offers
+            if offer.name not in mine
+            and (alias := listing.aliases.get(offer.name)) is not None
+            and cursor_variants.alias_matches(alias, offer)
+        }
+        desired = ask(
+            lambda: _pick_cursor_effort_variants(offers, saved, kept, on_account)
+        )
+    else:
+        desired = None
+    outcome = cursor_variants.plan_variants(
+        listing,
+        offers,
+        mine,
+        desired=desired,
+        kept=kept,
+        follow_out=follow_out,
+        listed=[model.id for model in plan.models],
+        namespace=cursor_variants.namespace_offers(plan.models),
+    )
+    outcome.skipped = skipped
+    base_to_create = {
+        alias
+        for model in plan.models
+        if (alias := router_aliases.base_alias_name(model.metadata.request_name))
+    } - set(listing.aliases)
+    cursor_variants.check_budget(outcome, listing, mine, len(base_to_create))
+    if outcome.over_budget and plan.variant_request == "flags":
+        raise click.ClickException(
+            cursor_variants.budget_message(
+                outcome.over_budget, f"{origin}/strategies", interactive=False
+            )
+        )
+    plan.offers = offers
+    plan.variants = outcome
+    plan.variant_work = _CursorVariantWork(
+        origin=origin,
+        base_url=base_url,
+        headers=headers,
+        listing=listing,
+        mine=mine,
+        owner=listing.owner,
+    )
+    _settle_dropped_variants(plan, receipt)
+
+
+def _settle_dropped_variants(plan: _CursorModelPlan, receipt: dict) -> None:
+    """Which receipt names leave Cursor, on any Router, and a note for the
+    names left on a Router or account Cursor no longer uses."""
+    work = plan.variant_work
+    staying = {*plan.variants.advertised, *plan.kept_variants}
+    plan.dropped_variants = sorted(cursor_variants.listed_names(receipt) - staying)
+    stranded: dict[tuple[str, str | None], list[str]] = {}
+    for account in receipt["accounts"]:
+        if not cursor_variants.in_cursor(account) or (
+            work is not None
+            and account["origin"] == work.origin
+            and account["owner"] == work.owner
+        ):
+            continue
+        names = sorted(
+            name
+            for name, entry in account["variants"].items()
+            if name not in staying and isinstance(entry, dict) and entry.get("created")
+        )
+        # The same name on the account Cursor uses now doesn't keep this
+        # one in use; only an unknown current account falls back to names.
+        if names and (work is not None or not set(account["variants"]) & staying):
+            stranded.setdefault(
+                (account["origin"], account.get("base_url")), []
+            ).extend(names)
+    for (origin, base), names in stranded.items():
+        plan.notes = [*plan.notes, _stranded_variants_line(origin, base, names, work)]
+
+
+def _stranded_variants_line(
+    origin: str, base: str | None, names: list[str], work: _CursorVariantWork | None
+) -> str:
+    where = (
+        "on another Router account"
+        if work is not None and origin == work.origin
+        else f"on {origin}"
+    )
+    command = "ramp router cursor prune-variants --api-key KEY"
+    if base and (work is None or origin != work.origin):
+        command = f"{ROUTER_BASE_URL_ENV}={base} {command}"
+    them = "it" if len(names) == 1 else "them"
+    return (
+        f"Cursor no longer lists {', '.join(names)}: setup made {them} {where}, "
+        f"which Cursor isn't set up with now. To delete {them}, run '{command}' "
+        "with that account's key."
+    )
+
+
+def _apply_cursor_variants(plan: _CursorModelPlan) -> None:
+    """Carry out the effort-variant plan: deletes, then creates.
+
+    Like the base aliases, variants are a bonus on a working setup: a
+    failure here means fewer names, never a failed setup (a flag run then
+    exits 1 at the end). Until Cursor's list is written, the receipt keeps
+    the names this run takes out, so a failed write still knows to take
+    them out next time; ``_finalize_cursor_variants`` settles it after.
+    """
+    work = plan.variant_work
+    if work is None:
+        return
+    outcome = plan.variants
+    created_by = cursor_variants.apply_variants(
+        work.origin, work.headers, outcome, work.mine
+    )
+    work.owner = work.owner or created_by
+    receipt = cursor_variants.read_receipt()
+    cursor_variants.set_account_variants(
+        receipt,
+        work.origin,
+        work.owner,
+        {
+            **{name: {**entry, "created": False} for name, entry in work.mine.items()},
+            **{
+                # Cursor still lists what it listed until its list is written.
+                name: (
+                    cursor_variants.listed_entry(entry)
+                    if name in work.mine
+                    and cursor_variants.entry_in_cursor(work.mine[name])
+                    else entry
+                )
+                for name, entry in outcome.entries.items()
+            },
+        },
+        base_url=work.base_url,
+    )
+    cursor_variants.write_receipt(receipt)
+    plan.notes = [
+        *plan.notes,
+        *outcome.note_lines(
+            f"{work.origin}/strategies", flags=plan.variant_request == "flags"
+        ),
+    ]
+    _settle_dropped_variants(plan, cursor_variants.read_receipt())
+
+
+def _finalize_cursor_variants(plan: _CursorModelPlan) -> None:
+    """Once Cursor's list is written, the receipt records what it lists now;
+    never raises. Until then it keeps the names this run took out, so the
+    next run still takes them out (``ramp router cursor`` writes nothing and
+    calls this once its steps are printed)."""
+    receipt = cursor_variants.read_receipt()
+    work = plan.variant_work
+    if work is not None and work.owner is not None:
+        cursor_variants.set_account_variants(
+            receipt,
+            work.origin,
+            work.owner,
+            dict(plan.variants.entries),
+            base_url=work.base_url,
+        )
+    staying = {*plan.variants.advertised, *plan.kept_variants}
+    # The account Cursor uses now, when this run knows it: the same name
+    # on another Router or account doesn't keep that one in use.
+    current = (
+        (work.origin, work.owner)
+        if work is not None and work.owner is not None
+        else None
+    )
+    for account in receipt["accounts"]:
+        in_use = bool(set(account["variants"]) & staying) and (
+            current is None or (account["origin"], account["owner"]) == current
+        )
+        if not in_use:
+            # Left on a Router or account Cursor no longer uses; kept so
+            # unconfigure can say so, and prune-variants there finds them.
+            account["in_cursor"] = False
+        else:
+            account.pop("in_cursor", None)
+    cursor_variants.write_receipt(receipt)
+
+
+def _cursor_variants_undelivered(plan: _CursorModelPlan | None) -> bool:
+    """Whether a flag asked for something effort variants couldn't do."""
+    if plan is None or plan.variant_request is None:
+        return False
+    outcome = plan.variants
+    if plan.variant_request == "none":
+        # Nothing can exist on a Router that doesn't support variants.
+        return bool(
+            outcome.failed
+            or outcome.referenced
+            or outcome.managed_key
+            or not outcome.listed
+        )
+    return outcome.undelivered()
+
+
+def _exit_if_cursor_variants_undelivered(
+    ctx: click.Context, plan: _CursorModelPlan | None, fmt: str
+) -> None:
+    if not _cursor_variants_undelivered(plan):
+        return
+    if fmt != "json":
+        click.echo(
+            "Cursor: not every effort variant asked for could be set up; "
+            "see the notes above.",
+            err=True,
+        )
+    # Not ctx.exit: main runs the CLI outside standalone mode, which would
+    # turn that into exit 0.
+    raise SystemExit(1)
+
+
+_CURSOR_EFFORT_LINES = (
+    "Cursor's effort picker has no effect on models that go through Router. "
+    "Router can add model names that pin a higher reasoning effort, such as "
+    "ramp-opus-5-5-high.",
+    "Higher effort uses more tokens and costs more. Cursor Teams plans also "
+    "charge a per-token fee on these requests.",
+)
+
+
+def _pick_cursor_effort_variants(
+    offers: list[cursor_variants.Offer],
+    saved: set[str],
+    kept: dict[str, cursor_variants.Kept] | None = None,
+    on_account: set[str] = frozenset(),
+) -> set[str] | None:
+    """Ask which effort-variant names to list; None keeps what is listed.
+
+    One y/N gate, default No, then one list of concrete names. Nothing is
+    selected on a first run; a re-run starts from its names, ticked, with
+    the ones setup no longer offers labelled why, and unticking removes.
+    Answering No, or cancelling, keeps them.
+    """
+    kept = kept or {}
+    for line in _CURSOR_EFFORT_LINES:
+        click.echo(line)
+    current = [offer.name for offer in offers if offer.name in saved] + list(kept)
+    if current:
+        question = (
+            "Change the higher-effort model names? (now: " + ", ".join(current) + ")"
+        )
+    else:
+        question = "Add model names with a higher reasoning effort?"
+    change = questionary.confirm(question, default=False, style=_picker_style()).ask()
+    if not change:
+        return None
+    rows = [
+        (
+            offer,
+            offer.name in saved,
+            "(already on your Router account)" if offer.name in on_account else "",
+        )
+        for offer in offers
+    ] + [(item.offer, True, item.why.picker_label()) for item in kept.values()]
+    width = max(len(offer.name) for offer, _, _ in rows)
+    chosen = questionary.checkbox(
+        "Which higher-effort names should be added?",
+        choices=[
+            questionary.Choice(
+                title=f"{offer.name.ljust(width)}  "
+                f"{offer.model.metadata.display_name or offer.request_name}, "
+                f"{offer.effort} effort" + (f"  {label}" if label else ""),
+                value=offer.name,
+                checked=checked,
+            )
+            for offer, checked, label in rows
+        ],
+        style=_picker_style(),
+        pointer=_PICKER_POINTER,
+        instruction="(space to toggle, enter to confirm; unticked names are removed)"
+        if current
+        else "(space to toggle, enter to confirm; none selected adds none)",
+    ).ask()
+    if chosen is None:
+        return None
+    return set(chosen)
+
+
+def _cursor_variant_lines(
+    plan: _CursorModelPlan, claude_aliases: dict[str, str]
+) -> list[str]:
+    """Each effort-variant name Cursor lists, with what it means, after the
+    base name and the effort that one runs at."""
+    names = plan.variant_names(claude_aliases)
+    if not names:
+        return []
+    by_request = {model.metadata.request_name: model for model in plan.catalog}
+    base_of = {model: alias for alias, model in claude_aliases.items()}
+    rows: list[tuple[str, str]] = []
+    for name in names:
+        request_name, effort = plan.variants.advertised[name]
+        model = by_request.get(request_name)
+        label = (model.metadata.display_name if model else "") or request_name
+        base = base_of.get(request_name, request_name)
+        if not any(row[0] == base for row in rows):
+            default = cursor_variants.effective_default(model) if model else None
+            shown = "no reasoning" if default == "none" else default
+            rows.append((base, f"{label} ({shown}, model default)" if shown else label))
+        rows.append((name, f"{label}, {effort} effort"))
+    width = max(len(name) for name, _ in rows)
+    return ["Reasoning effort for each Cursor model name:"] + [
+        f"  {name.ljust(width)}  {meaning}" for name, meaning in rows
+    ]
+
+
+def _remove_cursor_effort_variants() -> dict | None:
+    """Delete the effort variants this machine created, for unconfigure.
+
+    Only the Router the bound key belongs to is called, and only for the
+    account that key owns: a key is never sent to another Router. There,
+    only what this machine's receipt records as created here is deleted,
+    while Router still stamps it self-service with its effort. Everything
+    else is left and named with why (``kept``, with a reason code); base
+    ramp- aliases stay, as before. The receipt goes either way: after
+    unconfigure nothing on this machine uses those names, so
+    `ramp router cursor prune-variants` can find what was left. Returns None
+    when the receipt listed none; never raises.
+    """
+    receipt = cursor_variants.read_receipt()
+    cursor_variants.clear_receipt()
+    if not any(account["variants"] for account in receipt["accounts"]):
+        return None
+    api_key = router_repo.cursor_bound_api_key()
+    bound = router_repo.cursor_bound_upstream() if api_key else None
+    removed: list[str] = []
+    kept: list[dict] = []
+    listings: dict[str, router_aliases.AliasListing | None] = {}
+    stopped: str | None = None
+    for account in receipt["accounts"]:
+        origin = account["origin"]
+        entries = {
+            name: entry
+            for name, entry in sorted(account["variants"].items())
+            if isinstance(entry, dict)
+        }
+        created = {
+            name: entry for name, entry in entries.items() if entry.get("created")
+        }
+        base = account.get("base_url")
+        if not (
+            bound
+            and isinstance(base, str)
+            and router_repo.router_upstream(base) == bound
+        ):
+            # Another Router's key made these; this one is never sent there.
+            kept.extend(
+                {
+                    "name": name,
+                    "reason": "other_router",
+                    "router": origin,
+                    **({"base_url": base} if isinstance(base, str) else {}),
+                }
+                for name in created
+            )
+            continue
+        assert api_key is not None
+        headers = _router_alias_headers(api_key)
+        if origin not in listings:
+            try:
+                listings[origin] = router_aliases.list_aliases(origin, headers)
+            except Exception:
+                listings[origin] = None
+        listing = listings[origin]
+        if listing is None:
+            kept.extend({"name": name, "reason": "unreachable"} for name in created)
+            continue
+        if listing.owner is not None and listing.owner != account["owner"]:
+            kept.extend({"name": name, "reason": "other_account"} for name in created)
+            continue
+        for name, entry in entries.items():
+            alias = listing.aliases.get(name)
+            if alias is None:
+                continue
+            if cursor_variants.pin_cleared(alias):
+                # Edited in the dashboard: it's the user's now.
+                kept.append({"name": name, "reason": "edited"})
+            elif not entry.get("created"):
+                kept.append({"name": name, "reason": "another_machine"})
+            elif not cursor_variants.deletable(entry, alias):
+                kept.append({"name": name, "reason": "edited"})
+            elif stopped is not None:
+                kept.append({"name": name, "reason": stopped})
+            else:
+                verdict = cursor_variants.delete_alias(origin, headers, name)
+                if verdict == cursor_variants.DELETED:
+                    removed.append(name)
+                    continue
+                reason = {
+                    cursor_variants.NOT_SELF_SERVICE: "edited",
+                    cursor_variants.REFERENCED: "referenced",
+                    cursor_variants.MANAGED: "managed_key",
+                    cursor_variants.UNSUPPORTED: "unsupported",
+                }.get(verdict, "failed")
+                if reason in ("managed_key", "unsupported"):
+                    # Every other delete would be refused the same way.
+                    stopped = reason
+                kept.append({"name": name, "reason": reason})
+    if not removed and not kept:
+        return None
+    return {"removed": removed, "kept": kept}
+
+
+def _unconfigure_variant_lines(variants: dict) -> list[str]:
+    """What unconfigure did with the effort variants, and what it left."""
+    lines: list[str] = []
+    if variants.get("removed"):
+        lines.append(
+            "Removed the effort-variant names this machine created on Router: "
+            + ", ".join(variants["removed"])
+            + "."
+        )
+    by_reason: dict[str, list[dict]] = {}
+    for row in variants.get("kept") or []:
+        by_reason.setdefault(row["reason"], []).append(row)
+    stays = {
+        "another_machine": "another machine created it",
+        "edited": "it was edited in the Router dashboard, so it's yours now",
+        "referenced": "a routing profile uses it",
+    }
+    for reason, why in stays.items():
+        lines.extend(
+            f"{row['name']} stays on your Router account: {why}."
+            for row in by_reason.get(reason, [])
+        )
+    routers: dict[tuple[str, str | None], list[str]] = {}
+    for row in by_reason.get("other_router", []):
+        routers.setdefault((row["router"], row.get("base_url")), []).append(row["name"])
+    for (router, base), names in routers.items():
+        command = "ramp router cursor prune-variants --api-key KEY"
+        if base:
+            command = f"{ROUTER_BASE_URL_ENV}={base} {command}"
+        lines.append(
+            f"These stay on {router}, which Cursor isn't set up with now: "
+            f"{', '.join(names)}. To delete them, run '{command}' with a key "
+            "for that Router."
+        )
+    if rows := by_reason.get("other_account"):
+        lines.append(
+            "These stay on the Router account whose key created them: "
+            + ", ".join(row["name"] for row in rows)
+            + ". To delete them, run 'ramp router cursor prune-variants --api-key "
+            "KEY' with that key."
+        )
+    if rows := by_reason.get("managed_key"):
+        lines.append(
+            cursor_variants.MANAGED_KEY_NOTE
+            + " These stay on your Router account: "
+            + ", ".join(row["name"] for row in rows)
+        )
+    rest = [
+        row["name"]
+        for reason in ("unsupported", "unreachable", "failed")
+        for row in by_reason.get(reason, [])
+    ]
+    if rest:
+        lines.append(
+            "These effort-variant names couldn't be removed and stay on your "
+            "Router account; run 'ramp router cursor prune-variants' later, or "
+            f"remove them at {_statusline_origin(router_base_url())}/strategies: "
+            + ", ".join(rest)
+        )
+    return lines
+
+
 def _ensure_claude_aliases(
     api_key: str,
     base_url: str,
     models: list[RouterModel],
+    *,
+    listing: router_aliases.AliasListing | None | object = _READ_LISTING,
 ) -> dict[str, str]:
     """Give every Claude catalog model an alias name Cursor can route.
 
@@ -3668,53 +5234,41 @@ def _ensure_claude_aliases(
     network error, a name the user already spent — reads as "fewer aliases",
     never as a failed setup; guidance for models left without an alias falls
     back to the dashboard.
+
+    ``listing`` is the run's alias listing from ``_router_alias_listing``
+    (read here when not passed; None when it couldn't be read). Aliases this
+    creates are recorded in it.
     """
     claude_models = [
-        model for model in models if model.metadata.request_name.startswith("claude-")
+        model
+        for model in models
+        if router_aliases.base_alias_name(model.metadata.request_name)
     ]
     if not claude_models:
         return {}
+    if listing is _READ_LISTING:
+        listing = _router_alias_listing(api_key, base_url)
+    if not isinstance(listing, router_aliases.AliasListing):
+        return {}
     origin = _statusline_origin(base_url)
-    headers = {"Authorization": f"Bearer {api_key}", **_router_telemetry_headers()}
-    try:
-        response = httpx.get(
-            f"{origin}/self-service/model-aliases", headers=headers, timeout=10
-        )
-    except httpx.HTTPError:
-        return {}
-    if response.status_code != 200:
-        return {}
-    try:
-        payload = response.json()
-        if not isinstance(payload, dict):
-            return {}
-        existing = {
-            alias["name"]: [
-                value
-                for value in alias.get("candidate_models", [])
-                if isinstance(value, str)
-            ]
-            for alias in payload.get("data", [])
-            if isinstance(alias, dict) and isinstance(alias.get("name"), str)
-        }
-    except (ValueError, TypeError):
-        return {}
+    headers = _router_alias_headers(api_key)
     aliases: dict[str, str] = {}
     for model in claude_models:
         model_name = model.metadata.request_name
-        alias_name = f"ramp-{model_name.removeprefix('claude-')}"
-        if alias_name in existing:
+        alias_name = router_aliases.base_alias_name(model_name)
+        assert alias_name is not None
+        if alias_name in listing.aliases:
             # The name is only offered as this model's route when it in fact
             # routes there; a name the user already spent on something else
             # stays theirs and simply is not advertised.
-            if any(
-                _candidate_routes_model(value, model) for value in existing[alias_name]
+            if router_aliases.routed_models(
+                router_aliases.candidate_models(listing.aliases[alias_name]), [model]
             ):
                 aliases[alias_name] = model_name
             continue
         try:
             created = httpx.post(
-                f"{origin}/self-service/model-aliases",
+                f"{origin}{router_aliases.SELF_SERVICE_PATH}",
                 headers=headers,
                 json={"name": alias_name, "candidate_models": [model_name]},
                 timeout=10,
@@ -3723,80 +5277,67 @@ def _ensure_claude_aliases(
             continue
         if created.status_code == 201:
             aliases[alias_name] = model_name
+            try:
+                body = created.json()
+            except ValueError:
+                body = None
+            listing.record(
+                body
+                if isinstance(body, dict) and body.get("name") == alias_name
+                else {"name": alias_name, "candidate_models": [model_name]}
+            )
     return aliases
-
-
-def _candidate_routes_model(candidate: str, model: RouterModel) -> bool:
-    """True when a provider-qualified alias candidate routes exactly this model.
-
-    Candidates read ``provider:provider-model`` with an optional trailing
-    ``:service-tier``, and the stored spelling is the provider's own — which
-    for a rolling request name such as claude-sonnet-4-5 is the dated
-    snapshot it currently points at (claude-sonnet-4-5-20250929). Matching
-    against the model's provider_model from ``GET /v1/models`` therefore
-    recognizes the aliases this command creates, while still refusing
-    lookalikes that are genuinely different catalog entries: the separate
-    model claude-haiku-4-5-20251001 is not a route for claude-haiku-4-5,
-    whose own provider_model carries no date.
-    """
-    _, separator, qualified = candidate.partition(":")
-    segment = qualified if separator else candidate
-    request_name = model.metadata.request_name
-    provider_model = model.metadata.provider_model or request_name
-    return (
-        segment == provider_model
-        or segment.startswith(f"{provider_model}:")
-        or segment == request_name
-        or segment.startswith(f"{request_name}:")
-    )
 
 
 def _cursor_setup_steps(
     base_url: str,
     suggested_name: str | None,
     claude_aliases: dict[str, str] | None = None,
+    *,
+    names: list[str] | None = None,
+    variants: list[str] | None = None,
+    dropped: list[str] | None = None,
 ) -> list[str]:
-    """The fields Cursor actually has, in the order its UI presents them."""
-    steps = [
-        "Open Cursor Settings (Cmd/Ctrl+Shift+J) and go to Models, then API Keys.",
-        'Paste the key into the "OpenAI API Key" field.',
-        f'Toggle on "Override OpenAI Base URL" and set it to: {base_url}',
-        'Toggle on "OpenAI API Key" and confirm "Enable OpenAI API Key".',
-        (
-            "In the model list, enable or add the Router models to use."
-            + (f" Suggested start: {suggested_name}" if suggested_name else "")
-        ),
+    """The fields Cursor actually has, in the order its UI presents them.
+
+    ``names`` lists every model name for a narrowed model list; all models
+    leave the choice to the user, with the Claude alias names spelled out.
+    Either way the model step names the suggested model when it isn't listed
+    yet, since the last step picks it and a fresh Cursor profile has not
+    added it. ``variants`` are effort-variant names to add (a narrowed list
+    already has them), and ``dropped`` ones an earlier setup listed that
+    should go.
+    """
+    names = list(names) if names else [*sorted(claude_aliases or {}), *(variants or [])]
+    if suggested_name and suggested_name not in names:
+        names = [suggested_name, *names]
+    if names:
+        models = "Add these model names: " + ", ".join(names) + "."
+    else:
+        models = "Add or turn on the Router models you want."
+    if dropped:
+        models += " Remove these if you added them earlier: " + ", ".join(dropped) + "."
+    return [
+        f"Open Cursor Settings ({cursor.settings_shortcut()}) > Models > API Keys.",
+        'Paste the key into "OpenAI API Key".',
+        f'Turn on "Override OpenAI Base URL" and set it to {base_url}',
+        'Turn on "OpenAI API Key" and confirm "Enable OpenAI API Key".',
+        models,
+        f"Pick {suggested_name or 'a Router model'} in Cursor's chat.",
     ]
-    if claude_aliases:
-        steps.append(
-            "For Claude models, add these alias names instead of the claude- "
-            "ids Cursor refuses to route: " + ", ".join(sorted(claude_aliases))
-        )
-    steps.append("Pick the model in Cursor's chat model picker.")
-    return steps
 
 
 def _cursor_removal_steps() -> list[str]:
     """Undo the same fields setup filled in, in the same place."""
     return [
-        "Open Cursor Settings (Cmd/Ctrl+Shift+J) and go to Models, then API Keys.",
-        (
-            'Toggle off "OpenAI API Key" — or, if you used your own OpenAI '
-            "key before Ramp Router, paste that key back instead."
-        ),
-        (
-            'Toggle off "Override OpenAI Base URL" — or restore the URL you '
-            "used before Ramp Router, if you had one."
-        ),
-        (
-            "In the model list, remove any Router models you added and "
-            "re-disable any you enabled for Router."
-        ),
-        (
-            "Alias names created during setup stay on your Router account; "
-            "remove any you no longer want at "
-            f"{_statusline_origin(router_base_url())}/strategies."
-        ),
+        f"Open Cursor Settings ({cursor.settings_shortcut()}) > Models > API Keys.",
+        'Turn off "OpenAI API Key", or paste back the OpenAI key you used before.',
+        'Turn off "Override OpenAI Base URL", or set back the URL you used before.',
+        "Remove the Router models you added, and turn off any you turned on for "
+        "Router.",
+        "The ramp- model names stay on your Router account (this machine's "
+        "effort variants are removed); remove any you don't "
+        f"want at {_statusline_origin(router_base_url())}/strategies.",
     ]
 
 
@@ -3807,9 +5348,9 @@ def _cursor_note_lines(
     base_url: str | None = None,
 ) -> list[str]:
     lines = [
-        "Cursor sends base-URL-override requests from Cursor's servers, so",
-        "the Router key transits Cursor's backend, as with any BYOK provider.",
-        "Tab autocomplete and Cursor's own models keep using Cursor's backend.",
+        "Cursor sends these requests from its own servers, so your Router key "
+        "passes through Cursor, like any API key you add there.",
+        "Tab completion and Cursor's own models still run on Cursor.",
     ]
     claude_models = [
         model.metadata.request_name
@@ -3820,11 +5361,9 @@ def _cursor_note_lines(
         # No Claude models in this catalog means no aliases to talk about;
         # pointing at the dashboard would ask the user to fix nothing.
         return lines
-    lines.extend(
-        [
-            "Cursor never routes model ids beginning with claude- through the",
-            "override; Claude models are reached through Router alias names.",
-        ]
+    lines.append(
+        "Cursor won't send claude- model names to Router, so Claude models use "
+        "these names:"
     )
     aliases = claude_aliases or {}
     for alias_name, model_name in sorted(aliases.items()):
@@ -3840,23 +5379,22 @@ def _cursor_note_lines(
             _statusline_origin(base_url) if base_url else router_ui_url()
         )
         lines.append(
-            f"Create alias names at {strategies_origin}/strategies for: "
+            f"Create names for these at {strategies_origin}/strategies: "
             + ", ".join(missing)
         )
     return lines
 
 
 def _echo_cursor_guidance(steps: list[str]) -> None:
-    click.echo("Cursor keeps these settings in its own UI, so finish there:")
+    click.echo("Finish in Cursor:")
     for number, step in enumerate(steps, start=1):
         click.echo(f"  {number}. {step}")
 
 
 _CURSOR_KEYCHAIN_NOTE = (
-    'Cursor: macOS will ask to let "{program}" (the Ramp CLI) use "Cursor Safe '
-    "Storage\" in your keychain. That is Cursor's own encryption key; Ramp uses "
-    "it only to save your Router key in Cursor's encrypted format. Click Allow, "
-    "or Deny to get paste-in steps instead."
+    'Cursor: macOS will ask to let "{program}" use "Cursor Safe Storage", '
+    "Cursor's encryption key. Ramp uses it only to save your Router key in "
+    "Cursor. Enter your Mac password if asked, then click Allow."
 )
 
 
@@ -3865,12 +5403,280 @@ _CURSOR_KEYS_BLOCKED_LINES = [
     "key or base URL. Ask your Cursor team admin to allow personal API keys.",
 ]
 
+# Why configure gave Cursor paste-in steps instead of writing its settings;
+# JSON callers read these as fallback_reason.
+_CURSOR_FALLBACK_PLATFORM = "unsupported_platform"
+_CURSOR_FALLBACK_RUNNING = "cursor_running"
+_CURSOR_FALLBACK_NOT_FOUND = "settings_not_found"
+_CURSOR_FALLBACK_KEYCHAIN = "keychain_unavailable"
+_CURSOR_FALLBACK_ERROR = "settings_error"
+
+# A Cursor-only configure that changed nothing exits with this code, after
+# saying why, with no "Error:" prefix: a user's own "no" is not an error.
+CURSOR_NOT_SET_UP_EXIT_CODE = EXIT_RUNTIME
+_CURSOR_CONFIGURE = "'ramp router configure cursor'"
+# The last line whenever Cursor wasn't set up and no paste-in steps follow.
+_CURSOR_BY_HAND = "Or set it up by hand: ramp router cursor"
+
 
 def _cursor_set_up() -> bool:
     """Whether this CLI set Cursor up: settings it wrote, or a key it bound
     for transcript uploads (a setup pasted in by hand leaves only the latter).
     """
     return cursor.has_receipt() or router_repo.cursor_binding_path().exists()
+
+
+def _echo_past_spinner(text: str) -> None:
+    """Print a stderr line the spinner won't draw over.
+
+    The leading \\r and clear-line move past the spinner's line.
+    """
+    click.echo("\r\033[K" + text if sys.stderr.isatty() else text, err=True)
+
+
+def _echo_cursor_keychain_note() -> None:
+    """Say why the macOS permission dialog is about to appear."""
+    # macOS names the real executable, not the `ramp` symlink.
+    _echo_past_spinner(
+        _CURSOR_KEYCHAIN_NOTE.format(
+            program=os.path.basename(os.path.realpath(sys.executable))
+        )
+    )
+
+
+def _cursor_fallback(reason: str, message: str, **details) -> dict:
+    """Why Cursor's settings were not written: the reason and what to do next."""
+    return {"reason": reason, "message": message, **details}
+
+
+def _cursor_not_set_up(because: str, next_step: str = "") -> str:
+    """Every outcome that left Cursor unset, worded one way."""
+    return f"Cursor wasn't set up because {because}." + (
+        f" {next_step}" if next_step else ""
+    )
+
+
+def _cursor_open_message(outcome: str | None) -> str:
+    """Why an open Cursor kept its settings, by how asking it to quit went."""
+    rerun = f"run {_CURSOR_CONFIGURE} again"
+    quit_first = cursor.quit_instruction()
+    if outcome == "declined":
+        return _cursor_not_set_up(
+            "it's still open", f"When you're ready, {rerun} and let it quit Cursor."
+        )
+    if outcome in (cursor.QUIT_DONE, cursor.QUIT_FORCED):
+        return _cursor_not_set_up(
+            "it was opened again during setup",
+            f"Run {_CURSOR_CONFIGURE} again and keep Cursor closed until it finishes.",
+        )
+    if outcome == cursor.QUIT_DENIED:
+        return _cursor_not_set_up(
+            "macOS didn't let Ramp quit it",
+            f"{quit_first} and {rerun}. To let setup quit it next time, allow your "
+            "terminal in System Settings › Privacy & Security › Automation.",
+        )
+    because = {
+        cursor.QUIT_TIMEOUT: "it didn't quit in time",
+        cursor.QUIT_FAILED: "it didn't quit",
+        cursor.QUIT_FORCE_FAILED: "it didn't quit, even when forced",
+    }.get(outcome, "it's open")
+    return _cursor_not_set_up(because, f"{quit_first}, then {rerun}.")
+
+
+# Quit outcomes after which setup offers to force quit Cursor, and what the
+# offer says happened. A cancel in Cursor's own dialog can't be told apart
+# from a dialog left unanswered, so it is a timeout too.
+_CURSOR_FORCE_QUIT_REASONS = {
+    cursor.QUIT_TIMEOUT: (
+        f"Cursor is still open after {int(cursor.QUIT_CONFIRM_SECONDS)} seconds. "
+        "It may be waiting for you to answer a dialog."
+    ),
+    cursor.QUIT_DENIED: "macOS didn't let Ramp quit Cursor.",
+    cursor.QUIT_FAILED: "Cursor didn't quit.",
+}
+
+
+def _cursor_running_fallback(
+    pids: list[int] | None,
+    quit_outcome: str | None = None,
+    *,
+    inside: bool = False,
+    **details,
+) -> dict:
+    """Why a running Cursor kept its settings; ``pids`` is None when setup
+    couldn't tell whether Cursor is running, which counts as running."""
+    details = {"cursor_pids": pids or [], **details}
+    if quit_outcome is not None:
+        details["quit_outcome"] = quit_outcome
+    if pids is None:
+        details["process_check_failed"] = True
+        message = _cursor_not_set_up(
+            "Ramp couldn't check whether Cursor is running",
+            f"Quit Cursor yourself if it's open, then run {_CURSOR_CONFIGURE} again.",
+        )
+    elif inside or (quit_outcome is None and cursor.runs_inside_cursor()):
+        # Quitting Cursor would end this run too, as in Cursor's own agent.
+        message = _cursor_not_set_up(
+            "this is running in Cursor's terminal",
+            f"Run {_CURSOR_CONFIGURE} from Terminal or iTerm.",
+        )
+        details["inside_cursor"] = True
+    else:
+        message = _cursor_open_message(quit_outcome)
+    return _cursor_fallback(_CURSOR_FALLBACK_RUNNING, message, **details)
+
+
+def _cursor_missing_settings_fallback() -> dict:
+    path = cursor.state_db_path()
+    looked = f"(Looked in {cursor.user_dir()}.)"
+    other = cursor.other_build_user_dirs()
+    if other:
+        name, _ = other[0]
+        message = _cursor_not_set_up(
+            f"only {name} was found, and automatic setup supports only the "
+            "standard Cursor app",
+            looked,
+        )
+    else:
+        message = _cursor_not_set_up(
+            "its settings weren't found",
+            f"Open Cursor once, then run {_CURSOR_CONFIGURE} again. (Looked in "
+            f"{cursor.user_dir()}. If you start Cursor with --user-data-dir, set "
+            f"{cursor.USER_DIR_ENV} to that User folder.)",
+        )
+    return _cursor_fallback(
+        _CURSOR_FALLBACK_NOT_FOUND, message, settings_path=str(path)
+    )
+
+
+def _cursor_keychain_fallback() -> dict:
+    return _cursor_fallback(
+        _CURSOR_FALLBACK_KEYCHAIN,
+        _cursor_not_set_up(
+            'macOS didn\'t allow access to "Cursor Safe Storage"',
+            f"Run {_CURSOR_CONFIGURE} again and click Allow.",
+        ),
+    )
+
+
+def _cursor_error_fallback(exc: Exception) -> dict:
+    return _cursor_fallback(
+        _CURSOR_FALLBACK_ERROR,
+        _cursor_not_set_up(
+            f"of an error: {str(exc).rstrip('.')}",
+            f"Run {_CURSOR_CONFIGURE} again.",
+        ),
+    )
+
+
+def _stop_cursor_setup(fallback: dict) -> NoReturn:
+    """End a Cursor-only run that can't set Cursor up, before anything changed."""
+    click.echo(fallback["message"])
+    if fallback.get("personal_keys_blocked"):
+        show_notice("NOTICE", _CURSOR_KEYS_BLOCKED_LINES)
+    click.echo(_CURSOR_BY_HAND)
+    raise SystemExit(CURSOR_NOT_SET_UP_EXIT_CODE)
+
+
+def _offer_to_quit_cursor(
+    ctx: click.Context, fmt: str, clients: tuple[str, ...], *, unattended: bool
+) -> dict:
+    """Before sign-in, check that Cursor setup can finish, and offer to quit
+    an open Cursor so it can.
+
+    Only a person at a macOS terminal is asked; every other run keeps Cursor
+    open and gets paste-in steps. Cursor is quit only once setup knows it can
+    write: its settings exist, its team allows personal keys, and the keychain
+    handed over Cursor's encryption key. A Cursor-only run that can't finish
+    stops here, before a browser opens or a key is created. Otherwise returns
+    what the write needs: the quit outcome, a fallback already known, whether
+    the keychain was read, and whether to reopen Cursor.
+    """
+    if (
+        CURSOR_CLIENT not in clients
+        or sys.platform != "darwin"
+        or unattended
+        or not _can_prompt(ctx, fmt)
+    ):
+        return {}
+    state: dict = {}
+
+    def give_up(fallback: dict) -> dict:
+        if clients == (CURSOR_CLIENT,):
+            # Nothing else to set up and no paste-in steps here.
+            _stop_cursor_setup(fallback)
+        state["fallback"] = fallback
+        return state
+
+    pids = cursor.running_pids()
+    if pids is None:
+        # Neither whether Cursor runs nor whether this runs inside it is
+        # known, and a reopen would refuse too: never quit it blind.
+        return give_up(_cursor_running_fallback(None))
+    running = pids != []
+    if running and cursor.runs_inside_cursor():
+        # Quitting Cursor would end this run too.
+        return give_up(_cursor_running_fallback(pids, inside=True))
+    if not cursor.state_db_path().is_file():
+        return give_up(_cursor_missing_settings_fallback())
+    if running and cursor.personal_keys_blocked():
+        # Cursor would ignore the settings, so it isn't worth quitting.
+        return give_up(_cursor_running_fallback(pids, personal_keys_blocked=True))
+    if running and not click.confirm(
+        "Cursor is open. Setup needs to quit it, then reopens it with your open "
+        "files. Chats still running in Cursor will stop. Quit Cursor now?",
+        default=True,
+    ):
+        state["outcome"] = "declined"
+        return give_up(_cursor_running_fallback(pids, "declined"))
+    _echo_cursor_keychain_note()
+    try:
+        cursor.unlock()
+    except cursor.CursorKeychainError:
+        return give_up(_cursor_keychain_fallback())
+    except cursor.CursorSettingsError as exc:
+        return give_up(_cursor_error_fallback(exc))
+    state["unlocked"] = True
+    if not running:
+        return state
+    state["reopen"] = True
+    # Registered before the quit, so Cursor is reopened however this run ends,
+    # Ctrl+C during the wait included.
+    ctx.call_on_close(lambda: _reopen_cursor(state))
+    click.echo(
+        "Cursor: quitting. If macOS asks to let your terminal control Cursor, "
+        "click OK. If Cursor asks you to confirm, confirm."
+    )
+    outcome = cursor.request_quit()
+    if outcome != cursor.QUIT_DONE and cursor.running_pids() == []:
+        outcome = cursor.QUIT_DONE
+    if outcome in _CURSOR_FORCE_QUIT_REASONS:
+        if click.confirm(
+            f"{_CURSOR_FORCE_QUIT_REASONS[outcome]} Force quit it? Unsaved changes "
+            "and chats still running in Cursor may be lost.",
+            default=False,
+        ):
+            click.echo("Cursor: force quitting.")
+            outcome = cursor.force_quit()
+        elif cursor.running_pids() == []:
+            # It quit while the question was open.
+            outcome = cursor.QUIT_DONE
+    state["outcome"] = outcome
+    if outcome not in (cursor.QUIT_DONE, cursor.QUIT_FORCED):
+        return give_up(_cursor_running_fallback(cursor.running_pids() or [], outcome))
+    return state
+
+
+def _reopen_cursor(state: dict) -> bool | None:
+    """Reopen a Cursor setup quit, once; None when there was nothing to do."""
+    if not state.get("reopen"):
+        return None
+    state["reopen"] = False
+    if cursor.running_pids() != []:
+        # Never quit, or already opened again.
+        return None
+    state["reopened"] = cursor.reopen()
+    return state["reopened"]
 
 
 def _write_cursor_settings(
@@ -3881,32 +5687,70 @@ def _write_cursor_settings(
     *,
     announce: bool = False,
     prompt: bool = True,
-) -> dict | None:
-    """Write Cursor's settings, or return None so the caller falls back."""
+    quit_state: dict | None = None,
+    plan: _CursorModelPlan | None = None,
+) -> tuple[dict | None, dict | None]:
+    """Write Cursor's settings: (receipt, None), or (None, why it fell back)."""
     if sys.platform != "darwin":
-        return None
-    if cursor.is_running() or not cursor.state_db_path().is_file():
-        return None
-    if announce and prompt:
-        # Say why the macOS permission dialog is about to appear.
-        # The leading \r and clear-line move past the spinner's line.
-        # macOS names the real executable, not the `ramp` symlink.
-        note = _CURSOR_KEYCHAIN_NOTE.format(
-            program=os.path.basename(os.path.realpath(sys.executable))
+        return None, _cursor_fallback(
+            _CURSOR_FALLBACK_PLATFORM,
+            "Cursor wasn't set up automatically because automatic setup is "
+            "macOS-only for now.",
         )
-        click.echo("\r\033[K" + note if sys.stderr.isatty() else note, err=True)
+    state = quit_state or {}
+    if state.get("fallback"):
+        return None, state["fallback"]
+    quit_outcome = state.get("outcome")
+    if (pids := cursor.running_pids()) != []:
+        # Left open, or opened again after setup quit it: either way there
+        # is nothing to wait for.
+        return None, _cursor_running_fallback(pids, quit_outcome)
+    if not cursor.state_db_path().is_file():
+        return None, _cursor_missing_settings_fallback()
+    if announce and prompt and not state.get("unlocked"):
+        _echo_cursor_keychain_note()
     names = cursor.model_names_to_add(
         [model.metadata.request_name for model in models], claude_aliases
     )
+    if plan is not None:
+        names = plan.cursor_list(claude_aliases)
     try:
-        return cursor.configure(api_key, base_url, names, prompt=prompt)
-    except cursor.CursorSettingsError:
-        return None
+        return (
+            cursor.configure(
+                api_key,
+                base_url,
+                names,
+                prompt=prompt,
+                **(
+                    {
+                        "remove": [*plan.remove, *plan.dropped_variants],
+                        # Variant names reach Cursor by hand too ('ramp
+                        # router cursor'); this machine's receipt owns them.
+                        "remove_owned": plan.dropped_variants,
+                        "model_scope": plan.scope_to_save().to_json(),
+                    }
+                    if plan is not None
+                    else {}
+                ),
+            ),
+            None,
+        )
+    except cursor.CursorKeychainError:
+        return None, _cursor_keychain_fallback()
+    except cursor.CursorSettingsError as exc:
+        if (pids := cursor.running_pids()) != []:
+            # Cursor was opened again around the write.
+            return None, _cursor_running_fallback(pids, quit_outcome)
+        return None, _cursor_error_fallback(exc)
 
 
-@router_group.command(
+@router_group.group(
     "cursor",
-    help="Guided Ramp Router setup for Cursor's OpenAI base-URL override",
+    invoke_without_command=True,
+    help=(
+        "Print the steps to set up Ramp Router in Cursor by hand "
+        "('ramp router configure cursor' does it for you on macOS)."
+    ),
 )
 @click.option(
     "--api-key",
@@ -3927,37 +5771,66 @@ def _write_cursor_settings(
     is_flag=True,
     help="Print the API key instead of only copying it to the clipboard.",
 )
+@_cursor_model_options
 @click.pass_context
 def router_cursor(
     ctx: click.Context,
     api_key: str | None,
     no_browser: bool,
     show_key: bool,
+    cursor_models_view: str | None = None,
+    effort_variants: tuple[str, ...] = (),
+    no_effort_variants: bool = False,
 ) -> None:
     """Provision a Router key and walk through Cursor's two BYOK fields.
 
-    Cursor keeps its provider settings inside its own account-synced UI and
-    sends base-URL-override traffic from Cursor's servers, so there is no
-    config file this command could write and no local proxy that could sit in
-    between. What remains automatable is the credential and the exact values
-    to paste, which is precisely what this does.
+    Cursor keeps its provider settings in its own UI and sends base-URL
+    override traffic from Cursor's servers, so no local proxy can sit in
+    between. This prints the credential and the exact values to paste, and
+    works while Cursor is open; 'configure cursor' writes them for a closed
+    Cursor on macOS.
     """
+    if ctx.invoked_subcommand is not None:
+        # A subcommand resolves its own key; one given here still counts.
+        ctx.obj["cursor_api_key"] = api_key
+        return
     # Click has already copied any configured value into api_key. Drop the
     # secret from the environment before anything here spawns a child: the
     # workspace's probes and the clipboard helper below inherit what this
     # process still carries.
     os.environ.pop(CONFIGURE_KEY_ENV, None)
+    options = _cursor_options(cursor_models_view, effort_variants, no_effort_variants)
+    fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
+    # A key an unfinished 'configure cursor' created is handed over here
+    # rather than creating another one, to a person reading the steps only:
+    # JSON and --no-input callers still pass their own key.
+    pending_key = (
+        router_repo.pending_cursor_key(router_base_url())
+        if api_key is None and fmt != "json" and not ctx.obj["no_input"]
+        else None
+    )
+    pending_models = None
+    if pending_key is not None:
+        try:
+            pending_models = _fetch_models(pending_key)
+        except RouterKeyRejectedError:
+            # Revoked or otherwise unusable: create a new key as usual.
+            router_repo.clear_pending_cursor_key()
+            pending_key = None
+        else:
+            api_key = pending_key
     # --show-key asks for the key in this terminal, which the workspace's
     # clipboard handoff doesn't offer, and --no-browser is honored only here,
-    # so either keeps this command's own path.
+    # so either keeps this command's own path, as do the model-list flags.
     if (
         api_key is None
         and not show_key
         and not no_browser
+        and not options.given()
+        and not options.variants_given()
         and router_ui.launch(ctx, "connect", clients=("cursor",))
     ):
         return
-    fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     if api_key is not None:
         # A flag- or environment-supplied key is known now, so an empty one
         # is named as the invalid input before any browser or network work.
@@ -3975,6 +5848,11 @@ def router_cursor(
     browser_acquired_key = False
     if api_key is None and _can_prompt(ctx, fmt):
         api_key = _pick_stored_router_api_key()
+    # Asked before a browser opens, so cancelling it creates no key.
+    scope = _requested_cursor_scope(
+        options,
+        ask=(lambda question: question()) if _can_prompt(ctx, fmt) else None,
+    )
     if api_key is None:
         if fmt == "json":
             # Machine output must stay non-interactive: browser setup waits on
@@ -4003,23 +5881,64 @@ def router_cursor(
         # back from browser setup or a stored credential.
         raise click.ClickException("Ramp Router did not return an API key.")
     base_url = router_base_url()
-    models = _fetch_models(api_key, wait_for_key=browser_acquired_key)
+    catalog = pending_models or _fetch_models(
+        api_key, wait_for_key=browser_acquired_key
+    )
+    # Decided, and the flags checked against the catalog, before anything is
+    # bound or created. Nothing here writes Cursor's list, so nothing is
+    # removed and the choice isn't saved.
+    router_fallback = _router_fallback_model(CURSOR_CLIENT, api_key, base_url)
+    try:
+        plan = _plan_cursor_models(
+            api_key,
+            base_url,
+            catalog,
+            options,
+            scope=scope,
+            router_fallback=router_fallback,
+            ask=(lambda question: question()) if _can_prompt(ctx, fmt) else None,
+        )
+    except (click.ClickException, click.Abort) as exc:
+        # A flag Router's catalog refutes, or a cancelled question: a key
+        # this run created is kept for the next Cursor setup.
+        if browser_acquired_key:
+            _keep_cancelled_cursor_key(
+                base_url, api_key, stopped=isinstance(exc, click.ClickException)
+            )
+        raise
+    models = plan.models
     router_repo.bind_cursor(base_url, api_key, cursor.user_dir())
     # Reconcile the agent for the binding, as configure does: a Cursor-only
     # machine whose agent was removed with its last setup gets it back.
     router_schedule.install()
-    suggested_name = _cursor_suggested_model(
-        models, _router_fallback_model(CURSOR_CLIENT, api_key, base_url)
+    # Variant deletes first: the alias limit was planned with the room they
+    # free.
+    _apply_cursor_variants(plan)
+    claude_aliases = plan.claude_aliases(
+        _ensure_claude_aliases(api_key, base_url, models, listing=plan.alias_listing)
     )
-    claude_aliases = _ensure_claude_aliases(api_key, base_url, models)
+    suggested_name = _cursor_suggested_model(models, router_fallback, claude_aliases)
     key_on_clipboard = False if show_key else _copy_to_clipboard(api_key)
-    steps = _cursor_setup_steps(base_url, suggested_name, claude_aliases)
+    if pending_key is not None and (show_key or key_on_clipboard):
+        # Handed over, so it is no longer pending. Kept when it couldn't be,
+        # so a rerun with --show-key prints this key instead of a new one.
+        router_repo.clear_pending_cursor_key()
+    steps = _cursor_setup_steps(
+        base_url,
+        suggested_name,
+        claude_aliases,
+        names=plan.listed_names(claude_aliases),
+        variants=plan.variant_names(claude_aliases),
+        dropped=plan.dropped_variants,
+    )
+    # Nothing writes Cursor's list here; the steps say what to change.
+    _finalize_cursor_variants(plan)
     keys_blocked = cursor.personal_keys_blocked()
     if fmt == "json":
         payload = {
             "client": "cursor",
             "base_url": base_url,
-            "models_available": len(models),
+            **plan.to_json(),
             "suggested_model": suggested_name,
             "claude_aliases": claude_aliases,
             "api_key_on_clipboard": key_on_clipboard,
@@ -4030,8 +5949,11 @@ def router_cursor(
         if show_key:
             payload["api_key"] = api_key
         print_agent_json(payload, pagination=None)
+        _exit_if_cursor_variants_undelivered(ctx, plan, fmt)
         return
     click.echo("Connecting Ramp Router to Cursor")
+    if pending_key is not None:
+        click.echo("Reusing the Router key from your last unfinished Cursor setup.")
     click.echo()
     if show_key:
         click.echo(f"Router API key: {api_key}")
@@ -4049,13 +5971,12 @@ def router_cursor(
     click.echo()
     _echo_cursor_guidance(steps)
     click.echo()
-    model_count = len(models)
-    model_label = "model is" if model_count == 1 else "models are"
-    click.echo(
-        f"{model_count} {model_label} available; any Router model id outside the "
-        "claude- prefix works as a custom model name in Cursor."
+    show_notice(
+        "NOTE",
+        _cursor_note_lines(models, claude_aliases, base_url=base_url)
+        + _cursor_variant_lines(plan, claude_aliases)
+        + plan.notes,
     )
-    show_notice("NOTE", _cursor_note_lines(models, claude_aliases, base_url=base_url))
     if keys_blocked:
         show_notice("NOTICE", _CURSOR_KEYS_BLOCKED_LINES)
     summary = _fetch_configure_summary(api_key, base_url=base_url)
@@ -4067,6 +5988,191 @@ def router_cursor(
         )
     if hint := _cursor_tagging_hint():
         click.echo(hint)
+    _exit_if_cursor_variants_undelivered(ctx, plan, fmt)
+
+
+@router_cursor.command(
+    "prune-variants",
+    help=(
+        "Delete effort-variant aliases (ramp-<model>-<effort>) that setup made "
+        "but this machine's Cursor doesn't list, such as ones left by another "
+        "or a wiped machine."
+    ),
+)
+@click.option(
+    "--api-key",
+    metavar="KEY",
+    envvar=CONFIGURE_KEY_ENV,
+    help="Ramp Router API key. Defaults to the key Cursor was set up with.",
+)
+@click.option("--yes", is_flag=True, help="Delete without asking.")
+@click.pass_context
+def router_cursor_prune_variants(
+    ctx: click.Context, api_key: str | None, yes: bool
+) -> None:
+    os.environ.pop(CONFIGURE_KEY_ENV, None)
+    fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
+    api_key = api_key or ctx.obj.get("cursor_api_key")
+    if not api_key:
+        api_key = router_repo.cursor_bound_api_key()
+        bound = router_repo.cursor_bound_upstream()
+        if api_key and bound != router_repo.router_upstream(router_base_url()):
+            # The saved key belongs to the Router Cursor was set up with; it
+            # is never sent to another one.
+            raise click.UsageError(_prune_other_router_message(bound))
+    api_key = api_key.strip() if api_key else None
+    if not api_key:
+        raise click.UsageError(
+            f"Pass --api-key or set {CONFIGURE_KEY_ENV}: no Cursor setup on this "
+            "machine names a Router key."
+        )
+    origin = _statusline_origin(router_base_url())
+    headers = _router_alias_headers(api_key)
+    listing = router_aliases.list_aliases(origin, headers)
+    if listing is None:
+        raise click.ClickException(
+            "Router's alias list couldn't be read. Check the key and your "
+            "connection, then try again."
+        )
+    if cursor_variants.predates_variants(listing):
+        # A Router without pinned efforts (older, or rolled back): nothing
+        # here can be told apart, so nothing is read as edited or orphaned.
+        if fmt == "json":
+            print_agent_json(
+                {"orphans": [], "deleted": [], "unsupported": True}, pagination=None
+            )
+        else:
+            click.echo(
+                "This Router doesn't support effort variants yet, so nothing was "
+                "pruned."
+            )
+        return
+    receipt = cursor_variants.read_receipt()
+    # This machine's names a dashboard edit took over: left where they are
+    # and said once. They stay in the receipt until setup takes them out of
+    # Cursor's list.
+    edited = cursor_variants.edited_variants(listing, receipt, origin)
+    if edited:
+        cursor_variants.mark_edited(receipt, origin, listing.owner, edited)
+        cursor_variants.write_receipt(receipt)
+        if fmt != "json":
+            for name in edited:
+                click.echo(
+                    f"Left {name} in place: it was edited in the Router dashboard "
+                    "and no longer pins an effort. Delete it at "
+                    f"{origin}/strategies or rename it."
+                )
+    orphans = cursor_variants.orphaned_variants(listing, receipt, origin)
+    rows = [
+        {
+            "name": alias["name"],
+            "candidate_models": router_aliases.candidate_models(alias),
+            "reasoning_effort": alias["reasoning_effort"],
+        }
+        for alias in orphans
+    ]
+    also = {"edited": edited} if edited else {}
+    if not rows:
+        if fmt == "json":
+            print_agent_json({"orphans": [], "deleted": [], **also}, pagination=None)
+        else:
+            click.echo("No effort-variant aliases to prune.")
+        return
+    if fmt != "json":
+        click.echo("Effort-variant aliases this machine's Cursor doesn't list:")
+        width = max(len(row["name"]) for row in rows)
+        for row in rows:
+            click.echo(
+                f"  {row['name'].ljust(width)}  "
+                f"{', '.join(row['candidate_models'])} at {row['reasoning_effort']}"
+            )
+        click.echo(
+            "Another machine's Cursor may still use these; after deleting one, "
+            "that Cursor fails on it until setup runs there again."
+        )
+    if not yes:
+        if not _can_prompt(ctx, fmt):
+            if fmt == "json":
+                print_agent_json(
+                    {"orphans": rows, "deleted": [], "confirm_with": "--yes", **also},
+                    pagination=None,
+                )
+            else:
+                click.echo("Run this again with --yes to delete them.")
+            return
+        confirmed = questionary.confirm(
+            f"Delete {'this alias' if len(rows) == 1 else f'these {len(rows)} aliases'}"
+            " from Router?",
+            default=False,
+            style=_picker_style(),
+        ).ask()
+        if not confirmed:
+            click.echo("Nothing was deleted.")
+            return
+    deleted: list[str] = []
+    kept: list[dict] = []
+    stopped: str | None = None
+    for row in rows:
+        if stopped is not None:
+            kept.append({"name": row["name"], "reason": stopped})
+            continue
+        verdict = cursor_variants.delete_alias(origin, headers, row["name"])
+        if verdict == cursor_variants.DELETED:
+            deleted.append(row["name"])
+            continue
+        reason = {
+            cursor_variants.NOT_SELF_SERVICE: "edited",
+            cursor_variants.REFERENCED: "referenced",
+            cursor_variants.MANAGED: "managed_key",
+            cursor_variants.UNSUPPORTED: "unsupported",
+        }.get(verdict, "failed")
+        if reason in ("managed_key", "unsupported"):
+            # Every other delete would be refused the same way.
+            stopped = reason
+        kept.append({"name": row["name"], "reason": reason})
+    if fmt == "json":
+        print_agent_json(
+            {"orphans": rows, "deleted": deleted, "kept": kept, **also},
+            pagination=None,
+        )
+    else:
+        if deleted:
+            click.echo("Deleted: " + ", ".join(deleted))
+        if stopped == "managed_key":
+            click.echo(cursor_variants.MANAGED_KEY_NOTE)
+        for row in kept:
+            if row["reason"] == "referenced":
+                click.echo(f"{row['name']} stays: a routing profile uses it.")
+        if others := [row["name"] for row in kept if row["reason"] != "referenced"]:
+            click.echo(
+                "Couldn't delete these; remove them at "
+                f"{origin}/strategies: " + ", ".join(others)
+            )
+    if kept:
+        raise SystemExit(1)
+
+
+def _prune_other_router_message(bound: str | None) -> str:
+    """Why prune won't use the saved key here, and how to point it right."""
+    base = next(
+        (
+            account["base_url"]
+            for account in cursor_variants.read_receipt()["accounts"]
+            if isinstance(account.get("base_url"), str)
+            and router_repo.router_upstream(account["base_url"]) == bound
+        ),
+        None,
+    )
+    fix = (
+        f"run '{ROUTER_BASE_URL_ENV}={base} ramp router cursor prune-variants'"
+        if base
+        else f"set {ROUTER_BASE_URL_ENV} to that Router's URL"
+    )
+    return (
+        f"Cursor's saved Router key belongs to {bound or 'another Router'}, not "
+        f"{router_repo.router_upstream(router_base_url())}, so it isn't sent "
+        f"here. To prune there, {fix}; to prune here, pass --api-key."
+    )
 
 
 def _cursor_tagging_hint() -> str | None:
@@ -6386,15 +8492,19 @@ def _run_unconfigure(
                 except cursor.CursorSettingsError as exc:
                     failures.append(f"{AGENT_NAMES[item]}: {exc}")
                     continue
+                # Before unbinding: the bound key is the one that made them.
+                variants = _remove_cursor_effort_variants()
                 router_repo.unbind_cursor()
+                extra = {"effort_variants": variants} if variants else {}
                 if restored:
-                    results.append({"client": item, "removed": True})
+                    results.append({"client": item, "removed": True, **extra})
                     continue
                 results.append(
                     {
                         "client": item,
                         "removed": False,
                         "instructions": _cursor_removal_steps(),
+                        **extra,
                     }
                 )
                 continue
@@ -6494,9 +8604,13 @@ def _run_unconfigure(
             (result for result in results if result["client"] == CURSOR_CLIENT), None
         )
         if cursor_result and not cursor_result["removed"]:
-            click.echo("Cursor keeps its settings in its own UI, so undo it there:")
+            click.echo("Undo it in Cursor:")
             for number, step in enumerate(cursor_result["instructions"], start=1):
                 click.echo(f"  {number}. {step}")
+        for line in _unconfigure_variant_lines(
+            (cursor_result or {}).get("effort_variants") or {}
+        ):
+            click.echo(line)
     if failures:
         raise click.ClickException("Could not unconfigure " + "; ".join(failures))
 
@@ -12390,6 +14504,10 @@ def _router_telemetry_headers() -> dict[str, str]:
     }
 
 
+class RouterKeyRejectedError(click.ClickException):
+    """Router answered 401 or 403 for the key."""
+
+
 def _fetch_models(
     api_key: str,
     claude_code_view: bool = False,
@@ -12435,7 +14553,7 @@ def _fetch_models(
         payload = response.json()
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code in (401, 403):
-            raise click.ClickException(
+            raise RouterKeyRejectedError(
                 "That API key wasn't accepted by Ramp Router. "
                 f"Create or copy a key at {router_ui_url()} and try again."
             ) from None
@@ -12467,13 +14585,50 @@ def _fetch_models(
             continue
         discovered[identifier] = RouterModel(
             id=identifier,
-            metadata=_model_metadata(model.get("router"), identifier),
+            metadata=_with_router_alias(
+                _model_metadata(model.get("router"), identifier),
+                model.get("router_alias"),
+            ),
             created=_created(model.get("created")),
             pricing=_pricing(model.get("router")),
         )
     if not discovered:
         raise click.ClickException("No models are available for this Ramp Router key.")
     return list(discovered.values())
+
+
+def _with_router_alias(
+    metadata: RouterModelMetadata, alias: object
+) -> RouterModelMetadata:
+    """Mark a caller alias row: its candidates' models, and any pinned effort."""
+    if not isinstance(alias, dict):
+        return metadata
+    candidates = alias.get("candidates")
+    if not isinstance(candidates, list):
+        candidates = []
+    names: list[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        model, provider, provider_model = (
+            value if isinstance(value, str) else ""
+            for value in (
+                candidate.get("model"),
+                candidate.get("provider"),
+                candidate.get("provider_model"),
+            )
+        )
+        if model:
+            names.append(model)
+        if provider and provider_model:
+            names.append(f"{provider}:{provider_model}")
+    names = list(dict.fromkeys(names))
+    pinned = alias.get("reasoning_effort")
+    return dataclass_replace(
+        metadata,
+        alias_candidates=tuple(names),
+        pinned_effort=pinned if isinstance(pinned, str) else "",
+    )
 
 
 def _pricing(metadata: object) -> tuple[str | None, str | None, str | None]:

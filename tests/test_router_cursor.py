@@ -58,7 +58,7 @@ def _mock_cursor_setup(monkeypatch, *, models=None, clipboard=True, aliases=None
     monkeypatch.setattr(
         router_module,
         "_ensure_claude_aliases",
-        lambda api_key, base_url, models: aliases or {},
+        lambda api_key, base_url, models, **_kwargs: aliases or {},
     )
     monkeypatch.setattr(router_module, "_fetch_configure_summary", lambda *a, **k: None)
 
@@ -75,7 +75,8 @@ def test_cursor_prints_guided_steps_and_keeps_the_key_off_the_terminal(monkeypat
     assert router_module.DEFAULT_ROUTER_BASE_URL in result.output
     assert "Override OpenAI Base URL" in result.output
     assert "gpt-5.6-sol" in result.output
-    assert "2 models are available" in result.output
+    # The steps and the note already say which models to add.
+    assert "Router models are available" not in result.output
 
 
 def test_cursor_show_key_prints_the_key(monkeypatch):
@@ -308,7 +309,7 @@ def test_cursor_note_points_custom_deployments_at_their_own_origin(monkeypatch):
         base_url="https://my-router.example.test/v1",
     )
     assert any(
-        "https://my-router.example.test/strategies for: claude-opus-5" in line
+        "https://my-router.example.test/strategies: claude-opus-5" in line
         for line in lines
     )
 
@@ -326,7 +327,9 @@ def test_cursor_fallback_suggestion_skips_claude_ids(monkeypatch):
         ["--human", "router", "cursor", "--api-key", "router-secret"],
     )
     assert result.exit_code == 0, result.output
-    assert "Suggested start: grok-4.6" in result.output
+    assert "Pick grok-4.6 in Cursor's chat." in result.output
+    # Named once, in the last step.
+    assert "Start with" not in result.output
 
 
 def test_configure_cursor_prints_guided_steps(monkeypatch, tmp_path):
@@ -344,10 +347,13 @@ def test_configure_cursor_prints_guided_steps(monkeypatch, tmp_path):
     # Cursor is guided rather than written, so it is not announced as
     # connected the way file-configured agents are.
     assert "Connected to:" not in result.output
-    assert "2 models discovered" in result.output
+    # Nothing was added to Cursor, so there is no count to report.
+    assert "models discovered" not in result.output
     # The compatibility notice is not exclusive to `ramp router cursor`:
     # configure users get the same backend-transit disclosure.
-    assert "the Router key transits Cursor's backend" in result.output
+    assert "Tab completion and Cursor's own models still run on Cursor." in (
+        result.output
+    )
 
 
 def test_configure_cursor_json_contract(monkeypatch, tmp_path):
@@ -374,8 +380,8 @@ def test_unconfigure_cursor_prints_manual_steps(monkeypatch, tmp_path):
         ["--human", "router", "unconfigure", "cursor"],
     )
     assert result.exit_code == 0, result.output
-    assert "undo it there" in result.output
-    assert 'Toggle off "OpenAI API Key"' in result.output
+    assert "Undo it in Cursor:" in result.output
+    assert 'Turn off "OpenAI API Key"' in result.output
     assert "Removed Ramp Router" not in result.output
 
 
@@ -518,7 +524,9 @@ def test_cursor_lists_claude_aliases_when_the_router_creates_them(monkeypatch):
         ["--human", "router", "cursor", "--api-key", "router-secret"],
     )
     assert result.exit_code == 0, result.output
-    assert "add these alias names" in result.output
+    # The steps pick gpt-5.6-sol, so they add it too, ahead of the aliases.
+    assert "Add these model names: gpt-5.6-sol, ramp-fable-5." in result.output
+    assert "Pick gpt-5.6-sol in Cursor's chat." in result.output
     assert "fable-5" in result.output
     assert "strategies" not in result.output
 
@@ -551,7 +559,7 @@ def test_cursor_dashboard_hint_names_only_unaliased_models(monkeypatch):
     )
     assert result.exit_code == 0, result.output
     assert "fable-5 -> claude-fable-5" in result.output
-    assert "strategies for: claude-opus-5" in result.output
+    assert "strategies: claude-opus-5" in result.output
 
 
 def test_cursor_note_skips_alias_talk_without_claude_models(monkeypatch):
@@ -568,14 +576,14 @@ def test_cursor_omits_the_suggestion_when_nothing_routable_exists(monkeypatch):
     _mock_cursor_setup(
         monkeypatch,
         models=[_router_model("claude-opus-5")],
-        aliases={"ramp-opus-5": "claude-opus-5"},
+        aliases={},
     )
     result = CliRunner().invoke(
         cli,
         ["--human", "router", "cursor", "--api-key", "router-secret"],
     )
     assert result.exit_code == 0, result.output
-    assert "Suggested start" not in result.output
+    assert "Start with" not in result.output
 
 
 def test_cursor_json_includes_claude_aliases(monkeypatch):
@@ -846,7 +854,7 @@ def test_bare_unconfigure_removes_a_pasted_cursor_binding(monkeypatch, tmp_path)
     result = CliRunner().invoke(cli, ["--human", "router", "unconfigure"])
     assert result.exit_code == 0, result.output
     assert _cursor_binding() is None, result.output
-    assert 'Toggle off "OpenAI API Key"' in result.output
+    assert 'Turn off "OpenAI API Key"' in result.output
 
 
 def test_a_failed_cursor_restore_keeps_the_binding(monkeypatch, tmp_path):
@@ -874,7 +882,7 @@ def test_setup_file_deployment_is_what_cursor_gets_and_what_is_bound(
 
     def write(api_key, base_url, models, aliases, **kwargs):
         seen["base_url"] = base_url
-        return {"models_added": []} if written else None
+        return ({"models_added": []}, None) if written else (None, None)
 
     monkeypatch.setattr(router_module, "_write_cursor_settings", write)
     setup = tmp_path / "ramp-router-setup-x.json"
@@ -1342,7 +1350,7 @@ def test_configure_cursor_warns_when_the_team_blocks_personal_keys(
     _mock_cursor_setup(monkeypatch)
     monkeypatch.setenv("RAMP_CLAUDE_DESKTOP_APP_SUPPORT", str(tmp_path))
     monkeypatch.setattr(
-        router_module, "_write_cursor_settings", lambda *a, **k: written
+        router_module, "_write_cursor_settings", lambda *a, **k: (written, None)
     )
     _cursor_team_settings(byokDisabled=True)
     args = ["router", "configure", "cursor", "--api-key", "k"]
@@ -1360,3 +1368,18 @@ def test_status_says_when_the_team_blocks_personal_keys(monkeypatch):
     output, payload = _agent_status(monkeypatch)
     assert payload["personal_keys_blocked"] is True
     assert "Your Cursor team blocks personal API keys" in output
+
+
+@pytest.mark.parametrize(
+    ("suggested", "add_step"),
+    [
+        # No aliases: the suggested model still has to be added.
+        ("gpt-6.1-sol", "Add these model names: gpt-6.1-sol."),
+        # Nothing to suggest: the generic step.
+        (None, "Add or turn on the Router models you want."),
+    ],
+)
+def test_the_steps_add_the_model_they_pick(suggested, add_step):
+    steps = router_module._cursor_setup_steps("https://router.test/v1", suggested, {})
+    assert steps[-2] == add_step
+    assert steps[-1] == f"Pick {suggested or 'a Router model'} in Cursor's chat."

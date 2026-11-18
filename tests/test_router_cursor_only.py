@@ -164,7 +164,73 @@ def test_configure_cursor_enable_agent_works_without_another_client(
 ):
     _mock_cursor_setup(monkeypatch)
     monkeypatch.setattr(router_module, "_can_prompt", lambda *_a: True)
-    monkeypatch.setattr(router_module, "_write_cursor_settings", lambda *a, **k: None)
+    fallback = router_module._cursor_running_fallback([4242])
+    # Cursor was closed at the checks before sign-in and opened during it.
+    monkeypatch.setattr(router_module, "_offer_to_quit_cursor", lambda *a, **k: {})
+    monkeypatch.setattr(
+        router_module, "_write_cursor_settings", lambda *a, **k: (None, fallback)
+    )
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure",
+            "cursor",
+            "--enable-agent",
+            "--api-key",
+            CURSOR_KEY,
+        ],
+    )
+    if service == "darwin":
+        # A macOS terminal gets no paste-in steps, so Cursor isn't set up and
+        # has no key for the agent to tag with: the run changed nothing.
+        assert result.exit_code == router_module.CURSOR_NOT_SET_UP_EXIT_CODE
+        assert not router_repo.cursor_bound()
+        assert not router_repo.enabled()
+        assert "Override OpenAI Base URL" not in result.output
+        assert "steps" not in result.output
+        assert result.output.rstrip().splitlines()[-2:] == [
+            "Cursor wasn't set up because it's open. Quit Cursor (Cmd+Q), then "
+            "run 'ramp router configure cursor' again.",
+            "Or set it up by hand: ramp router cursor",
+        ]
+        return
+    assert result.exit_code == 0, result.output
+    assert router_repo.cursor_bound()
+    assert router_repo.enabled()
+    assert schedule.background_enabled()
+    assert _status()["state"] == "running"
+    # Enabling is part of this command, so no hint to run it.
+    assert "ramp router agent enable" not in result.output
+    # The run says why Cursor wasn't set up, and ends by saying tagging is on
+    # and what is left to do.
+    assert "Cursor wasn't set up because it's open." in result.output
+    assert "Override OpenAI Base URL" in result.output
+    assert result.output.rstrip().splitlines()[-1] == (
+        "Cursor: repository tagging is on. Finish the steps above to use "
+        "Router in Cursor."
+    )
+
+
+def test_enable_agent_after_other_agents_says_cursor_still_needs_setup():
+    assert router_module._cursor_enable_agent_summary(
+        {"settings_written": False, "steps_shown": False}
+    ) == ("Cursor: repository tagging is on, but Cursor isn't set up yet (see above).")
+
+
+def test_configure_cursor_enable_agent_says_when_cursor_is_done(service, monkeypatch):
+    _mock_cursor_setup(monkeypatch)
+    monkeypatch.setattr(router_module, "_can_prompt", lambda *_a: True)
+    monkeypatch.setattr(router_module, "_offer_to_quit_cursor", lambda *a, **k: {})
+    monkeypatch.setattr(
+        router_module,
+        "_write_cursor_settings",
+        lambda *a, **k: (
+            {"models_added": ["gpt-5.6-sol"], "added_now": ["gpt-5.6-sol"]},
+            None,
+        ),
+    )
     result = CliRunner().invoke(
         cli,
         [
@@ -178,12 +244,16 @@ def test_configure_cursor_enable_agent_works_without_another_client(
         ],
     )
     assert result.exit_code == 0, result.output
-    assert router_repo.cursor_bound()
     assert router_repo.enabled()
-    assert schedule.background_enabled()
-    assert _status()["state"] == "running"
-    # Enabling is part of this command, so no hint to run it.
-    assert "ramp router agent enable" not in result.output
+    assert "finish there" not in result.output
+    assert "Cursor: added gpt-5.6-sol." in result.output
+    # One Cursor line at the end says it all.
+    assert result.output.count("Cursor: set up") == 1
+    assert result.output.rstrip().splitlines()[-1] == (
+        "Cursor: set up, with repository tagging on. Open Cursor, and in a new "
+        "chat on This Mac, pick gpt-5.6-sol. If you sign in to a different "
+        "Cursor account, run 'ramp router configure cursor' again."
+    )
 
 
 def test_enable_records_the_custom_deployment_cursor_was_set_up_with(

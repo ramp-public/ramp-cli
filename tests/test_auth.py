@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import sys
 import threading
-import time
 from contextlib import nullcontext
 from urllib.parse import parse_qs, urlparse
 
@@ -448,7 +447,8 @@ def test_try_refresh__windows_lock_serializes_refresh_rotation(
     store.save_tokens("sandbox", "access-old", "refresh-old")
     original_get_tokens = store.get_tokens
     initial_reads = 0
-    initial_reads_lock = threading.Lock()
+    initial_read_threads: set[int] = set()
+    initial_reads_done = threading.Condition()
 
     class FakeMsvcrt:
         LK_LOCK = 1
@@ -470,23 +470,28 @@ def test_try_refresh__windows_lock_serializes_refresh_rotation(
 
     def tracked_get_tokens(env: str):
         nonlocal initial_reads
-        if not fake_msvcrt.lock_held:
-            with initial_reads_lock:
+        tokens = original_get_tokens(env)
+        # A thread's first read is the one try_refresh makes before taking the
+        # lock. Count it only after it has returned, so it has seen the store.
+        with initial_reads_done:
+            if threading.get_ident() not in initial_read_threads:
+                initial_read_threads.add(threading.get_ident())
                 initial_reads += 1
-        return original_get_tokens(env)
+                initial_reads_done.notify_all()
+        return tokens
 
     refresh_calls = 0
 
     def fake_refresh_tokens(env: str, refresh_token: str) -> TokenResponse:
         nonlocal refresh_calls
-        refresh_calls += 1
+        with initial_reads_done:
+            refresh_calls += 1
+        assert fake_msvcrt.lock_held
         assert refresh_token == "refresh-old"
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            with initial_reads_lock:
-                if initial_reads >= 2:
-                    break
-            time.sleep(0.01)
+        # Rotate only after both threads have read "refresh-old", so the other
+        # thread must wait on the lock and then reuse the rotated tokens.
+        with initial_reads_done:
+            assert initial_reads_done.wait_for(lambda: initial_reads == 2, timeout=10)
         return TokenResponse(access_token="access-new", refresh_token="refresh-new")
 
     monkeypatch.setattr(refresh_helper, "fcntl", None)
@@ -505,7 +510,7 @@ def test_try_refresh__windows_lock_serializes_refresh_rotation(
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(timeout=3)
+        thread.join(timeout=15)
 
     assert results == ["access-new", "access-new"]
     assert refresh_calls == 1

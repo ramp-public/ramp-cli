@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from ramp_cli import codex_hook_trust
-from ramp_cli.commands import router
+from ramp_cli.commands import cursor_models, router
 from ramp_cli.config.settings import config_dir
 
 
@@ -78,6 +78,24 @@ def isolated_config(tmp_path: Path, request: pytest.FixtureRequest):
     )
     # Cursor detection reads its user-data directory and state database.
     monkeypatch.setenv("RAMP_CURSOR_USER_DIR", str(tmp_path / "cursor-user"))
+    # A developer's open Cursor must not change what setup does, and setup
+    # must never quit or reopen it. Tests that need a running Cursor say so.
+    monkeypatch.setattr("ramp_cli.commands.cursor.running_pids", lambda: [])
+    monkeypatch.setattr("ramp_cli.commands.cursor.runs_inside_cursor", lambda: False)
+    monkeypatch.setattr("ramp_cli.commands.cursor.reopen", lambda: True)
+    # Setup reads Cursor's key from the keychain before quitting it; tests
+    # that need that read, or its refusal, say so. The key is never kept
+    # from one test to the next.
+    monkeypatch.setattr("ramp_cli.commands.cursor.unlock", lambda prompt=True: None)
+    monkeypatch.setattr("ramp_cli.commands.cursor._encryption_key", None)
+    # Cursor setup asks which models to list; a test that types its own
+    # answers gets Enter there: the saved choice, or the recommended list.
+    monkeypatch.setattr(
+        "ramp_cli.commands.router._pick_cursor_model_scope",
+        lambda previous: (
+            previous or cursor_models.ModelScope(view=cursor_models.VIEW_COMPACT)
+        ),
+    )
     # A RouterService pins the process to its Router origin; reset it so one
     # test's origin never decides where the next one's requests go.
     monkeypatch.setattr("ramp_cli.commands.router._session_origin", None)
