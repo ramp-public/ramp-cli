@@ -360,7 +360,8 @@ def test_unconfigure_leaves_no_empty_hooks_state_table(tmp_path, monkeypatch):
     unconfigured = CliRunner().invoke(cli, ["router", "unconfigure", "codex"])
     assert unconfigured.exit_code == 0, unconfigured.output
     assert tomllib.loads((codex_home / "config.toml").read_text()) == {
-        "model_provider": "openai"
+        "model_provider": "openai",
+        "mcp_servers": {"ramp": {"url": "https://mcp.ramp.com/mcp"}},
     }
 
 

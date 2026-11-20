@@ -49,11 +49,14 @@ _PREFERENCES_DOMAIN = "com.anthropic.claudefordesktop"
 _PREFERENCES_OVERRIDE = "RAMP_CLAUDE_DESKTOP_PREFERENCES"
 _STATE_FILE = "ramp-router-cowork-state.json"
 _SESSION_OWNERS_FILE = "ramp-router-session-owners.json"
+_PENDING_MODEL_FILE = "ramp-router-desktop-pending-model.json"
 _DESKTOP_CONFIG_FILE = "claude_desktop_config.json"
 _LOCAL_AGENT_SESSIONS_DIR = "local-agent-mode-sessions"
 _ACCOUNT_SETTINGS_FILE = "cowork_account_settings.json"
 _CODE_SESSIONS_DIR = "claude-code-sessions"
 _MODEL_SELECTOR_KEY = "__model_selector_state"
+# The selector surfaces Desktop keeps a model for in Router (3P) mode.
+_MODEL_SURFACES = ("cowork", "code")
 _ONE_MILLION_SUFFIX = "[1m]"
 _MODEL_HASH_ALPHABET = frozenset("0123456789abcdef")
 _MODEL_HASH_MIN_CHARS = 6
@@ -675,6 +678,15 @@ def _configure_stopped(
         servers[harnesses.SERVER] = harnesses.registration_entry(
             "desktop", connector_binding, servers.get(harnesses.SERVER)
         )
+    from ramp_cli.router_connectors import ramp_mcp  # noqa: PLC0415
+
+    if (
+        ramp_mcp.should_configure(router_repo.unwrap_url(router_base_url))
+        and (entry := ramp_mcp.desktop_entry()) is not None
+    ):
+        servers = desktop_config.setdefault("mcpServers", {})
+        if isinstance(servers, dict) and ramp_mcp.SERVER not in servers:
+            servers[ramp_mcp.SERVER] = entry
     meta["entries"] = [
         entry
         for entry in entries
@@ -795,6 +807,31 @@ def _resolve_current_model_id(
             matches.append(candidate)
     if len(matches) == 1:
         return matches[0]
+    return None
+
+
+def desktop_model_id(model: str, desktop_ids: tuple[str, ...]) -> str | None:
+    """Desktop's id for a model Claude Code lists under its own id, if Desktop lists it.
+
+    Anthropic names are the same in both projections, but Router aliases other
+    models differently per client: Claude Code's
+    ``claude-router-<slug>-<hash6>`` is Desktop's ``claude-router-model-<hash16>``,
+    both from one hash of the request name. That hash is what joins them, as
+    it joins a renamed id. A variant with the same 1M marker is preferred, so
+    the join never trades a 1M row for its standard-window sibling.
+    """
+    if model in desktop_ids:
+        return model
+    extended = model.lower().endswith(_ONE_MILLION_SUFFIX)
+    same_window = tuple(
+        candidate
+        for candidate in desktop_ids
+        if candidate.lower().endswith(_ONE_MILLION_SUFFIX) == extended
+    )
+    for candidates in (same_window, desktop_ids):
+        resolved = _resolve_current_model_id(model, candidates)
+        if resolved is not None:
+            return resolved
     return None
 
 
@@ -1071,6 +1108,8 @@ class ModelSelectionMigration:
 
     migrated: tuple[dict, ...]
     skipped_while_running: bool
+    # The default model a pending request put in place, if this pass did.
+    applied_default_model: str | None = None
 
 
 def migrate_model_selections(model_ids: tuple[str, ...]) -> ModelSelectionMigration:
@@ -1079,16 +1118,184 @@ def migrate_model_selections(model_ids: tuple[str, ...]) -> ModelSelectionMigrat
     The refresh path calls this in the background, where quitting the user's
     Claude Desktop would be hostile, so a running app skips the pass instead;
     configure covers the deterministic case because it already stops the app.
+    A default model requested while Desktop was open is put in place first.
     """
     if sys.platform != "darwin":
         return ModelSelectionMigration(migrated=(), skipped_while_running=False)
     with transaction_lock():
         if _claude_is_running():
             return ModelSelectionMigration(migrated=(), skipped_while_running=True)
+        applied = _apply_pending_default_model_stopped(model_ids)
         migrated, aborted = _migrate_model_selections_stopped(
             model_ids, still_safe=lambda: not _claude_is_running()
         )
-        return ModelSelectionMigration(migrated=migrated, skipped_while_running=aborted)
+        return ModelSelectionMigration(
+            migrated=migrated,
+            skipped_while_running=aborted,
+            applied_default_model=applied,
+        )
+
+
+def _pending_model_path() -> Path:
+    return state_path().parent / _PENDING_MODEL_FILE
+
+
+def _clear_pending_default_model() -> None:
+    try:
+        _pending_model_path().unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _selector_models() -> dict[str, dict[str, object]]:
+    """Each account-settings document's saved model per surface, as now on disk."""
+    snapshot: dict[str, dict[str, object]] = {}
+    for path in _account_settings_paths():
+        try:
+            settings, existed = _read_object(path, "Claude Desktop account settings")
+        except click.ClickException:
+            continue
+        if not existed:
+            continue
+        selector = settings.get(_MODEL_SELECTOR_KEY)
+        snapshot[str(path)] = _surface_models(
+            selector if isinstance(selector, dict) else {}
+        )
+    return snapshot
+
+
+def _surface_models(selector: dict) -> dict[str, object]:
+    surfaces = {
+        name for name, value in selector.items() if isinstance(value, dict)
+    } | set(_MODEL_SURFACES)
+    models: dict[str, object] = {}
+    for surface in sorted(surfaces):
+        preferences = selector.get(surface)
+        models[surface] = (
+            preferences.get("model") if isinstance(preferences, dict) else None
+        )
+    return models
+
+
+def _write_default_model_stopped(
+    model: str,
+    expected: dict[str, dict[str, object]] | None = None,
+    *,
+    still_safe: Callable[[], bool] | None = None,
+) -> tuple[int, bool]:
+    """Select ``model`` on every Desktop surface; best-effort while Desktop is closed.
+
+    With ``expected``, only the documents it lists are considered, and a
+    surface is changed only while it still holds the model it had when the
+    request was made: a pick made in Desktop after the request is newer, and
+    the newer choice wins. Returns the number of surfaces updated and whether
+    the pass aborted because Desktop launched mid-pass.
+    """
+    changed = 0
+    for path in _account_settings_paths():
+        key = str(path)
+        if expected is not None and key not in expected:
+            continue
+        try:
+            settings, existed = _read_object(path, "Claude Desktop account settings")
+        except click.ClickException:
+            continue
+        if not existed:
+            continue
+        selector = settings.get(_MODEL_SELECTOR_KEY)
+        if selector is None:
+            selector = settings[_MODEL_SELECTOR_KEY] = {}
+        if not isinstance(selector, dict):
+            continue
+        seen = expected.get(key) if expected is not None else None
+        writes = 0
+        for surface in _surface_models(selector):
+            preferences = selector.setdefault(surface, {})
+            if not isinstance(preferences, dict):
+                continue
+            if isinstance(seen, dict) and preferences.get("model") != seen.get(surface):
+                continue
+            if preferences.get("model") == model:
+                continue
+            preferences["model"] = model
+            writes += 1
+        if writes:
+            if still_safe is not None and not still_safe():
+                return changed, True
+            try:
+                _write_private_json(path, settings)
+            except OSError:
+                continue
+            changed += writes
+    return changed, False
+
+
+def _apply_pending_default_model_stopped(model_ids: tuple[str, ...]) -> str | None:
+    """Put a model requested while Desktop was open in place; caller holds the lock."""
+    path = _pending_model_path()
+    try:
+        pending, existed = _read_object(path, "Claude Desktop pending model")
+    except click.ClickException:
+        _clear_pending_default_model()
+        return None
+    if not existed:
+        return None
+    model, expected = pending.get("model"), pending.get("expected")
+    if not isinstance(model, str) or not isinstance(expected, dict):
+        _clear_pending_default_model()
+        return None
+    if not model_ids:
+        # No catalog to check the model against: keep the request for a pass that has one.
+        return None
+    if model not in model_ids:
+        # Router stopped serving it: there is nothing left to apply.
+        _clear_pending_default_model()
+        return None
+    changed, aborted = _write_default_model_stopped(
+        model, expected, still_safe=lambda: not _claude_is_running()
+    )
+    if not aborted:
+        _clear_pending_default_model()
+    return model if changed else None
+
+
+def cancel_pending_default_model() -> None:
+    """Drop a waiting request; a newer Claude Code choice supersedes it."""
+    if not _pending_model_path().exists():
+        return  # Nothing to drop, and no reason to create Desktop's directory.
+    with transaction_lock():
+        _clear_pending_default_model()
+
+
+def set_default_model(model: str) -> str:
+    """Make ``model`` Claude Desktop's saved model on every surface.
+
+    The caller checks ``model`` against Desktop's own Router catalog first.
+    Desktop rewrites these documents from memory while it runs, so a running
+    app is never written to: the request is kept and the next refresh made
+    while Desktop is closed puts it in place. Returns "applied", "unchanged",
+    "pending", or "no_selections" when Desktop has not saved any model choices
+    yet, so its own default already applies.
+    """
+    with transaction_lock():
+        _clear_pending_default_model()
+        snapshot = _selector_models()
+        if not snapshot:
+            return "no_selections"
+        if _claude_is_running():
+            _write_private_json(
+                _pending_model_path(), {"model": model, "expected": snapshot}
+            )
+            return "pending"
+        changed, aborted = _write_default_model_stopped(
+            model, still_safe=lambda: not _claude_is_running()
+        )
+        if aborted:
+            _write_private_json(
+                _pending_model_path(), {"model": model, "expected": snapshot}
+            )
+            return "pending"
+        return "applied" if changed else "unchanged"
 
 
 def configure(
@@ -1134,6 +1341,8 @@ def configure(
         # id string, and a stale id lands in its 200k unknown-model fallback.
         # Guarded like the refresh pass: a manual Desktop launch between the
         # quit above and this rewrite aborts the remaining writes.
+        # A model requested for an earlier connection may not be in this one's catalog.
+        _clear_pending_default_model()
         migrated, _aborted = _migrate_model_selections_stopped(
             model_ids, still_safe=lambda: not _claude_is_running()
         )
@@ -1550,6 +1759,7 @@ def unconfigure() -> None:
                     "Ramp Router is not configured in Claude Desktop."
                 )
             _unconfigure_stopped(state)
+            _clear_pending_default_model()
         except BaseException:
             try:
                 _launch_claude()

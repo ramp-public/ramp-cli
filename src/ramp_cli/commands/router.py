@@ -96,7 +96,7 @@ from ramp_cli.commands.router_user_strategies import (
     use_account_strategies,
 )
 from ramp_cli.config.settings import config_dir
-from ramp_cli.errors import EXIT_RUNTIME, RampCLIError
+from ramp_cli.errors import EXIT_AUTH_REQUIRED, EXIT_RUNTIME, RampCLIError
 from ramp_cli.output.formatter import (
     print_agent_json,
     print_json,
@@ -105,6 +105,7 @@ from ramp_cli.output.formatter import (
 )
 from ramp_cli.output.style import show_notice, start_spinner
 from ramp_cli.router_connectors import harnesses as connector_harnesses
+from ramp_cli.router_connectors import ramp_mcp
 from ramp_cli.router_connectors import skill as connector_skill
 from ramp_cli.router_integrations import integration_package_path
 from ramp_cli.router_setup import (
@@ -2299,6 +2300,7 @@ def _run_configure(
         # preference configures, so the repeat-configure shortcut clears it
         # like a full configure would.
         _scrub_stale_fable_verdict()
+        ramp_mcp.configure("claude-code", router_base_url())
         if connector_skill.refresh():
             connector_skill.install("claude-code")
         # Like every other configure, so RAMP_NO_SESSION_SYNC=1 removes the
@@ -2751,6 +2753,7 @@ def _run_configure(
                     if cursor.personal_keys_blocked()
                     else {}
                 )
+                ramp_mcp.configure(CURSOR_CLIENT, base_url)
                 reopen_result = _reopen_cursor(cursor_quit)
                 reopened = (
                     {"reopened": reopen_result} if reopen_result is not None else {}
@@ -2903,6 +2906,7 @@ def _run_configure(
                     failure_error = HarnessOutdatedError
                 continue
             switchyard_push.settle(written=True)
+            ramp_mcp.configure(item, base_url)
             if connector_skill_available and item in (
                 "claude-code",
                 "codex",
@@ -3325,6 +3329,11 @@ def _refresh_cowork_model_selections(
         "migrated_model_selections": len(outcome.migrated),
         "skipped_while_running": outcome.skipped_while_running,
         **({"migrated_gateway": True} if migrated_gateway else {}),
+        **(
+            {"applied_default_model": outcome.applied_default_model}
+            if outcome.applied_default_model
+            else {}
+        ),
     }
 
 
@@ -3362,6 +3371,12 @@ def _cowork_models_message(result: dict) -> str:
         )
     else:
         message = "Claude Desktop's saved model selections are current."
+    applied = result.get("applied_default_model")
+    if applied:
+        message = (
+            f"Switched Claude Desktop to {applied}, as chosen for Claude Code. "
+            + message
+        )
     if migrated_gateway:
         return "Moved Claude Desktop's Router profile to api.router.com. " + message
     return message
@@ -3760,6 +3775,24 @@ def router_harness_widget(ctx: click.Context, action: str) -> None:
     )
 
 
+def _format_refresh_failures(failures: list[tuple[str, str]]) -> str:
+    """Group agents that failed for the same reason so one error isn't repeated."""
+    grouped: dict[str, list[str]] = {}
+    for client_name, message in failures:
+        grouped.setdefault(message, []).append(client_name)
+    parts = [f"{', '.join(names)}: {message}" for message, names in grouped.items()]
+    return "Could not refresh " + "; ".join(parts)
+
+
+def _raise_refresh_failures(
+    failures: list[tuple[str, str]], *, all_key_rejected: bool
+) -> NoReturn:
+    message = _format_refresh_failures(failures)
+    if all_key_rejected:
+        raise RouterKeyRejectedError(message)
+    raise click.ClickException(message)
+
+
 def _refresh_clients(
     ctx: click.Context,
     *,
@@ -3778,12 +3811,17 @@ def _refresh_clients(
     admin_defaults.clear_cache()
     clients = configured_router_clients()
     results = []
-    failures = []
-    models_by_request: dict[tuple[str, bool, str, bool], list[RouterModel]] = {}
+    failures: list[tuple[str, str]] = []
+    all_key_rejected = True
+    models_by_request: dict[tuple[str, bool, str], list[RouterModel]] = {}
+    rejected_keys: dict[tuple[str, str], str] = {}
     switchyard_push = _SwitchyardPush(clients)
     # However the command ends, a push an interrupt left in flight is settled.
     ctx.call_on_close(switchyard_push.finish)
     for client in clients:
+        api_key: str | None = None
+        base_url: str | None = None
+        settings_origin: str | None = None
         try:
             path = _client_config_path(client)
             if models_only and client in {"opencode", "pi"}:
@@ -3843,6 +3881,9 @@ def _refresh_clients(
                 # The rewrite below keeps it for the same reason.
                 usage_origin = _stored_usage_origin(client, path)
                 settings_origin = usage_origin or _router_key_origin(base_url)
+                rejection_key = (api_key, base_url.rstrip("/"))
+                if rejection_key in rejected_keys:
+                    raise RouterKeyRejectedError(rejected_keys[rejection_key])
                 claude_code_view = client == "claude-code"
                 request_key = (api_key, claude_code_view, base_url)
                 models = models_by_request.get(request_key)
@@ -3925,9 +3966,24 @@ def _refresh_clients(
                         _, default_model, _ = _configure_client(
                             client, api_key, models, **configure_options
                         )
+        except RouterKeyRejectedError:
+            switchyard_push.settle(written=False)
+            dashboard = settings_origin or _router_key_origin(base_url)
+            message = (
+                "the saved Ramp Router API key was rejected (expired or revoked). "
+                f"Run 'ramp router configure' to reconnect with a new key ({dashboard}), "
+                "or 'ramp router unconfigure' to remove Router."
+            )
+            if api_key is not None and base_url is not None:
+                rejected_keys[(api_key, base_url.rstrip("/"))] = message
+            failures.append((CLIENT_NAMES[client], message))
+            if failures_out is not None:
+                failures_out.append({"client": client, "error": message})
+            continue
         except click.ClickException as exc:
             switchyard_push.settle(written=False)
-            failures.append(f"{CLIENT_NAMES[client]}: {exc.message}")
+            all_key_rejected = False
+            failures.append((CLIENT_NAMES[client], exc.message))
             if failures_out is not None:
                 failures_out.append({"client": client, "error": exc.message})
             continue
@@ -3982,7 +4038,7 @@ def _refresh_clients(
 
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     if failures and failures_out is None and fmt == "json":
-        raise click.ClickException("Could not refresh " + "; ".join(failures))
+        _raise_refresh_failures(failures, all_key_rejected=all_key_rejected)
     if (
         fmt != "json"
         and (results or cursor_bound)
@@ -4023,7 +4079,7 @@ def _refresh_clients(
                 show_notice("NOTE", trust_lines)
 
     if failures and failures_out is None:
-        raise click.ClickException("Could not refresh " + "; ".join(failures))
+        _raise_refresh_failures(failures, all_key_rejected=all_key_rejected)
     # The scheduled sync reads this to tell a skipped Cowork pass from a done one.
     return results
 
@@ -14507,6 +14563,8 @@ def _router_telemetry_headers() -> dict[str, str]:
 class RouterKeyRejectedError(click.ClickException):
     """Router answered 401 or 403 for the key."""
 
+    exit_code = EXIT_AUTH_REQUIRED
+
 
 def _fetch_models(
     api_key: str,
@@ -14555,7 +14613,7 @@ def _fetch_models(
         if exc.response.status_code in (401, 403):
             raise RouterKeyRejectedError(
                 "That API key wasn't accepted by Ramp Router. "
-                f"Create or copy a key at {router_ui_url()} and try again."
+                f"Create or copy a key at {_statusline_origin(base_url)} and try again."
             ) from None
         raise click.ClickException(
             "Ramp Router couldn't validate the key "
@@ -14682,9 +14740,9 @@ def _fetch_codex_catalog(api_key: str, *, base_url: str | None = None) -> dict:
         catalog = response.json()
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code in (401, 403):
-            raise click.ClickException(
+            raise RouterKeyRejectedError(
                 "That API key wasn't accepted by Ramp Router. "
-                f"Create or copy a key at {router_ui_url()} and try again."
+                f"Create or copy a key at {_statusline_origin(base_url)} and try again."
             ) from None
         raise click.ClickException(
             "Ramp Router couldn't load the Codex model catalog "
@@ -16350,6 +16408,18 @@ def router_set_model(
         click.echo(
             f"{'Would set' if dry_run else 'Set'} {CLIENT_NAMES[client]} default model to {model}."
         )
+        desktop = _DESKTOP_FOLLOW_MESSAGES.get(result.get("desktop", {}).get("status"))
+        if desktop:
+            click.echo(desktop)
+
+
+_DESKTOP_FOLLOW_MESSAGES = {
+    "applied": "Claude Desktop now uses it too.",
+    "unchanged": "Claude Desktop already uses it.",
+    "pending": "Claude Desktop will switch to it the next time it's closed and Router refreshes.",
+    "unavailable": "Claude Desktop's Router models don't include it, so Desktop keeps its own choice.",
+    "error": "Claude Desktop's model was not changed.",
+}
 
 
 @click.command(

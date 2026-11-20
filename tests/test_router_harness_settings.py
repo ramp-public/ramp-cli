@@ -59,6 +59,172 @@ def installed(monkeypatch, tmp_path):
     return writes
 
 
+def _desktop(monkeypatch, status="connected", models=("old", "new"), result="applied"):
+    cowork = router.claude_cowork
+    calls = []
+    monkeypatch.setattr(harness.sys, "platform", "darwin")
+    monkeypatch.setattr(cowork, "desktop_status", lambda: status)
+    monkeypatch.setattr(
+        cowork,
+        "configured_router_connection",
+        lambda: ("desktop-secret", "https://qa.router.invalid"),
+    )
+
+    def fetch(api_key, **kwargs):
+        calls.append(("fetch", api_key, kwargs))
+        return [
+            SimpleNamespace(id=name, metadata=SimpleNamespace(display_name=name))
+            for name in models
+        ]
+
+    monkeypatch.setattr(router, "_fetch_models", fetch)
+
+    def set_default(model):
+        calls.append(("set", model))
+        return result
+
+    monkeypatch.setattr(cowork, "set_default_model", set_default)
+    return calls
+
+
+def test_claude_code_model_change_follows_in_desktop(installed, monkeypatch):
+    calls = _desktop(monkeypatch)
+
+    result = harness.set_model("claude-code", "new")
+
+    assert result["desktop"] == {"status": "applied", "model": "new"}
+    desktop_fetch = next(call for call in calls if call[1] == "desktop-secret")
+    assert desktop_fetch[2] == {
+        "gateway_client": router.claude_cowork.GATEWAY_CLIENT,
+        "base_url": "https://qa.router.invalid/v1",
+    }
+    assert ("set", "new") in calls
+
+
+def test_desktop_gets_its_own_id_for_a_router_alias(installed, monkeypatch):
+    calls = _desktop(monkeypatch, models=("claude-router-model-337fe3cfc464fa96[1m]",))
+    monkeypatch.setattr(
+        router,
+        "_fetch_models",
+        lambda api_key, **kwargs: [
+            SimpleNamespace(id=name, metadata=SimpleNamespace(display_name=name))
+            for name in (
+                ("claude-router-model-337fe3cfc464fa96[1m]",)
+                if api_key == "desktop-secret"
+                else ("old", "claude-router-ramp-opus-5-5-337fe3[1m]")
+            )
+        ],
+    )
+
+    result = harness.set_model("claude-code", "claude-router-ramp-opus-5-5-337fe3[1m]")
+
+    assert result["desktop"] == {
+        "status": "applied",
+        "model": "claude-router-model-337fe3cfc464fa96[1m]",
+    }
+    assert ("set", "claude-router-model-337fe3cfc464fa96[1m]") in calls
+
+
+def test_desktop_keeps_its_choice_when_its_catalog_lacks_the_model(
+    installed, monkeypatch
+):
+    calls = []
+    _desktop(monkeypatch)
+    cowork = router.claude_cowork
+    # Claude Code's projection offers "new"; Desktop's own does not.
+    monkeypatch.setattr(
+        router,
+        "_fetch_models",
+        lambda api_key, **kwargs: [
+            SimpleNamespace(id=name, metadata=SimpleNamespace(display_name=name))
+            for name in (("old",) if api_key == "desktop-secret" else ("old", "new"))
+        ],
+    )
+    monkeypatch.setattr(cowork, "set_default_model", lambda model: calls.append(model))
+
+    result = harness.set_model("claude-code", "new")
+
+    assert result["desktop"] == {"status": "unavailable"}
+    assert calls == []
+
+
+def test_desktop_follow_never_fails_the_claude_code_change(installed, monkeypatch):
+    _desktop(monkeypatch)
+
+    def broken():
+        raise click.ClickException("The Claude Desktop Router credential changed.")
+
+    monkeypatch.setattr(router.claude_cowork, "configured_router_connection", broken)
+
+    result = harness.set_model("claude-code", "new")
+
+    assert result["default_model"] == "new"
+    assert result["desktop"] == {
+        "status": "error",
+        "error": "The Claude Desktop Router credential changed.",
+    }
+
+
+@pytest.mark.parametrize("client", ["codex", "opencode", "pi"])
+def test_only_claude_code_model_changes_follow_in_desktop(
+    installed, monkeypatch, client
+):
+    calls = _desktop(monkeypatch)
+    assert "desktop" not in harness.set_model(client, "new")
+    assert not any(call[0] == "set" for call in calls)
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "error", "not_connected"])
+def test_a_newer_claude_code_choice_drops_an_older_waiting_desktop_request(
+    installed, monkeypatch, failure
+):
+    cowork = router.claude_cowork
+    _desktop(
+        monkeypatch, status="inactive" if failure == "not_connected" else "connected"
+    )
+    pending = cowork._pending_model_path()
+    pending.parent.mkdir(parents=True, exist_ok=True)
+    pending.write_text(json.dumps({"model": "older", "expected": {}}))
+    if failure == "unavailable":
+        monkeypatch.setattr(
+            router,
+            "_fetch_models",
+            lambda api_key, **kwargs: [
+                SimpleNamespace(id=name, metadata=SimpleNamespace(display_name=name))
+                for name in (
+                    ("old",) if api_key == "desktop-secret" else ("old", "new")
+                )
+            ],
+        )
+    elif failure == "error":
+
+        def unreachable(*args, **kwargs):
+            raise click.ClickException("Router is unreachable.")
+
+        monkeypatch.setattr(cowork, "configured_router_connection", unreachable)
+
+    assert harness.set_model("claude-code", "new")["desktop"]["status"] == failure
+    assert not pending.exists()
+
+
+def test_disconnected_desktop_is_left_alone(installed, monkeypatch):
+    calls = _desktop(monkeypatch, status="inactive")
+    assert harness.set_model("claude-code", "new")["desktop"] == {
+        "status": "not_connected"
+    }
+    assert not any(call[0] == "set" for call in calls)
+
+
+def test_model_command_says_whether_desktop_followed(installed, monkeypatch):
+    _desktop(monkeypatch, result="pending")
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "model", "claude-code", "--model", "new"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Claude Desktop will switch to it the next time it's closed" in result.output
+
+
 @pytest.mark.parametrize("client", ["claude-code", "codex", "opencode", "pi", "hermes"])
 def test_model_update_uses_existing_writer_and_saved_endpoint(installed, client):
     data = harness.editor(client)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -10,11 +11,11 @@ import pytest
 from click.testing import CliRunner
 
 from ramp_cli.commands.update import _is_homebrew_install
-from ramp_cli.main import cli
+from ramp_cli.main import cli, main
 from ramp_cli.router_connectors import skill as connector_skill
 from ramp_cli.skills import get_skill_content, record_receipt
 from ramp_cli.skills.remote import active_skills_dir
-from ramp_cli.version_check import latest_version, parse_version
+from ramp_cli.version_check import _write_cache, latest_version, parse_version
 
 
 def _invoke(args, **kwargs):
@@ -168,7 +169,7 @@ class TestUpdateAvailable:
             # A user-deleted skill still has a receipt; updating must not restore it.
             record_receipt(target, "ramp-spend-analysis")
 
-        def run_installed_cli(command):
+        def run_installed_cli(command, **_kwargs):
             if command[1:3] == ["skills", "install"]:
                 installed = _invoke(command[1:])
                 assert installed.exit_code == 0, installed.output
@@ -292,8 +293,15 @@ class TestUpdateAvailable:
 
         assert result.exit_code == 0
         assert "configured agents only: OpenCode" in result.output
+        assert result.output.index(
+            "installed binary passed checksum verification"
+        ) < result.output.index("configured agents only: OpenCode")
         assert mock_run.call_count == 2
         install_command = mock_run.call_args_list[0].args[0][-1]
+        assert mock_run.call_args_list[0].kwargs == {
+            "capture_output": True,
+            "text": True,
+        }
         assert 'sh "$tmp" --no-skills' in install_command
         assert "--router" not in install_command
         assert mock_run.call_args_list[1].args[0] == [
@@ -353,10 +361,82 @@ class TestUpdateAvailable:
     def test_install_failure(
         self, mock_latest, mock_which, mock_run, mock_brew, isolated_config
     ):
-        mock_run.return_value = MagicMock(returncode=1)
+        mock_run.return_value = MagicMock(
+            returncode=1, stdout="", stderr="error Checksum verification failed!\n"
+        )
         result = _invoke(["update"])
         assert result.exit_code != 0
+        assert "Checksum verification failed!" in result.output
         assert "Update failed" in result.output
+
+    @patch(
+        "ramp_cli.commands.update.configured_router_clients",
+        return_value=("opencode", "pi", "conductor"),
+    )
+    @patch("ramp_cli.commands.update._is_homebrew_install", return_value=False)
+    @patch("ramp_cli.commands.update.suppress_next_update_notice")
+    @patch("ramp_cli.commands.update.subprocess.run")
+    @patch("ramp_cli.commands.update.shutil.which")
+    @patch("ramp_cli.commands.update.latest_version", return_value="0.2.0")
+    @patch("ramp_cli.commands.update.__version__", "0.1.3")
+    def test_router_refresh_rejected_key_does_not_suggest_rerunning_refresh(
+        self,
+        mock_latest,
+        mock_which,
+        mock_run,
+        mock_notice,
+        mock_brew,
+        mock_configured,
+        isolated_config,
+    ):
+        mock_which.side_effect = lambda command: {
+            "curl": "/usr/bin/curl",
+            "ramp": "/usr/local/bin/ramp",
+        }[command]
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="", stderr=""),
+            MagicMock(returncode=4),
+        ]
+
+        result = _invoke(["update"], env={"RAMP_INSTALL_DIR": "/usr/local/bin"})
+
+        assert result.exit_code == 4
+        assert "installed binary passed checksum verification" in result.output
+        assert "/usr/local/bin/ramp router refresh" not in result.output
+
+    @patch(
+        "ramp_cli.commands.update.configured_router_clients",
+        return_value=("opencode",),
+    )
+    @patch("ramp_cli.commands.update._is_homebrew_install", return_value=False)
+    @patch("ramp_cli.commands.update.suppress_next_update_notice")
+    @patch("ramp_cli.commands.update.subprocess.run")
+    @patch("ramp_cli.commands.update.shutil.which")
+    @patch("ramp_cli.commands.update.latest_version", return_value="0.2.0")
+    @patch("ramp_cli.commands.update.__version__", "0.1.3")
+    def test_router_refresh_non_auth_failure_suggests_retry(
+        self,
+        mock_latest,
+        mock_which,
+        mock_run,
+        mock_notice,
+        mock_brew,
+        mock_configured,
+        isolated_config,
+    ):
+        mock_which.side_effect = lambda command: {
+            "curl": "/usr/bin/curl",
+            "ramp": "/usr/local/bin/ramp",
+        }[command]
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="", stderr=""),
+            MagicMock(returncode=1),
+        ]
+
+        result = _invoke(["update"], env={"RAMP_INSTALL_DIR": "/usr/local/bin"})
+
+        assert result.exit_code == 1
+        assert "/usr/local/bin/ramp router refresh" in result.output
 
 
 class TestUpdateNpm:
@@ -582,6 +662,70 @@ class TestUpdateNoCurl:
         result = _invoke(["update"])
         assert result.exit_code != 0
         assert "curl is required" in result.output
+
+
+class TestUpdateSuppressesPassiveNotice:
+    @pytest.mark.parametrize("mode_flag", ["--human", "--agent"])
+    def test_version_check_failure_does_not_emit_update_notice(
+        self, mode_flag, isolated_config, monkeypatch, capsys
+    ):
+        _write_cache("999.0.0")
+        monkeypatch.setattr("ramp_cli.main.check_for_update", lambda: None)
+        monkeypatch.setattr("ramp_cli.commands.update.latest_version", lambda: None)
+        monkeypatch.setattr(sys, "argv", ["ramp", mode_flag, "update"])
+
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+
+        captured = capsys.readouterr()
+        assert exc_info.value.code != 0
+        assert "Update available" not in captured.err
+        assert "update_available" not in captured.err
+
+    def test_install_failure_does_not_emit_update_notice(
+        self, isolated_config, monkeypatch, capsys
+    ):
+        _write_cache("999.0.0")
+        monkeypatch.setattr("ramp_cli.main.check_for_update", lambda: None)
+        monkeypatch.setattr("ramp_cli.commands.update.__version__", "0.1.3")
+        monkeypatch.setattr("ramp_cli.commands.update.latest_version", lambda: "0.2.0")
+        monkeypatch.setattr(
+            "ramp_cli.commands.update._is_homebrew_install", lambda: False
+        )
+        monkeypatch.setattr(
+            "ramp_cli.commands.update.shutil.which", lambda _cmd: "/usr/bin/curl"
+        )
+        monkeypatch.setattr(
+            "ramp_cli.commands.update.subprocess.run",
+            lambda _cmd, **_kwargs: MagicMock(returncode=1),
+        )
+        monkeypatch.setattr(sys, "argv", ["ramp", "--human", "update"])
+
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+
+        captured = capsys.readouterr()
+        assert exc_info.value.code != 0
+        assert "Update failed" in captured.err
+        assert "Update available" not in captured.err
+
+    def test_homebrew_route_does_not_emit_passive_update_notice(
+        self, isolated_config, monkeypatch, capsys
+    ):
+        _write_cache("999.0.0")
+        monkeypatch.setattr("ramp_cli.main.check_for_update", lambda: None)
+        monkeypatch.setattr("ramp_cli.commands.update.__version__", "0.1.3")
+        monkeypatch.setattr("ramp_cli.commands.update.latest_version", lambda: "0.2.0")
+        monkeypatch.setattr(
+            "ramp_cli.commands.update._is_homebrew_install", lambda: True
+        )
+        monkeypatch.setattr(sys, "argv", ["ramp", "--human", "update"])
+
+        main()
+
+        captured = capsys.readouterr()
+        assert "brew upgrade ramp-cli" in captured.out
+        assert captured.err == ""
 
 
 class TestLatestVersionLookup:

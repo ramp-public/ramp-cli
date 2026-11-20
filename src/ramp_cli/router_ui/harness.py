@@ -2,6 +2,7 @@
 
 import hashlib
 import hmac
+import sys
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -310,7 +311,45 @@ def set_model(
             raise click.ClickException(
                 "The model catalog changed during the update. Reload to see the saved default."
             )
-        return result
+    if client == "claude-code":
+        result["desktop"] = follow_in_desktop(model)
+    return result
+
+
+def follow_in_desktop(model: str) -> dict:
+    """Give Claude Desktop the model just chosen for Claude Code.
+
+    Best effort: Claude Code's default is already saved, so nothing here fails
+    the change. Desktop gets the model only when its own Router catalog (a
+    separate projection, with its own workloads) offers it.
+    """
+    claude_cowork = router.claude_cowork
+    if sys.platform != "darwin":
+        return {"status": "not_connected"}
+    try:
+        # This choice supersedes any earlier one still waiting for Desktop to
+        # close, whatever happens to it below.
+        claude_cowork.cancel_pending_default_model()
+        if claude_cowork.desktop_status() != "connected":
+            return {"status": "not_connected"}
+        api_key, origin = claude_cowork.configured_router_connection()
+        models = router._fetch_models(
+            api_key,
+            gateway_client=claude_cowork.GATEWAY_CLIENT,
+            base_url=f"{origin.rstrip('/')}/v1",
+        )
+        desktop_model = claude_cowork.desktop_model_id(
+            model, tuple(entry.id for entry in models)
+        )
+        if desktop_model is None:
+            return {"status": "unavailable"}
+        return {
+            "status": claude_cowork.set_default_model(desktop_model),
+            "model": desktop_model,
+        }
+    except (click.ClickException, OSError) as exc:
+        message = exc.message if isinstance(exc, click.ClickException) else str(exc)
+        return {"status": "error", "error": message}
 
 
 def routing_settings(client: str) -> dict:

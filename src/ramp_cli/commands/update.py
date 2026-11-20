@@ -15,6 +15,7 @@ import click
 from ramp_cli import __version__
 from ramp_cli.commands import router_repo, router_schedule
 from ramp_cli.commands.router import CLIENT_NAMES, configured_router_clients
+from ramp_cli.errors import EXIT_AUTH_REQUIRED
 from ramp_cli.install_record import (
     npm_install_record,
     npm_update_command,
@@ -223,6 +224,7 @@ def _is_homebrew_install() -> bool:
 @click.option("--_npm-validate", is_flag=True, hidden=True)
 def update_cmd(_npm_validate: bool = False) -> None:
     """Update ramp CLI to the latest version."""
+    suppress_next_update_notice()
     # npm entrypoints use the native parser as a side-effect-free preflight.
     # Click has already rejected invalid flags/arguments before reaching here.
     if _npm_validate:
@@ -277,26 +279,31 @@ def update_cmd(_npm_validate: bool = False) -> None:
             "curl is required for updates. Install curl and try again."
         )
 
-    if router_clients:
-        names = ", ".join(CLIENT_NAMES[client] for client in router_clients)
-        click.echo(f"Refreshing Router setup for configured agents only: {names}.")
-
     click.echo("Installing...")
     installed_executable = _installed_executable()
     install_command = (
         'tmp="$(mktemp)" && trap \'rm -f "$tmp"\' 0 && '
         f'curl -fsSL {_INSTALL_URL} -o "$tmp" && sh "$tmp" --no-skills'
     )
-    run = subprocess.run(["sh", "-c", install_command])
+    run = subprocess.run(["sh", "-c", install_command], capture_output=True, text=True)
     if run.returncode != 0:
+        detail = "\n".join(
+            part.strip()
+            for part in (run.stderr, run.stdout)
+            if isinstance(part, str) and part.strip()
+        )
+        if detail:
+            click.echo(detail, err=True)
         raise click.ClickException(f"Update failed. Try manually:\n  {install_command}")
-    suppress_next_update_notice()
     click.echo(
         "Ramp CLI update succeeded; the installed binary passed checksum verification."
     )
     _warn_if_shadowed(installed_executable)
 
     if refresh_router:
+        if router_clients:
+            names = ", ".join(CLIENT_NAMES[client] for client in router_clients)
+            click.echo(f"Refreshing Router setup for configured agents only: {names}.")
         # Invoke the CLI after installation instead of teaching the separately
         # hosted installer a new flag. Refresh is receipt-scoped and reads the
         # credentials already stored for each configured agent. A Cursor-only
@@ -306,6 +313,11 @@ def update_cmd(_npm_validate: bool = False) -> None:
             installed_executable, "router", "refresh"
         )
         refresh = subprocess.run(refresh_command)
+        if refresh.returncode == EXIT_AUTH_REQUIRED:
+            # `ramp router refresh` already reported the rejected saved key
+            # and pointed to configure/unconfigure; do not suggest re-running
+            # refresh, which will fail the same way.
+            raise SystemExit(EXIT_AUTH_REQUIRED)
         if refresh.returncode != 0:
             raise click.ClickException(
                 "Ramp CLI was updated, but existing Router configurations "

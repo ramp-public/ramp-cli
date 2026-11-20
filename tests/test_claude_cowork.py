@@ -16,7 +16,7 @@ from click.testing import CliRunner
 from ramp_cli import __version__, claude_cowork
 from ramp_cli.commands import router, router_repo, router_schedule
 from ramp_cli.main import cli
-from ramp_cli.router_connectors import harnesses
+from ramp_cli.router_connectors import harnesses, ramp_mcp
 
 
 @pytest.fixture
@@ -877,6 +877,174 @@ def test_migrate_model_selections_heals_stale_ids_while_claude_is_closed(
     assert selector["cowork"]["model"] == "claude-fable-router-5-6-sol-419255[1m]"
 
 
+def _write_current_selector_state(root: Path, cowork="claude-opus-5") -> Path:
+    path = _account_settings_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "__model_selector_state": {
+                    "cowork": {"model": cowork},
+                    "code": {
+                        "model": "claude-opus-5",
+                        "thinking_by_model": {"claude-opus-5": {"effort": "low"}},
+                    },
+                }
+            }
+        )
+    )
+    return path
+
+
+def _selector(path: Path) -> dict:
+    return json.loads(path.read_text())["__model_selector_state"]
+
+
+def test_set_default_model_selects_it_on_every_surface_while_closed(cowork_host):
+    tmp_path, _events = cowork_host
+    path = _write_current_selector_state(tmp_path)
+
+    assert (
+        claude_cowork.set_default_model("claude-fable-router-5-6-sol-419255[1m]")
+        == "applied"
+    )
+
+    selector = _selector(path)
+    assert selector["cowork"]["model"] == "claude-fable-router-5-6-sol-419255[1m]"
+    assert selector["code"]["model"] == "claude-fable-router-5-6-sol-419255[1m]"
+    # Per-model thinking settings are Desktop's own and stay put.
+    assert selector["code"]["thinking_by_model"] == {"claude-opus-5": {"effort": "low"}}
+    assert (
+        claude_cowork.set_default_model("claude-fable-router-5-6-sol-419255[1m]")
+        == "unchanged"
+    )
+    assert not claude_cowork._pending_model_path().exists()
+
+
+def test_set_default_model_leaves_desktop_without_selections_alone(cowork_host):
+    assert claude_cowork.set_default_model("claude-opus-5") == "no_selections"
+    assert not claude_cowork._pending_model_path().exists()
+
+
+def test_set_default_model_waits_for_desktop_to_close(cowork_host, monkeypatch):
+    tmp_path, _events = cowork_host
+    path = _write_current_selector_state(tmp_path)
+    before = path.read_text()
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: True)
+
+    assert (
+        claude_cowork.set_default_model("claude-fable-router-5-6-sol-419255[1m]")
+        == "pending"
+    )
+    # A running Desktop rewrites the file from memory, so it isn't touched now.
+    assert path.read_text() == before
+
+    assert claude_cowork.migrate_model_selections(
+        CURRENT_MODEL_IDS
+    ).skipped_while_running
+    assert path.read_text() == before
+
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: False)
+    outcome = claude_cowork.migrate_model_selections(CURRENT_MODEL_IDS)
+
+    assert outcome.applied_default_model == "claude-fable-router-5-6-sol-419255[1m]"
+    assert (
+        _selector(path)["cowork"]["model"] == "claude-fable-router-5-6-sol-419255[1m]"
+    )
+    assert _selector(path)["code"]["model"] == "claude-fable-router-5-6-sol-419255[1m]"
+    assert not claude_cowork._pending_model_path().exists()
+
+
+def test_cancel_pending_default_model(cowork_host, monkeypatch):
+    tmp_path, _events = cowork_host
+    _write_current_selector_state(tmp_path)
+    claude_cowork.cancel_pending_default_model()  # nothing waiting is fine
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: True)
+    claude_cowork.set_default_model("claude-opus-5-5")
+
+    claude_cowork.cancel_pending_default_model()
+
+    assert not claude_cowork._pending_model_path().exists()
+
+
+def test_pending_default_model_yields_to_a_newer_pick_in_desktop(
+    cowork_host, monkeypatch
+):
+    tmp_path, _events = cowork_host
+    path = _write_current_selector_state(tmp_path)
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: True)
+    claude_cowork.set_default_model("claude-fable-router-5-6-sol-419255[1m]")
+
+    # Afterwards, the user picks another model for Cowork in Desktop itself.
+    settings = json.loads(path.read_text())
+    settings["__model_selector_state"]["cowork"]["model"] = (
+        "claude-fable-router-model-44968622fb48d054"
+    )
+    path.write_text(json.dumps(settings))
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: False)
+
+    claude_cowork.migrate_model_selections(CURRENT_MODEL_IDS)
+
+    selector = _selector(path)
+    assert selector["cowork"]["model"] == "claude-fable-router-model-44968622fb48d054"
+    assert selector["code"]["model"] == "claude-fable-router-5-6-sol-419255[1m]"
+
+
+def test_pending_default_model_is_dropped_once_router_stops_serving_it(
+    cowork_host, monkeypatch
+):
+    tmp_path, _events = cowork_host
+    path = _write_current_selector_state(tmp_path)
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: True)
+    claude_cowork.set_default_model("claude-retired")
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: False)
+
+    outcome = claude_cowork.migrate_model_selections(CURRENT_MODEL_IDS)
+
+    assert outcome.applied_default_model is None
+    assert _selector(path)["cowork"]["model"] == "claude-opus-5"
+    assert not claude_cowork._pending_model_path().exists()
+
+
+def test_reconfiguring_desktop_drops_a_pending_default_model(cowork_host, monkeypatch):
+    tmp_path, _events = cowork_host
+    path = _write_current_selector_state(tmp_path)
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: True)
+    claude_cowork.set_default_model("claude-fable-router-5-6-sol-419255[1m]")
+    monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: False)
+
+    claude_cowork.configure(
+        "router-secret", "https://router.example/v1", model_ids=CURRENT_MODEL_IDS
+    )
+
+    assert not claude_cowork._pending_model_path().exists()
+    assert _selector(path)["cowork"]["model"] == "claude-opus-5"
+
+
+def test_desktop_model_id_joins_claude_code_aliases_on_the_request_name_hash():
+    desktop = (
+        "claude-opus-5-5[1m]",
+        "claude-router-model-337fe3cfc464fa96[1m]",
+        "claude-router-model-337fe3cfc464fa96",
+        "claude-router-model-0730793ae2283796",
+    )
+    join = claude_cowork.desktop_model_id
+    # Anthropic names are shared as-is.
+    assert join("claude-opus-5-5[1m]", desktop) == "claude-opus-5-5[1m]"
+    # Router aliases join on the hash, keeping the 1M marker the user chose.
+    assert join("claude-router-ramp-opus-5-5-337fe3[1m]", desktop) == (
+        "claude-router-model-337fe3cfc464fa96[1m]"
+    )
+    assert join("claude-router-ramp-opus-5-5-337fe3", desktop) == (
+        "claude-router-model-337fe3cfc464fa96"
+    )
+    assert join("claude-router-ramp-haiku-4-5-073079", desktop) == (
+        "claude-router-model-0730793ae2283796"
+    )
+    assert join("claude-router-ramp-sonnet-5-ac8a1c[1m]", desktop) is None
+    assert join("claude-opus-4-20250514", desktop) is None
+
+
 def test_resolve_current_model_id_never_hash_joins_anthropic_dated_ids():
     # Anthropic's dated ids end in an all-hex segment too; only ids carrying
     # Router's generated naming scheme may join on the catalog hash.
@@ -1486,6 +1654,23 @@ def test_agent_routing_keeps_a_real_v1_in_the_gateway_path(tagging):
     router_repo._save_settings({"enabled": False})
     claude_cowork.refresh_agent_routing()
     assert claude_cowork.configured_gateway_base_url() == "https://api.router.com/v1"
+
+
+def test_routed_desktop_still_gets_ramp_mcp(tagging, monkeypatch):
+    monkeypatch.setattr(ramp_mcp.shutil, "which", lambda _name: "/usr/bin/npx")
+    claude_cowork.configure("router-secret", "https://api.router.com/v1")
+
+    assert router_repo.is_wrapped(claude_cowork.configured_gateway_base_url())
+    desktop = json.loads(claude_cowork._desktop_config_path().read_text())
+    assert desktop["mcpServers"]["ramp"] == ramp_mcp.desktop_entry()
+
+
+def test_desktop_without_npx_gets_no_mcp_servers_key(cowork_host, monkeypatch):
+    monkeypatch.setattr(ramp_mcp.shutil, "which", lambda _name: None)
+    claude_cowork.configure("router-secret", "https://api.router.com/v1")
+
+    desktop = json.loads(claude_cowork._desktop_config_path().read_text())
+    assert "mcpServers" not in desktop
 
 
 def test_a_key_sealed_by_desktop_keeps_refresh_and_routing_working(

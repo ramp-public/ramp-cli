@@ -907,7 +907,18 @@ def test_configure_connectors_opencode_uses_existing_jsonc_through_teardown(
     disabled = runner.invoke(cli, undo[0])
     assert disabled.exit_code == 0, disabled.output
     assert connector_harnesses.status("opencode")["state"] == "disabled"
-    assert json.loads(path.read_text()) == original
+    expected = {
+        **original,
+        "mcp": {
+            **original["mcp"],
+            "ramp": {
+                "type": "remote",
+                "url": "https://mcp.ramp.com/mcp",
+                "enabled": True,
+            },
+        },
+    }
+    assert json.loads(path.read_text()) == expected
     assert not default_path.exists()
 
 
@@ -5195,6 +5206,25 @@ def test_connector_skill_install_uses_home_when_override_is_empty(
     assert managed_skill_names(target) == [connector_skill.NAME]
 
 
+def test_repeat_claude_code_configure_adds_ramp_mcp(tmp_path, monkeypatch):
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    _mock_models(monkeypatch)
+    args = ["--human", "router", "configure", "claude-code"]
+    configured = CliRunner().invoke(cli, [*args, "--api-key", "router-secret"])
+    assert configured.exit_code == 0, configured.output
+    # As a setup from a CLI without Ramp MCP leaves it.
+    mcp_path = claude_home / ".claude.json"
+    mcp_path.write_text("{}")
+
+    repeated = CliRunner().invoke(cli, ["--no-input", *args])
+
+    assert repeated.exit_code == 0, repeated.output
+    assert json.loads(mcp_path.read_text())["mcpServers"]["ramp"]["url"] == (
+        "https://mcp.ramp.com/mcp"
+    )
+
+
 def test_reconfigure_claude_only_updates_model_view(tmp_path, monkeypatch):
     claude_home = tmp_path / "claude"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
@@ -6099,6 +6129,91 @@ def test_refresh_agent_mode_does_not_emit_success_before_partial_failure(
     assert '"clients"' not in result.output
 
 
+def test_refresh_groups_rejected_key_failures_and_caches_rejection(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(
+        router_module,
+        "configured_router_clients",
+        lambda: ("opencode", "pi", "conductor"),
+    )
+    monkeypatch.setattr(router_module, "_conductor_receipt_enrolls", lambda _path: True)
+    monkeypatch.setattr(
+        router_module, "_stored_router_api_key", lambda _client, _path: "revoked-key"
+    )
+    monkeypatch.setattr(
+        router_module,
+        "_refresh_router_base_url",
+        lambda _client, _path: "https://internal-api.router.com/v1",
+    )
+    monkeypatch.setattr(
+        router_module, "_stored_usage_origin", lambda _client, _path: None
+    )
+    monkeypatch.setattr(
+        router_module, "_refresh_cowork_model_selections", lambda **_kw: None
+    )
+    requests = []
+
+    def get(url, **kwargs):
+        requests.append(url)
+        return httpx.Response(401, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr("ramp_cli.commands.router.httpx.get", get)
+
+    result = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+
+    assert result.exit_code == 4
+    assert len(requests) == 1
+    assert result.output == (
+        "Error: Could not refresh OpenCode, Pi, Conductor: "
+        "the saved Ramp Router API key was rejected (expired or revoked). "
+        "Run 'ramp router configure' to reconnect with a new key "
+        "(https://internal.router.com), or 'ramp router unconfigure' to remove Router.\n"
+    )
+
+
+def test_refresh_mixed_rejected_key_and_other_failure_exits_runtime(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(
+        router_module,
+        "configured_router_clients",
+        lambda: ("opencode", "pi"),
+    )
+    monkeypatch.setattr(
+        router_module,
+        "_stored_router_api_key",
+        lambda client, _path: (
+            "revoked-key"
+            if client == "opencode"
+            else (_ for _ in ()).throw(click.ClickException("corrupt config"))
+        ),
+    )
+    monkeypatch.setattr(
+        router_module,
+        "_refresh_router_base_url",
+        lambda _client, _path: "https://api.router.com/v1",
+    )
+    monkeypatch.setattr(
+        router_module, "_stored_usage_origin", lambda _client, _path: None
+    )
+    monkeypatch.setattr(
+        router_module, "_refresh_cowork_model_selections", lambda **_kw: None
+    )
+    monkeypatch.setattr(
+        "ramp_cli.commands.router.httpx.get",
+        lambda url, **_kw: httpx.Response(401, request=httpx.Request("GET", url)),
+    )
+
+    result = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+
+    assert result.exit_code == 1
+    assert "OpenCode: the saved Ramp Router API key was rejected" in result.output
+    assert "; Pi: corrupt config" in result.output
+
+
 @pytest.mark.parametrize("restarted_apps", [[], ["Codex"]])
 def test_configure_codex_writes_router_provider(tmp_path, monkeypatch, restarted_apps):
     codex_home = tmp_path / "codex"
@@ -6558,7 +6673,10 @@ def test_configure_codex_replaces_quoted_root_keys(tmp_path, monkeypatch):
 
     assert result.exit_code == 0, result.output
     restored = tomllib.loads(config_path.read_text())
-    assert restored == tomllib.loads(original)
+    assert restored == {
+        **tomllib.loads(original),
+        "mcp_servers": {"ramp": {"url": "https://mcp.ramp.com/mcp"}},
+    }
 
 
 @pytest.mark.parametrize(
@@ -6630,7 +6748,10 @@ def test_codex_config_lines_split_only_on_newlines(tmp_path, monkeypatch):
 
     assert result.exit_code == 0, result.output
     restored = tomllib.loads(config_path.read_text(encoding="utf-8"))
-    assert restored == tomllib.loads(original)
+    assert restored == {
+        **tomllib.loads(original),
+        "mcp_servers": {"ramp": {"url": "https://mcp.ramp.com/mcp"}},
+    }
     assert restored["features"] == {"web_search": True}
 
 
@@ -6681,7 +6802,10 @@ def test_configure_codex_ignores_table_headers_inside_multiline_strings(
     result = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
 
     assert result.exit_code == 0, result.output
-    assert tomllib.loads(config_path.read_text()) == tomllib.loads(original)
+    assert tomllib.loads(config_path.read_text()) == {
+        **tomllib.loads(original),
+        "mcp_servers": {"ramp": {"url": "https://mcp.ramp.com/mcp"}},
+    }
 
 
 def test_codex_root_rewrite_refuses_to_change_unowned_values(monkeypatch):
@@ -9032,7 +9156,16 @@ def test_unconfigure_opencode_restores_previous_settings(tmp_path, monkeypatch):
     unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "opencode"])
 
     assert configure.exit_code == unconfigure.exit_code == 0
-    assert json.loads(config_path.read_text()) == original
+    assert json.loads(config_path.read_text()) == {
+        **original,
+        "mcp": {
+            "ramp": {
+                "type": "remote",
+                "url": "https://mcp.ramp.com/mcp",
+                "enabled": True,
+            }
+        },
+    }
     assert not (tmp_path / "ramp-router-state.json").exists()
     # Configure created tui.json, so unconfigure restores its absence.
     assert not tui_path.exists()
@@ -9573,7 +9706,16 @@ def test_configure_model_opencode_v2_replaces_the_users_own_model(
     # The CLI removed the pin, so unconfigure brings it back.
     unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "opencode"])
     assert unconfigure.exit_code == 0
-    assert json.loads(config_path.read_text()) == {"model": "anthropic/claude-opus-4"}
+    assert json.loads(config_path.read_text()) == {
+        "model": "anthropic/claude-opus-4",
+        "mcp": {
+            "ramp": {
+                "type": "remote",
+                "url": "https://mcp.ramp.com/mcp",
+                "enabled": True,
+            }
+        },
+    }
 
 
 def test_unconfigure_opencode_v2_does_not_resurrect_a_model_the_user_removed(
@@ -9652,7 +9794,16 @@ def test_unconfigure_opencode_v2_restores_a_router_model_it_lifted_out(
 
     unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "opencode"])
     assert unconfigure.exit_code == 0
-    assert json.loads(config_path.read_text()) == {"model": "ramp-router/hand-picked"}
+    assert json.loads(config_path.read_text()) == {
+        "model": "ramp-router/hand-picked",
+        "mcp": {
+            "ramp": {
+                "type": "remote",
+                "url": "https://mcp.ramp.com/mcp",
+                "enabled": True,
+            }
+        },
+    }
 
 
 def test_configure_pi_installs_plugin_and_is_idempotent(tmp_path, monkeypatch):
