@@ -15,6 +15,7 @@ PROD = "https://api.router.com/v1"
     [
         (PROD, True),
         ("https://internal-api.router.com/v1", True),
+        ("https://router-api.ramp.com/v1", True),
         ("https://qa-router-api.ramp.com/v1", False),
         ("http://localhost:8000/v1", False),
     ],
@@ -40,12 +41,24 @@ def test_should_configure_only_for_prod_router(base_url: str, expected: bool) ->
             {"type": "remote", "url": ramp_mcp.URL, "enabled": True},
         ),
         ("cursor", ".cursor/mcp.json", "mcpServers", {"url": ramp_mcp.URL}),
+        (
+            "antigravity",
+            "config/mcp_config.json",
+            "mcpServers",
+            {"url": ramp_mcp.URL},
+        ),
     ],
 )
 def test_configure_writes_entry_once(
     monkeypatch, tmp_path, harness: str, rel_path: str, key: str, expected_entry: dict
 ) -> None:
-    for var in ("HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_CONFIG_HOME"):
+    for var in (
+        "HOME",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "XDG_CONFIG_HOME",
+        "RAMP_ANTIGRAVITY_GEMINI_DIR",
+    ):
         monkeypatch.setenv(var, str(tmp_path))
     cfg = tmp_path / rel_path
 

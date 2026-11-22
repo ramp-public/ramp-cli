@@ -16,7 +16,7 @@ from ramp_cli import claude_cowork
 from ramp_cli.auth.refresh import _refresh_lock
 from ramp_cli.errors import RampCLIError
 
-HARNESSES = ("claude-code", "codex", "opencode", "pi", "desktop")
+HARNESSES = ("claude-code", "codex", "opencode", "pi", "antigravity", "desktop")
 SERVER = "ramp-connectors"
 EXECUTABLE_NAMES = (
     "ramp",
@@ -52,6 +52,10 @@ def config_path(harness: str, *, require_unambiguous: bool = True) -> Path:
             ).expanduser()
             / "mcp.json"
         )
+    if harness == "antigravity":
+        from ramp_cli.commands import antigravity  # noqa: PLC0415
+
+        return antigravity.mcp_config_path()
     configured = os.environ.get("OPENCODE_CONFIG")
     if configured:
         return Path(configured).expanduser()

@@ -100,7 +100,7 @@ def rows(result):
 
 def test_list_reports_every_supported_harness(machine):
     result = rows(agent("list"))
-    assert list(result) == list(router.CLIENT_NAMES)
+    assert list(result) == [c for c in router.CLIENT_NAMES if c != "antigravity"]
     assert result["claude-code"]["installed"] is True
     assert result["claude-code"]["connected"] is True
     assert result["claude-code"]["model"] == "claude-opus"

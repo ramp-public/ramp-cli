@@ -630,6 +630,7 @@ def _configure_stopped(
     profile: dict,
     *,
     connector_binding: str | None = None,
+    mcp: bool = False,
 ) -> Path:
     """Write the Cowork profile after Claude Desktop has stopped."""
     previous_state = _read_state()
@@ -681,7 +682,8 @@ def _configure_stopped(
     from ramp_cli.router_connectors import ramp_mcp  # noqa: PLC0415
 
     if (
-        ramp_mcp.should_configure(router_repo.unwrap_url(router_base_url))
+        mcp
+        and ramp_mcp.should_configure(router_repo.unwrap_url(router_base_url))
         and (entry := ramp_mcp.desktop_entry()) is not None
     ):
         servers = desktop_config.setdefault("mcpServers", {})
@@ -1304,6 +1306,7 @@ def configure(
     model_ids: tuple[str, ...] = (),
     *,
     connector_binding: str | None = None,
+    mcp: bool = False,
 ) -> tuple[Path, tuple[dict, ...]]:
     """Configure and relaunch Claude Desktop with a Cowork-safe Router profile."""
     preflight()
@@ -1327,7 +1330,11 @@ def configure(
                 if state is not None:
                     _owned_profile(state)
             profile_path = _configure_stopped(
-                api_key, router_base_url, profile, connector_binding=connector_binding
+                api_key,
+                router_base_url,
+                profile,
+                connector_binding=connector_binding,
+                mcp=mcp,
             )
         except BaseException:
             try:

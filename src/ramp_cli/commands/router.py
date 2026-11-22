@@ -56,6 +56,7 @@ from ramp_cli import (
     json5_edit,
 )
 from ramp_cli.commands import (
+    antigravity,
     claude_code,
     claude_code_default,
     codex_default,
@@ -217,6 +218,7 @@ CLIENT_NAMES = {
     "pi": "Pi",
     "hermes": "Hermes",
     "conductor": "Conductor",
+    "antigravity": "Antigravity",
 }
 # The command each agent puts on PATH. Used to tell which agents this machine
 # actually has, so the picker does not offer to write configuration into
@@ -928,7 +930,7 @@ def _render_codex_original_profile(
 
 
 _PROFILE_CLIENTS = ("claude-code", "codex")
-_MODEL_VIEW_CLIENTS = (*_PROFILE_CLIENTS, "opencode", "pi")
+_MODEL_VIEW_CLIENTS = (*_PROFILE_CLIENTS, "opencode", "pi", "antigravity")
 
 
 def _profile_notice(results: list[dict], restore_clients: str) -> list[str]:
@@ -1168,6 +1170,8 @@ def _detected_clients() -> tuple[str, ...]:
         detected.add("codex")
     if conductor.is_installed():
         detected.add("conductor")
+    if antigravity.is_installed():
+        detected.add("antigravity")
     if claude_cowork.is_available():
         detected.add(COWORK_CLIENT)
     return tuple(client for client in AGENT_NAMES if client in detected)
@@ -1230,6 +1234,8 @@ def _pick_installed_clients() -> tuple[str, ...]:
         # Conductor ships no PATH executable, so app-level detection is what
         # earns it a line beside the agents found by command name.
         candidates = (*candidates, "conductor")
+    if antigravity.is_installed():
+        candidates = (*candidates, "antigravity")
     cowork_available = claude_cowork.is_available()
     if cowork_available and "claude-code" not in candidates:
         # The Claude entry is the only interactive road to Cowork, so an
@@ -1245,6 +1251,7 @@ def _pick_installed_clients() -> tuple[str, ...]:
             for client in CLIENT_NAMES
             if (client != "hermes" or hermes_agent.hermes_executable() is not None)
             and (client != "conductor" or conductor.is_installed())
+            and (client != "antigravity" or antigravity.is_installed())
         )
     # The list says which apps an entry covers, so nobody has to think of
     # Claude Code and Claude Desktop as two separate things to configure.
@@ -1391,7 +1398,9 @@ def _pick_claude_models(
 ) -> str:
     model_clients = tuple(client for client in clients if client in _MODEL_VIEW_CLIENTS)
     subject = _human_join([CLIENT_NAMES[client] for client in model_clients])
-    recommended_default = any(client in _PROFILE_CLIENTS for client in model_clients)
+    recommended_default = any(
+        client in (*_PROFILE_CLIENTS, "antigravity") for client in model_clients
+    )
     recommended = "Recommended models"
     if recommended_default:
         recommended += " (default)"
@@ -1726,6 +1735,11 @@ def _cursor_model_options(command):
     help="Sign in, configure selected harnesses, and enable background refresh and repository tagging.",
 )
 @click.option(
+    "--mcp",
+    is_flag=True,
+    help="Also add the Ramp MCP server (https://mcp.ramp.com/mcp) to each configured app.",
+)
+@click.option(
     "--reuse-existing-key",
     is_flag=True,
     help=(
@@ -1762,6 +1776,14 @@ def _cursor_model_options(command):
     help="Models shown by Claude Code: recommended compact list or all models.",
 )
 @click.option(
+    "--antigravity-models",
+    type=click.Choice(("compact", "all"), case_sensitive=False),
+    help=(
+        "Models shown by Antigravity: compact recommendations (default) or all "
+        "models. Saved across refreshes."
+    ),
+)
+@click.option(
     "--base-url",
     metavar="URL",
     envvar=ROUTER_BASE_URL_ENV,
@@ -1785,12 +1807,14 @@ def router_configure(
     no_browser: bool,
     connectors: bool,
     enable_agent: bool,
+    mcp: bool,
     reuse_existing_key: bool,
     confirm_browser: bool,
     claude_models: str | None,
     codex_models: str | None,
     opencode_models: str | None,
     pi_models: str | None,
+    antigravity_models: str | None,
     base_url: str | None,
     ui_url: str | None,
     cursor_models_view: str | None = None,
@@ -1864,11 +1888,13 @@ def router_configure(
         codex_models is None
         and opencode_models is None
         and pi_models is None
+        and antigravity_models is None
         and not no_browser
         and not reuse_existing_key
         and not confirm_browser
         and not connectors
         and not enable_agent
+        and not mcp
         and not cursor_options.given()
         and not cursor_options.variants_given()
         and (not clients or (api_key is None and setup_file is None))
@@ -1900,12 +1926,14 @@ def router_configure(
         codex_models=codex_models,
         opencode_models=opencode_models,
         pi_models=pi_models,
+        antigravity_models=antigravity_models,
         api_key_source=ctx.get_parameter_source("api_key"),
         deployment_override=bool(base_url or ui_url),
         reuse_existing_key=reuse_existing_key,
         confirm_browser=confirm_browser,
         connectors=connectors,
         enable_agent=enable_agent,
+        mcp=mcp,
         cursor_options=cursor_options,
     )
     results = None
@@ -2112,12 +2140,14 @@ def _run_configure(
     codex_models: str | None = None,
     opencode_models: str | None = None,
     pi_models: str | None = None,
+    antigravity_models: str | None = None,
     legacy_cowork_alias: bool = False,
     deployment_override: bool = False,
     reuse_existing_key: bool = False,
     confirm_browser: bool = False,
     connectors: bool = False,
     enable_agent: bool = False,
+    mcp: bool = False,
     cursor_options: _CursorOptions | None = None,
 ) -> list[dict] | None:
     cursor_options = cursor_options or _CursorOptions()
@@ -2134,10 +2164,12 @@ def _run_configure(
         codex_models is None
         and opencode_models is None
         and pi_models is None
+        and antigravity_models is None
         and not no_browser
         and not reuse_existing_key
         and not connectors
         and not enable_agent
+        and not mcp
         and not cursor_options.given()
         and not cursor_options.variants_given()
         and (
@@ -2173,6 +2205,7 @@ def _run_configure(
         ("codex", codex_models),
         ("opencode", opencode_models),
         ("pi", pi_models),
+        ("antigravity", antigravity_models),
     ):
         if view is not None and clients != (client,):
             raise click.UsageError(
@@ -2300,7 +2333,8 @@ def _run_configure(
         # preference configures, so the repeat-configure shortcut clears it
         # like a full configure would.
         _scrub_stale_fable_verdict()
-        ramp_mcp.configure("claude-code", router_base_url())
+        if mcp:
+            ramp_mcp.configure("claude-code", router_base_url())
         if connector_skill.refresh():
             connector_skill.install("claude-code")
         # Like every other configure, so RAMP_NO_SESSION_SYNC=1 removes the
@@ -2379,6 +2413,8 @@ def _run_configure(
             )
         elif "codex" in clients:
             current_view = _configured_codex_model_view(_codex_config_path())
+        elif "antigravity" in clients:
+            current_view = _configured_antigravity_model_view(antigravity.config_path())
         else:
             current_view = _configured_plugin_model_view(
                 _json_config_path("opencode" if "opencode" in clients else "pi")
@@ -2394,6 +2430,8 @@ def _run_configure(
                 opencode_models = claude_models
             if "pi" in clients and pi_models is None:
                 pi_models = claude_models
+            if "antigravity" in clients and antigravity_models is None:
+                antigravity_models = claude_models
         else:
             claude_models = current_view
     restore_clients = (
@@ -2477,14 +2515,22 @@ def _run_configure(
                     "Cursor: reusing the Router key from your last unfinished setup."
                 )
     connector_skill_available = (
-        any(item in ("claude-code", "codex", "opencode", "pi") for item in clients)
+        any(
+            item in ("claude-code", "codex", "opencode", "pi", "antigravity")
+            for item in clients
+        )
         and connector_skill.refresh()
     )
     connector_binding = None
     if connectors:
+        connector_clients = tuple(
+            c
+            for c in clients
+            if c != "antigravity" or requested_clients or antigravity.is_installed()
+        )
         api_key, newly_created_key, connector_binding = configure_connector_harnesses(
             ctx,
-            clients,
+            connector_clients,
             base_url=base_url,
             api_key=api_key,
             no_browser=no_browser,
@@ -2663,12 +2709,19 @@ def _run_configure(
                 # naming it explicitly still preconfigures — but a bare run
                 # should not seed ~/.conductor on machines that never had it.
                 continue
+            if (
+                item == "antigravity"
+                and not requested_clients
+                and not antigravity.is_installed()
+            ):
+                continue
             if item == COWORK_CLIENT:
                 try:
                     profile_path, migrated_selections = claude_cowork.configure(
                         api_key,
                         base_url,
                         model_ids=tuple(model.id for model in models),
+                        mcp=mcp,
                         **(
                             {"connector_binding": connector_binding}
                             if connector_binding is not None
@@ -2753,7 +2806,8 @@ def _run_configure(
                     if cursor.personal_keys_blocked()
                     else {}
                 )
-                ramp_mcp.configure(CURSOR_CLIENT, base_url)
+                if mcp:
+                    ramp_mcp.configure(CURSOR_CLIENT, base_url)
                 reopen_result = _reopen_cursor(cursor_quit)
                 reopened = (
                     {"reopened": reopen_result} if reopen_result is not None else {}
@@ -2873,6 +2927,8 @@ def _run_configure(
                     configure_options["plugin_model_view"] = opencode_models
                 elif item == "pi" and pi_models is not None:
                     configure_options["plugin_model_view"] = pi_models
+                elif item == "antigravity" and antigravity_models is not None:
+                    configure_options["antigravity_model_view"] = antigravity_models
                 # The same origin this setup is being written to send its
                 # session-usage calls to.
                 pushed = switchyard_push.plan(
@@ -2906,12 +2962,14 @@ def _run_configure(
                     failure_error = HarnessOutdatedError
                 continue
             switchyard_push.settle(written=True)
-            ramp_mcp.configure(item, base_url)
+            if mcp:
+                ramp_mcp.configure(item, base_url)
             if connector_skill_available and item in (
                 "claude-code",
                 "codex",
                 "opencode",
                 "pi",
+                "antigravity",
             ):
                 connector_skill.install(item)
             switchyard_model = (
@@ -2944,6 +3002,21 @@ def _run_configure(
                 result["note_lines"] = notes
             if item == "claude-code":
                 result["note_lines"] = _claude_code_picker_note_lines(path)
+            if item == "antigravity":
+                ag_view = _configured_antigravity_model_view(path)
+                result["model_view"] = ag_view
+                ag_cfg = antigravity.read_config(path)
+                ag_list = (
+                    ag_cfg.get("models", {}).get("list")
+                    if isinstance(ag_cfg.get("models"), dict)
+                    else None
+                )
+                if isinstance(ag_list, list):
+                    result["models_visible"] = len(ag_list)
+                result["note_lines"] = _antigravity_note_lines(
+                    ag_view,
+                    configured_count=len(ag_list) if isinstance(ag_list, list) else 0,
+                )
             results.append(result)
         if confirm_browser:
             record_mdm_event(
@@ -2994,6 +3067,15 @@ def _run_configure(
         for result in results:
             if result["client"] == "codex":
                 result["restarted_apps"] = codex_desktop.restart_running()
+            elif result["client"] == "antigravity":
+                if antigravity.restart_running(action="configured"):
+                    result["restarted_apps"] = ["Antigravity"]
+                    if result.get("note_lines"):
+                        result["note_lines"] = [
+                            line
+                            for line in result["note_lines"]
+                            if not line.startswith("Restart Antigravity")
+                        ]
 
     connector_undo = (
         "\nTo disable connector tools, run:\n"
@@ -3075,7 +3157,10 @@ def _run_configure(
             message = f"{prefix}{model_count} {model_label} {action}."
             if len(results) == 1 and not discovered:
                 message += (
-                    " Restart any running Codex CLI sessions, then pick a model."
+                    " Pick a model in Antigravity."
+                    if result.get("restarted_apps")
+                    and result["client"] == "antigravity"
+                    else " Restart any running Codex CLI sessions, then pick a model."
                     if result.get("restarted_apps")
                     else " Restart any running agents, then pick a model."
                 )
@@ -3086,8 +3171,10 @@ def _run_configure(
             if result.get("restarted_apps"):
                 click.echo("Reopened: " + _human_join(result["restarted_apps"]) + ".")
             if result.get("model_view"):
+                client_label = CLIENT_NAMES.get(result["client"], result["client"])
                 click.echo(
-                    f"Codex model picker: {result['model_view']} (saved for future refreshes)."
+                    f"{client_label} model picker: {result['model_view']} "
+                    "(saved for future refreshes)."
                 )
             if result.get("switchyard_model"):
                 click.echo(
@@ -3864,22 +3951,44 @@ def _refresh_clients(
                     raise click.ClickException(
                         "Ramp Router is no longer configured in Conductor."
                     )
-                api_key = _stored_router_api_key(client, path)
-                # Keep the endpoint paired with the stored credential for
-                # other deployments, regardless of the environment under
-                # which a session-start sync happens. Both production hosts
-                # accept the same keys, so migrate only the exact CLI-owned
-                # legacy production URL unless this run explicitly selects
-                # a deployment through the environment.
-                base_url = _refresh_router_base_url(client, path)
+                antigravity_expected_connection: tuple[str, str | None] | None = None
+                if client == "antigravity":
+                    # Read receipt, credential, endpoint, and dashboard origin
+                    # atomically under the config lock, then release before
+                    # network discovery so slow requests never block concurrent
+                    # configure/unconfigure; the write step rechecks receipt and
+                    # expected_connection under the lock.
+                    with _antigravity_config_lock(path):
+                        if not antigravity.receipt_enrolls(
+                            antigravity.state_path(path)
+                        ):
+                            raise click.ClickException(
+                                "Ramp Router is no longer configured in Antigravity."
+                            )
+                        api_key = _stored_router_api_key(client, path)
+                        antigravity_expected_connection = (
+                            api_key,
+                            _stored_router_base_url(client, path),
+                        )
+                        base_url = _refresh_router_base_url(client, path)
+                        usage_origin = _stored_usage_origin(client, path)
+                else:
+                    api_key = _stored_router_api_key(client, path)
+                    # Keep the endpoint paired with the stored credential for
+                    # other deployments, regardless of the environment under
+                    # which a session-start sync happens. Both production hosts
+                    # accept the same keys, so migrate only the exact CLI-owned
+                    # legacy production URL unless this run explicitly selects
+                    # a deployment through the environment.
+                    base_url = _refresh_router_base_url(client, path)
+                    # The dashboard origin belongs to the same snapshot as the
+                    # credential and endpoint: read it now, not after discovery,
+                    # so a configure that reconnects to another deployment in
+                    # the meantime cannot pair the old key with the new host.
+                    # The rewrite below keeps it for the same reason.
+                    usage_origin = _stored_usage_origin(client, path)
                 if (base_url.rstrip("/"), api_key) in skip:
                     continue
-                # The dashboard origin belongs to the same snapshot as the
-                # credential and endpoint: read it now, not after discovery,
-                # so a configure that reconnects to another deployment in
-                # the meantime cannot pair the old key with the new host.
-                # The rewrite below keeps it for the same reason.
-                usage_origin = _stored_usage_origin(client, path)
                 settings_origin = usage_origin or _router_key_origin(base_url)
                 rejection_key = (api_key, base_url.rstrip("/"))
                 if rejection_key in rejected_keys:
@@ -3926,10 +4035,11 @@ def _refresh_clients(
                         else pushed
                     ),
                 }
-                if client == "codex" and pushed is not None:
-                    # Refresh normally re-reads Codex's own selection after
-                    # discovery. A pushed model is the change itself, but
-                    # only while the selection it replaces is still there.
+                if client in ("codex", "antigravity") and pushed is not None:
+                    # Refresh normally re-reads the harness's own selection
+                    # under the lock after discovery. A pushed model is the
+                    # change itself, but only while the selection it replaces
+                    # is still there.
                     configure_options["replace_model"] = selected_model
                 if client == "claude-code":
                     configure_options["claude_model_view"] = (
@@ -3949,6 +4059,11 @@ def _refresh_clients(
                     # scan and the write must win, not be resurrected.
                     configure_options["conductor_require_receipt"] = True
                     configure_options["conductor_lock_held"] = True
+                elif client == "antigravity":
+                    configure_options["antigravity_require_receipt"] = True
+                    configure_options["expected_connection"] = (
+                        antigravity_expected_connection
+                    )
                 with _pinned_usage_origin(usage_origin, keep_override=True):
                     if models_only:
                         default_model = _refresh_client_models(
@@ -6456,6 +6571,8 @@ def _scheduled_sync_connections() -> list[_SyncConnection]:
             transaction = _hermes_config_lock()
         elif client == "conductor":
             transaction = _conductor_settings_lock(path)
+        elif client == "antigravity":
+            transaction = _antigravity_config_lock(path)
         elif client == "claude-code":
             transaction = claude_code.settings_lock(path)
         elif client == "codex":
@@ -6472,6 +6589,8 @@ def _scheduled_sync_connections() -> list[_SyncConnection]:
                 if client == "claude-code" and not receipt.exists():
                     continue
                 if client == "conductor" and not _conductor_receipt_enrolls(receipt):
+                    continue
+                if client == "antigravity" and not antigravity.receipt_enrolls(receipt):
                     continue
                 base_url = _refresh_router_base_url(client, path)
                 connection = origins.setdefault(
@@ -8623,6 +8742,12 @@ def _run_unconfigure(
         raise click.ClickException("Ramp Router is not configured in any coding agent.")
     if failures and fmt == "json":
         raise click.ClickException("Could not unconfigure " + "; ".join(failures))
+    if not failures:
+        for result in results:
+            if result["client"] == "antigravity" and antigravity.restart_running(
+                action="removed"
+            ):
+                result["restarted"] = True
     if fmt == "json":
         if legacy_cowork_alias and results:
             # The deprecated alias is kept precisely for existing scripts, so
@@ -8656,6 +8781,12 @@ def _run_unconfigure(
             )
         if any(result["client"] == COWORK_CLIENT for result in results):
             click.echo("Claude Desktop was restarted.")
+        if any(
+            result.get("restarted")
+            for result in results
+            if result["client"] == "antigravity"
+        ):
+            click.echo("Antigravity was restarted.")
         cursor_result = next(
             (result for result in results if result["client"] == CURSOR_CLIENT), None
         )
@@ -8683,6 +8814,9 @@ def _unconfigure_client(client: str, path: Path) -> None:
         return
     if client == "conductor":
         _unconfigure_conductor(path)
+        return
+    if client == "antigravity":
+        _unconfigure_antigravity(path)
         return
     if client != "codex":
         _unconfigure_json_client(client, path)
@@ -11744,6 +11878,8 @@ def _client_config_path(client: str) -> Path:
         return hermes_agent.config_path()
     if client == "conductor":
         return conductor.settings_path()
+    if client == "antigravity":
+        return antigravity.config_path()
     return _codex_config_path() if client == "codex" else _json_config_path(client)
 
 
@@ -11774,6 +11910,10 @@ def configured_router_clients() -> tuple[str, ...]:
             # Same reasoning as Hermes: a torn-down, corrupt, or incomplete
             # receipt must not enroll a refresh that could resurrect a
             # removed setup or poison the restore snapshot.
+            continue
+        if client == "antigravity" and not antigravity.receipt_enrolls(
+            antigravity.state_path(path)
+        ):
             continue
         try:
             _stored_router_api_key(client, path)
@@ -11840,6 +11980,8 @@ def _stored_router_api_key_choices() -> list[tuple[str, tuple[str, ...]]]:
                 guard = _hermes_config_lock()
             elif client == "conductor":
                 guard = _conductor_settings_lock(path)
+            elif client == "antigravity":
+                guard = _antigravity_config_lock(path)
             else:
                 guard = nullcontext()
             with guard:
@@ -11849,6 +11991,10 @@ def _stored_router_api_key_choices() -> list[tuple[str, tuple[str, ...]]]:
                     continue
                 if client == "conductor" and not _conductor_receipt_enrolls(
                     path.parent / "ramp-router-state.json"
+                ):
+                    continue
+                if client == "antigravity" and not antigravity.receipt_enrolls(
+                    antigravity.state_path(path)
                 ):
                     continue
                 saved_url = _stored_router_base_url(client, path)
@@ -11949,6 +12095,18 @@ def _stored_router_base_url(client: str, path: Path) -> str | None:
             raise click.ClickException(
                 "Could not read the Router endpoint from the Conductor "
                 "setup. Run 'ramp router configure conductor' to repair it."
+            )
+    elif client == "antigravity":
+        config = antigravity.read_config(path)
+        gateway = config.get("gateway")
+        base_url = gateway.get("url") if isinstance(gateway, dict) else None
+        if not isinstance(base_url, str) or not base_url.strip():
+            state = _read_state_file(antigravity.state_path(path))
+            base_url = state.get("base_url")
+        if not isinstance(base_url, str) or not base_url.strip():
+            raise click.ClickException(
+                "Could not read the Router endpoint from the Antigravity "
+                "setup. Run 'ramp router configure antigravity' to repair it."
             )
 
     if isinstance(base_url, str) and base_url.strip():
@@ -12365,6 +12523,10 @@ def _stored_router_api_key(client: str, path: Path) -> str:
             api_key = (path.parent / "ramp-router" / CONDUCTOR_KEY_FILENAME).read_text(
                 encoding="utf-8"
             )
+        elif client == "antigravity":
+            config = antigravity.read_config(path)
+            gateway = config.get("gateway")
+            api_key = gateway.get("apiKey") if isinstance(gateway, dict) else None
         else:
             raise click.ClickException(
                 f"Refreshing {CLIENT_NAMES[client]} is not supported by this CLI."
@@ -12408,6 +12570,12 @@ def _configured_model(client: str, path: Path) -> str | None:
         # Conductor's own UI chooses a model per chat, so the setup pins
         # nothing a refresh could preserve.
         model = None
+    elif client == "antigravity":
+        config = antigravity.read_config(path)
+        models_cfg = config.get("models")
+        model = (
+            models_cfg.get("defaultModelId") if isinstance(models_cfg, dict) else None
+        )
     else:
         config = _read_json_config(client, path)
         if client == "opencode":
@@ -12944,11 +13112,13 @@ def _configure_client(
     claude_model_view: str | None = None,
     codex_model_view: str | None = None,
     plugin_model_view: str | None = None,
+    antigravity_model_view: str | None = None,
     preserve_model_view_ownership: bool = False,
     hermes_require_receipt: bool = False,
     hermes_lock_held: bool = False,
     conductor_require_receipt: bool = False,
     conductor_lock_held: bool = False,
+    antigravity_require_receipt: bool = False,
     strict_model: bool = False,
     explicit_model: bool = False,
     replace_model: str | bool | None | object = _UNCHECKED,
@@ -13001,6 +13171,22 @@ def _configure_client(
             **({} if replace_model is _UNCHECKED else {"replace_model": replace_model}),
         )
         return path, default_model, repaired
+
+    if client == "antigravity":
+        path = _client_config_path(client)
+        default_model = _configure_antigravity(
+            path,
+            api_key,
+            models,
+            base_url=base_url,
+            selected_model=selected_model,
+            model_view=antigravity_model_view,
+            require_receipt=antigravity_require_receipt,
+            expected_connection=expected_connection,
+            explicit_model=strict_model or explicit_model,
+            replace_model=replace_model,
+        )
+        return path, default_model, False
 
     config_path = (
         _client_config_path(client)
@@ -13103,6 +13289,15 @@ def _refresh_client_models(
         )
     if client == "codex":
         return _refresh_codex_models(
+            path,
+            api_key,
+            models,
+            base_url=base_url,
+            selected_model=selected_model,
+            replace_model=replace_model,
+        )
+    if client == "antigravity":
+        return _refresh_antigravity_models(
             path,
             api_key,
             models,
@@ -14771,6 +14966,373 @@ def _fetch_codex_catalog(api_key: str, *, base_url: str | None = None) -> dict:
     return catalog
 
 
+@contextmanager
+def _antigravity_config_lock(path: Path):
+    """Serialize Antigravity config reads and writes against ``config.json``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with claude_code.advisory_lock(path.parent / antigravity.LOCK_FILENAME):
+        yield
+
+
+def _configured_antigravity_model_view(path: Path) -> str:
+    """Use compact recommendations unless the user explicitly chose all."""
+    return (
+        "all"
+        if _saved_model_view(path, antigravity.MODEL_VIEW_KEY) == "all"
+        else "compact"
+    )
+
+
+def _antigravity_note_lines(model_view: str, *, configured_count: int) -> list[str]:
+    lines: list[str] = []
+    if model_view == "all" and configured_count > antigravity.CUSTOM_PLACEHOLDER_LIMIT:
+        lines.append(
+            f"Antigravity lists up to {antigravity.CUSTOM_PLACEHOLDER_LIMIT} custom "
+            "gateway models alongside built-in catalog matches; recommended models "
+            "are ordered first so they stay visible. To test any other Router model, "
+            "pin it with 'ramp router configure model antigravity --model <id>'."
+        )
+    if antigravity.is_running():
+        lines.append(
+            "Restart Antigravity so it reloads the updated Router gateway and model list."
+        )
+    return lines
+
+
+def _antigravity_live_model(config: dict) -> str | None:
+    models_cfg = config.get("models")
+    if isinstance(models_cfg, dict):
+        value = models_cfg.get("defaultModelId")
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _resolve_antigravity_model_in_lock(
+    path: Path,
+    existing: dict,
+    models: list[RouterModel],
+    *,
+    selected_model: str | None,
+    fallback: str | None,
+    explicit_model: bool = False,
+    replace_model: str | bool | None | object = _UNCHECKED,
+) -> tuple[str, str | None]:
+    """Resolve Antigravity's default model and Router-pick ownership under the lock.
+
+    Re-reads the live ``defaultModelId`` after network discovery so a model
+    saved by a concurrent CLI or UI action while discovery was in flight is
+    never overwritten.
+    """
+    live_model = _antigravity_live_model(existing)
+    if explicit_model:
+        candidate = selected_model
+    elif replace_model is not _UNCHECKED:
+        # A pushed model replaces only the selection it was planned against;
+        # if the user saved another model in the meantime, keep theirs.
+        candidate = (
+            selected_model
+            if live_model == replace_model
+            else _follow_switchyard_rename(live_model, models)
+        )
+    else:
+        candidate = _follow_switchyard_rename(live_model, models)
+    return _harness_default_model(
+        "antigravity",
+        path,
+        models,
+        candidate,
+        fallback=fallback,
+        explicit=explicit_model,
+    )
+
+
+def _configure_antigravity(
+    path: Path,
+    api_key: str,
+    models: list[RouterModel],
+    *,
+    base_url: str | None = None,
+    selected_model: str | None = None,
+    model_view: str | None = None,
+    require_receipt: bool = False,
+    expected_connection: tuple[str, str | None] | None = None,
+    explicit_model: bool = False,
+    replace_model: str | bool | None | object = _UNCHECKED,
+) -> str:
+    """Configure Antigravity's LLM gateway and model catalog for Ramp Router."""
+    effective_base_url = (base_url or router_base_url()).rstrip("/")
+    # Fetch compact recommendations and fallback before taking the config lock
+    # so slow network calls never block concurrent configure/unconfigure.
+    compact_models = _fetch_models(
+        api_key,
+        model_view="compact",
+        base_url=effective_base_url,
+    )
+    router_fallback = _router_fallback_model("antigravity", api_key, effective_base_url)
+    with _antigravity_config_lock(path):
+        state_file = antigravity.state_path(path)
+        if require_receipt and not antigravity.receipt_enrolls(state_file):
+            raise _not_configured("antigravity")
+        if (
+            expected_connection is not None
+            and (
+                _stored_router_api_key("antigravity", path),
+                _stored_router_base_url("antigravity", path),
+            )
+            != expected_connection
+        ):
+            raise click.ClickException(
+                "The Antigravity connection changed during the update. "
+                "Reload before saving."
+            )
+        existing = antigravity.read_config(path)
+        previous_state = _read_state_file(state_file)
+        effective_view = (
+            model_view
+            if model_view is not None
+            else (
+                "all"
+                if previous_state.get(antigravity.MODEL_VIEW_KEY) == "all"
+                else "compact"
+            )
+        )
+        default_model, router_pick = _resolve_antigravity_model_in_lock(
+            path,
+            existing,
+            models,
+            selected_model=selected_model,
+            fallback=router_fallback,
+            explicit_model=explicit_model,
+            replace_model=replace_model,
+        )
+        ordered = antigravity.select_models(
+            models,
+            compact_models=compact_models,
+            model_view=effective_view,
+            default_model=default_model,
+        )
+        previous_keys = previous_state.get("previous")
+        if not isinstance(previous_keys, dict):
+            existing_gateway = existing.get("gateway")
+            # A repair configure over a lost or corrupt receipt must never
+            # snapshot Router's own gateway/models as the pre-Router state to
+            # restore on unconfigure.
+            already_router = antigravity.is_router_gateway(
+                existing_gateway, base_url=effective_base_url
+            ) or (
+                isinstance(existing_gateway, dict)
+                and isinstance(existing_gateway.get("url"), str)
+                and _same_router(existing_gateway["url"], effective_base_url)
+            )
+            previous_keys = {}
+            for key in ("gateway", "models"):
+                if not already_router and key in existing:
+                    previous_keys[key] = {"present": True, "value": existing[key]}
+                else:
+                    previous_keys[key] = {"present": False}
+        created = previous_state.get("created")
+        if not isinstance(created, dict):
+            created = {"config_file": not os.path.lexists(path)}
+
+        written_gateway = antigravity.gateway_config(effective_base_url, api_key)
+        written_models = {
+            "list": antigravity.build_model_entries(ordered),
+            "defaultModelId": default_model,
+            "tiers": antigravity.build_tiers(ordered, default_model),
+        }
+        updated = dict(existing)
+        updated["gateway"] = written_gateway
+        updated["models"] = written_models
+        receipt = {
+            "base_url": effective_base_url,
+            antigravity.MODEL_VIEW_KEY: effective_view,
+            "previous": previous_keys,
+            "written": {
+                "gateway": written_gateway,
+                "models": written_models,
+            },
+            "created": created,
+            "usage_origin": _statusline_origin(effective_base_url),
+        }
+        try:
+            previous_state_raw: str | None = (
+                state_file.read_text(encoding="utf-8") if state_file.exists() else None
+            )
+        except (OSError, UnicodeError):
+            previous_state_raw = None
+        config_written = False
+        try:
+            _write_private_file(
+                state_file, json.dumps({**receipt, "pending": True}, indent=2) + "\n"
+            )
+            _write_private_file(path, json.dumps(updated, indent=2) + "\n")
+            config_written = True
+            _write_private_file(state_file, json.dumps(receipt, indent=2) + "\n")
+        except OSError as exc:
+            if not config_written:
+                _restore_private_file(state_file, previous_state_raw)
+            raise click.ClickException(
+                f"Could not write Antigravity Router config {path}: {exc}"
+            ) from None
+        router_picks.record("antigravity", path, router_pick)
+    return default_model
+
+
+def _refresh_antigravity_models(
+    path: Path,
+    api_key: str,
+    models: list[RouterModel],
+    *,
+    base_url: str | None = None,
+    selected_model: str | None = None,
+    replace_model: str | bool | None | object = _UNCHECKED,
+) -> str:
+    """Rewrite Antigravity's model catalog and default model while keeping its gateway."""
+    effective_base_url = (base_url or router_base_url()).rstrip("/")
+    # Discovery before the lock, as in _configure_antigravity and
+    # _refresh_claude_code_model.
+    compact_models = _fetch_models(
+        api_key,
+        model_view="compact",
+        base_url=effective_base_url,
+    )
+    router_fallback = _router_fallback_model("antigravity", api_key, effective_base_url)
+    with _antigravity_config_lock(path):
+        state_file = antigravity.state_path(path)
+        if not antigravity.receipt_enrolls(state_file):
+            raise _not_configured("antigravity")
+        if (
+            _stored_router_api_key("antigravity", path) != api_key
+            or _refresh_router_base_url("antigravity", path).rstrip("/")
+            != effective_base_url
+        ):
+            raise click.ClickException(
+                "The Antigravity connection changed during the update. "
+                "Reload before saving."
+            )
+        existing = antigravity.read_config(path)
+        gateway = existing.get("gateway")
+        if not (isinstance(gateway, dict) and gateway.get("enabled") is True):
+            raise _not_configured("antigravity")
+        previous_state = _read_state_file(state_file)
+        effective_view = (
+            "all"
+            if previous_state.get(antigravity.MODEL_VIEW_KEY) == "all"
+            else "compact"
+        )
+        default_model, router_pick = _resolve_antigravity_model_in_lock(
+            path,
+            existing,
+            models,
+            selected_model=selected_model,
+            fallback=router_fallback,
+            explicit_model=False,
+            replace_model=replace_model,
+        )
+        ordered = antigravity.select_models(
+            models,
+            compact_models=compact_models,
+            model_view=effective_view,
+            default_model=default_model,
+        )
+        written_models = {
+            "list": antigravity.build_model_entries(ordered),
+            "defaultModelId": default_model,
+            "tiers": antigravity.build_tiers(ordered, default_model),
+        }
+        updated = dict(existing)
+        updated["models"] = written_models
+        rendered = json.dumps(updated, indent=2) + "\n"
+        writes: list[tuple[Path, str]] = []
+        if _changed(path, rendered):
+            writes.append((path, rendered))
+        written = previous_state.get("written")
+        if isinstance(written, dict):
+            updated_state = {
+                **previous_state,
+                "written": {**written, "models": written_models},
+            }
+            rendered_state = json.dumps(updated_state, indent=2) + "\n"
+            if _changed(state_file, rendered_state):
+                writes.append((state_file, rendered_state))
+        if writes:
+            _write_model_files(writes, "antigravity")
+        router_picks.record("antigravity", path, router_pick)
+    return default_model
+
+
+def _unconfigure_antigravity(path: Path) -> None:
+    """Restore Antigravity's ``config.json`` to its pre-Router state."""
+    state_file = antigravity.state_path(path)
+    if not state_file.exists():
+        raise click.ClickException("Ramp Router is not configured in Antigravity.")
+    with _antigravity_config_lock(path):
+        state = _read_state_file(state_file)
+        previous = state.get("previous")
+        if not isinstance(previous, dict):
+            raise click.ClickException(
+                f"The Antigravity Router receipt at {state_file} is unreadable. "
+                "Run 'ramp router configure antigravity' to repair it, then "
+                "unconfigure again."
+            )
+        created = state.get("created")
+        if not isinstance(created, dict):
+            created = {}
+        written = state.get("written")
+        if not isinstance(written, dict):
+            written = {}
+        try:
+            _write_private_file(
+                state_file,
+                json.dumps({**state, "unconfigured": True}, indent=2) + "\n",
+            )
+        except OSError as exc:
+            raise click.ClickException(
+                f"Could not remove the Antigravity Router setup: {exc}"
+            ) from None
+        existing = antigravity.read_config(path)
+        restored = dict(existing)
+        recorded_base = (
+            state.get("base_url") if isinstance(state.get("base_url"), str) else None
+        )
+        gateway_is_ours = "gateway" in existing and (
+            existing["gateway"] == written["gateway"]
+            if "gateway" in written
+            else antigravity.is_router_gateway(
+                existing["gateway"], base_url=recorded_base
+            )
+        )
+        models_is_ours = "models" in existing and (
+            ("models" in written and existing["models"] == written["models"])
+            or ("models" not in written and gateway_is_ours)
+        )
+        # Only restore or remove blocks that still match Router's setup; if the
+        # user replaced gateway or models with another provider's configuration,
+        # preserve those edits and never delete the file.
+        for key, still_ours in (
+            ("gateway", gateway_is_ours),
+            ("models", models_is_ours),
+        ):
+            if not still_ours:
+                continue
+            entry = previous.get(key)
+            if isinstance(entry, dict) and entry.get("present") is True:
+                restored[key] = entry.get("value")
+            else:
+                restored.pop(key, None)
+        try:
+            if not restored and created.get("config_file") is True:
+                path.unlink(missing_ok=True)
+            else:
+                _write_private_file(path, json.dumps(restored, indent=2) + "\n")
+            state_file.unlink(missing_ok=True)
+        except OSError as exc:
+            raise click.ClickException(
+                f"Could not restore Antigravity config {path}: {exc}"
+            ) from None
+
+
 def _configured_codex_model_view(path: Path) -> str:
     """Use compact recommendations unless the user explicitly chose all."""
     return (
@@ -16399,6 +16961,9 @@ def router_set_model(
     from ramp_cli.router_ui.harness import set_model  # noqa: PLC0415
 
     result = set_model(client, model, expected=expected_connection, dry_run=dry_run)
+    if client == "antigravity" and not dry_run:
+        if antigravity.restart_running(action="updated"):
+            result["restarted"] = True
     fmt = resolve_format(ctx.obj.get("format"), ctx.obj.get("config_format"))
     if ctx.obj.get("agent_mode"):
         print_agent_json(result)
@@ -16408,6 +16973,8 @@ def router_set_model(
         click.echo(
             f"{'Would set' if dry_run else 'Set'} {CLIENT_NAMES[client]} default model to {model}."
         )
+        if result.get("restarted"):
+            click.echo("Antigravity was restarted.")
         desktop = _DESKTOP_FOLLOW_MESSAGES.get(result.get("desktop", {}).get("status"))
         if desktop:
             click.echo(desktop)

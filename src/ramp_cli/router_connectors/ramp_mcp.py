@@ -13,8 +13,11 @@ _ENTRIES = {
     "codex": {"url": URL},
     "opencode": {"type": "remote", "url": URL, "enabled": True},
     "cursor": {"url": URL},
+    "antigravity": {"url": URL},
 }
-_PROD_ROUTER_HOSTS = frozenset({"api.router.com", "internal-api.router.com"})
+_PROD_ROUTER_HOSTS = frozenset(
+    {"api.router.com", "internal-api.router.com", "router-api.ramp.com"}
+)
 
 
 def should_configure(base_url: str) -> bool:

@@ -36,6 +36,20 @@ def connection(client: str):
         yield Connection(client, None, key, base_url)
         return
     path = router._client_config_path(client)
+    if client == "antigravity":
+        with router._antigravity_config_lock(path):
+            if client not in router.configured_router_clients():
+                raise click.UsageError(
+                    "Connect this harness to Router before editing it."
+                )
+            key = router._stored_router_api_key(client, path)
+            endpoint = router._stored_router_base_url(client, path)
+        if not endpoint:
+            raise click.ClickException(
+                "The saved Router endpoint is missing. Repair this connection first."
+            )
+        yield Connection(client, path, key, endpoint)
+        return
     transaction = (
         router._hermes_config_lock()
         if client == "hermes"
@@ -118,6 +132,12 @@ def summaries() -> list[dict]:
     connected_clients = set(router.configured_router_clients())
     rows = []
     for client, name in router.CLIENT_NAMES.items():
+        if client == "antigravity":
+            # Kept out of `configure list` / `app-snapshot` until Router Desktop
+            # adds dedicated Antigravity icon and onboarding support; direct CLI
+            # commands (`configure`, `unconfigure`, `configure model(s)`) still
+            # accept `antigravity`.
+            continue
         row = {
             "harness": client,
             "name": name,
@@ -299,6 +319,11 @@ def set_model(
             )
         elif client == "hermes":
             options.update(hermes_require_receipt=True, hermes_lock_held=True)
+        elif client == "antigravity":
+            options.update(
+                antigravity_require_receipt=True,
+                expected_connection=(current.key, current.base_url),
+            )
         if client != "hermes":
             with connection(client) as latest:
                 check_connection(latest, current.token)

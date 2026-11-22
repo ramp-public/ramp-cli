@@ -607,7 +607,9 @@ def test_configure_connectors_machine_output_reauthenticates_and_reuses_key(
 ):
     monkeypatch.setattr(claude_cowork, "is_available", lambda: desktop_available)
     harnesses = tuple(
-        h for h in connector_harnesses.HARNESSES if desktop_available or h != "desktop"
+        h
+        for h in connector_harnesses.HARNESSES
+        if (desktop_available or h != "desktop") and h != "antigravity"
     )
     client = RouterUserClient(router_module.ROUTER_UI_URL)
     client.login(connectors=True)
@@ -907,18 +909,7 @@ def test_configure_connectors_opencode_uses_existing_jsonc_through_teardown(
     disabled = runner.invoke(cli, undo[0])
     assert disabled.exit_code == 0, disabled.output
     assert connector_harnesses.status("opencode")["state"] == "disabled"
-    expected = {
-        **original,
-        "mcp": {
-            **original["mcp"],
-            "ramp": {
-                "type": "remote",
-                "url": "https://mcp.ramp.com/mcp",
-                "enabled": True,
-            },
-        },
-    }
-    assert json.loads(path.read_text()) == expected
+    assert json.loads(path.read_text()) == original
     assert not default_path.exists()
 
 
@@ -1084,7 +1075,7 @@ def test_configure_cowork_consumes_the_setup_file_and_deletes_it_after_success(
             )
         ]
 
-    def configure(api_key, base_url, model_ids=()):
+    def configure(api_key, base_url, model_ids=(), mcp=False):
         captured["configure"] = (api_key, base_url)
         captured["configure_model_ids"] = model_ids
         return tmp_path / "Claude-3p" / "configLibrary" / "profile.json", ()
@@ -1712,7 +1703,7 @@ def test_configure_sets_up_cowork_alongside_a_coding_agent(tmp_path, monkeypatch
     monkeypatch.setattr(
         claude_cowork,
         "configure",
-        lambda api_key, base_url, model_ids=(): (
+        lambda api_key, base_url, model_ids=(), mcp=False: (
             captured.update(cowork=(api_key, base_url))
             or (tmp_path / "profile.json", ())
         ),
@@ -1794,7 +1785,7 @@ def test_a_setup_file_covers_every_selected_agent(tmp_path, monkeypatch):
     monkeypatch.setattr(
         claude_cowork,
         "configure",
-        lambda api_key, base_url, model_ids=(): (
+        lambda api_key, base_url, model_ids=(), mcp=False: (
             captured.update(cowork=(api_key, base_url))
             or (tmp_path / "profile.json", ())
         ),
@@ -5206,11 +5197,33 @@ def test_connector_skill_install_uses_home_when_override_is_empty(
     assert managed_skill_names(target) == [connector_skill.NAME]
 
 
+@pytest.mark.parametrize("mcp", [False, True])
+def test_configure_adds_ramp_mcp_only_with_mcp_flag(tmp_path, monkeypatch, mcp):
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    _mock_models(monkeypatch)
+    args = [
+        "--human",
+        "router",
+        "configure",
+        "claude-code",
+        "--api-key",
+        "router-secret",
+    ]
+
+    result = CliRunner().invoke(cli, [*args, *(["--mcp"] if mcp else [])])
+
+    assert result.exit_code == 0, result.output
+    mcp_path = claude_home / ".claude.json"
+    config = json.loads(mcp_path.read_text()) if mcp_path.exists() else {}
+    assert ("ramp" in config.get("mcpServers", {})) is mcp
+
+
 def test_repeat_claude_code_configure_adds_ramp_mcp(tmp_path, monkeypatch):
     claude_home = tmp_path / "claude"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
     _mock_models(monkeypatch)
-    args = ["--human", "router", "configure", "claude-code"]
+    args = ["--human", "router", "configure", "claude-code", "--mcp"]
     configured = CliRunner().invoke(cli, [*args, "--api-key", "router-secret"])
     assert configured.exit_code == 0, configured.output
     # As a setup from a CLI without Ramp MCP leaves it.
@@ -6673,10 +6686,7 @@ def test_configure_codex_replaces_quoted_root_keys(tmp_path, monkeypatch):
 
     assert result.exit_code == 0, result.output
     restored = tomllib.loads(config_path.read_text())
-    assert restored == {
-        **tomllib.loads(original),
-        "mcp_servers": {"ramp": {"url": "https://mcp.ramp.com/mcp"}},
-    }
+    assert restored == tomllib.loads(original)
 
 
 @pytest.mark.parametrize(
@@ -6748,10 +6758,7 @@ def test_codex_config_lines_split_only_on_newlines(tmp_path, monkeypatch):
 
     assert result.exit_code == 0, result.output
     restored = tomllib.loads(config_path.read_text(encoding="utf-8"))
-    assert restored == {
-        **tomllib.loads(original),
-        "mcp_servers": {"ramp": {"url": "https://mcp.ramp.com/mcp"}},
-    }
+    assert restored == tomllib.loads(original)
     assert restored["features"] == {"web_search": True}
 
 
@@ -6802,10 +6809,7 @@ def test_configure_codex_ignores_table_headers_inside_multiline_strings(
     result = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
 
     assert result.exit_code == 0, result.output
-    assert tomllib.loads(config_path.read_text()) == {
-        **tomllib.loads(original),
-        "mcp_servers": {"ramp": {"url": "https://mcp.ramp.com/mcp"}},
-    }
+    assert tomllib.loads(config_path.read_text()) == tomllib.loads(original)
 
 
 def test_codex_root_rewrite_refuses_to_change_unowned_values(monkeypatch):
@@ -9156,16 +9160,7 @@ def test_unconfigure_opencode_restores_previous_settings(tmp_path, monkeypatch):
     unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "opencode"])
 
     assert configure.exit_code == unconfigure.exit_code == 0
-    assert json.loads(config_path.read_text()) == {
-        **original,
-        "mcp": {
-            "ramp": {
-                "type": "remote",
-                "url": "https://mcp.ramp.com/mcp",
-                "enabled": True,
-            }
-        },
-    }
+    assert json.loads(config_path.read_text()) == original
     assert not (tmp_path / "ramp-router-state.json").exists()
     # Configure created tui.json, so unconfigure restores its absence.
     assert not tui_path.exists()
@@ -9706,16 +9701,7 @@ def test_configure_model_opencode_v2_replaces_the_users_own_model(
     # The CLI removed the pin, so unconfigure brings it back.
     unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "opencode"])
     assert unconfigure.exit_code == 0
-    assert json.loads(config_path.read_text()) == {
-        "model": "anthropic/claude-opus-4",
-        "mcp": {
-            "ramp": {
-                "type": "remote",
-                "url": "https://mcp.ramp.com/mcp",
-                "enabled": True,
-            }
-        },
-    }
+    assert json.loads(config_path.read_text()) == {"model": "anthropic/claude-opus-4"}
 
 
 def test_unconfigure_opencode_v2_does_not_resurrect_a_model_the_user_removed(
@@ -9794,16 +9780,7 @@ def test_unconfigure_opencode_v2_restores_a_router_model_it_lifted_out(
 
     unconfigure = runner.invoke(cli, ["--human", "router", "unconfigure", "opencode"])
     assert unconfigure.exit_code == 0
-    assert json.loads(config_path.read_text()) == {
-        "model": "ramp-router/hand-picked",
-        "mcp": {
-            "ramp": {
-                "type": "remote",
-                "url": "https://mcp.ramp.com/mcp",
-                "enabled": True,
-            }
-        },
-    }
+    assert json.loads(config_path.read_text()) == {"model": "ramp-router/hand-picked"}
 
 
 def test_configure_pi_installs_plugin_and_is_idempotent(tmp_path, monkeypatch):
@@ -12052,7 +12029,7 @@ def test_configure_without_a_terminal_targets_every_integration(
         browser_calls.append((url, no_browser))
         return "router-secret"
 
-    def configure_cowork(api_key, base_url, *, model_ids):
+    def configure_cowork(api_key, base_url, *, model_ids, mcp=False):
         desktop_keys["cowork"] = api_key
         assert base_url == ROUTER_BASE_URL
         assert model_ids == ("gpt-5.4",)
@@ -12370,7 +12347,7 @@ def test_configure_json_output_bypasses_the_picker(
     # Hermes is set up through its own executable, absent here, so a bare run
     # skips it rather than failing, and Conductor is skipped the same way on
     # a machine that never had the app; every other agent is configured.
-    expected = set(router_module.CLIENT_NAMES) - {"hermes", "conductor"}
+    expected = set(router_module.CLIENT_NAMES) - {"hermes", "conductor", "antigravity"}
     if desktop_apps_available:
         expected.add("cowork")
     assert configured_clients == expected

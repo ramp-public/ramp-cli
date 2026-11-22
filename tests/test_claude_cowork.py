@@ -1658,7 +1658,7 @@ def test_agent_routing_keeps_a_real_v1_in_the_gateway_path(tagging):
 
 def test_routed_desktop_still_gets_ramp_mcp(tagging, monkeypatch):
     monkeypatch.setattr(ramp_mcp.shutil, "which", lambda _name: "/usr/bin/npx")
-    claude_cowork.configure("router-secret", "https://api.router.com/v1")
+    claude_cowork.configure("router-secret", "https://api.router.com/v1", mcp=True)
 
     assert router_repo.is_wrapped(claude_cowork.configured_gateway_base_url())
     desktop = json.loads(claude_cowork._desktop_config_path().read_text())
@@ -1667,7 +1667,7 @@ def test_routed_desktop_still_gets_ramp_mcp(tagging, monkeypatch):
 
 def test_desktop_without_npx_gets_no_mcp_servers_key(cowork_host, monkeypatch):
     monkeypatch.setattr(ramp_mcp.shutil, "which", lambda _name: None)
-    claude_cowork.configure("router-secret", "https://api.router.com/v1")
+    claude_cowork.configure("router-secret", "https://api.router.com/v1", mcp=True)
 
     desktop = json.loads(claude_cowork._desktop_config_path().read_text())
     assert "mcpServers" not in desktop

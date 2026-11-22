@@ -1761,8 +1761,9 @@ fn thread_key(codex_md: Option<&Doc>) -> Option<String> {
     Some(format!("thread:{t}"))
 }
 
-/// Memory keys for the parent of a Codex child thread (a guardian review or a spawned agent),
-/// most specific first: the exact parent turn, then the parent thread.
+/// Memory keys for the parent of a child conversation, most specific first. A Codex child thread
+/// (a guardian review or a spawned agent) names its exact parent turn, then its parent thread. A
+/// Claude Code subagent shares its main agent's session ID, so its parent is that session.
 fn parent_memory_keys(ctx: &dyn Ctx, codex_md: Option<&Doc>) -> Vec<String> {
     let mut keys = Vec::new();
     if let Some(md) = codex_md {
@@ -1777,6 +1778,11 @@ fn parent_memory_keys(ctx: &dyn Ctx, codex_md: Option<&Doc>) -> Vec<String> {
         let k = format!("thread:{t}");
         if !keys.contains(&k) {
             keys.push(k);
+        }
+    }
+    if ctx.header("x-claude-code-agent-id").is_some_and(|a| !a.is_empty()) {
+        if let Some(s) = ctx.header("X-Claude-Code-Session-Id").filter(|s| !s.is_empty()) {
+            keys.push(format!("cc:{s}"));
         }
     }
     keys
@@ -2079,12 +2085,13 @@ fn finish(doc: &Doc, ctx: &mut dyn Ctx, codex_md: Option<&Doc>, an: &Analysis) -
         return Ok(a);
     }
     // Nothing in this request resolved a repository.
-    // A Codex child thread works for its parent turn. It often runs from a shared folder such as
-    // ~/code, and a guardian may run a probe like `ps` that stays in its history, which disables
-    // the session-memory rule below for the rest of the thread. Main threads keep that rule;
-    // only explicit child threads inherit the parent's repository, and the child's own evidence
-    // (handled above) always wins. The exact parent turn is current, so it beats the child's own
-    // session memory, which may come from an earlier task of a reused child thread.
+    // A Codex child thread or a Claude Code subagent works for its parent. It often runs from a
+    // shared folder such as ~/code, and one call outside a repository (`ps`, a search of ~/code,
+    // a read in /tmp) stays in its history, which disables the session-memory rule below for the
+    // rest of the conversation. Main conversations keep that rule; only explicit children inherit
+    // the parent's repository, and the child's own evidence (handled above) always wins. The exact
+    // parent turn is current, so it beats the child's own session memory, which may come from an
+    // earlier task of a reused child thread.
     let parents = parent_memory_keys(ctx, codex_md);
     let inherit = |a: &mut Attribution, ctx: &dyn Ctx, k: &str| -> bool {
         let Some((r, d)) = ctx.session_get(k) else { return false };

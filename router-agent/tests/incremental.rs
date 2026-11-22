@@ -67,6 +67,40 @@ fn bodies(alpha: &str, beta: &str, prefix_metadata: bool) -> Vec<Vec<u8>> {
 }
 
 #[test]
+fn claude_subagent_with_non_repo_evidence_inherits_session_repository() {
+    let tmp = std::env::temp_dir().join(format!("rrh-cc-subagent-{}", std::process::id()));
+    let parent = repo(&tmp.join("code"), "parent-repo");
+    let scratch = tmp.join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    std::fs::write(scratch.join("notes.txt"), "notes").unwrap();
+    let resolver = RepoResolver::default();
+    let sessions = SessionMemory::default();
+    let system = format!("You are Claude Code.\n<env>\nWorking directory: {}\n</env>", tmp.join("code").display());
+    let read = |path: String| {
+        serde_json::to_vec(&serde_json::json!({"model": "m", "system": system, "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "read", "name": "Read", "input": {"file_path": path}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "read", "content": "ok"}]}
+        ]}))
+        .unwrap()
+    };
+    let session = ("X-Claude-Code-Session-Id".to_string(), "session".to_string());
+
+    let mut main = T { headers: vec![session.clone()], resolver: &resolver, sessions: &sessions };
+    let main = attribute_bytes(&read(format!("{parent}/README.md")), &mut main, &ConvCache::default(), false).unwrap();
+    assert_eq!(main.attribution.repository.as_deref(), Some("ramp/parent-repo"));
+
+    // The subagent's only path is outside any repository, so it works for the main agent's repo.
+    let headers = vec![session, ("x-claude-code-agent-id".to_string(), "agent".to_string())];
+    let mut sub = T { headers, resolver: &resolver, sessions: &sessions };
+    let path = scratch.join("notes.txt").to_str().unwrap().to_string();
+    let sub = attribute_bytes(&read(path), &mut sub, &ConvCache::default(), false).unwrap();
+    assert_eq!(sub.attribution.repository.as_deref(), Some("ramp/parent-repo"));
+    assert_eq!(sub.attribution.repository_source.as_deref(), Some("parent_session_memory"));
+    std::fs::remove_dir_all(tmp).unwrap();
+}
+
+#[test]
 fn incremental_equals_full() {
     let tmp = std::env::temp_dir().join(format!("rrh-incr-{}", std::process::id()));
     let alpha = repo(&tmp, "alpha");

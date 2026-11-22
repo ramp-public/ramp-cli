@@ -62,6 +62,10 @@ def target_dir(harness: str) -> Path:
             Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
             / "opencode"
         )
+    elif harness == "antigravity":
+        from ramp_cli.commands import antigravity  # noqa: PLC0415
+
+        root = antigravity.config_dir()
     else:
         raise ValueError(f"No local skill directory for {harness}")
     return root.expanduser() / "skills"

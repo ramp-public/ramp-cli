@@ -69,7 +69,7 @@ CLIENT_KINDS = {"claude-code": "claude_code"}
 # - Claude Desktop ("cowork") covers the Cowork and Code tabs, and the Code tab
 #   is not known to carry a tag of its own.
 # - Cursor has no Router request tag.
-UNTAGGED_CLIENTS = frozenset({"conductor", "cowork", "cursor"})
+UNTAGGED_CLIENTS = frozenset({"antigravity", "conductor", "cowork", "cursor"})
 
 
 def client_kind(client: str) -> str:
@@ -274,11 +274,17 @@ def daily_series(usage: dict, dates: list, zone: tzinfo) -> dict:
     groups: dict[str, dict] = {}
     points = [p for p in usage.get("series") or [] if isinstance(p, dict)]
     costs = [f for f in COST_FIELDS if any(p.get(f) is not None for p in points)]
+    token_parts = [
+        f
+        for f in ("input_tokens", "cached_input_tokens")
+        if any(p.get(f) is not None for p in points)
+    ]
     zero = {
         "spend_usd": Decimal(0),
         **{field: Decimal(0) for field in costs},
         "request_count": 0,
         "total_tokens": 0,
+        **{field: 0 for field in token_parts},
     }
     for point in points:
         try:
@@ -310,6 +316,8 @@ def daily_series(usage: dict, dates: list, zone: tzinfo) -> dict:
                 target[field] += _decimal(point.get(field))
             target["request_count"] += _count(point.get("request_count"))
             target["total_tokens"] += _count(point.get("total_tokens"))
+            for field in token_parts:
+                target[field] += _count(point.get(field))
     ordered = sorted(
         groups.values(),
         key=lambda g: (
@@ -339,6 +347,10 @@ def daily_series(usage: dict, dates: list, zone: tzinfo) -> dict:
                 },
                 "request_count": sum(c["request_count"] for c in by_group.values()),
                 "total_tokens": sum(c["total_tokens"] for c in by_group.values()),
+                **{
+                    field: sum(c[field] for c in by_group.values())
+                    for field in token_parts
+                },
                 "groups": by_group,
             }
         )

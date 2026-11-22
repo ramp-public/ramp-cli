@@ -70,6 +70,18 @@ def isolated_config(tmp_path: Path, request: pytest.FixtureRequest):
     monkeypatch.setenv("RAMP_CLAUDE_DESKTOP_APP_SUPPORT", str(tmp_path / "app-support"))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "conductor"))
+    monkeypatch.setenv("RAMP_ANTIGRAVITY_GEMINI_DIR", str(tmp_path / "gemini"))
+    monkeypatch.setenv(
+        "RAMP_ANTIGRAVITY_APP_SUPPORT", str(tmp_path / "antigravity-support")
+    )
+    monkeypatch.setattr("ramp_cli.commands.antigravity.is_running", lambda: False)
+    monkeypatch.setattr(
+        "ramp_cli.commands.antigravity.runs_inside_antigravity",
+        lambda _pids=None: False,
+    )
+    monkeypatch.setattr(
+        "ramp_cli.commands.antigravity.restart_running", lambda **_kwargs: False
+    )
     # Conductor detection consults its application-support directory; pointing
     # it into the sandbox keeps a developer's real Conductor invisible and
     # gives tests full control over what "installed" means.

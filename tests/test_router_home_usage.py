@@ -2,7 +2,7 @@
 
 import json
 import time as system_time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -612,3 +612,62 @@ def test_merged_reads_keep_text_money_later_costs_and_the_same_groups():
         ]
     )
     assert [p["group"] for p in idle["series"]] == ["big"]
+
+
+def test_daily_series_forwards_input_and_cached_tokens():
+    zone = timezone.utc
+    dates = [date(2026, 11, 20), date(2026, 11, 21)]
+    with_cache = operations.daily_series(
+        {
+            "series": [
+                {
+                    "period_start_at": "2026-11-20T00:00:00+00:00",
+                    "group": "claude-opus-5-5",
+                    "spend_usd": "2.50",
+                    "request_count": 3,
+                    "total_tokens": 1000,
+                    "input_tokens": 800,
+                    "cached_input_tokens": 600,
+                },
+                {
+                    "period_start_at": "2026-11-20T00:00:00+00:00",
+                    "group": "gpt-6.1",
+                    "spend_usd": "1.00",
+                    "request_count": 2,
+                    "total_tokens": 500,
+                    "input_tokens": 400,
+                    "cached_input_tokens": 100,
+                },
+            ]
+        },
+        dates,
+        zone,
+    )
+    day0, day1 = with_cache["series"]
+    assert day0["input_tokens"] == 1200
+    assert day0["cached_input_tokens"] == 700
+    assert day0["groups"]["claude-opus-5-5"]["input_tokens"] == 800
+    assert day0["groups"]["claude-opus-5-5"]["cached_input_tokens"] == 600
+    assert day1["input_tokens"] == 0
+    assert day1["cached_input_tokens"] == 0
+    assert with_cache["groups"][0]["input_tokens"] == 800
+    assert with_cache["groups"][0]["cached_input_tokens"] == 600
+
+    without_cache = operations.daily_series(
+        {
+            "series": [
+                {
+                    "period_start_at": "2026-11-20T00:00:00+00:00",
+                    "group": "claude-opus-5-5",
+                    "spend_usd": "2.50",
+                    "request_count": 3,
+                    "total_tokens": 1000,
+                }
+            ]
+        },
+        dates,
+        zone,
+    )
+    assert "input_tokens" not in without_cache["series"][0]
+    assert "cached_input_tokens" not in without_cache["series"][0]
+    assert "input_tokens" not in without_cache["groups"][0]
