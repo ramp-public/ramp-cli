@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import plistlib
-import stat
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -17,10 +16,12 @@ from ramp_cli import __version__, claude_cowork
 from ramp_cli.commands import router, router_repo, router_schedule
 from ramp_cli.main import cli
 from ramp_cli.router_connectors import harnesses
+from tests.platform_support import assert_mode, skip_on_windows
 
 
 @pytest.fixture
 def cowork_host(tmp_path, monkeypatch):
+    skip_on_windows("Claude Desktop setup needs macOS file locking (fcntl)")
     monkeypatch.setattr(claude_cowork.sys, "platform", "darwin")
     monkeypatch.setenv("RAMP_CLAUDE_DESKTOP_APP_SUPPORT", str(tmp_path))
     events = []
@@ -129,7 +130,7 @@ def test_transaction_lock_excludes_a_second_holder(cowork_host):
     lock_path = claude_cowork.state_path().parent / ".ramp-router-cowork.lock"
 
     with claude_cowork.transaction_lock():
-        assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+        assert_mode(lock_path, 0o600)
         with lock_path.open("a+b") as second:
             with pytest.raises(OSError):
                 fcntl.flock(second.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -257,7 +258,7 @@ def test_configure_and_unconfigure_restore_the_previous_claude_setup(cowork_host
         profile_path,
         claude_cowork.state_path(),
     ):
-        assert stat.S_IMODE(private_file.stat().st_mode) == 0o600
+        assert_mode(private_file, 0o600)
     assert claude_cowork.configured_api_key() == "router-secret"
 
     claude_cowork.unconfigure()
@@ -1273,7 +1274,7 @@ def test_configure_and_unconfigure_carry_code_sessions_across_modes(cowork_host)
         "cli-z": "Old 3p",
     }
     copied = root / "Claude-3p/claude-code-sessions/3p/org/local_a.json"
-    assert stat.S_IMODE(copied.stat().st_mode) == 0o600
+    assert_mode(copied, 0o600)
 
     # Work continues in third-party mode, then Router is removed.
     _write_code_session(
@@ -1873,7 +1874,11 @@ def test_ssh_remote_sessions_keep_desktop_on_the_direct_route(
     assert router_repo.is_wrapped(claude_cowork.configured_gateway_base_url())
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root can list any directory")
+@pytest.mark.posix_only(reason="directory permission bits")
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root can list any directory",
+)
 def test_listener_stays_when_the_profile_library_cannot_be_listed(cowork_host):
     library = claude_cowork._config_library_path()
     library.mkdir(parents=True)

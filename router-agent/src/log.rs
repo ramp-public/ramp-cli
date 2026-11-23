@@ -1,5 +1,5 @@
 //! Attribution log: one JSON object per request, written off the request path by a dedicated
-//! thread, rotated at 5 MB, mode 0600. Never contains request or response content.
+//! thread, rotated at 5 MB, mode 0600 (on Unix). Never contains request or response content.
 
 use crate::attr::Attribution;
 use serde_json::{json, Map, Value};
@@ -25,7 +25,11 @@ pub fn attribution_fields(a: &Attribution, out: &mut Map<String, Value>) {
     }
 }
 
+#[cfg(windows)]
+pub use crate::win::timestamp;
+
 /// Local time as `%Y-%m-%dT%H:%M:%S%z`.
+#[cfg(unix)]
 pub fn timestamp() -> String {
     unsafe {
         let t = libc::time(std::ptr::null_mut());
@@ -59,8 +63,13 @@ impl Logger {
                                 std::fs::rename(&path, rotated)?;
                             }
                             let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
-                            use std::os::unix::fs::PermissionsExt;
-                            let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+                            // On Windows the log keeps its folder's inherited ACL (the profile's:
+                            // this user, SYSTEM and Administrators).
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+                            }
                             f.write_all(line.as_bytes())
                         })();
                     }

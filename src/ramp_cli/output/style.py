@@ -492,23 +492,38 @@ def show_notice(title: str, lines: list[str], file: TextIO | None = None) -> Non
     deliberately louder than the surrounding output.
 
     Three conventions keep the caller free of formatting. An empty string is a
-    blank row. Leading spaces survive wrapping, so a list of commands stays
-    indented under whatever introduced it. An unindented line ending in a
+    blank row. An indented line is a command (or a similar literal) and is
+    never wrapped, because a command broken across rows can't be copied and
+    run: the box widens to fit it, up to the window width on a terminal, past
+    which the command runs over the frame. An unindented line ending in a
     colon is the heading of the block below it and is emphasized.
     """
     file = file or sys.stdout
     use_color = _color_supported(file)
     width = max(_WIDTH_MIN, min(_term_width(), _WIDTH_MAX))
-    inner = width - 4
+    prose_width = width - 4
+    literal_width = max(
+        (len(line.rstrip()) for line in lines if line[:1] == " "), default=0
+    )
+    if hasattr(file, "isatty") and file.isatty():
+        # On a terminal, widen only as far as the window: a wider frame would
+        # soft-wrap every row. A longer command overflows its own row instead.
+        literal_width = min(literal_width, _term_width() - 4)
+    inner = max(prose_width, literal_width)
+    width = inner + 4
     yellow = _fg(*_NOTICE_YELLOW) if use_color else ""
     close = _reset() if use_color else ""
 
-    rendered: list[tuple[str, bool]] = []
+    # (text, heading, literal) for each row.
+    rendered: list[tuple[str, bool, bool]] = []
     for line in lines:
         indent = " " * (len(line) - len(line.lstrip()))
-        heading = not indent and line.rstrip().endswith(":")
-        for part in wrap_text(line.strip(), max(1, inner - len(indent))):
-            rendered.append((f"{indent}{part}" if part else "", heading))
+        if indent:
+            rendered.append((line.rstrip(), False, True))
+            continue
+        heading = line.rstrip().endswith(":")
+        for part in wrap_text(line.strip(), max(1, prose_width)):
+            rendered.append((part, heading, False))
 
     title_display = f" {title} "
     right_pad = max(1, width - 2 - 3 - len(title_display))
@@ -519,7 +534,7 @@ def show_notice(title: str, lines: list[str], file: TextIO | None = None) -> Non
     bottom = f"{yellow}{BOX_BL}{BOX_H * (width - 2)}{BOX_BR}{close}"
 
     out = [top]
-    for text, heading in rendered:
+    for text, heading, literal in rendered:
         # Padded by visible length, since the emphasis is added around the
         # text rather than counted as part of it.
         padding = " " * max(0, inner - len(text))
@@ -528,7 +543,11 @@ def show_notice(title: str, lines: list[str], file: TextIO | None = None) -> Non
             if heading and use_color
             else f"{text}{padding}"
         )
-        out.append(f"{yellow}{BOX_V}{close} {body} {yellow}{BOX_V}{close}")
+        # Only a command too wide for the window gives up its border; it
+        # runs past the frame rather than soft-wrapping the whole box.
+        overflow = literal and len(text) > inner
+        right = "" if overflow else f" {yellow}{BOX_V}{close}"
+        out.append(f"{yellow}{BOX_V}{close} {body}{right}")
     out.append(bottom)
     file.write("\n".join(out) + "\n")
     file.flush()

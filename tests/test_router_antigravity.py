@@ -1033,6 +1033,12 @@ def test_unconfigure_preserves_edited_gateway_even_with_custom_header(monkeypatc
     assert "models" not in after
 
 
+_RESTART_IS_MACOS_ONLY = pytest.mark.posix_only(
+    reason="restarting Antigravity uses macOS pgrep -u <uid>, osascript and open"
+)
+
+
+@_RESTART_IS_MACOS_ONLY
 @pytest.mark.parametrize(
     ("platform", "state", "expect_restarted", "expect_error"),
     [
@@ -1181,6 +1187,7 @@ def test_restart_called_on_configure_model_and_unconfigure_never_on_refresh(
     assert restarts == ["configured", "updated", "removed"]
 
 
+@_RESTART_IS_MACOS_ONLY
 def test_restart_skips_quit_when_ancestry_probe_fails(monkeypatch):
     monkeypatch.setattr(antigravity, "sys", SimpleNamespace(platform="darwin"))
     monkeypatch.setattr(antigravity, "runs_inside_antigravity", _real_runs_inside)

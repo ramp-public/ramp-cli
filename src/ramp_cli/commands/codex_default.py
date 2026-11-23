@@ -31,12 +31,15 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 from ramp_cli.config.settings import config_dir
 
 _CACHE_FILENAME = "codex-default-model.json"
 _PROBE_TIMEOUT_SECONDS = 15.0
+# Up to two seconds for Windows to release a stopped process's files.
+_CLEANUP_ATTEMPTS = 20
 _VERSION_TIMEOUT_SECONDS = 5.0
 # Nothing listens here, so the probe can never reach a real endpoint.
 _UNREACHABLE_BASE_URL = "http://127.0.0.1:9/v1"
@@ -109,8 +112,26 @@ def _write_cache(cache: dict[str, object]) -> None:
         os.replace(temporary, path)
 
 
+@contextlib.contextmanager
+def _temporary_home(prefix: str) -> Iterator[str]:
+    """A scratch home that is removed even when Windows releases it late.
+
+    Windows keeps a just-stopped process's files open for a moment, so a
+    single removal attempt would leave the directory behind.
+    """
+    home = tempfile.mkdtemp(prefix=prefix)
+    try:
+        yield home
+    finally:
+        for _ in range(_CLEANUP_ATTEMPTS):
+            shutil.rmtree(home, ignore_errors=True)
+            if not os.path.exists(home):
+                break
+            time.sleep(0.1)
+
+
 def _probe(executable: str) -> str | None:
-    with tempfile.TemporaryDirectory(prefix="ramp-codex-default-") as home:
+    with _temporary_home("ramp-codex-default-") as home:
         Path(home, "config.toml").write_text(_PROBE_CONFIG)
         workdir = Path(home, "work")
         workdir.mkdir()
@@ -175,10 +196,18 @@ def _read_header_model(process: subprocess.Popen[str]) -> str | None:
 
 def _stop(process: subprocess.Popen[str]) -> None:
     if process.poll() is None:
-        with contextlib.suppress(OSError):
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
             if os.name != "nt":
                 os.killpg(process.pid, signal.SIGKILL)
             else:  # pragma: no cover - exercised on Windows
-                process.kill()
+                # An npm-installed harness is a .cmd shim, so kill() would
+                # stop only cmd.exe and leave the real CLI holding files in
+                # the temporary home. Stop the whole process tree instead.
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
     with contextlib.suppress(subprocess.SubprocessError, OSError):
         process.wait(timeout=5)

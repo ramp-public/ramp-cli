@@ -13,6 +13,7 @@ from click.testing import CliRunner
 from ramp_cli.auth import store
 from ramp_cli.config import profiles, settings
 from ramp_cli.main import cli
+from tests.platform_support import assert_mode
 
 
 def test_switching_profiles_preserves_each_credential(isolated_config):
@@ -249,4 +250,4 @@ def test_concurrent_profile_writes_do_not_lose_credentials(
 def test_profiles_file_permissions_are_private(isolated_config):
     store.save_tokens("production", "token", "", profile="human")
 
-    assert profiles.profiles_path().stat().st_mode & 0o777 == 0o600
+    assert_mode(profiles.profiles_path(), 0o600)

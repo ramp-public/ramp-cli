@@ -23,20 +23,22 @@ pub const MAX_COMMAND_CHARS: usize = 20_000;
 
 // `\s` here also matches U+001C..U+001F.
 const S: &str = r"[\s\x1c-\x1f]";
+/// How a stated absolute directory starts: `/`, and on Windows also a drive (`C:\`, `C:/`).
+const ABS: &str = if cfg!(windows) { r"(?:/|[A-Za-z]:[\\/])" } else { "/" };
 
 /// Codex `<environment_context>` directory forms: `<cwd>`, "(Primary) working directory:", "cwd:".
 static DIRECTORY_PATTERNS: LazyLock<[Regex; 3]> = LazyLock::new(|| {
     [
         Regex::new(&format!(r"<cwd>{S}*([^<\n]+?){S}*</cwd>")).unwrap(),
-        Regex::new(&format!(r"(?im)^[\s\x1c-\x1f\-\*>]*(?:primary{S}+)?working director(?:y|ies):{S}*(/[^\n]+?){S}*$")).unwrap(),
-        Regex::new(&format!(r"(?im)^[\s\x1c-\x1f\-\*>]*(?:cwd|current working directory):{S}*(/[^\n]+?){S}*$")).unwrap(),
+        Regex::new(&format!(r"(?im)^[\s\x1c-\x1f\-\*>]*(?:primary{S}+)?working director(?:y|ies):{S}*({ABS}[^\n]+?){S}*$")).unwrap(),
+        Regex::new(&format!(r"(?im)^[\s\x1c-\x1f\-\*>]*(?:cwd|current working directory):{S}*({ABS}[^\n]+?){S}*$")).unwrap(),
     ]
 });
 
 /// Claude Code and OpenCode state their working directory inside an `<env>` block.
 static ENV_BLOCK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<env>(.*?)</env>").unwrap());
 static ENV_DIRECTORY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(r"(?im)^[\s\x1c-\x1f\-\*>]*(?:primary{S}+)?working director(?:y|ies):{S}*(/[^\n]+?){S}*$")).unwrap()
+    Regex::new(&format!(r"(?im)^[\s\x1c-\x1f\-\*>]*(?:primary{S}+)?working director(?:y|ies):{S}*({ABS}[^\n]+?){S}*$")).unwrap()
 });
 /// Pi states its working directory in a `<cwd>` section.
 static CWD_SECTION: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!(r"<cwd>{S}*([^<\n]+?){S}*</cwd>")).unwrap());
@@ -80,7 +82,7 @@ fn directory_in_text(text: &str) -> Option<String> {
     for pat in DIRECTORY_PATTERNS.iter() {
         for c in pat.captures_iter(text) {
             let start = c.get(0).unwrap().start();
-            let cand = paths::rstrip_chars(paths::strip(&c[1]), ".,;)");
+            let cand = paths::canon(paths::rstrip_chars(paths::strip(&c[1]), ".,;)"));
             if cand.starts_with('/') && best.as_ref().map_or(true, |b| start > b.0) {
                 best = Some((start, cand.to_string()));
             }
@@ -97,7 +99,7 @@ fn structured_directory_in_text(text: &str) -> Option<String> {
         let body = block.get(1).unwrap();
         for c in ENV_DIRECTORY.captures_iter(body.as_str()) {
             let start = body.start() + c.get(0).unwrap().start();
-            let cand = paths::rstrip_chars(paths::strip(&c[1]), ".,;)");
+            let cand = paths::canon(paths::rstrip_chars(paths::strip(&c[1]), ".,;)"));
             if cand.starts_with('/') && best.as_ref().map_or(true, |b| start > b.0) {
                 best = Some((start, cand.to_string()));
             }
@@ -105,7 +107,7 @@ fn structured_directory_in_text(text: &str) -> Option<String> {
     }
     for c in CWD_SECTION.captures_iter(text) {
         let start = c.get(0).unwrap().start();
-        let cand = paths::rstrip_chars(paths::strip(&c[1]), ".,;)");
+        let cand = paths::canon(paths::rstrip_chars(paths::strip(&c[1]), ".,;)"));
         if cand.starts_with('/') && best.as_ref().map_or(true, |b| start > b.0) {
             best = Some((start, cand.to_string()));
         }
@@ -186,7 +188,7 @@ pub fn nearest_existing_directory(path: &str) -> Option<String> {
 }
 
 static SHELL_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*=").unwrap());
-static SHELL_RESET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Shell cwd was reset to (/[^\s]+)").unwrap());
+static SHELL_RESET: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!(r"Shell cwd was reset to ({ABS}[^\s]+)")).unwrap());
 static PATCH_FILE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$|^\*\*\* Move to: (.+?)\s*$").unwrap());
 /// The operator line of a command that is exactly `apply_patch <<EOF`.
 static SOLE_PATCH_HEREDOC: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"^<<(-?)[ \t]*(?:'([A-Za-z_][A-Za-z0-9_]*)'|"([A-Za-z_][A-Za-z0-9_]*)"|\\?([A-Za-z_][A-Za-z0-9_]*))$"#).unwrap());
@@ -478,7 +480,7 @@ fn combine(h: Harness, msg: Option<String>, top: Option<Stated>, codex_md: Optio
             let env_cwd = msg;
             if let Some(md) = codex_md {
                 if let Some(ws) = md.get(md.root, "workspaces").filter(|&w| md.kind(w) == Kind::Obj) {
-                    let roots: Vec<String> = md.members(ws).into_iter().map(|(k, _)| k.into_owned()).collect();
+                    let roots: Vec<String> = md.members(ws).into_iter().map(|(k, _)| paths::canon(&k).into_owned()).collect();
                     let within = |cwd: &str, root: &str| cwd == root || cwd.starts_with(&format!("{}/", root.trim_end_matches('/')));
                     let pick = env_cwd
                         .as_ref()
@@ -512,6 +514,8 @@ fn msg_stated_full(doc: &Doc, h: Harness) -> (Option<&'static str>, Option<Strin
 
 fn abs_from(base: Option<&str>, p: &str) -> Option<String> {
     let p = paths::strip_chars(p, "'\"");
+    let p = windows_separators(paths::canon(p));
+    let p = &*p;
     if p.is_empty() || p == "-" || p.contains('$') {
         return None;
     }
@@ -522,6 +526,11 @@ fn abs_from(base: Option<&str>, p: &str) -> Option<String> {
         return Some(paths::normpath(p));
     }
     base.map(|b| paths::normpath(&paths::join(b, p)))
+}
+
+/// Windows tools write relative paths with `\`; attribution's paths use `/`.
+fn windows_separators(p: Cow<'_, str>) -> Cow<'_, str> {
+    if cfg!(windows) && p.contains('\\') { Cow::Owned(p.replace('\\', "/")) } else { p }
 }
 
 fn dir_of_file(path: &str) -> Option<String> {
@@ -621,6 +630,13 @@ fn skip_substitution(chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
 
 /// Decode one complete argument. An expansion makes only its value unknown; its end offset is
 /// still returned so later arguments can be scanned. Malformed/unfinished words return None.
+/// Whether an unquoted `\` before `next` is a path separator rather than an escape. Never in a
+/// POSIX shell. On Windows, PowerShell and cmd (Codex, Cursor) keep `\`, and Git Bash users quote
+/// such paths, so `C:\dir\file` before a name character is read as a path.
+fn literal_backslash(next: char) -> bool {
+    cfg!(windows) && (next.is_alphanumeric() || matches!(next, '.' | '_' | '-'))
+}
+
 fn shell_word(text: &str) -> Option<(Option<String>, usize)> {
     let mut word = String::new();
     let mut quote = None;
@@ -633,7 +649,7 @@ fn shell_word(text: &str) -> Option<(Option<String>, usize)> {
             (None, '\'' | '"') => quote = Some(c),
             (None | Some('"'), '\\') => {
                 let (_, next) = chars.next()?;
-                if quote == Some('"') && !matches!(next, '$' | '`' | '"' | '\\' | '\n') {
+                if (quote == Some('"') && !matches!(next, '$' | '`' | '"' | '\\' | '\n')) || (quote.is_none() && literal_backslash(next)) {
                     word.push('\\');
                 }
                 if next != '\n' {
@@ -1455,6 +1471,11 @@ fn shell_location_inner(cmd: &str, start: Option<&str>, depth: usize) -> (Option
     (loc, if pipeline { scope_start } else { cur })
 }
 
+/// A drive path written with backslashes (`C:\dir`), which has no `/` to mark it as a path.
+fn windows_absolute(t: &str) -> bool {
+    cfg!(windows) && paths::canon(t).starts_with('/')
+}
+
 /// Path-like tokens in a shell command (relative with a slash, or absolute under any root).
 fn shell_path_tokens(cmd: &str) -> Vec<String> {
     let mut rest = paths::char_prefix(cmd, MAX_COMMAND_CHARS);
@@ -1474,7 +1495,7 @@ fn shell_path_tokens(cmd: &str) -> Vec<String> {
         rest = &rest[end..];
         let Some(word) = word else { continue };
         let t = word.split_once('=').map_or(word.as_str(), |(_, v)| v);
-        if t.contains('/') && !t.starts_with('-') && !t.contains("://") && !out.iter().any(|o| o == t) {
+        if (t.contains('/') || windows_absolute(t)) && !t.starts_with('-') && !t.contains("://") && !out.iter().any(|o| o == t) {
             out.push(t.to_string());
             if out.len() >= 200 {
                 break;
@@ -1661,7 +1682,7 @@ fn events_over(doc: &Doc, calls: &[u32], roots: &[u32], h: Harness, stated: Opti
         let Some((args, _)) = parse_args(doc, call) else { continue };
         let a = args.root;
         let str_arg = |keys: &[&str]| keys.iter().find_map(|k| args.str_of(args.get(a, k)).map(|s| s.into_owned()));
-        let workdir = str_arg(&["workdir", "cwd", "working_directory", "directory"]).filter(|w| w.starts_with('/'));
+        let workdir = str_arg(&["workdir", "cwd", "working_directory", "directory"]).map(|w| paths::canon(&w).into_owned()).filter(|w| w.starts_with('/'));
         // action.working_directory for local_shell_call
         let base_for_call = workdir.clone().or_else(|| match h {
             Harness::ClaudeCode => shell_cwd.clone(),
@@ -1679,7 +1700,7 @@ fn events_over(doc: &Doc, calls: &[u32], roots: &[u32], h: Harness, stated: Opti
                     if let Some(id) = call_id(doc, call) {
                         for t in results.get(&id).into_iter().flatten() {
                             if let Some(m) = SHELL_RESET.captures_iter(t).last() {
-                                *shell_cwd = Some(m[1].trim_end_matches('.').to_string());
+                                *shell_cwd = Some(paths::canon(m[1].trim_end_matches('.')).into_owned());
                             }
                         }
                     }

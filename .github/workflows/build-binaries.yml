@@ -241,9 +241,28 @@ jobs:
         shell: bash
         run: uv sync --frozen
 
-      - name: Build with Nuitka
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: router-agent
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # As on macOS and Linux, the Ramp Router agent ships beside ramp in
+      # main.dist/ and builds alongside Nuitka. On Windows it is a windowless
+      # (Windows-subsystem) program that Task Scheduler starts at logon.
+      - name: Build with Nuitka and build the Ramp Router agent
         shell: bash
         run: |
+          set -euo pipefail
+          agent_log="$RUNNER_TEMP/router-agent-build.log"
+          cargo build --release --locked --manifest-path router-agent/Cargo.toml \
+            > "$agent_log" 2>&1 &
+          agent_pid=$!
+          trap 'kill "$agent_pid" 2>/dev/null || true' EXIT
+
           uv run python -m nuitka \
             --standalone \
             --output-filename="ramp-windows-amd64" \
@@ -256,6 +275,22 @@ jobs:
             --python-flag=no_site \
             --assume-yes-for-downloads \
             src/ramp_cli/main.py
+
+          agent_status=0
+          wait "$agent_pid" || agent_status=$?
+          trap - EXIT
+          echo "::group::Ramp Router agent build"
+          cat "$agent_log"
+          echo "::endgroup::"
+          test "$agent_status" -eq 0
+          # Copied in before the architecture check, which inspects every
+          # native file.
+          cp router-agent/target/release/ramp-router-agent.exe build/main.dist/ramp-router-agent.exe
+          # A Windows-subsystem program writes to the handles it is given, so
+          # check the captured output rather than trusting the exit code.
+          agent_version=$(build/main.dist/ramp-router-agent.exe --version | tr -d '\r')
+          echo "$agent_version"
+          [[ "$agent_version" == "ramp-router-agent "* ]]
 
       - name: Save Nuitka compiler cache
         if: github.ref == 'refs/heads/main'

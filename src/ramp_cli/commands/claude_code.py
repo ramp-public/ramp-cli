@@ -17,7 +17,7 @@ from pathlib import Path
 
 import click
 
-from ramp_cli import __version__
+from ramp_cli import __version__, cost_script
 from ramp_cli.commands.router_sync import (
     SYNC_HOOK_STOP_EVENT,
     SYNC_HOOK_USER_MANAGED,
@@ -498,11 +498,39 @@ def statusline_path(path: Path) -> Path:
     return path.parent / "ramp-router-statusline"
 
 
-def statusline_command(path: Path) -> str:
-    """The command Claude Code runs for the managed status line."""
+def statusline_command(path: Path) -> str | None:
+    """The command Claude Code runs for the managed status line.
+
+    None on Windows when no command can be written; see cost_script.
+    """
+    if os.name == "nt":
+        # Windows ignores the script's python3 shebang, so ramp runs it.
+        executable = cost_script.windows_executable()
+        return executable and cost_script.shell_command(
+            executable, statusline_path(path)
+        )
     # Quoted because Claude Code hands the command to a shell, and the settings
     # directory is ordinarily under a home directory that can contain spaces.
     return shlex.quote(str(statusline_path(path)))
+
+
+def _runs_statusline(command: str, path: Path) -> bool:
+    """Report whether a command runs our status line, from whichever ramp."""
+    script = str(statusline_path(path))
+    if command in {statusline_command(path), script}:
+        return True
+    invocation = cost_script.invocation(command)
+    # The Windows form names the script with forward slashes, maybe in its
+    # 8.3 short form.
+    return (
+        invocation is not None
+        and not invocation[0]
+        and any(
+            cost_script.same_windows_path(invocation[1], candidate)
+            for candidate in (script, cost_script.bare_path(script))
+            if candidate
+        )
+    )
 
 
 def _statusline_slot_is_ours(settings: dict, path: Path) -> bool:
@@ -518,10 +546,7 @@ def _statusline_slot_is_ours(settings: dict, path: Path) -> bool:
     if not isinstance(current, dict) or current.get("type") != "command":
         return False
     command = current.get("command")
-    return isinstance(command, str) and command in {
-        statusline_command(path),
-        str(statusline_path(path)),
-    }
+    return isinstance(command, str) and _runs_statusline(command, path)
 
 
 def without_router_statusline(settings: dict, path: Path) -> dict:
@@ -928,6 +953,10 @@ def original_settings_command(path: Path, *, use_default_model: bool = False) ->
     """
     settings = original_settings_path(path)
     model_option = " --model default" if use_default_model else ""
+    if os.name == "nt":
+        # PowerShell 5.1 and cmd don't expand "~" or strip single quotes, so
+        # give Windows shells the full path in double quotes.
+        return f'claude --settings "{settings}"{model_option}'
     try:
         relative = settings.relative_to(Path.home())
     except (ValueError, RuntimeError):

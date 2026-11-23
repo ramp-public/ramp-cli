@@ -1,7 +1,9 @@
 """Tests for writing Cursor's local OpenAI override."""
 
+import base64
 import json
 import sqlite3
+from contextlib import closing
 
 import pytest
 from click.testing import CliRunner
@@ -56,7 +58,7 @@ def cursor_db(monkeypatch):
     monkeypatch.setattr(cursor, "encrypt_with_cursor", encrypt)
     path = cursor.state_db_path()
     path.parent.mkdir(parents=True)
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db, db:
         db.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB)")
         db.execute(
             "INSERT INTO ItemTable VALUES (?, ?)",
@@ -74,7 +76,7 @@ def cursor_db(monkeypatch):
 
 
 def _rows(path):
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db, db:
         return dict(db.execute("SELECT key, value FROM ItemTable"))
 
 
@@ -91,7 +93,7 @@ def test_reconfigure_then_unconfigure_restores_the_original_settings(cursor_db):
 
     # Signing in to another Cursor account turns the key off; configure again.
     settings["useOpenAIKey"] = False
-    with sqlite3.connect(cursor_db) as db:
+    with closing(sqlite3.connect(cursor_db)) as db, db:
         db.execute(
             "UPDATE ItemTable SET value = ? WHERE key = ?",
             (json.dumps(settings), cursor._SETTINGS_KEY),
@@ -231,13 +233,32 @@ def test_json_configure_never_prompts(cursor_db, monkeypatch, tmp_path):
     assert PROMPTS == [False]
 
 
-def test_other_platforms_fall_back_without_probing(cursor_db, monkeypatch, tmp_path):
+def test_windows_writes_settings_without_a_permission_note(
+    cursor_db, monkeypatch, tmp_path
+):
     _mock_cursor_setup(monkeypatch, aliases={})
     monkeypatch.setenv("RAMP_CLAUDE_DESKTOP_APP_SUPPORT", str(tmp_path))
     monkeypatch.setattr("sys.platform", "win32")
+    monkeypatch.setattr(router_module, "_can_prompt", lambda ctx, fmt: True)
+    result = CliRunner().invoke(
+        cli,
+        ["--human", "router", "configure", "cursor", "--api-key", "router-secret"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Cursor: set up. Open Cursor, and in a new chat on This PC" in result.output
+    assert "This Mac" not in result.output
+    assert "Cursor Safe Storage" not in result.output
+    assert "Override OpenAI Base URL" not in result.output
+    assert _rows(cursor_db)[cursor._OPENAI_KEY_SECRET] == CIPHERTEXT
+
+
+def test_other_platforms_fall_back_without_probing(cursor_db, monkeypatch, tmp_path):
+    _mock_cursor_setup(monkeypatch, aliases={})
+    monkeypatch.setenv("RAMP_CLAUDE_DESKTOP_APP_SUPPORT", str(tmp_path))
+    monkeypatch.setattr("sys.platform", "linux")
 
     def probe():
-        raise AssertionError("is_running must not run off macOS")
+        raise AssertionError("is_running must not run off macOS and Windows")
 
     monkeypatch.setattr(cursor, "is_running", probe)
     monkeypatch.setattr(cursor, "running_pids", probe)
@@ -281,6 +302,136 @@ def test_bare_unconfigure_restores_cursor(cursor_db, monkeypatch, tmp_path):
     assert "restored your previous settings for: Cursor" in result.output
     assert _settings(cursor_db)["openAIBaseUrl"] == "https://api.openai.com/v1"
     assert not cursor.has_receipt()
+
+
+def test_windows_encrypts_in_chromiums_v10_gcm_format(monkeypatch):
+    monkeypatch.setattr("sys.platform", "win32")
+    monkeypatch.setattr(cursor, "_windows_safe_storage_key", lambda: b"k" * 32)
+    monkeypatch.setattr(cursor.os, "urandom", lambda size: b"n" * size)
+    calls = []
+
+    def gcm(key, nonce, plaintext):
+        calls.append((key, nonce, plaintext))
+        return b"<ciphertext>" + b"t" * 16
+
+    monkeypatch.setattr(cursor, "_aes_256_gcm_encrypt", gcm)
+
+    stored = json.loads(cursor.encrypt_with_cursor("router-key"))
+
+    assert calls == [(b"k" * 32, b"n" * 12, b"router-key")]
+    assert stored["type"] == "Buffer"
+    assert bytes(stored["data"]) == b"v10" + b"n" * 12 + b"<ciphertext>" + b"t" * 16
+
+
+def test_windows_key_comes_from_local_state_through_dpapi(monkeypatch, tmp_path):
+    user = tmp_path / "Cursor" / "User"
+    user.mkdir(parents=True)
+    monkeypatch.setenv(cursor.USER_DIR_ENV, str(user))
+    wrapped = base64.b64encode(b"DPAPI" + b"<blob>").decode()
+    (user.parent / "Local State").write_text(
+        json.dumps({"os_crypt": {"encrypted_key": wrapped}}), encoding="utf-8"
+    )
+    unwrapped = []
+    monkeypatch.setattr(
+        cursor, "_dpapi_unprotect", lambda blob: unwrapped.append(blob) or b"k" * 32
+    )
+
+    assert cursor._windows_safe_storage_key() == b"k" * 32
+    assert unwrapped == [b"<blob>"]
+
+
+def test_windows_without_a_key_explains_how_to_get_one(monkeypatch, tmp_path):
+    user = tmp_path / "Cursor" / "User"
+    user.mkdir(parents=True)
+    monkeypatch.setenv(cursor.USER_DIR_ENV, str(user))
+
+    with pytest.raises(cursor.CursorSettingsError, match="Open Cursor once"):
+        cursor._windows_safe_storage_key()
+
+
+TASKLIST = r"C:\Windows\System32\tasklist.exe"
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "pids"),
+    [
+        (0, b'"Cursor.exe","4242","Console","1","180,000 K"\r\n', [4242]),
+        (
+            0,
+            b'"Cursor.exe","4242","Console","1","180,000 K"\r\n'
+            b'"Cursor.exe","4243","Console","1","90,000 K"\r\n',
+            [4242, 4243],
+        ),
+        (
+            0,
+            b"INFO: No tasks are running which match the specified criteria.\r\n",
+            [],
+        ),
+        # Localized output in an OEM code page must not break the check.
+        (
+            0,
+            b'"Cursor.exe","4242","Konsole","1","180.000 K"\r\nGr\x81\xe1e\r\n',
+            [4242],
+        ),
+        (
+            0,
+            b"INFORMATION: Es werden keine Tasks mit den angegebenen \x84\x94\r\n",
+            [],
+        ),
+        # An unreadable answer counts as running, so nothing is written.
+        (1, b"", None),
+        (0, b'"Cursor.exe","?","Console","1","180,000 K"\r\n', None),
+    ],
+)
+def test_windows_running_check(monkeypatch, returncode, stdout, pids):
+    monkeypatch.setattr("sys.platform", "win32")
+    monkeypatch.setattr(cursor, "running_pids", _REAL_RUNNING_PIDS)
+    monkeypatch.setenv("USERNAME", "someone")
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    seen = []
+
+    def run(command, **kwargs):
+        seen.append((command, kwargs))
+        assert "text" not in kwargs
+        return cursor.subprocess.CompletedProcess(command, returncode, stdout, b"")
+
+    monkeypatch.setattr(cursor.subprocess, "run", run)
+
+    assert cursor.running_pids() == pids
+    assert cursor.is_running() is (pids != [])
+    command, kwargs = seen[0]
+    assert command[:3] == [TASKLIST, "/FI", "IMAGENAME eq Cursor.exe"]
+    assert "USERNAME eq someone" in command
+    # Never a console window, even when run without one.
+    assert kwargs["creationflags"] == getattr(cursor.subprocess, "CREATE_NO_WINDOW", 0)
+
+
+@pytest.mark.parametrize(
+    ("system_root", "expected"),
+    [
+        (r"D:\Win", r"D:\Win\System32\tasklist.exe"),
+        # Unset or empty: the default location, never a bare name that could
+        # resolve from the current folder.
+        (None, TASKLIST),
+        ("", TASKLIST),
+    ],
+)
+def test_windows_tasklist_runs_by_absolute_path(monkeypatch, system_root, expected):
+    monkeypatch.setattr("sys.platform", "win32")
+    monkeypatch.setattr(cursor, "running_pids", _REAL_RUNNING_PIDS)
+    if system_root is None:
+        monkeypatch.delenv("SystemRoot", raising=False)
+    else:
+        monkeypatch.setenv("SystemRoot", system_root)
+    seen = []
+
+    def run(command, **kwargs):
+        seen.append(command)
+        return cursor.subprocess.CompletedProcess(command, 0, b"", b"")
+
+    monkeypatch.setattr(cursor.subprocess, "run", run)
+    assert cursor.running_pids() == []
+    assert seen[0][0] == expected
 
 
 CONFIGURE = ["router", "configure", "cursor", "--api-key", "router-secret"]
@@ -331,7 +482,7 @@ def _keychain_denied(monkeypatch):
 
 
 def _unreadable(monkeypatch):
-    with sqlite3.connect(cursor.state_db_path()) as db:
+    with closing(sqlite3.connect(cursor.state_db_path())) as db, db:
         db.execute(
             "UPDATE ItemTable SET value = ? WHERE key = ?",
             ("not json", cursor._SETTINGS_KEY),
@@ -395,8 +546,8 @@ FALLBACKS = {
     "other-platform": (
         lambda monkeypatch: monkeypatch.setattr("sys.platform", "linux"),
         "unsupported_platform",
-        "Cursor wasn't set up automatically because automatic setup is "
-        "macOS-only for now.",
+        "Cursor wasn't set up automatically because automatic setup works "
+        "only on macOS and Windows for now.",
         {},
     ),
 }
@@ -496,8 +647,13 @@ PGREP_ARGV = {
         "timeout",
     ],
 )
+@pytest.mark.posix_only(
+    reason="Cursor's process check runs pgrep -u <uid>; automatic Cursor setup "
+    "is macOS-only"
+)
 def test_running_pids_reads_pgrep(cursor_db, monkeypatch, platform, pgrep, pids):
     monkeypatch.setattr("sys.platform", platform)
+    monkeypatch.setattr(cursor.os, "getuid", lambda: 123, raising=False)
     calls = _pgrep(monkeypatch, **pgrep)
     assert cursor.running_pids() == pids
     uid = str(cursor.os.getuid())

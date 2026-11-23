@@ -544,9 +544,10 @@ def test_experimental_preset_saves_model_pair_and_auto_without_legacy_toggle(rou
             app.screen.query_one("#experimental").press()
             await settle(app, pilot)
             app.screen.query_one("#experimental-tabs", Tabs).active = "auto-tab"
-            await pilot.pause()
+            await settle(app, pilot)
             app.screen.query_one("#up-1").press()
-            await pilot.pause()
+            # A slower runner can still be applying the move when save reads it.
+            await settle(app, pilot)
             app.screen.query_one("#editor-save").press()
             await settle(app, pilot)
             assert writes(router)[-1][2] == {

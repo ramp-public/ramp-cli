@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import stat
+import sys
 import time
 from pathlib import Path
 from uuid import uuid4
@@ -14,6 +15,7 @@ import click
 
 from ramp_cli.auth.refresh import _refresh_lock
 from ramp_cli.client.router_user import RouterUserClient, _atomic_write, _jwt_account
+from ramp_cli.commands import router_local_auth
 from ramp_cli.commands.router_user import _routing_profiles, create_named_key
 from ramp_cli.config.settings import config_dir
 from ramp_cli.errors import EXIT_AUTH_REQUIRED, RampCLIError
@@ -44,7 +46,36 @@ def sign_in(
     return client.access_token(check_session=True)
 
 
+_STATE_LIMIT = 16384
+_DIRECTORY_ERROR = (
+    "Router setup key directory must be owned by you and not writable by other users."
+)
+_FILE_ERROR = "Router setup key must be an owner-private regular file (600)."
+_UNREADABLE = "Could not read the Router setup key; no new key was created."
+
+
 def _read_state(path: Path) -> dict:
+    if sys.platform == "win32":
+        # The agent's owner/DACL rule (router_winsec) instead of uid and mode.
+        if not path.parent.exists():
+            return {}
+        try:
+            router_local_auth.check_directory(path.parent)
+        except OSError:
+            raise click.ClickException(_DIRECTORY_ERROR) from None
+        try:
+            text = router_local_auth.read_private(path)
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError):
+            raise click.ClickException(_FILE_ERROR) from None
+        if len(text.encode("utf-8")) > _STATE_LIMIT:
+            raise click.ClickException(_FILE_ERROR)
+        try:
+            state = json.loads(text)
+        except ValueError:
+            raise click.ClickException(_UNREADABLE) from None
+        return _checked_state(state)
     try:
         parent = path.parent.stat()
         if (
@@ -52,9 +83,7 @@ def _read_state(path: Path) -> dict:
             or parent.st_uid != os.getuid()
             or parent.st_mode & 0o022
         ):
-            raise click.ClickException(
-                "Router setup key directory must be owned by you and not writable by other users."
-            )
+            raise click.ClickException(_DIRECTORY_ERROR)
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         return {}
@@ -68,17 +97,17 @@ def _read_state(path: Path) -> dict:
             not stat.S_ISREG(info.st_mode)
             or info.st_uid != os.getuid()
             or info.st_mode & 0o077
-            or info.st_size > 16384
+            or info.st_size > _STATE_LIMIT
         ):
-            raise click.ClickException(
-                "Router setup key must be an owner-private regular file (600)."
-            )
+            raise click.ClickException(_FILE_ERROR)
         try:
             state = json.load(handle)
         except (ValueError, UnicodeError):
-            raise click.ClickException(
-                "Could not read the Router setup key; no new key was created."
-            ) from None
+            raise click.ClickException(_UNREADABLE) from None
+    return _checked_state(state)
+
+
+def _checked_state(state: object) -> dict:
     if not isinstance(state, dict) or not isinstance(state.get("request_id"), str):
         raise click.ClickException(
             "Invalid Router setup key state; no new key was created."
@@ -106,7 +135,7 @@ def _saved_key(client: RouterUserClient, path: Path) -> tuple[str, bool]:
         profiles = _routing_profiles(client) or []
         default = next((p for p in profiles if p.get("is_default")), None)
         state = {"request_id": str(uuid4()), "routing_profile": default}
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        router_local_auth.make_directory(path.parent)
         # Durable idempotency identity precedes the write: retry a lost response
         # with the same key request instead of silently creating another key.
         _atomic_write(path, state)

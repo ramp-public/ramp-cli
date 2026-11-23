@@ -9,6 +9,7 @@ import hmac
 import io
 import json
 import math
+import ntpath
 import os
 import re
 import shlex
@@ -52,6 +53,7 @@ from ramp_cli import (
     claude_cowork,
     codex_desktop,
     codex_hook_trust,
+    cost_script,
     hermes_agent,
     json5_edit,
 )
@@ -1853,7 +1855,8 @@ def router_configure(
                 f"Unset {SYNC_OPT_OUT_ENV} before enabling the agent."
             )
         if (
-            sys.platform != "darwin" and not sys.platform.startswith("linux")
+            sys.platform not in ("darwin", "win32")
+            and not sys.platform.startswith("linux")
         ) or not router_repo.service_supported():
             raise click.UsageError(
                 "--enable-agent requires the native Router agent and a supported service manager."
@@ -1977,17 +1980,19 @@ def _cursor_written_line(result: dict, *, tagging: bool = False) -> str:
     pick = f"pick {model}" if model else "pick a Router model"
     reopened = result.get("reopened")
     tag = ", with repository tagging on" if tagging else ""
+    # Cursor names the local run target after the platform.
+    machine = "This PC" if sys.platform == "win32" else "This Mac"
     if reopened:
         status = (
             "force quit, set up, and reopened"
             if result.get("quit_outcome") == cursor.QUIT_FORCED
             else "set up and reopened"
         )
-        return f"Cursor: {status}{tag}. In a new chat on This Mac, {pick}."
+        return f"Cursor: {status}{tag}. In a new chat on {machine}, {pick}."
     status = f"set up{tag}"
     if reopened is False:
         status += ", but it couldn't be reopened"
-    return f"Cursor: {status}. Open Cursor, and in a new chat on This Mac, {pick}."
+    return f"Cursor: {status}. Open Cursor, and in a new chat on {machine}, {pick}."
 
 
 def _cursor_added_line(result: dict) -> str | None:
@@ -2468,11 +2473,11 @@ def _run_configure(
     # Cursor's settings can be written only while it is closed, so ask before
     # a browser opens or a key is created.
     cursor_quit = _offer_to_quit_cursor(ctx, fmt, clients, unattended=confirm_browser)
-    # A macOS terminal run shows no paste-in steps for Cursor: setup either
+    # An interactive setup that can write Cursor shows no paste-in steps: it either
     # finishes or says how to run it again.
     cursor_quiet = (
         CURSOR_CLIENT in clients
-        and sys.platform == "darwin"
+        and _cursor_writes_supported()
         and _can_prompt(ctx, fmt)
         and not confirm_browser
     )
@@ -2631,7 +2636,8 @@ def _run_configure(
                     scope=cursor_scope,
                     router_fallback=cursor_fallback,
                     ask=cursor_ask,
-                    writes=sys.platform == "darwin" and not cursor_quit.get("fallback"),
+                    writes=_cursor_writes_supported()
+                    and not cursor_quit.get("fallback"),
                 )
             except (click.ClickException, click.Abort) as exc:
                 # Stopped before anything was written: Cursor comes back, and
@@ -3251,7 +3257,8 @@ def _run_configure(
         # partial failure is recoverable; the user has no reason to guess that.
         raise failure_error(
             "Could not configure "
-            + "; ".join(failures)
+            # A failure that is a sentence already ends in a period.
+            + "; ".join(failures).rstrip(".")
             + f". Run 'ramp router unconfigure{restore_clients}' to restore your "
             f"previous settings.{connector_undo}"
         )
@@ -3650,11 +3657,17 @@ def _allow_desktop_restart(ctx: click.Context) -> None:
 @click.pass_context
 def router_agent_enable(ctx: click.Context, helper_port: int | None) -> None:
     _allow_desktop_restart(ctx)
-    if sys.platform != "darwin" and not sys.platform.startswith("linux"):
-        raise click.UsageError("Background sync requires macOS or Linux.")
+    if sys.platform not in ("darwin", "win32") and not sys.platform.startswith("linux"):
+        raise click.UsageError("Background sync requires macOS, Linux, or Windows.")
     if os.environ.get(SYNC_OPT_OUT_ENV):
         raise click.UsageError(
             f"Unset {SYNC_OPT_OUT_ENV} before enabling background sync."
+        )
+    if sys.platform == "win32" and not router_repo.service_supported():
+        # Windows has no timer fallback: background sync is the agent.
+        raise click.ClickException(
+            "Background sync on Windows needs the Ramp Router agent "
+            "(ramp-router-agent.exe), which ships with the Windows installer."
         )
     # Cursor has no receipt a refresh could read, but its binding is a setup
     # the agent serves: it uploads Cursor's repository tags.
@@ -3799,6 +3812,21 @@ def _set_codex_cost_hook(path: Path, *, enabled: bool) -> bool:
                 f"Could not update Codex config {path}: {exc}"
             ) from None
     return True
+
+
+@router_group.command(
+    "run-cost-script",
+    hidden=True,
+    add_help_option=False,
+    context_settings={"ignore_unknown_options": True},
+)
+@click.argument("args", nargs=-1, type=click.UNPROCESSED)
+def router_run_cost_script(args: tuple[str, ...]) -> None:
+    """Run a downloaded Router cost script with this CLI's own Python.
+
+    Normally answered before the CLI loads; see cost_script.
+    """
+    sys.exit(cost_script.run(list(args)))
 
 
 @router_group.command(
@@ -4977,6 +5005,17 @@ def _settle_dropped_variants(plan: _CursorModelPlan, receipt: dict) -> None:
         plan.notes = [*plan.notes, _stranded_variants_line(origin, base, names, work)]
 
 
+def _prune_command(base: str | None, *, with_key: bool = True) -> str:
+    command = "ramp router cursor prune-variants"
+    if with_key:
+        command += " --api-key KEY"
+    if not base:
+        return command
+    if sys.platform == "win32":
+        return f"{command} --base-url {base}"
+    return f"{ROUTER_BASE_URL_ENV}={base} {command}"
+
+
 def _stranded_variants_line(
     origin: str, base: str | None, names: list[str], work: _CursorVariantWork | None
 ) -> str:
@@ -4985,9 +5024,7 @@ def _stranded_variants_line(
         if work is not None and origin == work.origin
         else f"on {origin}"
     )
-    command = "ramp router cursor prune-variants --api-key KEY"
-    if base and (work is None or origin != work.origin):
-        command = f"{ROUTER_BASE_URL_ENV}={base} {command}"
+    command = _prune_command(base if work is None or origin != work.origin else None)
     them = "it" if len(names) == 1 else "them"
     return (
         f"Cursor no longer lists {', '.join(names)}: setup made {them} {where}, "
@@ -5328,9 +5365,7 @@ def _unconfigure_variant_lines(variants: dict) -> list[str]:
     for row in by_reason.get("other_router", []):
         routers.setdefault((row["router"], row.get("base_url")), []).append(row["name"])
     for (router, base), names in routers.items():
-        command = "ramp router cursor prune-variants --api-key KEY"
-        if base:
-            command = f"{ROUTER_BASE_URL_ENV}={base} {command}"
+        command = _prune_command(base)
         lines.append(
             f"These stay on {router}, which Cursor isn't set up with now: "
             f"{', '.join(names)}. To delete them, run '{command}' with a key "
@@ -5597,6 +5632,11 @@ def _echo_cursor_keychain_note() -> None:
     )
 
 
+def _cursor_writes_supported() -> bool:
+    """Whether configure can write Cursor's settings on this platform."""
+    return sys.platform in ("darwin", "win32")
+
+
 def _cursor_fallback(reason: str, message: str, **details) -> dict:
     """Why Cursor's settings were not written: the reason and what to do next."""
     return {"reason": reason, "message": message, **details}
@@ -5671,7 +5711,12 @@ def _cursor_running_fallback(
         # Quitting Cursor would end this run too, as in Cursor's own agent.
         message = _cursor_not_set_up(
             "this is running in Cursor's terminal",
-            f"Run {_CURSOR_CONFIGURE} from Terminal or iTerm.",
+            f"Run {_CURSOR_CONFIGURE} from "
+            + (
+                "Terminal or iTerm."
+                if sys.platform == "darwin"
+                else "a terminal outside Cursor."
+            ),
         )
         details["inside_cursor"] = True
     else:
@@ -5737,17 +5782,14 @@ def _offer_to_quit_cursor(
     """Before sign-in, check that Cursor setup can finish, and offer to quit
     an open Cursor so it can.
 
-    Only a person at a macOS terminal is asked; every other run keeps Cursor
-    open and gets paste-in steps. Cursor is quit only once setup knows it can
-    write: its settings exist, its team allows personal keys, and the keychain
-    handed over Cursor's encryption key. A Cursor-only run that can't finish
-    stops here, before a browser opens or a key is created. Otherwise returns
-    what the write needs: the quit outcome, a fallback already known, whether
-    the keychain was read, and whether to reopen Cursor.
+    Only interactive macOS and Windows runs offer to quit. First check for
+    settings, team policy and (on macOS) access to the encryption key. A
+    Cursor-only run that cannot finish stops before sign-in. Other clients
+    can continue with the known Cursor fallback.
     """
     if (
         CURSOR_CLIENT not in clients
-        or sys.platform != "darwin"
+        or not _cursor_writes_supported()
         or unattended
         or not _can_prompt(ctx, fmt)
     ):
@@ -5782,14 +5824,15 @@ def _offer_to_quit_cursor(
     ):
         state["outcome"] = "declined"
         return give_up(_cursor_running_fallback(pids, "declined"))
-    _echo_cursor_keychain_note()
-    try:
-        cursor.unlock()
-    except cursor.CursorKeychainError:
-        return give_up(_cursor_keychain_fallback())
-    except cursor.CursorSettingsError as exc:
-        return give_up(_cursor_error_fallback(exc))
-    state["unlocked"] = True
+    if sys.platform == "darwin":
+        _echo_cursor_keychain_note()
+        try:
+            cursor.unlock()
+        except cursor.CursorKeychainError:
+            return give_up(_cursor_keychain_fallback())
+        except cursor.CursorSettingsError as exc:
+            return give_up(_cursor_error_fallback(exc))
+        state["unlocked"] = True
     if not running:
         return state
     state["reopen"] = True
@@ -5799,6 +5842,8 @@ def _offer_to_quit_cursor(
     click.echo(
         "Cursor: quitting. If macOS asks to let your terminal control Cursor, "
         "click OK. If Cursor asks you to confirm, confirm."
+        if sys.platform == "darwin"
+        else "Cursor: quitting. If Cursor asks you to confirm, confirm."
     )
     outcome = cursor.request_quit()
     if outcome != cursor.QUIT_DONE and cursor.running_pids() == []:
@@ -5844,11 +5889,11 @@ def _write_cursor_settings(
     plan: _CursorModelPlan | None = None,
 ) -> tuple[dict | None, dict | None]:
     """Write Cursor's settings: (receipt, None), or (None, why it fell back)."""
-    if sys.platform != "darwin":
+    if not _cursor_writes_supported():
         return None, _cursor_fallback(
             _CURSOR_FALLBACK_PLATFORM,
-            "Cursor wasn't set up automatically because automatic setup is "
-            "macOS-only for now.",
+            "Cursor wasn't set up automatically because automatic setup works "
+            "only on macOS and Windows for now.",
         )
     state = quit_state or {}
     if state.get("fallback"):
@@ -5860,7 +5905,9 @@ def _write_cursor_settings(
         return None, _cursor_running_fallback(pids, quit_outcome)
     if not cursor.state_db_path().is_file():
         return None, _cursor_missing_settings_fallback()
-    if announce and prompt and not state.get("unlocked"):
+    # Windows unlocks Cursor's key silently with the user's own credentials;
+    # only macOS asks first.
+    if announce and prompt and not state.get("unlocked") and sys.platform == "darwin":
         _echo_cursor_keychain_note()
     names = cursor.model_names_to_add(
         [model.metadata.request_name for model in models], claude_aliases
@@ -5902,7 +5949,7 @@ def _write_cursor_settings(
     invoke_without_command=True,
     help=(
         "Print the steps to set up Ramp Router in Cursor by hand "
-        "('ramp router configure cursor' does it for you on macOS)."
+        "('ramp router configure cursor' does it for you on macOS and Windows)."
     ),
 )
 @click.option(
@@ -5941,7 +5988,7 @@ def router_cursor(
     override traffic from Cursor's servers, so no local proxy can sit in
     between. This prints the credential and the exact values to paste, and
     works while Cursor is open; 'configure cursor' writes them for a closed
-    Cursor on macOS.
+    Cursor on macOS and Windows.
     """
     if ctx.invoked_subcommand is not None:
         # A subcommand resolves its own key; one given here still counts.
@@ -6158,28 +6205,35 @@ def router_cursor(
     envvar=CONFIGURE_KEY_ENV,
     help="Ramp Router API key. Defaults to the key Cursor was set up with.",
 )
+@click.option(
+    "--base-url",
+    metavar="URL",
+    callback=_validate_deployment_url,
+    help="Router gateway /v1 URL to prune.",
+)
 @click.option("--yes", is_flag=True, help="Delete without asking.")
 @click.pass_context
 def router_cursor_prune_variants(
-    ctx: click.Context, api_key: str | None, yes: bool
+    ctx: click.Context, api_key: str | None, base_url: str | None, yes: bool
 ) -> None:
     os.environ.pop(CONFIGURE_KEY_ENV, None)
     fmt = resolve_format(ctx.obj["format"], ctx.obj["config_format"])
     api_key = api_key or ctx.obj.get("cursor_api_key")
+    base = base_url or router_base_url()
     if not api_key:
         api_key = router_repo.cursor_bound_api_key()
         bound = router_repo.cursor_bound_upstream()
-        if api_key and bound != router_repo.router_upstream(router_base_url()):
+        if api_key and bound != router_repo.router_upstream(base):
             # The saved key belongs to the Router Cursor was set up with; it
             # is never sent to another one.
-            raise click.UsageError(_prune_other_router_message(bound))
+            raise click.UsageError(_prune_other_router_message(bound, base))
     api_key = api_key.strip() if api_key else None
     if not api_key:
         raise click.UsageError(
             f"Pass --api-key or set {CONFIGURE_KEY_ENV}: no Cursor setup on this "
             "machine names a Router key."
         )
-    origin = _statusline_origin(router_base_url())
+    origin = _router_key_origin(base_url) if base_url else _statusline_origin(base)
     headers = _router_alias_headers(api_key)
     listing = router_aliases.list_aliases(origin, headers)
     if listing is None:
@@ -6305,7 +6359,7 @@ def router_cursor_prune_variants(
         raise SystemExit(1)
 
 
-def _prune_other_router_message(bound: str | None) -> str:
+def _prune_other_router_message(bound: str | None, selected_base: str) -> str:
     """Why prune won't use the saved key here, and how to point it right."""
     base = next(
         (
@@ -6317,13 +6371,13 @@ def _prune_other_router_message(bound: str | None) -> str:
         None,
     )
     fix = (
-        f"run '{ROUTER_BASE_URL_ENV}={base} ramp router cursor prune-variants'"
+        f"run '{_prune_command(base, with_key=False)}'"
         if base
         else f"set {ROUTER_BASE_URL_ENV} to that Router's URL"
     )
     return (
         f"Cursor's saved Router key belongs to {bound or 'another Router'}, not "
-        f"{router_repo.router_upstream(router_base_url())}, so it isn't sent "
+        f"{router_repo.router_upstream(selected_base)}, so it isn't sent "
         f"here. To prune there, {fix}; to prune here, pass --api-key."
     )
 
@@ -10427,11 +10481,21 @@ def _install_claude_code_statusline(
     """
     if not router_settings.harness_widget_enabled():
         return None
+    # A Windows short form exists only for an existing folder, and first-time
+    # setup may not have created the settings folder yet.
+    with contextlib.suppress(OSError):
+        claude_code.statusline_path(settings_file).parent.mkdir(
+            parents=True, exist_ok=True
+        )
+    command = claude_code.statusline_command(settings_file)
+    if command is None:
+        _skip_statusline(_NO_WINDOWS_COMMAND)
+        return None
     url = f"{_statusline_origin(base_url)}/claude-code-statusline"
     script_path = claude_code.statusline_path(settings_file)
     if not _install_cost_script(url, script_path, _skip_statusline):
         return None
-    return claude_code.statusline_command(settings_file)
+    return command
 
 
 def _skip_statusline(reason: str) -> None:
@@ -10465,12 +10529,18 @@ def _install_cost_script(
     return _write_cost_script(script, script_path, skip)
 
 
+# Why a Windows cost-script command is None; see cost_script.
+_NO_WINDOWS_COMMAND = (
+    "the path to ramp or to the script cannot be written into a Windows command"
+)
+
+
 def _cost_script_runtime_available(skip: Callable[[str], None]) -> bool:
     """Report whether this platform can execute the bundled Python scripts."""
     if os.name == "nt":
-        # The python3 shebang means nothing to Windows' command interpreter.
-        skip("it is not supported on Windows")
-        return False
+        # The python3 shebang means nothing to Windows, so the agents run the
+        # scripts through `ramp router run-cost-script` instead.
+        return True
     if not shutil.which("python3"):
         skip("python3 was not found on PATH")
         return False
@@ -10505,11 +10575,17 @@ def _install_codex_cost_hook(path: Path, base_url: str | None = None) -> str | N
     """
     if not router_settings.harness_widget_enabled():
         return None
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    command = _codex_cost_hook_command(path.parent, base_url)
+    if command is None:
+        _skip_codex_cost_hook(_NO_WINDOWS_COMMAND)
+        return None
     url = f"{_statusline_origin(base_url)}/codex-cost-hook"
     hook_path = path.parent / CODEX_COST_HOOK
     if not _install_cost_script(url, hook_path, _skip_codex_cost_hook):
         return None
-    return _codex_cost_hook_command(path.parent, base_url)
+    return command
 
 
 def _skip_codex_cost_hook(reason: str) -> None:
@@ -10517,8 +10593,22 @@ def _skip_codex_cost_hook(reason: str) -> None:
     click.echo(f"Skipping the Codex Router cost hook: {reason}.", err=True)
 
 
-def _codex_cost_hook_command(home: Path, base_url: str | None = None) -> str:
-    """The shell command Codex runs on Stop, with Router credentials wired in."""
+def _codex_cost_hook_command(home: Path, base_url: str | None = None) -> str | None:
+    """The shell command Codex runs on Stop, with Router credentials wired in.
+
+    None on Windows when no command can be written; see cost_script.
+    """
+    if os.name == "nt":
+        # Codex runs Windows hooks through cmd.exe or PowerShell, neither with
+        # `$(...)`, and Windows ignores the script's shebang: ramp reads the key
+        # and runs it.
+        executable = cost_script.windows_executable()
+        return executable and cost_script.hook_command(
+            executable,
+            home / CODEX_COST_HOOK,
+            key_file=home / "ramp-router-key",
+            base_url=_statusline_origin(base_url),
+        )
     command, args = _codex_key_command(home / "ramp-router-key")
     read_key = " ".join(shlex.quote(part) for part in (command, *args))
     # The key is read at run time from the private key file, never written
@@ -10542,7 +10632,13 @@ _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
 def _command_runs_cost_hook(command: str) -> bool:
-    """Report whether a hook command's executable is the managed script."""
+    """Report whether a hook command's executable is the managed script.
+
+    On Windows that is `ramp router run-cost-script`, given the script.
+    """
+    invocation = cost_script.invocation(command)
+    if invocation is not None:
+        return ntpath.basename(invocation[1]) == CODEX_COST_HOOK
     try:
         tokens = shlex.split(command)
     except ValueError:
@@ -10924,8 +11020,9 @@ def _configure_claude_code(
             updated, path, state
         )
         # In the shared configure/refresh path so existing setups gain the
-        # hooks and refresh repairs a stale ramp path. None (Windows or no
-        # resolvable entrypoint) registers nothing. The Stop hook reruns the
+        # hooks and refresh repairs a stale ramp path. None (no resolvable
+        # entrypoint, or none Windows can run as a bare command) registers
+        # nothing. The Stop hook reruns the
         # sync after every turn so a session's own /model pick, which Claude
         # Code saves as the default for new sessions, is put back to the
         # workspace default before the next session starts.
@@ -12464,6 +12561,9 @@ def _codex_cost_hook_origin(config: dict) -> str | None:
         for command in _hook_group_commands(group):
             if command is None or not _command_runs_cost_hook(command):
                 continue
+            invocation = cost_script.invocation(command)
+            if invocation is not None:
+                return invocation[0].get(cost_script.BASE_URL_OPTION)
             for token in shlex.split(command):
                 name, separator, assigned = token.partition("=")
                 if separator and name == "ROUTER_BASE_URL":
@@ -15621,7 +15721,7 @@ def _configure_codex(
     cost_hook_command = (
         None if strict_model else _install_codex_cost_hook(path, base_url)
     )
-    # None (Windows or no resolvable ramp entrypoint) registers nothing.
+    # None (no ramp entrypoint the hook can run) registers nothing.
     sync_hook_command = None if strict_model else session_sync_hook_command("codex")
     # Router's answer for this connection, asked at the same origin the
     # setup's session-usage calls go to (and that the receipt records).

@@ -6,6 +6,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 
 import click
 import pytest
@@ -373,11 +374,8 @@ def test_mdm_runs_never_ask(monkeypatch):
     )
 
 
-@pytest.mark.parametrize("platform", ["linux", "win32"])
-def test_other_platforms_never_ask_and_keep_the_paste_in_steps(
-    mac, monkeypatch, interactive, platform
-):
-    monkeypatch.setattr("sys.platform", platform)
+def test_linux_never_asks_and_keeps_the_paste_in_steps(mac, monkeypatch, interactive):
+    monkeypatch.setattr("sys.platform", "linux")
     fake = FakeCursor(monkeypatch)
     result = _run(input="y\n")
     assert result.exit_code == 0, result.output
@@ -511,6 +509,7 @@ def test_a_cursor_that_quits_late_is_not_force_quit(
 
 
 def _osascript(monkeypatch, *, returncode=0, stderr="", timeout=False, error=None):
+    monkeypatch.setattr("sys.platform", "darwin")
     commands = []
 
     def run(command, **kwargs):
@@ -572,11 +571,14 @@ def test_reopen_opens_cursor_by_bundle_id(monkeypatch):
     assert commands == [["open", "-b", cursor.APP_BUNDLE_ID]]
 
 
+@pytest.mark.posix_only(reason="Cursor's process check runs pgrep -u <uid>")
 def test_runs_inside_cursor_walks_parents_with_the_real_pgrep_argv(monkeypatch):
     # macOS pgrep without -a leaves out this process's ancestors, Cursor
     # among them, so the walk has nothing to find. With -a it does.
     monkeypatch.setattr("sys.platform", "darwin")
     monkeypatch.setattr(cursor, "running_pids", _REAL_RUNNING_PIDS)
+
+    monkeypatch.setattr(cursor.os, "getuid", lambda: 123, raising=False)
 
     def pgrep(command, **kwargs):
         listed = "100\n" if "-a" in command else ""
@@ -598,6 +600,8 @@ class FakeProcesses:
     def __init__(
         self, monkeypatch, pids, *, survives_term=(), survives_kill=(), denied=False
     ):
+        monkeypatch.setattr("sys.platform", "darwin")
+        monkeypatch.setattr(signal, "SIGKILL", KILL, raising=False)
         self.alive = set(pids)
         self.survives_term = set(survives_term)
         self.survives_kill = set(survives_kill)
@@ -619,7 +623,10 @@ class FakeProcesses:
             self.alive.discard(pid)
 
 
-TERM, KILL = signal.SIGTERM, signal.SIGKILL
+TERM, KILL = signal.SIGTERM, getattr(signal, "SIGKILL", 9)
+_FORCE_QUIT_IS_POSIX_ONLY = pytest.mark.posix_only(
+    reason="these force-quit Cursor with SIGTERM/SIGKILL; Windows uses taskkill"
+)
 
 
 @pytest.mark.parametrize(
@@ -646,12 +653,14 @@ TERM, KILL = signal.SIGTERM, signal.SIGKILL
     ],
     ids=["term", "term-then-kill", "survives", "not-allowed", "none-running"],
 )
+@_FORCE_QUIT_IS_POSIX_ONLY
 def test_force_quit(monkeypatch, pids, options, expected, sent):
     processes = FakeProcesses(monkeypatch, pids, **options)
     assert cursor.force_quit(term_wait=0.01, kill_wait=0.01) == expected
     assert processes.sent == sent
 
 
+@_FORCE_QUIT_IS_POSIX_ONLY
 def test_force_quit_signals_only_the_cursor_pids_it_found(monkeypatch):
     processes = FakeProcesses(monkeypatch, [11], survives_term=[11])
     real_kill = processes.kill
@@ -682,7 +691,7 @@ connection.execute(
     "UPDATE ItemTable SET value = ? WHERE key = ?",
     (json.dumps({"openAIBaseUrl": "https://half-written.test"}), sys.argv[2]),
 )
-os.kill(os.getpid(), signal.SIGKILL)
+os._exit(1)
 """
 
 
@@ -694,13 +703,14 @@ def _kill_cursor_mid_write(state_db):
     assert state_db.with_name(state_db.name + "-journal").exists()
 
 
+@pytest.mark.posix_only(reason="simulates a killed Cursor with SIGKILL")
 def test_settings_left_mid_write_by_a_killed_cursor_are_recovered(
     state_db, monkeypatch
 ):
     # A killed writer leaves a hot journal that only a writable connection
     # can roll back; a read-only one fails, or reads what was rolled back.
     monkeypatch.setattr("sys.platform", "darwin")
-    with sqlite3.connect(state_db) as db:
+    with closing(sqlite3.connect(state_db)) as db, db:
         db.execute(
             "INSERT INTO ItemTable VALUES (?, ?)",
             (cursor._ADMIN_SETTINGS_KEYS[0], json.dumps({"byokDisabled": True})),
@@ -714,12 +724,12 @@ def test_settings_left_mid_write_by_a_killed_cursor_are_recovered(
     assert settings["openAIBaseUrl"] == "https://router.test/v1"
     # The half-written transaction is gone and the committed settings remain.
     assert settings["aiSettings"]["userAddedModels"] == ["mine", "gpt-5.6-sol"]
-    with sqlite3.connect(state_db) as db:
+    with closing(sqlite3.connect(state_db)) as db, db:
         assert db.execute("SELECT count(*) FROM ItemTable").fetchone()[0] == 4
 
 
 def test_settings_in_a_wal_left_by_a_killed_cursor_are_read(state_db, tmp_path):
-    with sqlite3.connect(state_db) as db:
+    with closing(sqlite3.connect(state_db)) as db, db:
         db.execute("PRAGMA journal_mode=WAL")
     writer = sqlite3.connect(state_db)
     writer.execute("PRAGMA wal_autocheckpoint=0")
@@ -761,3 +771,110 @@ def test_a_running_cursor_is_read_without_writing(state_db, monkeypatch):
     cursor.personal_keys_blocked()
     cursor.read_override_base_url()
     assert modes == ["ro", "ro"]
+
+
+@pytest.mark.parametrize(
+    ("outcome", "answers", "calls", "message"),
+    [
+        (cursor.QUIT_DONE, "y\n", ["quit", "reopen"], "set up and reopened"),
+        (
+            cursor.QUIT_TIMEOUT,
+            "y\ny\n",
+            ["quit", "force", "reopen"],
+            "force quit, set up",
+        ),
+        (cursor.QUIT_FAILED, "y\nn\n", ["quit"], "Close Cursor fully (File > Exit)"),
+    ],
+)
+def test_windows_quit_offer(
+    mac, monkeypatch, interactive, outcome, answers, calls, message
+):
+    monkeypatch.setattr("sys.platform", "win32")
+    fake = FakeCursor(monkeypatch, outcome=outcome)
+    result = _run(input=answers)
+    assert result.exit_code == (1 if outcome == cursor.QUIT_FAILED else 0), (
+        result.output
+    )
+    assert PROMPT in result.output
+    assert message in result.output
+    assert "macOS" not in result.output
+    assert "Keychain" not in result.output
+    assert fake.calls == calls
+
+
+@pytest.mark.parametrize(
+    ("force", "found", "remaining", "status", "expected"),
+    [
+        (False, [11, 12], [], 0, cursor.QUIT_DONE),
+        (False, [11], [11], 0, cursor.QUIT_TIMEOUT),
+        (False, [11], [11], 1, cursor.QUIT_FAILED),
+        (False, None, None, 1, cursor.QUIT_FAILED),
+        (True, [11, 12], [], 0, cursor.QUIT_FORCED),
+        (True, [11], [11], 0, cursor.QUIT_FORCE_FAILED),
+        (True, [11], [], 1, cursor.QUIT_DONE),
+        (True, [], [], 0, cursor.QUIT_DONE),
+    ],
+)
+def test_windows_taskkill(monkeypatch, force, found, remaining, status, expected):
+    monkeypatch.setattr("sys.platform", "win32")
+    monkeypatch.setenv("SystemRoot", r"D:\Win")
+    monkeypatch.setattr(cursor, "running_pids", lambda: found)
+    monkeypatch.setattr(cursor, "wait_until_quit", lambda timeout: remaining)
+    monkeypatch.setattr(
+        cursor, "_windows_image_path", lambda pid: r"D:\Apps\Cursor.exe"
+    )
+    monkeypatch.setattr(cursor, "_windows_cursor_image", None)
+    monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+    commands = []
+
+    def run(command, **kwargs):
+        assert kwargs["creationflags"] == subprocess.CREATE_NO_WINDOW
+        commands.append(command)
+        return subprocess.CompletedProcess(command, status)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert (cursor.force_quit() if force else cursor.request_quit()) == expected
+    switches = ["/F", "/T"] if force else []
+    assert commands == [
+        [
+            r"D:\Win\System32\taskkill.exe",
+            *switches,
+            "/PID",
+            str(pid),
+            "/FI",
+            "IMAGENAME eq Cursor.exe",
+        ]
+        for pid in found or []
+    ]
+    if found:
+        assert cursor._windows_cursor_image == r"D:\Apps\Cursor.exe"
+
+
+@pytest.mark.parametrize("cached", [None, r"D:\Apps\Cursor.exe"])
+@pytest.mark.parametrize("launches", [True, False])
+def test_windows_reopen(monkeypatch, cached, launches):
+    monkeypatch.setattr("sys.platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", r"C:\Local")
+    monkeypatch.setattr(cursor, "_windows_cursor_image", cached)
+    monkeypatch.setattr(subprocess, "DETACHED_PROCESS", 8, raising=False)
+    calls = []
+
+    def launch(command, **kwargs):
+        calls.append(command)
+        assert kwargs["creationflags"] == subprocess.DETACHED_PROCESS
+        if not launches:
+            raise FileNotFoundError
+
+    monkeypatch.setattr(subprocess, "Popen", launch)
+    assert _REAL_REOPEN() is launches
+    assert calls[0] == [cached or r"C:\Local\Programs\cursor\Cursor.exe"]
+    if not launches:
+        assert calls[-1] == [r"C:\Local\Programs\cursor\Cursor.exe"]
+
+
+def test_windows_cursor_terminal_through_shell(monkeypatch):
+    monkeypatch.setattr("sys.platform", "win32")
+    monkeypatch.setattr(cursor.os, "getppid", lambda: 22)
+    monkeypatch.setattr(cursor, "running_pids", lambda: [11])
+    monkeypatch.setattr(cursor, "_windows_parent_pids", lambda: {22: 17, 17: 11})
+    assert _REAL_RUNS_INSIDE_CURSOR()

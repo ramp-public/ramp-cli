@@ -171,7 +171,7 @@ impl Scheduler {
         // A Cowork pass waits for Claude Desktop to close: run it once every
         // process ramp recorded is gone (signal 0 only checks it exists).
         let wait: Vec<i32> = manifest.get("cowork_wait_pids").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_i64).filter_map(|p| i32::try_from(p).ok()).filter(|&p| p > 0).collect();
-        if !wait.is_empty() && wait.iter().all(|&p| unsafe { libc::kill(p, 0) } != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)) {
+        if !wait.is_empty() && wait.iter().all(|&p| process_gone(p)) {
             return Decision::Refresh("cowork");
         }
         if manifest.get("due_at").and_then(Value::as_f64).is_none_or(|d| t >= d) {
@@ -280,7 +280,6 @@ impl Scheduler {
     }
 
     fn run_ramp(&self) -> String {
-        use std::os::unix::process::CommandExt;
         let log = self.cfg.log.as_ref().and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
         let mut cmd = std::process::Command::new(&self.cfg.ramp);
         cmd.args(["router", "sync", "--scheduled", "--env-file"]).arg(&self.cfg.env_file);
@@ -293,17 +292,7 @@ impl Scheduler {
                 cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
             }
         }
-        // Its own session, so restarting the agent never stops a refresh mid-write; and low
-        // priority, since the agent itself may be serving requests at normal priority.
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                libc::setpriority(libc::PRIO_PROCESS, 0, 10);
-                low_io_priority();
-                Ok(())
-            });
-        }
-        match cmd.status() {
+        match spawn_detached(&mut cmd).and_then(|mut child| child.wait()) {
             Ok(s) => s.to_string(),
             Err(e) => format!("could not start {}: {e}", self.cfg.ramp.display()),
         }
@@ -317,6 +306,55 @@ impl Scheduler {
             }
         }
     }
+}
+
+/// Its own session, so restarting the agent never stops a refresh mid-write; and low
+/// priority, since the agent itself may be serving requests at normal priority.
+#[cfg(unix)]
+fn spawn_detached(cmd: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+            low_io_priority();
+            Ok(())
+        });
+    }
+    cmd.spawn()
+}
+
+/// No console window (the agent has none to share, so a console program would get a visible one;
+/// everything `ramp` starts inherits its hidden console), its own process group, and below-normal
+/// priority, which its children inherit (Windows cannot lower another process's I/O priority).
+/// Out of Task Scheduler's job when the job allows it, so ending or restarting the task never
+/// stops a refresh mid-write; a job that forbids breaking away refuses the flag, and then the
+/// refresh runs inside it.
+#[cfg(windows)]
+fn spawn_detached(cmd: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    use crate::win::{BELOW_NORMAL_PRIORITY_CLASS, CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+    use std::os::windows::process::CommandExt;
+    let base = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | BELOW_NORMAL_PRIORITY_CLASS;
+    cmd.creation_flags(base | CREATE_BREAKAWAY_FROM_JOB);
+    match cmd.spawn() {
+        Err(e) if e.raw_os_error() == Some(5) => {
+            cmd.creation_flags(base);
+            cmd.spawn()
+        }
+        other => other,
+    }
+}
+
+/// Whether a process ramp recorded has exited: kill(pid, 0) failing with ESRCH (signal 0 only
+/// checks that it exists).
+#[cfg(unix)]
+fn process_gone(pid: i32) -> bool {
+    (unsafe { libc::kill(pid, 0) }) != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(windows)]
+fn process_gone(pid: i32) -> bool {
+    crate::win::process_gone(pid as u32)
 }
 
 #[cfg(target_os = "macos")]
@@ -334,7 +372,7 @@ fn low_io_priority() {
     unsafe { libc::syscall(libc::SYS_ioprio_set, 1, 0, 3 << 13) };
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 fn low_io_priority() {}
 
 #[derive(Debug)]

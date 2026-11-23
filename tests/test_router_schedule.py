@@ -31,6 +31,7 @@ _REAL_UNINSTALL = schedule.uninstall
 _CONNECTION = router_module._SyncConnection("https://router.test/v1", "secret-key")
 
 
+@pytest.mark.posix_only(reason="launchd and systemd scheduled jobs")
 def test_fallback_jobs_absolutize_relative_paths(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     executable = Path("install/ramp")
@@ -46,6 +47,7 @@ def test_fallback_jobs_absolutize_relative_paths(monkeypatch, tmp_path):
     assert f"StandardOutput=append:{tmp_path / log}" in service
 
 
+@pytest.mark.posix_only(reason="launchd and systemd scheduled jobs")
 def test_fallback_systemd_escapes_specifiers_dollars_and_quotes(tmp_path):
     root = tmp_path / 'config %Q ${LITERAL} "quoted" \\ folder'
     executable, log, env_file = root / "ramp", root / "sync.log", root / "env.json"
@@ -231,6 +233,7 @@ def test_missing_endpoint_falls_back_to_the_session_cooldown(monkeypatch, refres
     assert refreshes == [True, True]
 
 
+@pytest.mark.posix_only(reason="launchd and systemd scheduled jobs")
 def test_job_definitions_render_and_unchanged_content_never_reloads(
     monkeypatch, tmp_path
 ):
@@ -407,6 +410,7 @@ def test_connections_read_under_client_lock_and_skip_unenrolled(monkeypatch, tmp
     ]
 
 
+@pytest.mark.posix_only(reason="launchd and systemd scheduled jobs")
 def test_opt_out_during_a_background_install_still_wins(monkeypatch, tmp_path):
     """A run that passed the opt-out check must not re-enable the job after it."""
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -815,6 +819,7 @@ def test_a_broken_setup_backs_off_without_holding_back_new_versions(
     assert (config_dir() / "router-sync-last").exists()
 
 
+@pytest.mark.posix_only(reason="launchd and systemd scheduled jobs")
 def test_opt_out_never_removes_the_job_under_a_running_refresh(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(schedule.sys, "platform", "darwin")
@@ -848,6 +853,7 @@ def test_a_detached_sync_does_not_leave_its_run_marked_scheduled(monkeypatch):
     assert schedule.SCHEDULED_ENV not in os.environ
 
 
+@pytest.mark.posix_only(reason="launchd and systemd scheduled jobs")
 def test_opt_out_removes_the_job_once_a_running_refresh_finishes(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(schedule.sys, "platform", "darwin")
@@ -874,6 +880,7 @@ def test_opt_out_removes_the_job_once_a_running_refresh_finishes(monkeypatch, tm
     assert events == ["refresh finished", "bootout"]
 
 
+@pytest.mark.posix_only(reason="launchd and systemd scheduled jobs")
 def test_a_deferred_opt_out_reaches_a_job_under_another_config_root(
     monkeypatch, tmp_path
 ):

@@ -38,6 +38,7 @@ from ramp_cli.config import settings
 from ramp_cli.errors import EXIT_AUTH_REQUIRED, ApiError, RampCLIError
 from ramp_cli.main import cli
 from ramp_cli.output.style import show_detail_card
+from tests.platform_support import assert_mode
 
 
 def credentials(**changes):
@@ -1625,8 +1626,12 @@ def test_old_keychain_metadata_requires_fresh_login():
 def test_file_storage_has_no_platform_specific_backend(monkeypatch, platform):
     client = RouterUserClient("http://localhost:3080")
     monkeypatch.setattr(sys, "platform", platform)
+    # Windows gets a private DACL on the file instead of mode 0600 (stubbed off Windows).
+    secured = []
+    monkeypatch.setattr(auth_client.router_winsec, "secure", secured.append)
     client._save(credentials())
     assert client._load()["refresh_token"] == "refresh-old"
+    assert len(secured) == (platform == "win32")
 
 
 def test_failed_atomic_write_preserves_existing_credentials(monkeypatch):
@@ -1800,7 +1805,7 @@ def test_ai_spend_passes_core_through_and_reuses_the_private_cache(monkeypatch):
     assert data["available"] is True and data["stale"] is False
     assert json.loads(second.output) == data
     assert len(calls) == 1
-    assert _ai_spend_cache().stat().st_mode & 0o777 == 0o600
+    assert_mode(_ai_spend_cache(), 0o600)
     assert _run_ai_spend(monkeypatch, replies, "--max-age", "60")[0].exit_code == 2
     assert _run_ai_spend(monkeypatch, replies, "--timeout", "0")[0].exit_code == 2
 

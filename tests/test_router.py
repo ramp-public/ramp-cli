@@ -30,10 +30,11 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
 import ramp_cli.commands.router as router_module
-from ramp_cli import __version__, claude_cowork, codex_desktop
+from ramp_cli import __version__, claude_cowork, codex_desktop, cost_script
 from ramp_cli.client.router_user import RouterUserClient
 from ramp_cli.codex_desktop import restart_running
 from ramp_cli.commands import claude_code, cursor, router_repo, router_settings
+from ramp_cli.commands import router_sync as sync_module
 from ramp_cli.commands.router import DEFAULT_ROUTER_BASE_URL as ROUTER_BASE_URL
 from ramp_cli.config.settings import config_dir
 from ramp_cli.errors import RampCLIError
@@ -44,6 +45,56 @@ from ramp_cli.router_connectors import skill as connector_skill
 from ramp_cli.router_connectors.skill import refresh as refresh_connector_catalog
 from ramp_cli.skills import managed_skill_names, record_receipt
 from ramp_cli.skills.remote import active_skills_dir
+from tests.platform_support import WINDOWS, assert_mode
+
+_DESKTOP_NEEDS_FCNTL = pytest.mark.posix_only(
+    reason="Claude Desktop setup needs macOS file locking (fcntl)"
+)
+
+_HOOKS_ARE_POSIX_ONLY = pytest.mark.posix_only(
+    reason="checks the POSIX hook and status line commands; Windows writes its own, tested separately"
+)
+
+# Every connector harness, with Claude Desktop's case skipped where its setup
+# can't run, and the harnesses this host can actually set up together.
+_CONNECTOR_HARNESS_PARAMS = [
+    pytest.param(h, marks=_DESKTOP_NEEDS_FCNTL) if h == "desktop" else h
+    for h in connector_harnesses.HARNESSES
+]
+_HOST_CONNECTOR_HARNESSES = tuple(
+    h for h in connector_harnesses.HARNESSES if not WINDOWS or h != "desktop"
+)
+_DESKTOP_AVAILABLE_PARAMS = [False, pytest.param(True, marks=_DESKTOP_NEEDS_FCNTL)]
+
+# conftest's stand-in for the resolved ramp entrypoint, as a native path.
+_RAMP_EXECUTABLE = str(Path("/opt/ramp-cli/bin/ramp"))
+
+_WIDGET_SKIP_PREFIXES = (
+    "Skipping the Claude Code Router status line: ",
+    "Skipping the Codex Router cost hook: ",
+)
+
+
+def _without_windows_widget_skips(lines: list[str]) -> list[str]:
+    """Drop the usage-widget skip notices, on Windows only.
+
+    The status line and cost hook are POSIX scripts, so Windows setup skips
+    both and says so; everywhere else the lines are compared as written.
+    """
+    if not WINDOWS:
+        return lines
+    return [line for line in lines if not line.startswith(_WIDGET_SKIP_PREFIXES)]
+
+
+def _codex_key_auth(key_path: Path) -> dict:
+    """The auth command Codex runs to read the Router key on this platform."""
+    if WINDOWS:
+        return {"command": "cmd", "args": ["/c", "type", str(key_path)]}
+    return {"command": "/bin/cat", "args": [str(key_path)]}
+
+
+# The real host check, kept before the autouse fixture below replaces it.
+_REAL_COWORK_PREFLIGHT = claude_cowork.preflight
 
 
 @pytest.fixture(autouse=True)
@@ -229,8 +280,16 @@ def _router_model(identifier, *, request_name=None, display_name=None):
     )
 
 
+def _fake_ramp_executable(tmp_path: Path) -> Path:
+    """An absolute ramp path on every OS; /usr/bin/ramp is relative on Windows."""
+    executable = tmp_path / "bin" / "ramp"
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.write_text("")
+    return executable
+
+
 @pytest.fixture
-def connector_setup(monkeypatch):
+def connector_setup(monkeypatch, tmp_path):
     _mock_models(monkeypatch)
     _mock_codex_catalog(monkeypatch)
     monkeypatch.setattr(claude_cowork, "_quit_claude", lambda: None)
@@ -240,7 +299,8 @@ def connector_setup(monkeypatch):
         assert connector_harnesses.status("desktop")["state"] == "enabled"
 
     monkeypatch.setattr(claude_cowork, "_launch_claude", launch)
-    monkeypatch.setattr(connector_harnesses, "_executable", lambda: "/usr/bin/ramp")
+    ramp_executable = str(_fake_ramp_executable(tmp_path))
+    monkeypatch.setattr(connector_harnesses, "_executable", lambda: ramp_executable)
     monkeypatch.setattr(connector_auth, "issue", lambda *a, **kw: "mcp-secret")
     monkeypatch.setattr(router_module, "_can_prompt", lambda *a: True)
     monkeypatch.setattr(router_module, "_pick_claude_models", lambda *a: "compact")
@@ -294,6 +354,63 @@ def connector_setup(monkeypatch):
     return calls
 
 
+def _desktop_host_is_windows(monkeypatch):
+    """Run Claude Desktop setup as Windows would: no fcntl, real host check."""
+    monkeypatch.setattr(claude_cowork, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(claude_cowork, "fcntl", None)
+    monkeypatch.setattr(claude_cowork, "preflight", _REAL_COWORK_PREFLIGHT)
+
+
+@pytest.mark.parametrize("connectors", [False, True])
+def test_naming_desktop_on_windows_fails_before_any_agent_is_configured(
+    monkeypatch, connector_setup, connectors
+):
+    _desktop_host_is_windows(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--human",
+            "router",
+            "configure",
+            "codex",
+            "desktop",
+            *(["--connectors"] if connectors else ["--api-key", "router-secret"]),
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "Automatic Claude Desktop setup currently supports macOS only." in (
+        result.output
+    )
+    assert ".." not in result.output
+    assert not router_module._client_config_path("codex").exists()
+    assert connector_harnesses.status("codex")["state"] == "disabled"
+    assert connector_setup == []
+
+
+def test_a_desktop_failure_after_the_preflight_reads_as_one_sentence(
+    monkeypatch, connector_setup
+):
+    # The autouse fixture skips the preflight, so Windows' answer comes from
+    # the Desktop lock once Codex is already written.
+    monkeypatch.setattr(claude_cowork, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(claude_cowork, "fcntl", None)
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "codex", "desktop", "--connectors"]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert (
+        "Could not configure Claude Desktop: Automatic Claude Desktop setup "
+        "currently supports macOS only. Run 'ramp router unconfigure"
+    ) in " ".join(result.output.split())
+
+
+@pytest.mark.posix_only(
+    reason="--enable-agent needs the launchd or systemd background agent"
+)
 @pytest.mark.parametrize("connectors", [False, True])
 def test_configure_agent_composes_with_optional_connectors(
     monkeypatch, connector_setup, connectors
@@ -344,7 +461,11 @@ def test_configure_agent_composes_with_optional_connectors(
 
 @pytest.mark.parametrize(
     "clients",
-    [(h,) for h in connector_harnesses.HARNESSES] + [connector_harnesses.HARNESSES],
+    [
+        pytest.param((h,), marks=_DESKTOP_NEEDS_FCNTL) if h == "desktop" else (h,)
+        for h in connector_harnesses.HARNESSES
+    ]
+    + [_HOST_CONNECTOR_HARNESSES],
 )
 @pytest.mark.parametrize("quiet", [False, True])
 def test_configure_connectors_shows_setup_progress_then_notice(
@@ -433,13 +554,15 @@ def test_configure_connectors_shows_setup_progress_then_notice(
         trust_notes = router_module._codex_hook_trust_note_lines(
             router_module._client_config_path("codex")
         )
-        assert trust_notes
+        # Windows installs no Codex hooks yet, so there is nothing to trust.
+        assert trust_notes or WINDOWS
         expected_notes.extend(trust_notes)
     text = " ".join(" ".join(notice).split())
     for note in expected_notes:
         assert " ".join(note.split()) in text
 
 
+@_DESKTOP_NEEDS_FCNTL
 @pytest.mark.parametrize(
     "servers", [{"ramp-connectors": {"command": "third-party", "args": []}}, []]
 )
@@ -479,7 +602,7 @@ def test_configure_desktop_connectors_preserves_conflicts_flushed_on_quit(
 
 
 @pytest.mark.parametrize("prior_login", ["none", "ordinary", "connectors"])
-@pytest.mark.parametrize("desktop_available", [False, True])
+@pytest.mark.parametrize("desktop_available", _DESKTOP_AVAILABLE_PARAMS)
 def test_configure_connectors_creates_key_without_reuse_prompt(
     monkeypatch, connector_setup, prior_login, desktop_available
 ):
@@ -531,6 +654,7 @@ def test_configure_connectors_creates_key_without_reuse_prompt(
     assert "router-secret" not in result.output
 
 
+@_DESKTOP_NEEDS_FCNTL
 @pytest.mark.parametrize("installed", [(), ("codex",)])
 def test_bare_connectors_can_configure_only_automatic_desktop(
     monkeypatch, connector_setup, installed
@@ -556,7 +680,7 @@ def test_bare_connectors_can_configure_only_automatic_desktop(
 
 
 @pytest.mark.parametrize("reuse", [True, False])
-@pytest.mark.parametrize("harness", connector_harnesses.HARNESSES)
+@pytest.mark.parametrize("harness", _CONNECTOR_HARNESS_PARAMS)
 def test_configure_connectors_offers_saved_key_before_creating_another(
     monkeypatch, connector_setup, reuse, harness
 ):
@@ -601,7 +725,7 @@ def test_configure_connectors_offers_saved_key_before_creating_another(
     assert "replacement-secret" not in result.output
 
 
-@pytest.mark.parametrize("desktop_available", [False, True])
+@pytest.mark.parametrize("desktop_available", _DESKTOP_AVAILABLE_PARAMS)
 def test_configure_connectors_machine_output_reauthenticates_and_reuses_key(
     monkeypatch, connector_setup, desktop_available
 ):
@@ -654,12 +778,12 @@ def test_configure_connectors_machine_output_reauthenticates_and_reuses_key(
     assert [path.read_bytes() for path in paths] == before
 
 
-@pytest.mark.parametrize("selected", connector_harnesses.HARNESSES)
+@pytest.mark.parametrize("selected", _CONNECTOR_HARNESS_PARAMS)
 def test_configure_connectors_preserves_previously_enabled_harnesses(
     connector_setup, selected
 ):
     runner = CliRunner()
-    previous = tuple(h for h in connector_harnesses.HARNESSES if h != selected)
+    previous = tuple(h for h in _HOST_CONNECTOR_HARNESSES if h != selected)
     first = runner.invoke(
         cli, ["--human", "router", "configure", *previous, "--connectors"]
     )
@@ -689,6 +813,7 @@ def test_configure_connectors_preserves_previously_enabled_harnesses(
         assert all(
             row["state"] == "enabled"
             for row in connector_auth.status(client)["harnesses"]
+            if row["harness"] in _HOST_CONNECTOR_HARNESSES
         )
         for harness in previous:
             assert connector_harnesses.status(harness)["binding_id"] == current
@@ -714,7 +839,7 @@ def test_configure_connectors_preserves_previously_enabled_harnesses(
     ],
 )
 def test_configure_connectors_does_not_retarget_unselected_harnesses(
-    connector_setup, difference
+    connector_setup, difference, tmp_path
 ):
     runner = CliRunner()
     first = runner.invoke(
@@ -728,7 +853,12 @@ def test_configure_connectors_does_not_retarget_unselected_harnesses(
         path.unlink()
     elif difference == "custom":
         config = connector_harnesses.config_path("codex")
-        config.write_text(config.read_text().replace("/usr/bin/ramp", "/custom/mcp"))
+        executable = str(_fake_ramp_executable(tmp_path))
+        text = config.read_text()
+        # TOML basic strings escape backslashes the way JSON does.
+        for written in (json.dumps(executable)[1:-1], executable):
+            text = text.replace(written, "/custom/mcp")
+        config.write_text(text)
     elif difference == "disabled":
         connector_harnesses.disable("codex")
     else:
@@ -1210,7 +1340,7 @@ def test_configure_codex_consumes_the_setup_file_and_pins_the_live_catalog(
     assert [
         model["slug"] for model in json.loads(catalog_path.read_text())["models"]
     ] == ["router-model-a", "router-model-b"]
-    payload = json.loads(result.output)["data"][0]
+    payload = json.loads(result.stdout)["data"][0]
     assert payload["setup_file_deleted"] is True
 
 
@@ -1695,6 +1825,7 @@ def test_configure_cowork_classifies_bad_input_before_the_host_check(
     assert "not installed" not in plaintext.output
 
 
+@_DESKTOP_NEEDS_FCNTL
 def test_configure_sets_up_cowork_alongside_a_coding_agent(tmp_path, monkeypatch):
     codex_home = tmp_path / "codex"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
@@ -2291,7 +2422,7 @@ def test_refresh_reapplies_only_clients_with_router_receipts(tmp_path, monkeypat
             "apiKey": "keep-me",
             "rampCliVersion": __version__,
             "modelView": "all",
-            "rampExecutable": "/opt/ramp-cli/bin/ramp",
+            "rampExecutable": _RAMP_EXECUTABLE,
         },
     ]
     # A refresh rewrites the TUI registration too, so a rotated key never
@@ -2396,6 +2527,9 @@ def test_refresh_reapplies_codex_config_and_preserves_selected_model(
     ] == ["a", "Claude Fable 5.1"]
 
 
+@pytest.mark.posix_only(
+    reason="Codex's live catalog reload goes over a Unix domain socket"
+)
 def test_unexpected_codex_reload_error_does_not_stop_opencode_refresh(
     tmp_path, monkeypatch
 ):
@@ -2687,6 +2821,7 @@ def test_hook_reset_reads_the_receipt_under_the_config_lock(tmp_path, monkeypatc
     assert tomllib.loads(config_path.read_text())["model"] == "a"
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_configure_and_refresh_say_when_codex_has_not_trusted_the_hooks(
     tmp_path, monkeypatch
 ):
@@ -2991,6 +3126,7 @@ def _offline(monkeypatch):
     monkeypatch.setattr(router_module, "update_notice", lambda: None)
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_configure_claude_code_starts_new_sessions_on_the_admin_default_model(
     tmp_path, monkeypatch
 ):
@@ -3401,6 +3537,7 @@ def test_background_refresh_records_a_claude_code_default_under_the_key_in_use(
     )
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_unconfigure_claude_code_restores_the_pre_router_model_and_removes_hooks(
     tmp_path, monkeypatch
 ):
@@ -3587,7 +3724,7 @@ def test_refresh_pushes_switchyard_once_into_every_supported_harness(
     # One key, one read of Router's settings, however many harnesses use it.
     assert len(get.settings_requests) == 1
     assert list(_pushes()) == [_push_token()]
-    assert router_module._switchyard_push_path().stat().st_mode & 0o777 == 0o600
+    assert_mode(router_module._switchyard_push_path(), 0o600)
 
     # Nothing more to push or announce.
     refreshed = _refresh()
@@ -4499,6 +4636,7 @@ def test_refresh_writes_back_a_model_saved_during_its_settings_request(
     assert _opencode_model(tmp_path) == "ramp-router/gpt-5.5"
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_codex_keeps_its_dashboard_origin_without_the_cost_hook(tmp_path, monkeypatch):
     # The hook is optional (Windows, failed download), so the origin it
     # carries is also recorded in the receipt and read back from there.
@@ -4588,6 +4726,7 @@ def _stale_cowork_selection(tmp_path, monkeypatch):
     return settings_path
 
 
+@_DESKTOP_NEEDS_FCNTL
 def test_refresh_migrates_stale_cowork_model_selections(tmp_path, monkeypatch):
     settings_path = _stale_cowork_selection(tmp_path, monkeypatch)
     monkeypatch.setattr(claude_cowork, "_claude_is_running", lambda: False)
@@ -4624,6 +4763,7 @@ def test_refresh_migrates_stale_cowork_model_selections(tmp_path, monkeypatch):
     assert selector["cowork"]["model"] == "claude-fable-router-5-6-sol-419255[1m]"
 
 
+@_DESKTOP_NEEDS_FCNTL
 def test_refresh_migrates_a_closed_cli_owned_cowork_profile(tmp_path, monkeypatch):
     monkeypatch.setattr(claude_cowork.sys, "platform", "darwin")
     monkeypatch.setenv("RAMP_CLAUDE_DESKTOP_APP_SUPPORT", str(tmp_path))
@@ -4693,6 +4833,7 @@ def test_cowork_refresh_keeps_key_and_endpoint_paired_across_reconfigure(
     assert captured == [expected_connection]
 
 
+@_DESKTOP_NEEDS_FCNTL
 def test_refresh_leaves_cowork_selections_alone_while_claude_runs(
     tmp_path, monkeypatch
 ):
@@ -4719,6 +4860,7 @@ def test_refresh_leaves_cowork_selections_alone_while_claude_runs(
     assert settings_path.read_text() == before
 
 
+@_DESKTOP_NEEDS_FCNTL
 def test_refresh_reports_an_unusable_cowork_setup_without_failing(
     tmp_path, monkeypatch
 ):
@@ -4745,6 +4887,7 @@ def test_refresh_reports_an_unusable_cowork_setup_without_failing(
     assert settings_path.read_text() == before
 
 
+@_DESKTOP_NEEDS_FCNTL
 def test_refresh_syncs_cowork_models_when_its_route_cannot_change(
     tmp_path, monkeypatch
 ):
@@ -6211,11 +6354,7 @@ def test_configure_codex_writes_router_provider(tmp_path, monkeypatch, restarted
         "supports_websockets": False,
         # Command auth, not experimental_bearer_token: Codex only refreshes its
         # model list for providers using a command or a ChatGPT account.
-        "auth": {
-            "command": "/bin/cat",
-            "args": [str(key_path)],
-            "timeout_ms": 5000,
-        },
+        "auth": {**_codex_key_auth(key_path), "timeout_ms": 5000},
         # Router answers with Codex's own catalog shape only for a client that
         # declares itself. That shape carries no harness prompt, so it must
         # arrive with the model_instructions_file written below and never on
@@ -6249,23 +6388,33 @@ def test_configure_codex_writes_router_provider(tmp_path, monkeypatch, restarted
         assert "Reopened: Codex." in result.output
     assert "Create or copy an API key" not in result.output
     assert "router-secret" not in result.output
-    assert config_path.stat().st_mode & 0o777 == 0o600
-    assert key_path.stat().st_mode & 0o777 == 0o600
-    assert catalog_path.stat().st_mode & 0o777 == 0o600
+    assert_mode(config_path, 0o600)
+    assert_mode(key_path, 0o600)
+    assert_mode(catalog_path, 0o600)
+
+
+_CODEX_APP_RESTART_NEEDS_MACOS = pytest.mark.posix_only(
+    reason="the Codex app restart drives osascript, and pgrep -u with this user's uid, on macOS"
+)
 
 
 @pytest.mark.parametrize(
     ("platform", "app", "state"),
     [
-        ("darwin", "Codex", "running"),
-        ("darwin", "ChatGPT", "running"),
-        ("darwin", "Codex", "stopped"),
-        ("darwin", "Codex", "quit-failed"),
-        ("darwin", "Codex", "quit-pending"),
-        ("darwin", "Codex", "open-failed"),
-        ("darwin", "Codex", "probe-failed"),
-        ("darwin", "Codex", "quit-timeout"),
-        ("darwin", "Codex", "missing-helper"),
+        *(
+            pytest.param("darwin", app, state, marks=_CODEX_APP_RESTART_NEEDS_MACOS)
+            for app, state in [
+                ("Codex", "running"),
+                ("ChatGPT", "running"),
+                ("Codex", "stopped"),
+                ("Codex", "quit-failed"),
+                ("Codex", "quit-pending"),
+                ("Codex", "open-failed"),
+                ("Codex", "probe-failed"),
+                ("Codex", "quit-timeout"),
+                ("Codex", "missing-helper"),
+            ]
+        ),
         ("linux", "Codex", "running"),
         ("win32", "Codex", "running"),
     ],
@@ -6346,7 +6495,8 @@ def test_configure_reopens_codex_after_saving(
         assert "Ramp Router was configured, but" in result.output
         assert "manually" in result.output
     else:
-        assert json.loads(result.output)["data"][0]["restarted_apps"] == (
+        # stdout alone: Windows setup adds skip notices on stderr.
+        assert json.loads(result.stdout)["data"][0]["restarted_apps"] == (
             [app] if platform == "darwin" and state == "running" else []
         )
 
@@ -6992,6 +7142,7 @@ def _stop_sync_hook_groups(codex_home):
     ]
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_configure_codex_installs_the_cost_hook(tmp_path, monkeypatch):
     codex_home = tmp_path / "codex"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
@@ -7018,6 +7169,7 @@ def test_configure_codex_installs_the_cost_hook(tmp_path, monkeypatch):
     assert state["cost_hook_managed"] is True
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_a_repeat_configure_keeps_one_cost_hook_beside_the_users_hooks(
     tmp_path, monkeypatch
 ):
@@ -7042,6 +7194,7 @@ def test_a_repeat_configure_keeps_one_cost_hook_beside_the_users_hooks(
     assert sum("codex-cost-hook" in command for command in commands) == 1
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_refresh_replaces_a_stale_installed_cost_hook(tmp_path, monkeypatch):
     codex_home = tmp_path / "codex"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
@@ -7060,6 +7213,7 @@ def test_refresh_replaces_a_stale_installed_cost_hook(tmp_path, monkeypatch):
     assert (codex_home / "codex-cost-hook").read_text() == _COST_HOOK_SCRIPT
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_a_failed_hook_download_on_refresh_keeps_the_installed_hook(
     tmp_path, monkeypatch
 ):
@@ -7085,6 +7239,7 @@ def test_a_failed_hook_download_on_refresh_keeps_the_installed_hook(
     assert len(_cost_hook_groups(codex_home)) == 1
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_a_failed_hook_download_on_configure_defers_to_the_next_refresh(
     tmp_path, monkeypatch
 ):
@@ -7113,6 +7268,7 @@ def test_a_failed_hook_download_on_configure_defers_to_the_next_refresh(
     assert state["cost_hook_managed"] is True
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_a_missing_python3_skips_the_cost_hook(tmp_path, monkeypatch):
     codex_home = tmp_path / "codex"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
@@ -7129,6 +7285,7 @@ def test_a_missing_python3_skips_the_cost_hook(tmp_path, monkeypatch):
     assert _cost_hook_groups(codex_home) == []
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_a_manual_cost_hook_registration_is_not_duplicated(tmp_path, monkeypatch):
     # The exploded spelling already answers Stop; a second group would too.
     codex_home = tmp_path / "codex"
@@ -7166,6 +7323,7 @@ _SHARED_STOP_GROUP = (
 )
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_a_shared_stop_group_is_preserved_verbatim(tmp_path, monkeypatch):
     # A group carrying the user's own hooks beside the cost hook is theirs.
     codex_home = tmp_path / "codex"
@@ -7189,6 +7347,7 @@ def test_a_shared_stop_group_is_preserved_verbatim(tmp_path, monkeypatch):
     assert (codex_home / "codex-cost-hook").read_text() == _COST_HOOK_SCRIPT
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_unconfigure_leaves_a_shared_stop_group_and_its_script(tmp_path, monkeypatch):
     codex_home = tmp_path / "codex"
     codex_home.mkdir()
@@ -7209,6 +7368,7 @@ def test_unconfigure_leaves_a_shared_stop_group_and_its_script(tmp_path, monkeyp
     assert (codex_home / "codex-cost-hook").exists()
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_a_solo_handwritten_cost_hook_group_is_replaced_in_place(tmp_path, monkeypatch):
     # A solo cost-hook group is upgraded in place rather than duplicated.
     codex_home = tmp_path / "codex"
@@ -7243,6 +7403,7 @@ def test_a_solo_handwritten_cost_hook_group_is_replaced_in_place(tmp_path, monke
     assert not (codex_home / "codex-cost-hook").exists()
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_a_wrapper_hook_that_resembles_the_script_is_not_claimed(tmp_path, monkeypatch):
     # The user's own script merely contains the managed name.
     codex_home = tmp_path / "codex"
@@ -7279,6 +7440,7 @@ def test_a_wrapper_hook_that_resembles_the_script_is_not_claimed(tmp_path, monke
     assert (codex_home / "codex-cost-hook").exists()
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_a_hook_passing_the_script_to_another_program_is_not_claimed(
     tmp_path, monkeypatch
 ):
@@ -7335,6 +7497,7 @@ def test_command_runs_cost_hook_identifies_the_executable(tmp_path):
     assert not runs("'unbalanced")
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_an_env_wrapped_solo_registration_is_owned(tmp_path, monkeypatch):
     # env plus assignments still executes the script, so the solo group is
     # replaced in place rather than duplicated.
@@ -7367,6 +7530,7 @@ def test_an_env_wrapped_solo_registration_is_owned(tmp_path, monkeypatch):
     assert _cost_hook_groups(codex_home) == []
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_an_env_option_hook_is_preserved_as_the_users(tmp_path, monkeypatch):
     # env options are not parsed, so the group is conservatively unrecognized.
     codex_home = tmp_path / "codex"
@@ -7518,6 +7682,7 @@ def test_unconfigure_keeps_the_version_nudge_state_while_cowork_remains(
     assert (state_dir / "server-recommended-version").read_text() == "9.9.9"
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_unconfigure_keeps_a_cost_hook_a_manual_registration_still_runs(
     tmp_path, monkeypatch
 ):
@@ -7549,6 +7714,7 @@ def test_unconfigure_keeps_a_cost_hook_a_manual_registration_still_runs(
     )
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_the_cost_hook_uses_the_overridden_router_origin(tmp_path, monkeypatch):
     codex_home = tmp_path / "codex"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
@@ -7565,6 +7731,7 @@ def test_the_cost_hook_uses_the_overridden_router_origin(tmp_path, monkeypatch):
     assert "ROUTER_BASE_URL=https://router.example" in group["hooks"][0]["command"]
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_configure_targets_the_deployment_named_by_flags(tmp_path, monkeypatch):
     codex_home = tmp_path / "codex"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
@@ -7674,6 +7841,7 @@ def _refresh_agents():
     return result
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_configure_codex_registers_the_session_sync_hook(tmp_path, monkeypatch):
     codex_home = tmp_path / "codex"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
@@ -7734,6 +7902,7 @@ def test_refresh_repairs_a_stale_codex_sync_hook_path(tmp_path, monkeypatch):
     assert stop_group["hooks"][0]["command"] == moved_stop
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_a_manual_sync_hook_registration_is_not_duplicated(tmp_path, monkeypatch):
     # The exploded spelling already answers SessionStart; a second group
     # would run the sync twice per session start.
@@ -7794,6 +7963,7 @@ def test_unconfigure_spares_a_sync_group_the_user_added_after_configure(
     assert group["hooks"][0]["command"] == "/theirs/ramp router sync --hook"
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_codex_hook_ownership_consumes_only_one_identical_group(tmp_path, monkeypatch):
     codex_home = tmp_path / "codex"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
@@ -7822,6 +7992,7 @@ def test_codex_hook_ownership_consumes_only_one_identical_group(tmp_path, monkey
     assert len(_sync_hook_groups(codex_home)) == 1
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_an_edited_managed_sync_group_becomes_the_users(tmp_path, monkeypatch):
     codex_home = tmp_path / "codex"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
@@ -7882,6 +8053,7 @@ def test_unconfigure_removes_the_codex_sync_hook(tmp_path, monkeypatch):
     assert _stop_sync_hook_groups(codex_home) == []
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_configure_claude_registers_the_session_start_sync_hook(tmp_path, monkeypatch):
     claude_home = tmp_path / "claude"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
@@ -8859,13 +9031,16 @@ def test_configure_codex_accepts_api_key_flag_noninteractively(tmp_path, monkeyp
     )
 
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["data"][0]["client"] == "codex"
     # The key reaches Codex through the auth command's file, never inline.
     assert (codex_home / "ramp-router-key").read_text() == "router-secret"
-    assert tomllib.loads((codex_home / "config.toml").read_text())["model_providers"][
-        "ramp-router"
-    ]["auth"]["args"] == [str(codex_home / "ramp-router-key")]
+    assert (
+        tomllib.loads((codex_home / "config.toml").read_text())["model_providers"][
+            "ramp-router"
+        ]["auth"]["args"]
+        == _codex_key_auth(codex_home / "ramp-router-key")["args"]
+    )
     assert "router-secret" not in result.output
 
 
@@ -9046,7 +9221,7 @@ def test_configure_opencode_installs_plugin_and_preserves_config(tmp_path, monke
             # version recorded here rather than one it could observe.
             "rampCliVersion": __version__,
             "modelView": "all",
-            "rampExecutable": "/opt/ramp-cli/bin/ramp",
+            "rampExecutable": _RAMP_EXECUTABLE,
         },
     ]
     assert config["plugin"] == [expected_entry]
@@ -9057,7 +9232,7 @@ def test_configure_opencode_installs_plugin_and_preserves_config(tmp_path, monke
     tui_config = json.loads(tui_path.read_text())
     assert tui_config["$schema"] == "https://opencode.ai/tui.json"
     assert tui_config["plugin"] == [expected_entry]
-    assert tui_path.stat().st_mode & 0o777 == 0o600
+    assert_mode(tui_path, 0o600)
     assert "Connecting Ramp Router to your coding agent" in result.output
     assert "Connected to: OpenCode" in result.output
     assert (
@@ -9065,7 +9240,7 @@ def test_configure_opencode_installs_plugin_and_preserves_config(tmp_path, monke
         in result.output
     )
     assert "router-secret" not in result.output
-    assert config_path.stat().st_mode & 0o777 == 0o600
+    assert_mode(config_path, 0o600)
 
 
 def test_configure_opencode_derives_usage_origin_from_base_url_override(
@@ -9292,12 +9467,18 @@ def test_unconfigure_opencode_keeps_newer_provider_override(tmp_path, monkeypatc
     }
 
 
-def _fake_opencode(tmp_path, version: str) -> None:
-    """Stand in for the installed OpenCode binary's --version output."""
-    script = tmp_path / "bin" / "opencode"
+def _fake_opencode(tmp_path, version: str) -> Path:
+    """Stand in for the installed OpenCode binary's --version output.
+
+    A batch file on Windows, which is also how npm installs opencode there.
+    """
+    script = tmp_path / "bin" / ("opencode.cmd" if WINDOWS else "opencode")
     script.parent.mkdir(exist_ok=True)
-    script.write_text(f"#!/bin/sh\necho '{version}'\n")
-    script.chmod(0o755)
+    if WINDOWS:
+        script.write_text(f"@echo {version}\r\n")
+    else:
+        script.write_text(f"#!/bin/sh\necho '{version}'\n")
+        script.chmod(0o755)
     return script
 
 
@@ -9385,7 +9566,7 @@ def test_configure_opencode_v2_writes_plugins_objects_and_cli_json(
             "apiKey": "router-secret",
             "rampCliVersion": __version__,
             "modelView": "all",
-            "rampExecutable": "/opt/ramp-cli/bin/ramp",
+            "rampExecutable": _RAMP_EXECUTABLE,
             # v2's starting model rides with the plugin, which gives it to
             # the agents and the registry, so the config's own ``model``
             # cannot outrank an organization default the plugin applies.
@@ -9406,7 +9587,7 @@ def test_configure_opencode_v2_writes_plugins_objects_and_cli_json(
     cli_config = json.loads(cli_path.read_text())
     assert cli_config["$schema"] == "https://opencode.ai/v2/cli.json"
     assert cli_config["plugins"] == [expected_entry]
-    assert cli_path.stat().st_mode & 0o777 == 0o600
+    assert_mode(cli_path, 0o600)
     assert not router_module._opencode_tui_config_path().exists()
     state = json.loads((tmp_path / "opencode" / "ramp-router-state.json").read_text())
     assert state["opencode_generation"] == 2
@@ -10175,9 +10356,9 @@ def test_configure_codex_retags_archived_sessions_and_unconfigure_restores_them(
             "SELECT id, model_provider FROM threads ORDER BY id"
         ).fetchall() == [("filed", "ramp-router"), ("live", "ramp-router")]
     state = json.loads((codex_home / "ramp-router-state.json").read_text())
-    assert {session["id"]: session["path"] for session in state["sessions"]} == {
-        "live": "sessions/live.jsonl",
-        "filed": "archived_sessions/filed.jsonl",
+    assert {session["id"]: Path(session["path"]) for session in state["sessions"]} == {
+        "live": Path("sessions/live.jsonl"),
+        "filed": Path("archived_sessions/filed.jsonl"),
     }
 
     removed = runner.invoke(cli, ["--human", "router", "unconfigure", "codex"])
@@ -11306,7 +11487,8 @@ def test_unconfigure_keeps_an_unowned_file_at_the_managed_instructions_name(
     instructions = codex_home / router_module.CODEX_ORIGINAL_INSTRUCTIONS
     instructions.write_text("MY OWN INSTRUCTIONS")
     (codex_home / "config.toml").write_text(
-        f'model = "gpt-5.4"\nmodel_instructions_file = "{instructions}"\n'
+        # A literal string, so a Windows path's backslashes are not escapes.
+        f"model = \"gpt-5.4\"\nmodel_instructions_file = '{instructions}'\n"
     )
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     _mock_models(monkeypatch)
@@ -11969,6 +12151,7 @@ def test_configure_without_a_terminal_targets_every_integration(
     # passing --no-input. Drawing a full-screen picker there aborts the command
     # instead of configuring anything.
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows home
     monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
@@ -12225,6 +12408,7 @@ def test_client_picker_does_not_inverse_video_every_checked_row():
 
 def test_configure_picker_targets_only_selected_clients(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows home
     monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
@@ -12469,6 +12653,7 @@ def test_unconfigure_shows_a_spinner_while_restoring(tmp_path, monkeypatch):
 
 def test_configure_and_unconfigure_accept_multiple_clients(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows home
     monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
@@ -12499,15 +12684,19 @@ def test_configure_and_unconfigure_accept_multiple_clients(tmp_path, monkeypatch
     original_settings = tmp_path / ".claude" / "original.settings.json"
     escape = "claude --settings ~/.claude/original.settings.json --model default"
     assert configure.exit_code == 0, configure.output
-    assert configure.output.splitlines()[:6] == [
-        "Connecting Ramp Router to your coding agents",
-        "Skipping the Claude Code Router status line: it could not be "
-        "downloaded from https://app.router.com/claude-code-statusline.",
-        "Connected to: Claude Code and Codex",
-        "Claude Code: 1 model added.",
-        "Codex: 1 model added.",
-        "Restart any running agents, then pick a model.",
-    ]
+    expected = _without_windows_widget_skips(
+        [
+            "Connecting Ramp Router to your coding agents",
+            "Skipping the Claude Code Router status line: it could not be "
+            "downloaded from https://app.router.com/claude-code-statusline.",
+            "Connected to: Claude Code and Codex",
+            "Claude Code: 1 model added.",
+            "Codex: 1 model added.",
+            "Restart any running agents, then pick a model.",
+        ]
+    )
+    lines = _without_windows_widget_skips(configure.output.splitlines())
+    assert lines[: len(expected)] == expected
     notice = _notice_lines(configure.output)
     assert notice[0].startswith("Claude Code & Codex only support one model provider")
     assert any("claude.ai connectors" in line for line in notice)
@@ -12580,6 +12769,7 @@ def test_configure_and_unconfigure_without_client_targets_everything(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows home
     monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
     monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
@@ -12606,19 +12796,23 @@ def test_configure_and_unconfigure_without_client_targets_everything(
     )
 
     assert configure.exit_code == 0
-    assert configure.output.splitlines()[:8] == [
-        "Connecting Ramp Router to your coding agents",
-        # _mock_models serves no status line asset, so configure says why the
-        # extra was skipped without failing anything.
-        "Skipping the Claude Code Router status line: it could not be "
-        "downloaded from https://app.router.com/claude-code-statusline.",
-        "Connected to: Claude Code, Codex, OpenCode, and Pi",
-        "Claude Code: 1 model added.",
-        "Codex: 1 model added.",
-        "OpenCode: 1 model added.",
-        "Pi: 1 model added.",
-        "Restart any running agents, then pick a model.",
-    ]
+    expected = _without_windows_widget_skips(
+        [
+            "Connecting Ramp Router to your coding agents",
+            # _mock_models serves no status line asset, so configure says why
+            # the extra was skipped without failing anything.
+            "Skipping the Claude Code Router status line: it could not be "
+            "downloaded from https://app.router.com/claude-code-statusline.",
+            "Connected to: Claude Code, Codex, OpenCode, and Pi",
+            "Claude Code: 1 model added.",
+            "Codex: 1 model added.",
+            "OpenCode: 1 model added.",
+            "Pi: 1 model added.",
+            "Restart any running agents, then pick a model.",
+        ]
+    )
+    lines = _without_windows_widget_skips(configure.output.splitlines())
+    assert lines[: len(expected)] == expected
     notice = _notice_lines(configure.output)
     assert "claude --settings ~/claude/original.settings.json --model default" in notice
     assert "codex --profile original" in notice
@@ -13489,7 +13683,7 @@ def test_a_setup_written_before_the_client_marker_is_marked_as_replaced(
     )
 
     assert result.exit_code == 0, result.output
-    assert json.loads(result.output)["data"][0]["replaced_outdated_setup"] is True
+    assert json.loads(result.stdout)["data"][0]["replaced_outdated_setup"] is True
     config = tomllib.loads((codex_home / "config.toml").read_text())
     headers = config["model_providers"]["ramp-router"]["http_headers"]
     assert headers["X-Gateway-Client"] == "codex"
@@ -13512,7 +13706,7 @@ def test_a_current_setup_is_not_marked_as_replaced(tmp_path, monkeypatch):
     )
 
     assert again.exit_code == 0, again.output
-    assert json.loads(again.output)["data"][0]["replaced_outdated_setup"] is False
+    assert json.loads(again.stdout)["data"][0]["replaced_outdated_setup"] is False
 
 
 @pytest.mark.parametrize(
@@ -13545,7 +13739,7 @@ def test_a_setup_written_by_an_earlier_cli_reports_the_installed_version(
     )
 
     assert result.exit_code == 0, result.output
-    assert json.loads(result.output)["data"][0]["replaced_outdated_setup"] is True
+    assert json.loads(result.stdout)["data"][0]["replaced_outdated_setup"] is True
     config = tomllib.loads((codex_home / "config.toml").read_text())
     headers = config["model_providers"]["ramp-router"]["http_headers"]
     assert headers["X-Gateway-Ramp-Cli-Version"] == __version__
@@ -15425,6 +15619,7 @@ def _stop_commands(codex_home):
     ]
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_harness_widget_round_trips_the_codex_cost_hook(tmp_path, monkeypatch):
     codex_home = _configure_codex_for_widget(tmp_path, monkeypatch)
     original = _cost_hook_commands(codex_home)
@@ -15473,6 +15668,7 @@ def test_unconfigure_after_disable_removes_the_codex_script(tmp_path, monkeypatc
     assert not (codex_home / "codex-cost-hook").exists()
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_harness_widget_reports_agent_json(tmp_path, monkeypatch):
     codex_home = _configure_codex_for_widget(tmp_path, monkeypatch)
     assert _cost_hook_commands(codex_home)
@@ -15537,6 +15733,97 @@ def test_background_refresh_moves_the_codex_model_while_removing_the_cost_hook(
 
     assert _cost_hook_commands(codex_home) == []
     assert tomllib.loads(config_path.read_text())["model"] == "gpt-5.4"
+
+
+_WINDOWS_RAMP = "C:/Users/me/AppData/Local/Ramp/ramp-windows-amd64.exe"
+
+
+def _simulate_windows(monkeypatch):
+    """Take the Windows branches of the cost-script and sync-hook setup only."""
+
+    class _WindowsOs:
+        name = "nt"
+
+        def __getattr__(self, attribute):
+            return getattr(os, attribute)
+
+    monkeypatch.setattr(router_module, "os", _WindowsOs())
+    monkeypatch.setattr(claude_code, "os", _WindowsOs())
+    monkeypatch.setattr(sync_module, "os", _WindowsOs())
+    monkeypatch.setattr(cost_script, "windows_executable", lambda: _WINDOWS_RAMP)
+
+
+def test_windows_claims_the_status_line_another_ramp_wrote(tmp_path):
+    path = tmp_path / "settings.json"
+    script = (tmp_path / "ramp-router-statusline").as_posix()
+    elsewhere = {
+        "type": "command",
+        "command": f"C:/old/ramp.exe router run-cost-script {script}",
+    }
+
+    assert "statusLine" not in claude_code.without_router_statusline(
+        {"statusLine": elsewhere}, path
+    )
+    theirs = {**elsewhere, "command": "C:/old/ramp.exe router run-cost-script C:/x"}
+    assert claude_code.without_router_statusline({"statusLine": theirs}, path) == {
+        "statusLine": theirs
+    }
+
+
+def test_windows_runs_the_codex_cost_hook_through_ramp(tmp_path, monkeypatch):
+    _simulate_windows(monkeypatch)
+    codex_home = _configure_codex_for_widget(tmp_path, monkeypatch)
+
+    (command,) = _cost_hook_commands(codex_home)
+
+    def native(path: object) -> str:
+        return str(path).replace("/", "\\")
+
+    # Bare words, which cmd.exe and PowerShell both run as written.
+    assert command == (
+        f"{native(_WINDOWS_RAMP)} router run-cost-script "
+        f"--key-file {native(codex_home / 'ramp-router-key')} "
+        "--base-url https://app.router.com "
+        f"{native(codex_home / 'codex-cost-hook')}"
+    )
+    assert (
+        router_module._codex_cost_hook_origin(
+            tomllib.loads((codex_home / "config.toml").read_text())
+        )
+        == "https://app.router.com"
+    )
+
+    _harness_widget("disable")
+    assert _cost_hook_commands(codex_home) == []
+    _harness_widget("enable")
+    assert _cost_hook_commands(codex_home) == [command]
+
+    result = CliRunner().invoke(cli, ["--human", "router", "unconfigure", "codex"])
+
+    assert result.exit_code == 0, result.output
+    assert not (codex_home / "codex-cost-hook").exists()
+    assert [
+        group["hooks"][0]["command"] for group in _cost_hook_groups(codex_home)
+    ] == ["/home/me/notify.sh"]
+
+
+def test_windows_skips_a_cost_script_it_cannot_write_a_command_for(
+    tmp_path, monkeypatch
+):
+    _simulate_windows(monkeypatch)
+    monkeypatch.setattr(cost_script, "windows_executable", lambda: None)
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "cannot be written into a Windows command" in result.output
+    assert not (codex_home / "codex-cost-hook").exists()
+    assert _cost_hook_groups(codex_home) == []
 
 
 def test_a_disable_during_the_cost_hook_download_still_wins(tmp_path, monkeypatch):
@@ -15699,3 +15986,93 @@ def test_helper_endpoint_check_moves_only_the_endpoint(tmp_path, monkeypatch):
     )
     router_module._reconcile_helper_endpoints()
     assert codex_config.read_text() == before
+
+
+def _hook_commands(hooks: dict, event: str) -> list[str]:
+    return [
+        entry["command"]
+        for group in hooks.get(event, [])
+        for entry in group.get("hooks", [])
+    ]
+
+
+def _windows_sync_commands(client: str) -> tuple[str, str]:
+    return (
+        sync_module.session_sync_hook_command(client),
+        sync_module.session_sync_hook_command(client, sync_module.SYNC_HOOK_STOP_EVENT),
+    )
+
+
+def test_windows_codex_sync_hooks_are_written_once_and_removed(tmp_path, monkeypatch):
+    _simulate_windows(monkeypatch)
+    monkeypatch.setattr(router_module, "spawn_detached_refresh", lambda: None)
+    codex_home = _configure_codex_for_widget(tmp_path, monkeypatch)
+    start, stop = _windows_sync_commands("codex")
+    assert start.split()[1:] == [
+        _WINDOWS_RAMP.replace("/", "\\"),
+        *"router sync --hook --client codex".split(),
+    ]
+
+    def hooks():
+        return tomllib.loads((codex_home / "config.toml").read_text())["hooks"]
+
+    args = ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    for run in (args, ["--human", "router", "refresh"]):
+        assert _hook_commands(hooks(), "SessionStart") == [start]
+        assert _hook_commands(hooks(), "Stop").count(stop) == 1
+        result = CliRunner().invoke(cli, run)
+        assert result.exit_code == 0, result.output
+    assert _hook_commands(hooks(), "SessionStart") == [start]
+    assert _hook_commands(hooks(), "Stop").count(stop) == 1
+
+    # A ramp that moved replaces the commands rather than adding to them.
+    moved = "C:/Users/me/AppData/Local/Ramp2/ramp-windows-amd64.exe"
+    monkeypatch.setattr(cost_script, "windows_executable", lambda: moved)
+    result = CliRunner().invoke(cli, ["--human", "router", "refresh"])
+    assert result.exit_code == 0, result.output
+    start, stop = _windows_sync_commands("codex")
+    assert "Ramp2" in start
+    assert _hook_commands(hooks(), "SessionStart") == [start]
+    assert [c for c in _hook_commands(hooks(), "Stop") if "router sync" in c] == [stop]
+
+    result = CliRunner().invoke(cli, ["--human", "router", "unconfigure", "codex"])
+    assert result.exit_code == 0, result.output
+    remaining = tomllib.loads((codex_home / "config.toml").read_text())["hooks"]
+    assert "SessionStart" not in remaining
+    assert _hook_commands(remaining, "Stop") == ["/home/me/notify.sh"]
+
+
+def test_windows_claude_code_sync_hooks_are_written_once_and_removed(
+    tmp_path, monkeypatch
+):
+    _simulate_windows(monkeypatch)
+    monkeypatch.setattr(router_module, "spawn_detached_refresh", lambda: None)
+    settings_path = _configure_claude_for_subagents(
+        monkeypatch, tmp_path, [{"id": "gpt-5.4"}]
+    )
+    start, stop = _windows_sync_commands("claude-code")
+    assert start.split()[1:] == [
+        _WINDOWS_RAMP,
+        *"router sync --hook --client claude-code".split(),
+    ]
+
+    def hooks():
+        return json.loads(settings_path.read_text()).get("hooks", {})
+
+    for run in (
+        ["--human", "router", "configure", "claude-code", "--api-key", "router-secret"],
+        ["--human", "router", "refresh"],
+    ):
+        assert _hook_commands(hooks(), "SessionStart") == [start]
+        assert _hook_commands(hooks(), "Stop") == [stop]
+        result = CliRunner().invoke(cli, run)
+        assert result.exit_code == 0, result.output
+    assert _hook_commands(hooks(), "SessionStart") == [start]
+    assert _hook_commands(hooks(), "Stop") == [stop]
+
+    result = CliRunner().invoke(
+        cli, ["--human", "router", "unconfigure", "claude-code"]
+    )
+    assert result.exit_code == 0, result.output
+    assert _hook_commands(hooks(), "SessionStart") == []
+    assert _hook_commands(hooks(), "Stop") == []

@@ -8,6 +8,7 @@ use rrh::proxy::{Conn, Server, MAX_BUFFERED_BODY_BYTES};
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use sha2::{Digest, Sha256};
 
@@ -46,6 +47,17 @@ impl Drop for Cleanup {
     }
 }
 
+/// The agent refuses credentials in a folder others can write. A Windows %TEMP% can inherit such
+/// entries (Codex's sandbox users get Modify on it), so the test folder gets this user's alone.
+#[cfg(windows)]
+fn private_on_windows(dir: &std::path::Path) {
+    let user = std::env::var("USERNAME").unwrap();
+    let icacls = |args: &[&str]| assert!(std::process::Command::new("icacls").args(args).stdout(std::process::Stdio::null()).status().unwrap().success());
+    // The folder gets this user alone; what is already in it inherits that.
+    icacls(&[dir.to_str().unwrap(), "/inheritance:r", "/grant:r", &format!("{user}:(OI)(CI)F"), "/Q"]);
+    icacls(&[&format!("{}\\*", dir.display()), "/reset", "/T", "/Q"]);
+}
+
 async fn proxy(settings: Option<PathBuf>) -> (String, tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
     proxy_peer(settings, true).await
 }
@@ -73,9 +85,13 @@ async fn proxy_peer(settings: Option<PathBuf>, verified: bool) -> (String, tokio
     let settings = settings.unwrap_or_else(|| cleanup.0.as_ref().unwrap().join("settings.json"));
     let credentials = settings.parent().unwrap().join("router-agent-credentials");
     std::fs::create_dir_all(&credentials).unwrap();
+    #[cfg(windows)]
+    private_on_windows(settings.parent().unwrap());
     if !settings.exists() { std::fs::write(&settings, br#"{"enabled":true}"#).unwrap(); }
     let record = credentials.join(format!("{:x}.json", Sha256::digest(TOKEN.as_bytes())));
     std::fs::write(&record, br#"{"upstream":"api.router.com","api_key":"real-upstream-key"}"#).unwrap();
+    // On Windows the record keeps the temp folder's inherited ACL, which is private to this user.
+    #[cfg(unix)]
     std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).unwrap();
     let mut server = Server::new(addr.port(), None, Some(settings), "test".into(), None);
     Arc::get_mut(&mut server).unwrap().upstream_override = Some(format!("http://{upstream_addr}"));

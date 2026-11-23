@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import stat
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
 
@@ -13,6 +12,11 @@ import pytest
 
 from ramp_cli.commands import router, router_repo
 from ramp_cli.commands import router_local_auth as auth
+from tests.platform_support import assert_mode
+
+pytestmark = pytest.mark.posix_only(
+    reason="the agent's private files are checked with os.getuid"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -46,8 +50,8 @@ def test_token_is_private_stable_and_bound_to_key_and_upstream():
         router_repo.upstream_api_key(token, "https://internal-api.router.com/v1")
     path = router_repo.local_token_path(token)
     assert path.read_text() == token
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    assert stat.S_IMODE(path.with_suffix(".json").stat().st_mode) == 0o600
+    assert_mode(path, 0o600)
+    assert_mode(path.with_suffix(".json"), 0o600)
 
 
 def test_failed_credential_write_keeps_real_key_off_loopback(monkeypatch):

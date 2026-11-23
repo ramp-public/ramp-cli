@@ -4,13 +4,15 @@ Session-start hooks only help while an agent starts sessions with hooks on.
 An opt-in login service keeps every Router setup fresh regardless:
 
 - The Ramp Router agent (``ramp-router-agent``, shipped next to ``ramp``) runs
-  as one launchd agent / systemd user service. Every few minutes it asks Router
+  as one launchd agent / systemd user service / Task Scheduler logon task
+  (Windows). Every few minutes it asks Router
   whether anything changed, using a manifest this module writes, and runs
   `ramp router sync --scheduled` only when it did or a refresh is due. With
   repository tagging on (router_repo), the same process also listens for
   agent requests and adds the repository to them.
 - Without the agent binary (a source or wheel install), a plain launchd agent
-  or systemd timer runs `ramp router sync --scheduled` every 15 minutes.
+  or systemd timer runs `ramp router sync --scheduled` every 15 minutes. On
+  Windows there is no such fallback: background sync needs the agent.
 
 Everything here is fail-open: install and uninstall never raise, and
 failures go to the router-sync log.
@@ -36,8 +38,9 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from xml.parsers.expat import ExpatError
+from xml.sax.saxutils import escape as _xml_escape
 
-from ramp_cli.commands import conductor, router_sync
+from ramp_cli.commands import conductor, router_sync, router_winsec
 from ramp_cli.commands.router_sync import (
     SYNC_OPT_OUT_ENV,
     log_failure,
@@ -49,7 +52,7 @@ from ramp_cli.config.settings import config_dir
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - no job is installed on Windows
+except ImportError:  # pragma: no cover - Windows
     fcntl = None
 
 LAUNCHD_LABEL = "com.ramp.router-sync"
@@ -57,7 +60,12 @@ SYSTEMD_NAME = "ramp-router-sync"
 INTERVAL_SECONDS = 15 * 60
 AGENT_LABEL = "com.ramp.router"
 AGENT_SYSTEMD_NAME = "ramp-router"
-AGENT_BINARY = "ramp-router-agent"
+AGENT_BINARY = (
+    "ramp-router-agent.exe" if sys.platform == "win32" else "ramp-router-agent"
+)
+# The Windows Task Scheduler task. Task names are machine-wide, so each user's
+# carries their name; the record of what was registered lives beside the locks.
+AGENT_TASK_PREFIX = "Ramp Router Agent"
 # The agent's own check is a few small requests, so it can look more often.
 AGENT_INTERVAL_SECONDS = 5 * 60
 # A development build of the agent to install instead of the bundled one.
@@ -339,7 +347,7 @@ def _homebrew_opt_path(path: Path) -> Path:
 
 
 def _service_manager() -> bool:
-    if sys.platform == "darwin":
+    if sys.platform in ("darwin", "win32"):
         return True
     return sys.platform.startswith("linux") and shutil.which("systemctl") is not None
 
@@ -368,6 +376,9 @@ def write_manifest(manifest: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(".tmp")
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    if sys.platform == "win32":
+        # Modes mean nothing here: this user and SYSTEM only, before the keys.
+        router_winsec.secure(temp)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         json.dump(manifest, handle)
     os.chmod(temp, 0o600)
@@ -452,6 +463,13 @@ def _agent_arguments(agent: Path, ramp: Path, listen: int | None) -> list[str]:
         "--sync-log",
         str(log_path().absolute()),
     ]
+    if sys.platform == "win32":
+        # A task has no StandardErrorPath or environment: the agent opens its own
+        # log, and gets the CA bundles launchd and systemd pass in the environment.
+        arguments += ["--agent-log", str(agent_log_path().absolute())]
+        files = ca_files()
+        if files:
+            arguments += ["--extra-ca-files", os.pathsep.join(files)]
     if listen is not None:
         from ramp_cli.commands import router_repo  # noqa: PLC0415
 
@@ -557,7 +575,9 @@ AGENT_DISABLED = "disabled"  # turned off in Login Items (or launchctl disable)
 AGENT_NOT_LOADED = "not_loaded"  # installed, but launchd/systemd is not running it
 AGENT_NOT_INSTALLED = "not_installed"
 LOGIN_ITEMS_HINT = (
-    "turn on ramp-router-agent in System Settings > General > Login Items & Extensions"
+    "enable the Ramp Router Agent task in Task Scheduler"
+    if sys.platform == "win32"
+    else "turn on ramp-router-agent in System Settings > General > Login Items & Extensions"
 )
 
 
@@ -602,6 +622,11 @@ def agent_state() -> str:
     """Whether the agent this install set up is actually running."""
     if not agent_installed():
         return AGENT_NOT_INSTALLED
+    if sys.platform == "win32":
+        state = _task_state()
+        if state == "Disabled":
+            return AGENT_DISABLED
+        return AGENT_RUNNING if state == "Running" else AGENT_NOT_LOADED
     if sys.platform == "darwin":
         if _launchd_disabled(AGENT_LABEL):
             return AGENT_DISABLED
@@ -614,6 +639,8 @@ def agent_state() -> str:
 
 
 def agent_installed() -> bool:
+    if sys.platform == "win32":
+        return _task_record_path().exists()
     if sys.platform == "darwin":
         return _agent_plist_path().exists()
     return (_systemd_dir() / f"{AGENT_SYSTEMD_NAME}.service").exists()
@@ -622,7 +649,9 @@ def agent_installed() -> bool:
 def _installed_agent_arguments() -> list[str]:
     """The installed agent service's command line, or [] when unreadable."""
     try:
-        if sys.platform == "darwin":
+        if sys.platform == "win32":
+            arguments = _task_record().get("arguments")
+        elif sys.platform == "darwin":
             with _agent_plist_path().open("rb") as plist:
                 arguments = plistlib.load(plist)["ProgramArguments"]
         elif sys.platform.startswith("linux"):
@@ -669,7 +698,9 @@ def _serves_another_root() -> bool:
 
 
 def _install_agent(agent: Path, ramp: Path, listen: int | None) -> None:
-    if sys.platform == "darwin":
+    if sys.platform == "win32":
+        _install_agent_task(agent, ramp, listen)
+    elif sys.platform == "darwin":
         _install_agent_launchd(render_agent_plist(agent, ramp, listen))
     elif sys.platform.startswith("linux"):
         _install_agent_systemd(*render_agent_systemd(agent, ramp, listen))
@@ -756,8 +787,243 @@ def _install_agent_systemd(service: str, socket: str | None = None) -> None:
         log_failure("could not start the Ramp Router agent with systemctl")
 
 
+# ---------------------------------------------------------------------------
+# Windows: a Task Scheduler logon task
+# ---------------------------------------------------------------------------
+
+# No console window for schtasks or PowerShell, whatever started ramp (a
+# windowless agent's refresh, a GUI app's hook): Windows would give a console
+# program started without one a new, visible console.
+_CREATE_NO_WINDOW = 0x0800_0000
+# Task Scheduler priorities: 5 is normal, 7 below normal (Windows's default).
+_TASK_PRIORITY_SERVING = 5
+_TASK_PRIORITY_BACKGROUND = 7
+
+
+def agent_task_name() -> str:
+    """The task's name: one per user, since names are machine-wide.
+
+    The registered name wins, so a run whose USERNAME differs from the one
+    that installed the task (a renamed account, the task's own environment)
+    updates that task instead of adding a second.
+    """
+    name = _task_record().get("name")
+    if isinstance(name, str) and name.startswith(AGENT_TASK_PREFIX):
+        return name
+    user = os.environ.get("USERNAME") or Path.home().name
+    user = "".join(c for c in user if c not in '\\/:*?"<>|') or "user"
+    return f"{AGENT_TASK_PREFIX} ({user})"
+
+
+def _task_record_path() -> Path:
+    """What was registered: the task name, its arguments, and its XML."""
+    return router_sync.job_lock_dir() / "router-agent-task.json"
+
+
+def _task_record() -> dict:
+    """The registered task's record, or {} when missing or unreadable."""
+    try:
+        record = json.loads(_task_record_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return record if isinstance(record, dict) else {}
+
+
+def render_agent_task(
+    agent: Path, ramp: Path, listen: int | None, user_sid: str
+) -> str:
+    """The task definition: start at logon and keep running while logged on.
+
+    Runs as the user with their normal (non-elevated) token, only while they
+    are logged on, so no password is stored. A logon trigger starts it; a
+    trigger repeating every minute (Task Scheduler's shortest) restarts it if
+    it stopped (a new instance is ignored while one runs), as launchd's
+    KeepAlive does: RestartOnFailure covers only a task that failed to start,
+    not a process that exited. No time limit, and batteries never stop it.
+    """
+    arguments = subprocess.list2cmdline(_agent_arguments(agent, ramp, listen)[1:])
+    priority = _TASK_PRIORITY_BACKGROUND if listen is None else _TASK_PRIORITY_SERVING
+    sid = _xml_escape(user_sid)
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>Ramp CLI</Author>
+    <Description>Ramp Router background agent: keeps Router setups fresh and tags coding-agent requests with their Git repository. Managed by 'ramp router agent enable/disable'.</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{sid}</UserId>
+    </LogonTrigger>
+    <TimeTrigger>
+      <Enabled>true</Enabled>
+      <StartBoundary>2025-01-01T00:00:00</StartBoundary>
+      <Repetition>
+        <Interval>PT1M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{sid}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>{priority}</Priority>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>999</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{_xml_escape(subprocess.list2cmdline([str(agent)]))}</Command>
+      <Arguments>{_xml_escape(arguments)}</Arguments>
+      <WorkingDirectory>{_xml_escape(str(Path.home()))}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"""
+
+
+def _system32(*program: str) -> str:
+    """A Windows tool by absolute path.
+
+    CreateProcess looks in the current directory before System32, so a bare
+    "schtasks" run from inside a cloned repository could start a file there.
+    """
+    root = os.environ.get("SystemRoot") or "C:\\Windows"
+    return str(Path(root, "System32", *program))
+
+
+def _windows_run(
+    *command: str, timeout: float = 30
+) -> subprocess.CompletedProcess | None:
+    try:
+        return subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _schtasks(*args: str) -> bool:
+    result = _windows_run(_system32("schtasks.exe"), *args)
+    return result is not None and result.returncode == 0
+
+
+_TASK_MISSING = "Missing"
+
+
+def _task_state(name: str | None = None) -> str | None:
+    """Task Scheduler's state for the task (Running, Ready, Disabled, ...).
+
+    _TASK_MISSING when Task Scheduler has no such task, and None when it could
+    not be asked. PowerShell, not schtasks: schtasks prints the state in the
+    display language.
+    """
+    name = (name or agent_task_name()).replace("'", "''")
+    result = _windows_run(
+        _system32("WindowsPowerShell", "v1.0", "powershell.exe"),
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        # Listing the folder fails only when Task Scheduler can't be read, so a
+        # failure is never mistaken for a missing task.
+        f"$t = @(Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop"
+        f" | Where-Object TaskName -eq '{name}'); "
+        f"if ($t) {{ $t[0].State }} else {{ '{_TASK_MISSING}' }}",
+    )
+    if result is None or result.returncode != 0:
+        return None
+    return result.stdout.decode("utf-8", "replace").strip() or None
+
+
+def _install_agent_task(agent: Path, ramp: Path, listen: int | None) -> None:
+    name = agent_task_name()
+    xml = render_agent_task(agent, ramp, listen, router_winsec.current_user_sid())
+    record = {
+        "name": name,
+        "arguments": _agent_arguments(agent, ramp, listen),
+        "xml": xml,
+    }
+    state = _task_state(name)
+    if state is None:
+        # Registering could re-enable a task the user turned off.
+        log_failure("could not read the Ramp Router agent's Task Scheduler state")
+        return
+    if state == "Disabled":
+        # The user turned it off in Task Scheduler; registering it again would
+        # turn it back on behind their back.
+        log_failure(f"the Ramp Router agent is off; {LOGIN_ITEMS_HINT}")
+        return
+    if state != _TASK_MISSING and _task_record().get("xml") == xml:
+        if state != "Running":
+            _schtasks("/Run", "/TN", name)
+        return
+    if state == "Running":
+        if os.environ.get(SCHEDULED_ENV):
+            # This may be the agent's own refresh, which stays in the task's
+            # job when Windows denies breaking away: ending the task would
+            # kill it. The next interactive install replaces the task.
+            return
+        # Nor end it under a refresh that is writing; a later install retries.
+        with sync_lock() as free:
+            if not free:
+                return
+            _schtasks("/End", "/TN", name)
+    temporary = router_sync.job_lock_dir() / f".router-agent-task-{os.getpid()}.xml"
+    try:
+        temporary.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(xml, encoding="utf-16")
+        if not _schtasks("/Create", "/TN", name, "/XML", str(temporary), "/F"):
+            log_failure("could not register the Ramp Router agent with Task Scheduler")
+            return
+    finally:
+        temporary.unlink(missing_ok=True)
+    _write_if_changed(
+        _task_record_path(), (json.dumps(record, indent=2) + "\n").encode("utf-8")
+    )
+    if not _schtasks("/Run", "/TN", name):
+        log_failure("could not start the Ramp Router agent task")
+
+
+def _uninstall_agent_task() -> None:
+    name = agent_task_name()
+    if _task_state(name) != _TASK_MISSING:
+        _schtasks("/End", "/TN", name)
+        _schtasks("/Delete", "/TN", name, "/F")
+    _task_record_path().unlink(missing_ok=True)
+
+
 def _uninstall_agent() -> None:
-    if sys.platform == "darwin":
+    if sys.platform == "win32":
+        _uninstall_agent_task()
+    elif sys.platform == "darwin":
         plist = _agent_plist_path()
         if plist.exists():
             plist.unlink()
@@ -806,8 +1072,10 @@ def _install_service() -> None:
     if agent is None:
         if agent_installed():
             _uninstall_agent()
-        if not background_enabled():
-            return  # a missing listener binary must not turn on timer-based sync
+        if not background_enabled() or sys.platform == "win32":
+            # A missing listener binary must not turn on timer-based sync, and
+            # Windows has no timer job: background sync there is the agent.
+            return
         if sys.platform == "darwin":
             _install_launchd()
         else:
@@ -1119,11 +1387,13 @@ def _schedule_lock() -> Iterator[None]:
     with path.open("a+b") as lock_file:
         if fcntl is not None:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        else:
+            while not router_sync.try_lock(lock_file):
+                time.sleep(0.05)
         try:
             yield
         finally:
-            if fcntl is not None:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            router_sync.unlock(lock_file)
 
 
 def install(*, preserve_opt_out: bool = False) -> None:
@@ -1225,6 +1495,8 @@ def _uninstall(*, keep_listener: bool = False) -> None:
 
 
 def _job_installed() -> bool:
+    if sys.platform == "win32":
+        return False  # no timer job on Windows
     if sys.platform == "darwin":
         return _launchd_paths()[0].exists()
     return (_systemd_dir() / f"{SYSTEMD_NAME}.timer").exists()

@@ -14,6 +14,10 @@ from ramp_cli.commands import router_repo
 from ramp_cli.commands import router_schedule as schedule
 from ramp_cli.main import cli
 
+pytestmark = pytest.mark.posix_only(
+    reason="the background agent runs under launchd or systemd"
+)
+
 _REAL_INSTALL = schedule.install
 
 
@@ -55,11 +59,20 @@ def test_enable_rejects_environment_opt_out(monkeypatch):
     assert not schedule.background_enabled()
 
 
-def test_enable_rejects_windows_without_saving_preference(monkeypatch):
-    monkeypatch.setattr(router_module.sys, "platform", "win32")
+def test_enable_rejects_unsupported_platforms_without_saving_preference(monkeypatch):
+    monkeypatch.setattr(router_module.sys, "platform", "freebsd14")
     result = invoke("enable")
     assert result.exit_code == 2
-    assert "requires macOS or Linux" in result.output
+    assert "requires macOS, Linux, or Windows" in result.output
+    assert not schedule.background_enabled()
+
+
+def test_enable_on_windows_needs_the_agent_and_saves_nothing(monkeypatch):
+    monkeypatch.setattr(router_module.sys, "platform", "win32")
+    monkeypatch.setattr(router_module.router_repo, "service_supported", lambda: False)
+    result = invoke("enable")
+    assert result.exit_code != 0
+    assert "ramp-router-agent.exe" in result.output
     assert not schedule.background_enabled()
 
 

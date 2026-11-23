@@ -22,6 +22,10 @@ from tests.test_router_agent import _executable, _plist, launchd  # noqa: F401
 from tests.test_router_cursor import _mock_cursor_setup
 from tests.test_router_systemd import systemd  # noqa: F401
 
+pytestmark = pytest.mark.posix_only(
+    reason="Cursor uploads go through the launchd or systemd background agent"
+)
+
 # Captured before the conftest fixture turns these into no-ops.
 _REAL_INSTALL = schedule.install
 _REAL_UNINSTALL = schedule.uninstall

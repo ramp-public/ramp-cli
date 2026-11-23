@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -11,13 +15,85 @@ from ramp_cli import codex_hook_trust
 from ramp_cli.commands import cursor_models, router
 from ramp_cli.config.settings import config_dir
 
+# Coding-agent and helper binaries the CLI looks up on PATH and then runs or
+# reads. A developer's real installs must stay invisible to tests; fakes a test
+# writes under its own tmp_path are still found.
+_HARNESS_EXECUTABLES = frozenset(
+    {"claude", "codex", "cursor", "hermes", "opencode", "pi", "cloudflared"}
+)
+_REAL_WHICH = shutil.which
+
+
+def _keep_tmp_out_of_the_windows_profile() -> None:
+    """Root pytest's temp directories outside the user's profile on Windows.
+
+    %TEMP% lives under %USERPROFILE% there, so code that walks up from a test's
+    working directory (skill directory detection, for one) reaches the
+    developer's real home and finds their real ~/.codex/skills. Only applies
+    when neither --basetemp nor PYTEST_DEBUG_TEMPROOT already chose a root.
+    """
+    if sys.platform != "win32" or os.environ.get("PYTEST_DEBUG_TEMPROOT"):
+        return
+    temp = Path(tempfile.gettempdir()).resolve()
+    if not temp.is_relative_to(Path.home().resolve()):
+        return
+    public = Path(os.environ.get("PUBLIC") or r"C:\Users\Public")
+    os.environ["PYTEST_DEBUG_TEMPROOT"] = str(public / "ramp-cli-pytest")
+    (public / "ramp-cli-pytest").mkdir(parents=True, exist_ok=True)
+
+
+_keep_tmp_out_of_the_windows_profile()
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "posix_only(reason): skip on Windows; the behavior under test only "
+        "exists on macOS or Linux (launchd, systemd, fcntl, Unix sockets, ...)",
+    )
+    config.addinivalue_line(
+        "markers",
+        "real_harness_binaries: let shutil.which find coding-agent binaries "
+        "installed outside the test's tmp_path",
+    )
+
+
+_WINDOWS_KNOWN_FAILURES = Path(__file__).with_name("windows_known_failures.txt")
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    if sys.platform != "win32":
+        return
+    lines = _WINDOWS_KNOWN_FAILURES.read_text().splitlines()
+    known = {line.split("#", 1)[0].strip() for line in lines} - {""}
+    for item in items:
+        marker = item.get_closest_marker("posix_only")
+        if marker is not None:
+            reason = marker.kwargs.get("reason", "requires macOS or Linux")
+            item.add_marker(pytest.mark.skip(reason=f"POSIX only: {reason}"))
+            continue
+        # "tests/test_x.py::Class::test_y[param]": list the whole test or one case.
+        test_id = item.nodeid.rsplit("/", 1)[-1]
+        if test_id in known or test_id.split("[", 1)[0] in known:
+            item.add_marker(
+                pytest.mark.skip(
+                    reason="known Windows failure, see " + _WINDOWS_KNOWN_FAILURES.name
+                )
+            )
+
 
 def _codex_trust_unavailable(*_args, **_kwargs):
     raise codex_hook_trust.TrustUnavailable("not in tests")
 
 
 @pytest.fixture(autouse=True)
-def isolated_config(tmp_path: Path, request: pytest.FixtureRequest):
+def isolated_config(
+    tmp_path: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    request: pytest.FixtureRequest,
+):
     """Redirect config to a temp directory so tests don't touch real config.
 
     Every coding agent this CLI configures keeps its files somewhere under the
@@ -56,7 +132,35 @@ def isolated_config(tmp_path: Path, request: pytest.FixtureRequest):
     )
     router._bundled_codex_catalog_from.cache_clear()
     # Codex discovers personal skills in ~/.agents independently of CODEX_HOME.
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    # On Windows Path.home() reads USERPROFILE, not HOME, and per-user app
+    # state lives under APPDATA and LOCALAPPDATA. Set them everywhere so the
+    # sandbox does not depend on which variable a code path happens to read.
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.delenv("HOMEDRIVE", raising=False)
+    monkeypatch.delenv("HOMEPATH", raising=False)
+    monkeypatch.setenv("APPDATA", str(home / "AppData" / "Roaming"))
+    monkeypatch.setenv("LOCALAPPDATA", str(home / "AppData" / "Local"))
+    # Running the developer's real coding agents (codex, claude, ...) reads
+    # their real defaults and state. Fakes under the test's temp root still
+    # resolve; a test that needs a real install opts in with a marker.
+    if request.node.get_closest_marker("real_harness_binaries") is None:
+        sandbox = tmp_path_factory.getbasetemp().resolve()
+
+        def sandboxed_which(cmd, mode=os.F_OK | os.X_OK, path=None):
+            found = _REAL_WHICH(cmd, mode=mode, path=path)
+            if found is None:
+                return None
+            name = Path(os.fspath(cmd)).name.lower()
+            stem = name.rsplit(".", 1)[0] if name.endswith((".exe", ".cmd")) else name
+            if stem not in _HARNESS_EXECUTABLES:
+                return found
+            if Path(found).resolve().is_relative_to(sandbox):
+                return found
+            return None
+
+        monkeypatch.setattr(shutil, "which", sandboxed_which)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     # Explicit OpenCode paths take precedence over the isolated XDG directory.
     monkeypatch.delenv("OPENCODE_CONFIG", raising=False)

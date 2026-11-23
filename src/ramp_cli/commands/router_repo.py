@@ -104,12 +104,12 @@ def settings_path() -> Path:
 
 def health_token(*, create: bool = False) -> str | None:
     """User-private key for health challenge responses; never sent to the listener."""
-    if not hasattr(os, "getuid") or not hasattr(os, "O_NOFOLLOW"):
+    if not router_local_auth.supported():
         return None
     path = config_dir() / "router-agent-health-token"
     try:
         if create:
-            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            router_local_auth.make_directory(path.parent)
         with router_local_auth.private_lock(path.with_suffix(".lock")):
             try:
                 token = router_local_auth.read_private(path)
@@ -412,7 +412,7 @@ def pending_cursor_key(base_url: str) -> str | None:
 
 def _read_cursor_binding() -> dict | None:
     path = cursor_binding_path()
-    # No binding, no private-file checks: they need os.getuid, which Windows lacks.
+    # No binding, no private-file checks.
     if not path.exists() and not path.is_symlink():
         return None
     try:
@@ -494,7 +494,7 @@ def _allow_host(settings: dict, hostname: str | None) -> None:
 def cursor_bound_user_dir() -> Path | None:
     """Cursor's folder as the binding names it (what the agent scans), or None."""
     path = cursor_binding_path()
-    # No binding, no private-file checks: they need os.getuid, which Windows lacks.
+    # No binding, no private-file checks.
     if not path.exists() and not path.is_symlink():
         return None
     try:

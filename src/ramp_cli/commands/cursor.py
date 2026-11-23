@@ -3,14 +3,17 @@
 Cursor keeps its Models / API Keys screen in a SQLite state database. While
 Cursor is quit, ``ramp router configure cursor`` writes the OpenAI base-URL
 override, turns the OpenAI key on, stores the key encrypted the way Cursor
-does, and adds Router's model names. A receipt keeps the settings from before
-the first write so ``unconfigure`` can restore them.
+does (on macOS and Windows), and adds Router's model names. A receipt keeps
+the settings from before the first write so ``unconfigure`` can restore them.
 """
 
+import base64
 import copy
+import csv
 import ctypes
 import hashlib
 import json
+import ntpath
 import os
 import shutil
 import signal
@@ -20,6 +23,7 @@ import sys
 import threading
 import time
 from collections.abc import Iterable
+from ctypes import wintypes
 from pathlib import Path
 
 # Redirects Cursor's user-data directory. Tests set it so detection never
@@ -235,6 +239,8 @@ def running_pids() -> list[int] | None:
     macOS pgrep leaves out its own ancestors unless given -a, and Cursor is
     one when this runs in Cursor's terminal. On Linux, -a means something else.
     """
+    if sys.platform == "win32":
+        return _running_pids_windows()
     command = ["pgrep", "-u", str(os.getuid()), "-x", _PROCESS_NAME]
     if sys.platform == "darwin":
         command.insert(1, "-a")
@@ -306,22 +312,31 @@ def runs_inside_cursor() -> bool:
     if not cursor_pids:
         return False
     pid, seen = os.getppid(), set()
+    if sys.platform == "win32":
+        parents = _windows_parent_pids()
+        if parents is None:
+            # The CLI may be in Cursor's terminal. Keep the app open.
+            return True
     while pid > 1 and pid not in seen and len(seen) < 64:
         if pid in cursor_pids:
             return True
         seen.add(pid)
-        pid = _parent_pid(pid)
+        pid = parents.get(pid, 0) if sys.platform == "win32" else _parent_pid(pid)
     return False
 
 
 def request_quit(timeout: float = QUIT_CONFIRM_SECONDS) -> str:
-    """Ask Cursor to quit the way Cmd+Q does, and wait for it to exit.
+    """Ask Cursor to close normally, and wait for it to exit.
 
     Cursor saves unsaved files for its next launch and may ask the user to
     confirm, for example while agents are running. A cancel in that dialog
     looks the same as a dialog left unanswered. Never force-quits. Returns
     one of the QUIT_* outcomes.
     """
+    if sys.platform == "win32":
+        return _taskkill_cursor(force=False, timeout=timeout)
+    if sys.platform != "darwin":
+        return QUIT_FAILED
     # Checked first so that a Cursor which exited meanwhile is not launched
     # only to be told to quit.
     script = (
@@ -354,7 +369,7 @@ def force_quit(
 ) -> str:
     """Stop this user's Cursor main process without asking.
 
-    Only the pids ``running_pids`` names are signalled, and only while they
+    On Unix, only the pids ``running_pids`` names are signalled, and only while they
     still are Cursor, so Cursor Nightly, other apps and a reused pid are never
     touched. SIGTERM comes first: Electron handles it the way it handles
     app.quit(), so Cursor saves its state when nothing vetoes the quit. It can
@@ -364,6 +379,8 @@ def force_quit(
     Returns QUIT_FORCED once Cursor is gone, QUIT_DONE when it had already
     quit and nothing was signalled, and QUIT_FORCE_FAILED otherwise.
     """
+    if sys.platform == "win32":
+        return _taskkill_cursor(force=True, timeout=kill_wait)
     found = running_pids()
     if found is None:
         return QUIT_FORCE_FAILED
@@ -398,7 +415,28 @@ def force_quit(
 
 
 def reopen() -> bool:
-    """Open Cursor again after setup quit it; its windows come back."""
+    """Open Cursor again after setup quit it."""
+    if sys.platform == "win32":
+        paths = [_windows_cursor_image]
+        if local := os.environ.get("LOCALAPPDATA"):
+            paths.append(ntpath.join(local, "Programs", "cursor", "Cursor.exe"))
+        for path in paths:
+            if not path or not ntpath.isabs(path):
+                continue
+            try:
+                subprocess.Popen(
+                    [path],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.DETACHED_PROCESS,
+                )
+                return True
+            except OSError:
+                continue
+        return False
+    if sys.platform != "darwin":
+        return False
     try:
         completed = subprocess.run(
             ["open", "-b", APP_BUNDLE_ID],
@@ -410,6 +448,160 @@ def reopen() -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return completed.returncode == 0
+
+
+_windows_cursor_image: str | None = None
+
+
+def _windows_image_path(pid: int) -> str | None:
+    kernel = ctypes.WinDLL("kernel32")
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    handle = kernel.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    try:
+        path = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(path))
+        if (
+            kernel.QueryFullProcessImageNameW(
+                wintypes.HANDLE(handle), 0, path, ctypes.byref(size)
+            )
+            and ntpath.basename(path.value).lower() == "cursor.exe"
+        ):
+            return path.value
+        return None
+    finally:
+        kernel.CloseHandle(wintypes.HANDLE(handle))
+
+
+class _ProcessEntry(ctypes.Structure):
+    """PROCESSENTRY32W used by the Tool Help process snapshot."""
+
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.c_size_t),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", wintypes.LONG),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", wintypes.WCHAR * 260),
+    ]
+
+
+def _windows_parent_pids() -> dict[int, int] | None:
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    snapshot = kernel.CreateToolhelp32Snapshot(2, 0)  # TH32CS_SNAPPROCESS
+    if snapshot == wintypes.HANDLE(-1).value:
+        return None
+    handle = wintypes.HANDLE(snapshot)
+    try:
+        entry = _ProcessEntry()
+        entry.dwSize = ctypes.sizeof(entry)
+        parents = {}
+        found = kernel.Process32FirstW(handle, ctypes.byref(entry))
+        while found:
+            parents[entry.th32ProcessID] = entry.th32ParentProcessID
+            found = kernel.Process32NextW(handle, ctypes.byref(entry))
+        return parents if ctypes.get_last_error() == 18 else None  # ERROR_NO_MORE_FILES
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def _system32_tool(name: str) -> str:
+    root = os.environ.get("SystemRoot") or r"C:\Windows"
+    return ntpath.join(root, "System32", name)
+
+
+def _taskkill_cursor(*, force: bool, timeout: float) -> str:
+    global _windows_cursor_image
+    failure = QUIT_FORCE_FAILED if force else QUIT_FAILED
+    pids = running_pids()
+    if pids is None:
+        return failure
+    if not pids:
+        return QUIT_DONE
+    # Remember custom installations before taskkill can close the process.
+    image = next((path for pid in pids if (path := _windows_image_path(pid))), None)
+    if image or not force:
+        _windows_cursor_image = image
+    flags = ["/F", "/T"] if force else []
+    requested = False
+    for pid in pids:
+        try:
+            result = subprocess.run(
+                [
+                    _system32_tool("taskkill.exe"),
+                    *flags,
+                    "/PID",
+                    str(pid),
+                    "/FI",
+                    "IMAGENAME eq Cursor.exe",
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=5,
+                check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            requested |= result.returncode == 0
+        except subprocess.TimeoutExpired:
+            # The close message may already be at Cursor's confirmation dialog.
+            requested = True
+        except OSError:
+            continue
+    if wait_until_quit(timeout) == []:
+        return QUIT_FORCED if force and requested else QUIT_DONE
+    return QUIT_TIMEOUT if requested and not force else failure
+
+
+def _running_pids_windows() -> list[int] | None:
+    """Process ids of this user's Cursor.exe, like ``running_pids``.
+
+    Unknown is None and counts as running: a write while Cursor is open would
+    be lost when it quits, so a failed check falls back to the paste-in steps.
+    Every Cursor.exe is listed, its helpers included, as they share the name.
+    """
+    command = [
+        _system32_tool("tasklist.exe"),
+        "/FI",
+        f"IMAGENAME eq {_PROCESS_NAME}.exe",
+        "/FO",
+        "CSV",
+        "/NH",
+    ]
+    username = os.environ.get("USERNAME", "")
+    if username:
+        command += ["/FI", f"USERNAME eq {username}"]
+    try:
+        # Bytes, not text: tasklist writes in the console's OEM code page,
+        # which may not decode as the ANSI one on localized Windows. The
+        # image name and pid are ASCII, so Latin-1 reads them safely.
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            timeout=5,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    pids = []
+    lines = (completed.stdout or b"").decode("latin-1").splitlines()
+    for row in csv.reader(lines):
+        if len(row) < 2 or row[0].lower() != f"{_PROCESS_NAME.lower()}.exe":
+            continue
+        try:
+            pids.append(int(row[1]))
+        except ValueError:
+            # Cursor is listed, but not readably: count it as running.
+            return None
+    return pids
 
 
 def configure(
@@ -654,15 +846,155 @@ def _cursor_encryption_key(prompt: bool) -> bytes:
 
 
 def encrypt_with_cursor(api_key: str, prompt: bool = True) -> str:
-    """Encrypt a key the way Cursor's Electron safeStorage does on macOS.
+    """Encrypt a key the way Cursor's Electron safeStorage does.
 
-    Chromium's scheme: the "Cursor Safe Storage" Keychain password, PBKDF2-SHA1
-    (salt "saltysalt", 1003 rounds, 16 bytes), AES-128-CBC with a 16-space IV,
-    and a "v10" prefix, stored as ``JSON.stringify`` of a Node Buffer.
+    Stored as ``JSON.stringify`` of a Node Buffer holding Chromium's "v10"
+    format. On macOS: the "Cursor Safe Storage" Keychain password, PBKDF2-SHA1
+    (salt "saltysalt", 1003 rounds, 16 bytes), and AES-128-CBC with a 16-space
+    IV. On Windows: the AES-256 key in Cursor's "Local State", protected with
+    DPAPI, and AES-256-GCM as nonce + ciphertext + tag.
     """
-    key = _cursor_encryption_key(prompt)
-    data = list(b"v10" + _aes_128_cbc_encrypt(key, b" " * 16, api_key.encode()))
+    if sys.platform == "darwin":
+        key = _cursor_encryption_key(prompt)
+        payload = _aes_128_cbc_encrypt(key, b" " * 16, api_key.encode())
+    elif sys.platform == "win32":
+        nonce = os.urandom(12)
+        payload = nonce + _aes_256_gcm_encrypt(
+            _windows_safe_storage_key(), nonce, api_key.encode()
+        )
+    else:
+        raise CursorSettingsError("Writing Cursor's settings needs macOS or Windows.")
+    data = list(b"v10" + payload)
     return json.dumps({"type": "Buffer", "data": data}, separators=(",", ":"))
+
+
+def _windows_safe_storage_key() -> bytes:
+    """Cursor's safeStorage key from its "Local State", unwrapped with DPAPI.
+
+    Chromium keeps it base64-encoded with a "DPAPI" prefix under
+    ``os_crypt.encrypted_key``. Cursor creates it the first time it stores a
+    secret, so a Cursor that has never run has none yet.
+    """
+    local_state = user_dir().parent / "Local State"
+    try:
+        state = json.loads(local_state.read_text(encoding="utf-8"))
+        wrapped = base64.b64decode(state["os_crypt"]["encrypted_key"])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise CursorSettingsError(
+            "Cursor's encryption key was not found. Open Cursor once, then retry."
+        ) from exc
+    if not wrapped.startswith(b"DPAPI"):
+        raise CursorSettingsError("Cursor's encryption key is in an unknown format.")
+    key = _dpapi_unprotect(wrapped[len(b"DPAPI") :])
+    if len(key) != 32:
+        raise CursorSettingsError("Cursor's encryption key is in an unknown format.")
+    return key
+
+
+class _DataBlob(ctypes.Structure):
+    _fields_ = [
+        ("cbData", ctypes.c_uint32),
+        ("pbData", ctypes.POINTER(ctypes.c_char)),
+    ]
+
+
+def _dpapi_unprotect(data: bytes) -> bytes:
+    """Decrypt a DPAPI blob for the current Windows user, in-process."""
+    crypt32 = ctypes.WinDLL("crypt32")  # type: ignore[attr-defined]
+    kernel32 = ctypes.WinDLL("kernel32")  # type: ignore[attr-defined]
+    buffer = ctypes.create_string_buffer(data, len(data))
+    source = _DataBlob(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char)))
+    result = _DataBlob()
+    ok = crypt32.CryptUnprotectData(
+        ctypes.byref(source), None, None, None, None, 0, ctypes.byref(result)
+    )
+    if not ok:
+        raise CursorSettingsError("Cursor's encryption key could not be unlocked.")
+    try:
+        return ctypes.string_at(result.pbData, result.cbData)
+    finally:
+        kernel32.LocalFree(result.pbData)
+
+
+class _AuthenticatedCipherModeInfo(ctypes.Structure):
+    # BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO
+    _fields_ = [
+        ("cbSize", ctypes.c_ulong),
+        ("dwInfoVersion", ctypes.c_ulong),
+        ("pbNonce", ctypes.c_void_p),
+        ("cbNonce", ctypes.c_ulong),
+        ("pbAuthData", ctypes.c_void_p),
+        ("cbAuthData", ctypes.c_ulong),
+        ("pbTag", ctypes.c_void_p),
+        ("cbTag", ctypes.c_ulong),
+        ("pbMacContext", ctypes.c_void_p),
+        ("cbMacContext", ctypes.c_ulong),
+        ("cbAAD", ctypes.c_ulong),
+        ("cbData", ctypes.c_ulonglong),
+        ("dwFlags", ctypes.c_ulong),
+    ]
+
+
+def _aes_256_gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
+    """AES-256-GCM through Windows CNG (bcrypt.dll), returning ciphertext + tag.
+
+    In-process for the same reason as on macOS: the key never reaches a
+    subprocess or the process list.
+    """
+    bcrypt = ctypes.WinDLL("bcrypt")  # type: ignore[attr-defined]
+    algorithm = ctypes.c_void_p()
+    handle = ctypes.c_void_p()
+
+    def check(status: int) -> None:
+        if status != 0:
+            raise CursorSettingsError("Cursor's key could not be encrypted.")
+
+    check(bcrypt.BCryptOpenAlgorithmProvider(ctypes.byref(algorithm), "AES", None, 0))
+    try:
+        mode = ctypes.create_unicode_buffer("ChainingModeGCM")
+        check(
+            bcrypt.BCryptSetProperty(
+                algorithm, "ChainingMode", mode, ctypes.sizeof(mode), 0
+            )
+        )
+        key_buffer = ctypes.create_string_buffer(key, len(key))
+        check(
+            bcrypt.BCryptGenerateSymmetricKey(
+                algorithm, ctypes.byref(handle), None, 0, key_buffer, len(key), 0
+            )
+        )
+        try:
+            nonce_buffer = ctypes.create_string_buffer(nonce, len(nonce))
+            tag = ctypes.create_string_buffer(16)
+            info = _AuthenticatedCipherModeInfo()
+            info.cbSize = ctypes.sizeof(info)
+            info.dwInfoVersion = 1  # BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO_VERSION
+            info.pbNonce = ctypes.cast(nonce_buffer, ctypes.c_void_p)
+            info.cbNonce = len(nonce)
+            info.pbTag = ctypes.cast(tag, ctypes.c_void_p)
+            info.cbTag = len(tag)
+            source = ctypes.create_string_buffer(plaintext, len(plaintext))
+            out = ctypes.create_string_buffer(len(plaintext))
+            written = ctypes.c_ulong()
+            check(
+                bcrypt.BCryptEncrypt(
+                    handle,
+                    source,
+                    len(plaintext),
+                    ctypes.byref(info),
+                    None,
+                    0,
+                    out,
+                    len(out),
+                    ctypes.byref(written),
+                    0,
+                )
+            )
+            return out.raw[: written.value] + tag.raw
+        finally:
+            bcrypt.BCryptDestroyKey(handle)
+    finally:
+        bcrypt.BCryptCloseAlgorithmProvider(algorithm, 0)
 
 
 def _aes_128_cbc_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:

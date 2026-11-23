@@ -42,12 +42,12 @@ pub fn normalize_remote(url: &str) -> Option<(String, String)> {
 
 /// File contents; None if unreadable or not UTF-8 (a garbled remote must not become a slug).
 fn read_text(path: &str) -> Option<String> {
-    String::from_utf8(std::fs::read(path).ok()?).ok()
+    String::from_utf8(std::fs::read(&*paths::native(path)).ok()?).ok()
 }
 
 /// (worktree_root, git_dir) for the checkout containing `start`.
 pub fn find_git_dir(start: &str) -> Option<(String, String)> {
-    let mut current = paths::abspath(start);
+    let mut current = paths::abspath(&paths::canon(start));
     loop {
         let dotgit = paths::join(&current, ".git");
         if paths::isdir(&dotgit) {
@@ -56,7 +56,7 @@ pub fn find_git_dir(start: &str) -> Option<(String, String)> {
         if paths::isfile(&dotgit) {
             let content = read_text(&dotgit)?;
             if let Some(rest) = paths::strip(&content).strip_prefix("gitdir:") {
-                let mut git_dir = paths::strip(rest).to_string();
+                let mut git_dir = paths::canon(paths::strip(rest)).into_owned();
                 if !git_dir.starts_with('/') {
                     git_dir = paths::normpath(&paths::join(&current, &git_dir));
                 }
@@ -146,13 +146,15 @@ fn remote_from_config(git_dir: &str) -> (Option<String>, bool) {
 
 /// `git -C root remote get-url origin`, two-second limit.
 fn git_remote_get_url(root: &str) -> Option<String> {
-    let mut child = Command::new("git")
-        .args(["-C", root, "remote", "get-url", "origin"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+    let mut cmd = Command::new("git");
+    cmd.args(["-C", &paths::native(root), "remote", "get-url", "origin"]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        // The agent has no console, so git would open a console window of its own.
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(crate::win::CREATE_NO_WINDOW);
+    }
+    let mut child = cmd.spawn().ok()?;
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         match child.try_wait() {
@@ -203,24 +205,32 @@ const TTL: Duration = Duration::from_secs(600);
 
 /// Folders where coding agents and Homebrew keep their own state, such as Codex memories and
 /// Claude settings. Agents read them as bookkeeping, not project work, so they never name a
-/// repository and the turn keeps its project repository. RRH_AGENT_STATE_DIRS, colon separated,
-/// replaces the list. Project checkouts that agents create inside these folders still resolve:
-/// anything under a `worktrees` folder (Codex's and Cursor's default), and any linked Git
-/// worktree, which also covers a custom Codex `git-worktree-root`.
-static AGENT_STATE: LazyLock<Vec<String>> = LazyLock::new(|| match std::env::var("RRH_AGENT_STATE_DIRS") {
-    Ok(dirs) => dirs.split(':').filter(|d| !d.is_empty()).map(paths::normpath).collect(),
-    Err(_) => {
-        let home = paths::expanduser("~");
-        let mut dirs: Vec<String> = [".codex", ".claude", ".pi", ".cursor"].iter().map(|d| paths::join(&home, d)).collect();
-        if let Ok(codex_home) = std::env::var("CODEX_HOME") {
-            if codex_home.starts_with('/') {
-                dirs.push(paths::normpath(&codex_home));
-            }
-        }
-        dirs.extend(["/opt/homebrew", "/usr/local/Homebrew", "/home/linuxbrew/.linuxbrew"].map(String::from));
-        dirs
+/// repository and the turn keeps its project repository. RRH_AGENT_STATE_DIRS, separated like PATH
+/// (`:`, or `;` on Windows), replaces the list. Project checkouts that agents create inside these
+/// folders still resolve: anything under a `worktrees` folder (Codex's and Cursor's default), and
+/// any linked Git worktree, which also covers a custom Codex `git-worktree-root`.
+static AGENT_STATE: LazyLock<Vec<String>> =
+    LazyLock::new(|| agent_state_dirs(std::env::var("RRH_AGENT_STATE_DIRS").ok(), &paths::expanduser("~"), std::env::var("CODEX_HOME").ok()));
+
+/// The agent state folders, in attribution's path form (`/C:/...` on Windows).
+fn agent_state_dirs(list: Option<String>, home: &str, codex_home: Option<String>) -> Vec<String> {
+    if let Some(list) = list {
+        return std::env::split_paths(&list)
+            .filter_map(|d| d.into_os_string().into_string().ok())
+            .filter(|d| !d.is_empty())
+            .map(|d| paths::normpath(&paths::canon(&d)))
+            .collect();
     }
-});
+    let mut dirs: Vec<String> = [".codex", ".claude", ".pi", ".cursor"].iter().map(|d| paths::join(home, d)).collect();
+    if let Some(codex_home) = codex_home {
+        let codex_home = paths::canon(&codex_home);
+        if codex_home.starts_with('/') {
+            dirs.push(paths::normpath(&codex_home));
+        }
+    }
+    dirs.extend(["/opt/homebrew", "/usr/local/Homebrew", "/home/linuxbrew/.linuxbrew"].map(String::from));
+    dirs
+}
 
 /// The agent state folder `directory` is in, unless it is in that folder's `worktrees`.
 fn agent_state<'a>(roots: &'a [String], directory: &str) -> Option<&'a str> {
@@ -257,7 +267,9 @@ impl RepoResolver {
         self.resolve_with(&AGENT_STATE, directory)
     }
 
+    /// `agent_roots` in attribution's path form; `directory` may also be a native Windows path.
     fn resolve_with(&self, agent_roots: &[String], directory: &str) -> Option<Resolved> {
+        let directory = &*paths::canon(directory);
         let state = agent_state(agent_roots, directory);
         cached(&self.dirs, directory, 50_000, || {
             if !paths::isdir(directory) {
@@ -288,6 +300,30 @@ mod tests {
     }
 
     #[test]
+    fn agent_state_dirs_follow_the_platform() {
+        // Not single-letter roots: on Windows "/x/a" is Git Bash's X: drive.
+        let list = std::env::join_paths(["/state/a", "", "/state/b/../c"]).unwrap().into_string().unwrap();
+        assert_eq!(agent_state_dirs(Some(list), "/h", None), ["/state/a", "/state/c"]);
+        let defaults = agent_state_dirs(None, "/h", Some("/codex/home/".into()));
+        assert_eq!(&defaults[..5], ["/h/.codex", "/h/.claude", "/h/.pi", "/h/.cursor", "/codex/home"]);
+        // A relative CODEX_HOME is not a folder anyone can name.
+        assert!(!agent_state_dirs(None, "/h", Some("codex".into())).contains(&"codex".to_string()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn agent_state_dirs_take_windows_paths() {
+        let list = std::env::join_paths([r"C:\Users\me\.codex", r"D:\state"]).unwrap().into_string().unwrap();
+        assert_eq!(agent_state_dirs(Some(list), "/C:/Users/me", None), ["/C:/Users/me/.codex", "/D:/state"]);
+        let defaults = agent_state_dirs(None, "/C:/Users/me", Some(r"E:\codex-home".into()));
+        assert!(defaults.contains(&"/E:/codex-home".to_string()));
+        assert!(defaults.contains(&"/C:/Users/me/.codex".to_string()));
+        let roots = agent_state_dirs(None, "/C:/Users/me", None);
+        assert!(agent_state(&roots, &paths::canon(r"C:\Users\me\.codex\memories")).is_some());
+        assert!(agent_state(&roots, &paths::canon(r"C:\Users\me\.codex\worktrees\x")).is_none());
+    }
+
+    #[test]
     fn linked_worktrees_inside_agent_state_resolve() {
         let base = std::env::temp_dir().join(format!("rrh-agent-state-{}", std::process::id()));
         let state = base.join(".codex");
@@ -304,7 +340,7 @@ mod tests {
         std::fs::create_dir_all(worktree.join("src")).unwrap();
         std::fs::write(worktree.join(".git"), format!("gitdir: {}\n", main.join(".git/worktrees/wt").display())).unwrap();
 
-        let roots = [state.to_str().unwrap().to_string()];
+        let roots = [paths::canon(state.to_str().unwrap()).into_owned()];
         let resolver = RepoResolver::default();
         assert_eq!(resolver.resolve_with(&roots, state.join("memories").to_str().unwrap()), None);
         assert_eq!(resolver.resolve_with(&roots, state.to_str().unwrap()), None);

@@ -37,6 +37,12 @@ from ramp_cli.version_check import (
 # repository. Every install.oss.sh change must be copied there byte-for-byte
 # and deployed from agent-cards-site so fresh installs and self-updates agree.
 _INSTALL_URL = "https://agents.ramp.com/install.sh"
+# The Windows installer, served from ramp/agent-cards-site/public/install.ps1
+# the same way.
+_WINDOWS_INSTALL_URL = "https://agents.ramp.com/install.ps1"
+_WINDOWS_INSTALL_COMMAND = (
+    f'powershell -ExecutionPolicy ByPass -c "irm {_WINDOWS_INSTALL_URL} | iex"'
+)
 _SKILLS_CATALOG_HOST = "api.github.com"
 
 
@@ -128,12 +134,18 @@ def _offer_optional_skills_update(ramp_executable: Path) -> None:
 
 def _installed_executable() -> Path:
     bin_dir = Path(os.environ.get("RAMP_INSTALL_DIR") or Path.home() / ".local/bin")
-    return bin_dir.expanduser() / "ramp"
+    # The Windows installer's command is a .cmd launcher, which PowerShell and
+    # Command Prompt both run.
+    name = "ramp.cmd" if sys.platform == "win32" else "ramp"
+    return bin_dir.expanduser() / name
 
 
 def _installed_invocation(installed: Path, *args: str) -> list[str]:
     command = [str(installed), *args]
-    return ["sh", *command] if sys.platform == "win32" else command
+    # A Git Bash install leaves only an extensionless shell script.
+    if sys.platform == "win32" and installed.suffix.lower() != ".cmd":
+        return ["sh", *command]
+    return command
 
 
 def _installed_version(installed: Path) -> str:
@@ -187,11 +199,27 @@ def _warn_if_shadowed(installed: Path) -> None:
     )
     click.echo(f"  Resolved ramp:  {resolved} (v{resolved_version})")
     click.echo(f"  Installed ramp: {installed} (v{installed_version})")
-    click.echo("Run the updated CLI directly:")
     direct_command = _installed_invocation(installed, "--version")
-    click.echo(f"  {' '.join(shlex.quote(part) for part in direct_command)}")
-    click.echo("Use the updated CLI in this shell with:")
-    click.echo(f"  export PATH={shlex.quote(str(installed.parent))}:$PATH && hash -r")
+    if sys.platform == "win32":
+        # PowerShell runs a quoted program path only through the & operator.
+        direct = "& " + " ".join(_powershell_quote(part) for part in direct_command)
+        folder = _powershell_quote(str(installed.parent) + ";")
+        use_in_shell = f"$env:Path = {folder} + $env:Path"
+        # PowerShell syntax: Command Prompt can run neither line.
+        directly, shell = "directly in PowerShell", "PowerShell window"
+    else:
+        direct = " ".join(shlex.quote(part) for part in direct_command)
+        folder = shlex.quote(str(installed.parent))
+        use_in_shell = f"export PATH={folder}:$PATH && hash -r"
+        directly, shell = "directly", "shell"
+    click.echo(f"Run the updated CLI {directly}:")
+    click.echo(f"  {direct}")
+    click.echo(f"Use the updated CLI in this {shell} with:")
+    click.echo(f"  {use_in_shell}")
+
+
+def _powershell_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
 
 
 def _cursor_agent_installed() -> bool:
@@ -274,18 +302,42 @@ def update_cmd(_npm_validate: bool = False) -> None:
         click.echo(f"  {command}")
         return
 
-    if not shutil.which("curl"):
+    windows = sys.platform == "win32"
+    if not windows and not shutil.which("curl"):
         raise click.ClickException(
             "curl is required for updates. Install curl and try again."
         )
 
     click.echo("Installing...")
     installed_executable = _installed_executable()
-    install_command = (
-        'tmp="$(mktemp)" && trap \'rm -f "$tmp"\' 0 && '
-        f'curl -fsSL {_INSTALL_URL} -o "$tmp" && sh "$tmp" --no-skills'
-    )
-    run = subprocess.run(["sh", "-c", install_command], capture_output=True, text=True)
+    if windows:
+        # Windows has no sh; the PowerShell installer takes options from the
+        # environment, since `irm | iex` can't pass arguments.
+        install_command = _WINDOWS_INSTALL_COMMAND
+        run = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                f"irm {_WINDOWS_INSTALL_URL} | iex",
+            ],
+            env={**os.environ, "RAMP_NO_SKILLS": "1"},
+            capture_output=True,
+            text=True,
+            # Windows PowerShell writes to a pipe in the console code page,
+            # which need not match Python's locale encoding.
+            errors="replace",
+        )
+    else:
+        install_command = (
+            'tmp="$(mktemp)" && trap \'rm -f "$tmp"\' 0 && '
+            f'curl -fsSL {_INSTALL_URL} -o "$tmp" && sh "$tmp" --no-skills'
+        )
+        run = subprocess.run(
+            ["sh", "-c", install_command], capture_output=True, text=True
+        )
     if run.returncode != 0:
         detail = "\n".join(
             part.strip()
@@ -319,10 +371,13 @@ def update_cmd(_npm_validate: bool = False) -> None:
             # refresh, which will fail the same way.
             raise SystemExit(EXIT_AUTH_REQUIRED)
         if refresh.returncode != 0:
+            if windows:
+                retry = "& " + " ".join(_powershell_quote(p) for p in refresh_command)
+            else:
+                retry = " ".join(shlex.quote(part) for part in refresh_command)
             raise click.ClickException(
                 "Ramp CLI was updated, but existing Router configurations "
-                "could not be refreshed. Run:\n"
-                f"  {' '.join(shlex.quote(part) for part in refresh_command)}"
+                f"could not be refreshed. Run:\n  {retry}"
             )
     else:
         _offer_optional_skills_update(installed_executable)

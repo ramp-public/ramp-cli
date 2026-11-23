@@ -1,7 +1,8 @@
 """Hermes Agent (NousResearch hermes-agent) helpers for Ramp Router setup.
 
 Hermes keeps configuration in ``$HERMES_HOME/config.yaml`` and secrets in
-``$HERMES_HOME/.env`` (both default under ``~/.hermes``). Configuration
+``$HERMES_HOME/.env`` (both default under ``~/.hermes``, or
+``%LOCALAPPDATA%\\hermes`` on Windows). Configuration
 reads and writes go through ``hermes config get/set/unset`` — Hermes's
 stable scripting surface — instead of editing the YAML directly, so its
 managed-install guards, profile resolution, key coercion, and credential
@@ -25,6 +26,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -39,11 +41,23 @@ ROUTER_KEY_ENV = "RAMP_ROUTER_API_KEY"
 
 
 def hermes_home() -> Path:
-    """Locate the Hermes home directory, exactly as Hermes resolves it."""
+    """Locate the Hermes home directory, exactly as Hermes resolves it.
+
+    Mirrors Hermes's ``get_hermes_home``: ``HERMES_HOME`` when set, otherwise
+    ``%LOCALAPPDATA%\\hermes`` on Windows and ``~/.hermes`` elsewhere, each with
+    ``HERMES_DATA_DIR_SUFFIX`` appended.
+    """
     configured = os.environ.get(HERMES_HOME_ENV, "").strip()
     if configured:
-        return Path(configured).expanduser()
-    return Path.home() / ".hermes"
+        return Path(os.path.expanduser(os.path.expandvars(configured)))
+    suffix = os.environ.get("HERMES_DATA_DIR_SUFFIX", "")
+    if sys.platform == "win32":
+        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+        base = (
+            Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
+        )
+        return base / f"hermes{suffix}"
+    return Path.home() / f".hermes{suffix}"
 
 
 def config_path() -> Path:
@@ -290,7 +304,9 @@ def write_env_line(name: str, assignment: str | None) -> None:
     """
     path = env_path()
     try:
-        existing = path.read_text(encoding="utf-8")
+        # Bytes, not read_text: text mode would turn "\r\n" into "\n" and hide
+        # which line endings the file uses.
+        existing = path.read_bytes().decode("utf-8")
         lines = existing.splitlines()
     except FileNotFoundError:
         existing = None
@@ -303,7 +319,10 @@ def write_env_line(name: str, assignment: str | None) -> None:
         kept.append(assignment)
     if existing is None and assignment is None:
         return
-    content = ("\n".join(kept) + "\n") if kept else ""
+    # Keep the file's own line endings: a .env edited on Windows may use CRLF,
+    # and rewriting every line would show the whole file as changed.
+    eol = "\r\n" if existing and "\r\n" in existing else "\n"
+    content = (eol.join(kept) + eol) if kept else ""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         # A dotfiles-managed .env may be a symlink; write through to its
@@ -325,7 +344,9 @@ def write_env_line(name: str, assignment: str | None) -> None:
             mode = 0o600
         fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as output:
+            # newline="" writes the endings above as they are; text mode would
+            # turn every "\n" into "\r\n" on Windows.
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as output:
                 output.write(content)
                 output.flush()
                 os.fsync(output.fileno())

@@ -6,6 +6,7 @@ import json
 import os
 import sys
 
+import pytest
 from click.testing import CliRunner
 
 from ramp_cli.config import settings
@@ -66,6 +67,7 @@ def test_normalize_env_prod_alias(isolated_config):
     assert settings.resolve_environment("prod") == ENV_PRODUCTION
 
 
+@pytest.mark.posix_only(reason="POSIX permission bits")
 def test_config_file_permissions(isolated_config):
     cfg = settings.Config()
     cfg.environment = "sandbox"
@@ -76,6 +78,7 @@ def test_config_file_permissions(isolated_config):
     assert mode == 0o600
 
 
+@pytest.mark.posix_only(reason="POSIX permission bits")
 def test_loose_permission_warning_emitted_on_posix(isolated_config, capsys):
     cfg = settings.Config()
     cfg.environment = "sandbox"
@@ -119,6 +122,7 @@ def test_config_dir_normalizes_git_bash_xdg_config_home(monkeypatch):
     )
 
 
+@pytest.mark.posix_only(reason="simulates MSYS Python, whose paths are POSIX paths")
 def test_config_dir_keeps_msys_python_xdg_config_home_posix(monkeypatch):
     monkeypatch.setattr(sys, "platform", "msys")
     monkeypatch.setenv("MSYSTEM", "MINGW64")
@@ -127,6 +131,7 @@ def test_config_dir_keeps_msys_python_xdg_config_home_posix(monkeypatch):
     assert str(settings.config_dir()) == "/c/Users/alice/.config/ramp"
 
 
+@pytest.mark.posix_only(reason="simulates MSYS Python, whose paths are POSIX paths")
 def test_config_dir_does_not_claim_cygwin_path_support(monkeypatch):
     monkeypatch.setattr(sys, "platform", "cygwin")
     monkeypatch.setenv("MSYSTEM", "MINGW64")

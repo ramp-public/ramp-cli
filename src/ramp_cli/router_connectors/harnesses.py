@@ -74,13 +74,42 @@ def config_path(harness: str, *, require_unambiguous: bool = True) -> Path:
     return existing[0] if existing else paths[0]
 
 
+# Script launchers a Windows install puts on PATH (npm writes ramp.cmd). A
+# harness starts an MCP server without a shell, so it needs the real
+# executable, and an entry an earlier setup wrote with a launcher still has to
+# count as this CLI's own so setup can replace it.
+_WINDOWS_LAUNCHER_SUFFIXES = (".cmd", ".bat", ".ps1")
+
+
+def _is_ramp_executable_name(name: str) -> bool:
+    if sys.platform != "win32":
+        return name in EXECUTABLE_NAMES
+    # Windows file names are case-insensitive: PATH lookup returns "ramp.CMD".
+    return name.lower() in (*EXECUTABLE_NAMES, "ramp.cmd")
+
+
 def _executable() -> str:
     executable = shutil.which("ramp")
-    if executable:
+    launcher = (
+        executable is not None
+        and sys.platform == "win32"
+        and Path(executable).suffix.lower() in _WINDOWS_LAUNCHER_SUFFIXES
+    )
+    if executable and not launcher:
         return str(Path(executable).absolute())
     path = Path(sys.argv[0]).absolute()
-    if path.name in EXECUTABLE_NAMES and path.is_file() and os.access(path, os.X_OK):
+    if sys.platform == "win32" and not path.suffix and not path.exists():
+        # pip and uv console-script launchers report argv[0] without ".exe".
+        path = path.with_suffix(".exe")
+    if (
+        _is_ramp_executable_name(path.name)
+        and path.suffix.lower() not in _WINDOWS_LAUNCHER_SUFFIXES
+        and path.is_file()
+        and os.access(path, os.X_OK)
+    ):
         return str(path)
+    if executable:
+        return str(Path(executable).absolute())
     raise RampCLIError("Install the ramp executable before registering connectors.")
 
 
@@ -112,7 +141,7 @@ def _owned(harness: str, entry: object) -> str | None:
     if (
         not isinstance(command, str)
         or not Path(command).is_absolute()
-        or Path(command).name not in EXECUTABLE_NAMES
+        or not _is_ramp_executable_name(Path(command).name)
         or not isinstance(args, list)
         or len(args) != 5
         or args[:4] != ["router", "connectors", "bridge", "--binding"]
@@ -354,7 +383,8 @@ def _write(path: Path, text: str, original: str) -> None:
     fd, temporary = tempfile.mkstemp(dir=path.parent)
     try:
         if path.exists():
-            os.fchmod(fd, path.stat().st_mode & 0o777)
+            # os.fchmod doesn't exist on Windows before Python 3.13.
+            os.chmod(temporary, path.stat().st_mode & 0o777)
         with os.fdopen(fd, "w") as output:
             output.write(text)
             output.flush()

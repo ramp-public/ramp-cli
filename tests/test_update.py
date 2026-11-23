@@ -10,12 +10,25 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
+from ramp_cli.commands import update as update_module
 from ramp_cli.commands.update import _is_homebrew_install
 from ramp_cli.main import cli, main
 from ramp_cli.router_connectors import skill as connector_skill
 from ramp_cli.skills import get_skill_content, record_receipt
 from ramp_cli.skills.remote import active_skills_dir
 from ramp_cli.version_check import _write_cache, latest_version, parse_version
+
+
+@pytest.fixture(autouse=True)
+def _posix_update_flow_on_windows_hosts(monkeypatch):
+    """Keep the POSIX update tests POSIX when the suite runs on Windows.
+
+    On Windows the update runs the real PowerShell installer, so an unmocked
+    test would install over the developer's own profile. Tests that cover the
+    Windows flow patch the platform back themselves.
+    """
+    if sys.platform == "win32":
+        monkeypatch.setattr("ramp_cli.commands.update.sys.platform", "linux")
 
 
 def _invoke(args, **kwargs):
@@ -322,7 +335,7 @@ class TestUpdateAvailable:
     @patch("ramp_cli.commands.update.latest_version", return_value="0.2.0")
     @patch("ramp_cli.commands.update.__version__", "0.1.3")
     @patch("ramp_cli.commands.update.sys.platform", "win32")
-    def test_router_refresh_uses_sh_for_windows_wrapper(
+    def test_windows_update_uses_the_powershell_installer(
         self,
         mock_latest,
         mock_which,
@@ -332,10 +345,10 @@ class TestUpdateAvailable:
         mock_configured,
         isolated_config,
     ):
+        # Windows has no sh or curl requirement; the .cmd launcher is reachable.
         mock_which.side_effect = lambda command: {
-            "curl": "/usr/bin/curl",
-            "ramp": "C:/Users/user/.local/bin/ramp",
-        }[command]
+            "ramp": "C:/Users/user/.local/bin/ramp.cmd",
+        }.get(command)
         mock_run.side_effect = [
             MagicMock(returncode=0),
             MagicMock(returncode=0),
@@ -345,13 +358,85 @@ class TestUpdateAvailable:
             ["update"], env={"RAMP_INSTALL_DIR": "C:/Users/user/.local/bin"}
         )
 
-        assert result.exit_code == 0
+        assert result.exit_code == 0, result.output
+        install = mock_run.call_args_list[0]
+        assert install.args[0][0] == "powershell.exe"
+        assert install.args[0][-1] == "irm https://agents.ramp.com/install.ps1 | iex"
+        assert install.kwargs["env"]["RAMP_NO_SKILLS"] == "1"
+        # Like the sh installer, its output shows only when it fails.
+        assert install.kwargs["capture_output"] is True
+        assert install.kwargs["text"] is True
+        assert result.output.index(
+            "installed binary passed checksum verification"
+        ) < result.output.index("configured agents only: OpenCode")
         assert mock_run.call_args_list[1].args[0] == [
-            "sh",
-            "C:/Users/user/.local/bin/ramp",
+            str(Path("C:/Users/user/.local/bin") / "ramp.cmd"),
             "router",
             "refresh",
         ]
+
+    @patch("ramp_cli.commands.update._is_homebrew_install", return_value=False)
+    @patch("ramp_cli.commands.update.subprocess.run")
+    @patch("ramp_cli.commands.update.shutil.which", return_value=None)
+    @patch("ramp_cli.commands.update.latest_version", return_value="0.2.0")
+    @patch("ramp_cli.commands.update.__version__", "0.1.3")
+    @patch("ramp_cli.commands.update.sys.platform", "win32")
+    def test_windows_install_failure_shows_installer_output(
+        self, mock_latest, mock_which, mock_run, mock_brew, isolated_config
+    ):
+        mock_run.return_value = MagicMock(
+            returncode=1,
+            stdout="error Checksum verification failed.\n",
+            stderr="Ramp CLI was not installed.\n",
+        )
+
+        result = _invoke(["update"])
+
+        assert result.exit_code != 0
+        assert "Checksum verification failed." in result.output
+        assert "Ramp CLI was not installed." in result.output
+        assert (
+            'powershell -ExecutionPolicy ByPass -c "irm '
+            'https://agents.ramp.com/install.ps1 | iex"'
+        ) in result.output
+        assert "curl" not in result.output
+
+    @patch(
+        "ramp_cli.commands.update.configured_router_clients",
+        return_value=("opencode",),
+    )
+    @patch("ramp_cli.commands.update._is_homebrew_install", return_value=False)
+    @patch("ramp_cli.commands.update.suppress_next_update_notice")
+    @patch("ramp_cli.commands.update.subprocess.run")
+    @patch("ramp_cli.commands.update.shutil.which", return_value=None)
+    @patch("ramp_cli.commands.update.latest_version", return_value="0.2.0")
+    @patch("ramp_cli.commands.update.__version__", "0.1.3")
+    @patch("ramp_cli.commands.update.sys.platform", "win32")
+    def test_windows_refresh_failure_hint_uses_powershell_syntax(
+        self,
+        mock_latest,
+        mock_which,
+        mock_run,
+        mock_notice,
+        mock_brew,
+        mock_configured,
+        isolated_config,
+    ):
+        mock_run.side_effect = [MagicMock(returncode=0), MagicMock(returncode=1)]
+
+        result = _invoke(
+            ["update"], env={"RAMP_INSTALL_DIR": "C:/Users/user/.local/bin"}
+        )
+
+        assert result.exit_code != 0
+        launcher = str(Path("C:/Users/user/.local/bin") / "ramp.cmd")
+        assert f"& '{launcher}' 'router' 'refresh'" in result.output
+
+    @patch("ramp_cli.commands.update.sys.platform", "win32")
+    def test_windows_git_bash_install_runs_through_sh(self):
+        assert update_module._installed_invocation(
+            Path("C:/Users/user/.local/bin/ramp"), "--version"
+        ) == ["sh", str(Path("C:/Users/user/.local/bin/ramp")), "--version"]
 
     @patch("ramp_cli.commands.update._is_homebrew_install", return_value=False)
     @patch("ramp_cli.commands.update.subprocess.run")
@@ -760,3 +845,25 @@ class TestParseVersion:
         assert parse_version("0.2.0") > parse_version("0.1.3")
         assert parse_version("0.1.3") == parse_version("0.1.3")
         assert parse_version("0.1.2") < parse_version("0.1.3")
+
+
+@patch("ramp_cli.commands.update.sys.platform", "win32")
+def test_windows_shadow_hint_uses_powershell_syntax(capsys):
+    with (
+        patch(
+            "ramp_cli.commands.update.shutil.which",
+            return_value="C:/Old/ramp.cmd",
+        ),
+        patch("ramp_cli.commands.update._same_executable", return_value=False),
+        patch("ramp_cli.commands.update._running_version", return_value="0.1.0"),
+        patch("ramp_cli.commands.update._installed_version", return_value="0.2.0"),
+    ):
+        update_module._warn_if_shadowed(Path("C:/Users/it's me/.local/bin/ramp.cmd"))
+
+    output = capsys.readouterr().out
+    installed = str(Path("C:/Users/it's me/.local/bin/ramp.cmd")).replace("'", "''")
+    folder = str(Path("C:/Users/it's me/.local/bin")).replace("'", "''")
+    assert f"  & '{installed}' '--version'" in output
+    assert f"  $env:Path = '{folder};' + $env:Path" in output
+    assert "Run the updated CLI directly in PowerShell:" in output
+    assert "Use the updated CLI in this PowerShell window with:" in output

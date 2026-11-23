@@ -22,9 +22,11 @@ class TestBundledSpecs:
         assert "ramp_cli" in str(AGENT_TOOL_SPEC)
 
     def test_local_spec_path_is_env_specific(self):
-        assert str(local_agent_tool_spec("production")).endswith(
-            "ramp/agent-tool-production.json"
+        assert local_agent_tool_spec("production").parts[-2:] == (
+            "ramp",
+            "agent-tool-production.json",
         )
-        assert str(local_agent_tool_spec("sandbox")).endswith(
-            "ramp/agent-tool-sandbox.json"
+        assert local_agent_tool_spec("sandbox").parts[-2:] == (
+            "ramp",
+            "agent-tool-sandbox.json",
         )

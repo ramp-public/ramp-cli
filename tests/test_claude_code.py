@@ -12,6 +12,12 @@ import ramp_cli.commands.claude_code as claude_code
 import ramp_cli.commands.router as router_module
 from ramp_cli import __version__
 from ramp_cli.main import cli
+from tests.platform_support import assert_mode
+from tests.test_router import _WINDOWS_RAMP, _simulate_windows
+
+_STATUS_LINE_IS_POSIX_ONLY = pytest.mark.posix_only(
+    reason="checks the POSIX status line command; Windows writes its own, tested below"
+)
 
 
 def _router_metadata(identifier):
@@ -52,6 +58,8 @@ def _mock_models(monkeypatch, models=None):
 def test_settings_live_in_the_user_directory(monkeypatch, tmp_path):
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
+    # Path.home() reads USERPROFILE on Windows.
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     assert claude_code.settings_path() == tmp_path / ".claude" / "settings.json"
 
     # An isolated config directory is how a test run or a second profile keeps
@@ -65,6 +73,8 @@ def test_user_config_sits_beside_the_configured_settings(monkeypatch, tmp_path):
     # ~/.claude where the settings live.
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
+    # Path.home() reads USERPROFILE on Windows.
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     assert claude_code.user_config_path() == tmp_path / ".claude.json"
 
     # With an isolated config directory, the file moves to that root.
@@ -1355,7 +1365,7 @@ def test_the_key_is_stored_privately_and_never_printed(monkeypatch, tmp_path):
     assert result.exit_code == 0, result.output
     assert "router-secret" not in result.output
     path = tmp_path / "settings.json"
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert_mode(path, 0o600)
     assert (
         json.loads(path.read_text())["env"]["ANTHROPIC_AUTH_TOKEN"] == "router-secret"
     )
@@ -1671,6 +1681,7 @@ def _mock_router_endpoints(monkeypatch, script=_STATUSLINE_SCRIPT):
     return urls
 
 
+@_STATUS_LINE_IS_POSIX_ONLY
 def test_configure_installs_the_status_line(monkeypatch, tmp_path):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
     urls = _mock_router_endpoints(monkeypatch)
@@ -1712,6 +1723,7 @@ def test_a_status_line_the_user_configured_is_left_alone(monkeypatch, tmp_path):
     assert json.loads(settings_path.read_text())["statusLine"] == theirs
 
 
+@_STATUS_LINE_IS_POSIX_ONLY
 def test_a_repeat_configure_refreshes_the_status_line(monkeypatch, tmp_path):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
     runner = CliRunner()
@@ -1766,6 +1778,7 @@ def test_a_block_page_is_not_installed_as_the_status_line(monkeypatch, tmp_path)
     assert "statusLine" not in json.loads((tmp_path / "settings.json").read_text())
 
 
+@_STATUS_LINE_IS_POSIX_ONLY
 def test_a_missing_python3_skips_the_status_line(monkeypatch, tmp_path):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
     _mock_router_endpoints(monkeypatch)
@@ -1796,6 +1809,39 @@ def test_unconfigure_removes_the_status_line(monkeypatch, tmp_path):
     settings = json.loads((tmp_path / "settings.json").read_text())
     assert "statusLine" not in settings
     assert "ROUTER_BASE_URL" not in settings.get("env", {})
+
+
+def test_windows_runs_the_status_line_through_ramp(monkeypatch, tmp_path):
+    _simulate_windows(monkeypatch)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    _mock_router_endpoints(monkeypatch)
+    runner = CliRunner()
+    settings_path = tmp_path / "settings.json"
+
+    configured = runner.invoke(
+        cli, ["--human", "router", "configure", "claude-code", "--api-key", "secret"]
+    )
+
+    assert configured.exit_code == 0, configured.output
+    original = json.loads(settings_path.read_text())
+    script = (tmp_path / "ramp-router-statusline").as_posix()
+    assert original["statusLine"] == {
+        "type": "command",
+        "command": f"{_WINDOWS_RAMP} router run-cost-script {script}",
+    }
+
+    for action in ("disable", "enable"):
+        toggled = runner.invoke(cli, ["--human", "router", "harness-widget", action])
+        assert toggled.exit_code == 0, toggled.output
+        settings = json.loads(settings_path.read_text())
+        assert ("statusLine" in settings) is (action == "enable")
+    assert settings == original
+
+    removed = runner.invoke(cli, ["--human", "router", "unconfigure", "claude-code"])
+
+    assert removed.exit_code == 0, removed.output
+    assert "statusLine" not in json.loads(settings_path.read_text())
+    assert not (tmp_path / "ramp-router-statusline").exists()
 
 
 def test_a_status_line_changed_since_is_left_by_unconfigure(tmp_path):
@@ -1977,6 +2023,7 @@ def test_a_user_status_line_never_becomes_router_state(monkeypatch, tmp_path):
     assert json.loads(settings_path.read_text())["statusLine"] == second
 
 
+@_STATUS_LINE_IS_POSIX_ONLY
 def test_a_slot_taken_since_the_first_configure_is_freed_again(monkeypatch, tmp_path):
     # First configure could not install the status line; the user still has
     # none when a repeat configure succeeds and takes the empty slot. The
@@ -2243,3 +2290,16 @@ def test_plan_stop_hook_keeps_the_users_stop_entries_and_defers_to_a_wrapper():
     )
     assert configured == {"hooks": {"Stop": [wrapper]}}
     assert state[claude_code.STOP_HOOK_STATE_KEY] == "user-managed"
+
+
+def test_original_settings_command_uses_a_quoted_absolute_path_on_windows(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(claude_code.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(claude_code.os, "name", "nt")
+    settings = tmp_path / ".claude" / "settings.json"
+
+    command = claude_code.original_settings_command(settings, use_default_model=True)
+
+    expected = claude_code.original_settings_path(settings)
+    assert command == f'claude --settings "{expected}" --model default'

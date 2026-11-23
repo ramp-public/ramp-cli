@@ -53,7 +53,8 @@ fn codex_memory_reads_do_not_replace_the_project_repository() {
     let memories = state.join("memories");
     repo(&project, Some("git@github.com:ramp/project.git"));
     repo(&memories, None);
-    std::env::set_var("RRH_AGENT_STATE_DIRS", &state);
+    // Separated like PATH, so a Windows drive path's colon is not a separator.
+    std::env::set_var("RRH_AGENT_STATE_DIRS", std::env::join_paths([state.as_path(), tmp.join("other").as_path()]).unwrap());
     let [project_call, project_output] = read("c1", project.join("lib/notes.md").to_str().unwrap());
     let [memory_call, memory_output] = read("c2", memories.join("lib/notes.md").to_str().unwrap());
     let body = serde_json::json!({

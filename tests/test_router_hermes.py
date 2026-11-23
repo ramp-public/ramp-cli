@@ -22,6 +22,7 @@ import ramp_cli.commands.router as router_module
 from ramp_cli import claude_cowork, hermes_agent
 from ramp_cli.commands.router import DEFAULT_ROUTER_BASE_URL as ROUTER_BASE_URL
 from ramp_cli.main import cli
+from tests.platform_support import assert_mode
 
 
 @pytest.fixture(autouse=True)
@@ -245,7 +246,7 @@ def test_configure_hermes_writes_config_env_and_receipt(fake_hermes, monkeypatch
     }
     receipt = fake_hermes.home / "ramp-router-state.json"
     # The receipt can carry a pre-existing key, so it is owner-only.
-    assert receipt.stat().st_mode & 0o777 == 0o600
+    assert_mode(receipt, 0o600)
     assert "Connected to: Hermes" in result.output
     assert (
         "2 models added. Restart any running agents, then pick a model."
@@ -268,7 +269,7 @@ def test_configure_hermes_creates_env_with_owner_only_permissions(
     assert result.exit_code == 0, result.output
     env_file = fake_hermes.home / ".env"
     assert env_file.read_text() == "RAMP_ROUTER_API_KEY=router-secret\n"
-    assert env_file.stat().st_mode & 0o777 == 0o600
+    assert_mode(env_file, 0o600)
 
 
 def test_configure_hermes_requires_the_hermes_binary(tmp_path, monkeypatch):
@@ -477,7 +478,7 @@ def test_configure_tightens_a_world_readable_env_file(fake_hermes, monkeypatch):
     assert result.exit_code == 0, result.output
     # The file now carries a Router credential, so owner-only wins over the
     # permissions the pre-existing file arrived with.
-    assert env_file.stat().st_mode & 0o777 == 0o600
+    assert_mode(env_file, 0o600)
 
 
 def test_unconfigure_preserves_the_receipt_when_an_unset_fails(
@@ -749,7 +750,7 @@ def test_env_writes_preserve_a_symlinked_env_file(fake_hermes, tmp_path, monkeyp
     lines = target.read_text().splitlines()
     assert "OTHER_KEY=untouched" in lines
     assert "RAMP_ROUTER_API_KEY=router-secret" in lines
-    assert target.stat().st_mode & 0o777 == 0o600
+    assert_mode(target, 0o600)
 
 
 def test_malformed_config_json_is_an_error_not_an_absence(fake_hermes, monkeypatch):
@@ -901,7 +902,7 @@ def test_key_removal_is_atomic_and_keeps_file_permissions(fake_hermes, monkeypat
     assert "OTHER_KEY=keep-me" in lines
     assert not any(line.startswith("RAMP_ROUTER_API_KEY=") for line in lines)
     # A removal stores no secret of ours, so the user's chosen mode stays.
-    assert env_file.stat().st_mode & 0o777 == 0o640
+    assert_mode(env_file, 0o640)
 
 
 def test_an_unreadable_env_file_is_an_error_not_an_absence(fake_hermes, monkeypatch):
@@ -2097,3 +2098,51 @@ def test_a_provider_switch_keeps_the_users_model_pairing(fake_hermes, monkeypatc
     assert unconfigure.exit_code == 0, unconfigure.output
     store = json.loads(fake_hermes.store_path.read_text())
     assert store["model"] == {"provider": "fallback", "default": "gpt-5.4"}
+
+
+def test_hermes_home_matches_hermes_on_windows(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.delenv("HERMES_DATA_DIR_SUFFIX", raising=False)
+    monkeypatch.setattr(hermes_agent.sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local"))
+
+    assert hermes_agent.hermes_home() == tmp_path / "Local" / "hermes"
+
+    monkeypatch.setenv("HERMES_DATA_DIR_SUFFIX", "-dev")
+    assert hermes_agent.hermes_home() == tmp_path / "Local" / "hermes-dev"
+
+
+def test_hermes_home_keeps_dot_hermes_elsewhere(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.delenv("HERMES_DATA_DIR_SUFFIX", raising=False)
+    monkeypatch.setattr(hermes_agent.sys, "platform", "darwin")
+    monkeypatch.setattr(hermes_agent.Path, "home", lambda: tmp_path)
+
+    assert hermes_agent.hermes_home() == tmp_path / ".hermes"
+
+
+def test_hermes_home_expands_a_configured_path(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_ROOT_FOR_TEST", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", "$HERMES_ROOT_FOR_TEST/custom")
+
+    assert hermes_agent.hermes_home() == tmp_path / "custom"
+
+
+@pytest.mark.parametrize("eol", ["\n", "\r\n"])
+def test_env_writes_keep_the_files_line_endings(monkeypatch, tmp_path, eol):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    env = tmp_path / ".env"
+    env.write_bytes(eol.join(["# keep me", "OTHER=1", ""]).encode())
+
+    hermes_agent.write_env_value("RAMP_ROUTER_API_KEY", "router-secret")
+
+    assert (
+        env.read_bytes()
+        == eol.join(
+            ["# keep me", "OTHER=1", "RAMP_ROUTER_API_KEY=router-secret", ""]
+        ).encode()
+    )
+
+    hermes_agent.write_env_value("RAMP_ROUTER_API_KEY", None)
+
+    assert env.read_bytes() == eol.join(["# keep me", "OTHER=1", ""]).encode()

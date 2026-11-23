@@ -174,6 +174,9 @@ def test_only_claude_code_model_changes_follow_in_desktop(
     assert not any(call[0] == "set" for call in calls)
 
 
+@pytest.mark.posix_only(
+    reason="Claude Desktop setup is macOS-only and locks with fcntl"
+)
 @pytest.mark.parametrize("failure", ["unavailable", "error", "not_connected"])
 def test_a_newer_claude_code_choice_drops_an_older_waiting_desktop_request(
     installed, monkeypatch, failure

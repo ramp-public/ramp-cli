@@ -1,0 +1,57 @@
+# Tests that should pass on Windows but don't yet. Windows CI skips them; every
+# other platform still runs them. This is debt: fix a test (or the product) and
+# delete its line. Tests that can never apply to Windows use the posix_only
+# marker instead.
+#
+# One "file::[Class::]test" per line covers every parametrization; add
+# "[params]" to name a single case.
+
+# `ramp update` assumes the POSIX installer: it runs install.sh through sh,
+# reruns the CLI as "sh <path>", and prints export/PATH hints. ramp-cli#968
+# adds the PowerShell installer and reworks these tests.
+test_update.py::TestUpdateAvailable::test_accepting_skills_update_refreshes_only_managed_skills
+test_update.py::TestUpdateAvailable::test_skills_catalog_failure_does_not_touch_skill_directories
+test_update.py::TestUpdateAvailable::test_warns_when_updated_binary_is_shadowed_on_path
+test_update.py::TestUpdateAvailable::test_router_update_refreshes_only_configured_agents
+test_update.py::TestUpdateAvailable::test_router_refresh_uses_sh_for_windows_wrapper
+test_update.py::TestUpdateAvailable::test_router_refresh_non_auth_failure_suggests_retry
+
+# The router TUI subprocess hits UnicodeEncodeError on a cp1252 console;
+# ramp-cli#968 switches Windows output to UTF-8.
+test_router_subprocess.py::test_tui_command_ignores_cwd_package
+
+# Passed in a triage run, but has been timing-flaky on the Windows runner.
+test_router_strategies_user.py::test_coding_retry_keeps_visible_reverts_after_lost_write_response[True]
+
+# The Claude escape command is written as ~/'.claude\original.settings.json',
+# which neither PowerShell nor cmd expands; ramp-cli#968 writes the full path
+# in double quotes on Windows.
+test_router.py::test_claude_escape_command_is_written_to_be_typed
+test_router.py::test_notice_reports_the_cost_of_taking_the_default
+test_router.py::test_reconfigure_advertises_both_escape_commands_after_unconfigure
+test_router.py::test_configure_and_unconfigure_accept_multiple_clients
+test_router.py::test_configure_and_unconfigure_without_client_targets_everything
+
+# The local Router helper (repository attribution) needs the Router agent,
+# which runs only on macOS and Linux until ramp-cli#973.
+test_router.py::test_helper_endpoint_check_moves_only_the_endpoint
+
+# Keeping a Router key for the next Cursor setup (the pending key), and binding
+# the key Cursor sends, both store it through router_repo.health_token(), which
+# returns None without os.getuid and os.O_NOFOLLOW. On Windows a cancelled or
+# flag-stopped Cursor setup therefore loses its new key, and unconfigure can't
+# delete the effort variants it made. ramp-cli#973 lifts that gate.
+test_cursor_quiet_fallback.py::test_a_key_created_for_an_unfinished_setup_is_reused
+test_cursor_quiet_fallback.py::test_a_rerun_that_fails_again_keeps_the_key_pending
+test_cursor_quiet_fallback.py::test_a_rejected_pending_key_is_replaced_with_a_new_one
+test_cursor_quiet_fallback.py::test_only_a_cursor_only_run_reuses_the_pending_key
+test_cursor_quiet_fallback.py::test_manual_setup_hands_over_the_pending_key
+test_cursor_quiet_fallback.py::test_unattended_manual_setup_leaves_the_pending_key_alone
+test_cursor_quiet_fallback.py::test_a_pending_key_belongs_to_its_router_and_goes_with_unconfigure
+test_cursor_quiet_fallback.py::test_the_steps_are_shown_when_a_new_key_cannot_be_kept
+test_cursor_quiet_fallback.py::test_a_pending_key_the_clipboard_couldnt_take_stays_for_show_key
+test_cursor_quiet_fallback.py::test_steps_that_couldnt_copy_a_reused_key_keep_it_pending
+test_router_cursor_variants.py::test_a_key_created_for_a_run_a_flag_stops_is_kept
+test_router_cursor_variants.py::test_a_levels_timeout_keeps_names_only_for_the_same_key
+test_router_cursor_variants.py::test_unconfigure_removes_only_what_this_machine_made
+test_router_cursor_variants.py::test_unconfigure_never_sends_the_key_to_another_router

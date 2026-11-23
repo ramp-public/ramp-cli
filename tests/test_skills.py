@@ -8,6 +8,7 @@ import shutil
 import tomllib
 
 import pytest
+import tomli_w
 from click.testing import CliRunner
 
 from ramp_cli.config import settings
@@ -44,6 +45,15 @@ _REMOTE_SKILLS = [
     "vendor-document-upload",
     "x402-pay",
 ]
+
+
+def _legacy_known_state(target, skill: str) -> str:
+    """The pre-receipt skills.toml that recorded one skill for a target.
+
+    Serialized rather than formatted by hand: a Windows path pasted into a
+    quoted TOML key turns its backslashes into escapes.
+    """
+    return tomli_w.dumps({"known": {str(target.resolve()): skill}})
 
 
 @pytest.fixture(autouse=True)
@@ -233,7 +243,7 @@ class TestSkillsInstall:
         (legacy / "SKILL.md").write_text("old bundled content")
         state = settings.config_dir() / "skills.toml"
         state.parent.mkdir(parents=True, exist_ok=True)
-        state.write_text(f'[known]\n"{tmp_path.resolve()}" = "browser-automation"\n')
+        state.write_text(_legacy_known_state(tmp_path, "browser-automation"))
 
         result = CliRunner().invoke(
             cli,
@@ -405,7 +415,7 @@ class TestSkillsSync:
         (user_dir / "notes.txt").write_text("user notes")
         state = settings.config_dir() / "skills.toml"
         state.parent.mkdir(parents=True, exist_ok=True)
-        state.write_text(f'[known]\n"{target.resolve()}" = "browser-automation"\n')
+        state.write_text(_legacy_known_state(target, "browser-automation"))
 
         result = self._install_all(target)
 
@@ -464,7 +474,7 @@ class TestSkillsSync:
         target = tmp_path / "skills"
         state = settings.config_dir() / "skills.toml"
         state.parent.mkdir(parents=True, exist_ok=True)
-        state.write_text(f'[known]\n"{target.resolve()}" = "some-retired-skill"\n')
+        state.write_text(_legacy_known_state(target, "some-retired-skill"))
 
         self._install_all(target)
         entry = tomllib.loads(state.read_text())["targets"][str(target.resolve())]
@@ -548,7 +558,7 @@ class TestSkillsSync:
         (legacy / "notes.txt").write_text("user notes")
         state = settings.config_dir() / "skills.toml"
         state.parent.mkdir(parents=True, exist_ok=True)
-        state.write_text(f'[known]\n"{tmp_path.resolve()}" = "browser-automation"\n')
+        state.write_text(_legacy_known_state(tmp_path, "browser-automation"))
 
         def failing_receipt(target_dir, installed_name, replaces=None):
             raise OSError("read-only config")
@@ -574,7 +584,7 @@ class TestSkillsSync:
         (legacy / "notes.txt").write_text("user notes")
         state = settings.config_dir() / "skills.toml"
         state.parent.mkdir(parents=True, exist_ok=True)
-        state.write_text(f'[known]\n"{tmp_path.resolve()}" = "browser-automation"\n')
+        state.write_text(_legacy_known_state(tmp_path, "browser-automation"))
 
         real_copy2 = shutil.copy2
 
@@ -783,7 +793,7 @@ class TestSkillsUninstall:
         (legacy / "SKILL.md").write_text("old bundled content")
         state = settings.config_dir() / "skills.toml"
         state.parent.mkdir(parents=True, exist_ok=True)
-        state.write_text(f'[known]\n"{target.resolve()}" = "browser-automation"\n')
+        state.write_text(_legacy_known_state(target, "browser-automation"))
         runner = CliRunner()
 
         result = runner.invoke(
@@ -828,7 +838,7 @@ class TestSkillsUninstall:
         assert cancelled.exit_code != 0
         assert f"{skill}/" in cancelled.output
         assert "SKILL.md" in cancelled.output
-        assert "scripts/custom.sh" in cancelled.output
+        assert str(nested_file.relative_to(skill)) in cancelled.output
         assert "Confirming will delete them too" in cancelled.output
         assert "Continue? [y/N]" in cancelled.output
         assert nested_file.read_text() == "user-authored"

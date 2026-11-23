@@ -8,10 +8,12 @@ from click.testing import CliRunner
 
 from ramp_cli import claude_cowork as desktop
 from ramp_cli.main import cli
+from tests.platform_support import skip_on_windows
 
 
 @pytest.fixture
 def sealed(tmp_path, monkeypatch):
+    skip_on_windows("Claude Desktop setup needs macOS file locking (fcntl)")
     monkeypatch.setenv("RAMP_CLAUDE_DESKTOP_APP_SUPPORT", str(tmp_path))
     monkeypatch.setattr(desktop, "preflight", lambda: None)
     monkeypatch.setattr(desktop, "_claude_is_running", lambda: False)

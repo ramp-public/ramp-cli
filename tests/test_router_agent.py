@@ -8,7 +8,6 @@ import hmac
 import json
 import os
 import plistlib
-import stat
 import subprocess
 from pathlib import Path
 
@@ -21,6 +20,11 @@ from ramp_cli.commands import router as router_module
 from ramp_cli.commands import router_repo
 from ramp_cli.commands import router_schedule as schedule
 from ramp_cli.main import cli
+from tests.platform_support import assert_mode
+
+pytestmark = pytest.mark.posix_only(
+    reason="the background agent runs under launchd or systemd"
+)
 
 # Captured before the conftest fixture turns these into no-ops.
 _REAL_INSTALL = schedule.install
@@ -523,7 +527,7 @@ def test_manifest_lists_each_version_request_with_what_was_applied(
     router_module._write_agent_manifest([with_defaults, revoked])
 
     path = schedule.manifest_path()
-    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    assert_mode(path, 0o600)
     manifest = json.loads(path.read_text())
     assert manifest["due_at"] == now - 3600 + schedule.FULL_REFRESH_SECONDS
     first, second = manifest["connections"]
@@ -929,7 +933,7 @@ def test_health_authenticates_a_fresh_challenge_without_sending_the_key(monkeypa
     token = router_repo.health_token(create=True)
     assert token is not None
     path = router_repo.settings_path().with_name("router-agent-health-token")
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert_mode(path, 0o600)
     assert router_repo.health_token(create=True) == token
     challenges = []
 

@@ -119,6 +119,7 @@ def test_render_eye_outside():
 # ---------------------------------------------------------------------------
 # Lifecycle tests
 # ---------------------------------------------------------------------------
+@pytest.mark.posix_only(reason="the coin game needs a POSIX terminal")
 def test_coin_game_terminal_too_short(monkeypatch):
     """Coin game should error if terminal is too short."""
     monkeypatch.setitem(os.environ, "COLUMNS", "80")

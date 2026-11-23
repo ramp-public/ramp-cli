@@ -1,9 +1,19 @@
 """Click root group and command registration."""
 
+# ruff: noqa: E402
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
+
+# Before the imports below, which load every command: agents run Router's
+# cost scripts through this after nearly every update. Every entry point,
+# the frozen binary's included, imports this module first.
+from ramp_cli import cost_script
+
+cost_script.run_if_invoked(sys.argv)
+
 import traceback
 from dataclasses import dataclass
 from enum import StrEnum
@@ -682,14 +692,34 @@ def _is_session_sync_invocation() -> bool:
     return bool({"--hook", "--detached", "--scheduled"} & arguments)
 
 
+def _use_utf8_output() -> None:
+    """Keep the CLI's arrows and box drawing from crashing output on Windows.
+
+    A Windows console accepts Unicode, but a pipe, a file, or Git Bash's
+    terminal gets the ANSI code page (often cp1252), which can't encode them.
+    PYTHONUTF8 doesn't reach the frozen binary, so set the streams here.
+    """
+    if sys.platform != "win32":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None and (stream.encoding or "").lower() != "utf-8":
+            with contextlib.suppress(ValueError, OSError):
+                reconfigure(encoding="utf-8", errors="replace")
+
+
 def main() -> None:
+    _use_utf8_output()
     # Every invocation, session-sync hooks included; the Router-served
     # statusline reads this file.
     record_installed_version()
     if not _is_session_sync_invocation():
         check_for_update()
     try:
-        cli(standalone_mode=False)
+        # Usage text names the program after argv[0]. Windows launchers run
+        # the release binary by its own name (ramp-windows-amd64.exe), so name
+        # the command users actually type.
+        cli(standalone_mode=False, prog_name="ramp")
     except click.exceptions.Abort:
         _emit_error(130, "Operation aborted by user")
         sys.exit(130)

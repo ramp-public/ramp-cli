@@ -1456,6 +1456,8 @@ def test_prune_lists_orphans_and_deletes_only_after_confirmation(
 
 
 def test_prune_never_sends_the_saved_key_to_another_router(router, monkeypatch):
+    monkeypatch.setattr("sys.platform", "darwin")
+
     def prune():
         return CliRunner().invoke(
             cli, ["--human", "--no-input", "router", "cursor", "prune-variants"]
@@ -1800,7 +1802,11 @@ def test_unconfigure_without_variants_never_calls_router(router, cursor_db):
     assert router.deletes == []
 
 
-def test_unconfigure_never_sends_the_key_to_another_router(monkeypatch, cursor_db):
+@pytest.mark.parametrize("platform", ["darwin", "win32"])
+def test_unconfigure_never_sends_the_key_to_another_router(
+    monkeypatch, cursor_db, platform
+):
+    monkeypatch.setattr("sys.platform", platform)
     here = FakeRouter()
     elsewhere = FakeRouter(origin=INTERNAL_ORIGIN)
     stray = _route(monkeypatch, here, elsewhere)
@@ -1821,16 +1827,24 @@ def test_unconfigure_never_sends_the_key_to_another_router(monkeypatch, cursor_d
         "user_id": "user-1",
         **_variant("ramp-opus-5-5-xhigh", "claude-opus-5-5", "xhigh"),
     }
+    monkeypatch.setattr(router_repo, "cursor_bound_api_key", lambda: "k")
+    monkeypatch.setattr(router_repo, "cursor_bound_upstream", lambda: "api.router.com")
     result = _unconfigure()
     assert result.exit_code == 0, result.output
     assert here.deletes == ["ramp-opus-5-5-high"]
     # No request at all reached the other Router.
     assert elsewhere.requests == []
     assert stray == []
-    assert (
-        f"To delete them, run 'RAMP_ROUTER_BASE_URL={INTERNAL_BASE_URL} ramp router "
-        "cursor prune-variants --api-key KEY'" in _flat(result.output)
+    command = (
+        f"ramp router cursor prune-variants --api-key KEY --base-url {INTERNAL_BASE_URL}"
+        if platform == "win32"
+        else f"RAMP_ROUTER_BASE_URL={INTERNAL_BASE_URL} ramp router cursor prune-variants --api-key KEY"
     )
+    assert f"To delete them, run '{command}'" in _flat(result.output)
+    if platform == "win32":
+        assert _prune("--base-url", INTERNAL_BASE_URL).exit_code == 0
+        assert elsewhere.requests
+        assert stray == []
 
 
 # === Prompts and paste-in steps ===

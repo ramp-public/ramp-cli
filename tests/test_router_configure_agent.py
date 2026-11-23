@@ -15,6 +15,10 @@ from ramp_cli.commands import router_credentials as onboarding
 from ramp_cli.errors import RampCLIError
 from ramp_cli.main import cli
 
+pytestmark = pytest.mark.posix_only(
+    reason="--enable-agent needs the launchd or systemd background agent"
+)
+
 
 @pytest.fixture
 def flow(monkeypatch, isolated_config):
@@ -207,7 +211,7 @@ def test_account_and_workspace_switch_do_not_reuse_old_secret(flow, monkeypatch)
         "opt_out",
         "mismatched_origin",
         "invalid_url",
-        "windows",
+        "unsupported_os",
     ],
 )
 def test_invalid_setup_fails_before_login_or_writes(flow, monkeypatch, failure):
@@ -222,7 +226,7 @@ def test_invalid_setup_fails_before_login_or_writes(flow, monkeypatch, failure):
     elif failure == "invalid_url":
         monkeypatch.setenv("RAMP_ROUTER_BASE_URL", "http://remote.example/v1")
     else:
-        monkeypatch.setattr(router.sys, "platform", "win32")
+        monkeypatch.setattr(router.sys, "platform", "freebsd14")
     assert invoke("--enable-agent").exit_code != 0
     flow["factory"].assert_not_called()
     flow["create"].assert_not_called()

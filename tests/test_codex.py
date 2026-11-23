@@ -13,6 +13,7 @@ from click.testing import CliRunner
 import ramp_cli.commands.codex as codex_module
 import ramp_cli.commands.router as router_module
 from ramp_cli.main import cli
+from tests.platform_support import assert_mode
 
 EXISTING_CONFIG = """\
 # my codex config
@@ -110,7 +111,7 @@ class TestSet:
         assert data["profiles"]["original"]["model"] == "gpt-4.1"
         assert "# my codex config" in content
         assert "# keep me" in content
-        assert (path.stat().st_mode & 0o777) == 0o600
+        assert_mode(path, 0o600)
 
     def test_set_creates_config_when_missing(self):
         path = _config_path()

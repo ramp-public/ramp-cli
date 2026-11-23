@@ -1,4 +1,9 @@
-"""Private files for the Router agent's local credential boundary."""
+"""Private files for the Router agent's local credential boundary.
+
+On Unix a private file is this user's with mode 0600 in a folder no one else
+can write. Windows has no modes, so there the same promise is an owner and a
+DACL (router_winsec), checked the way the native agent checks it.
+"""
 
 from __future__ import annotations
 
@@ -8,13 +13,51 @@ import hmac
 import json
 import os
 import stat
+import sys
 import tempfile
+import time
 from pathlib import Path
 
+from ramp_cli.commands import router_winsec
+
 TOKEN_PREFIX = "ramp-local-"
+_WINDOWS = sys.platform == "win32"
+
+
+def supported() -> bool:
+    """Whether this platform can keep the agent's files private."""
+    return _WINDOWS or (hasattr(os, "getuid") and hasattr(os, "O_NOFOLLOW"))
+
+
+def make_directory(path: Path) -> None:
+    """Create ``path`` private to this user if it is missing.
+
+    On Windows an existing folder this user owns is made private too: it may
+    inherit entries a parent was given for others (Codex's Windows sandbox
+    gives its sandbox users Modify on folders it shares with them), which the
+    agent would otherwise refuse. Its own, protected DACL replaces those; a
+    folder someone else owns is left alone and refused.
+    """
+    if not path.is_dir():
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if _WINDOWS:
+            router_winsec.secure(path)
+        return
+    if (
+        _WINDOWS
+        and not router_winsec.directory_is_private(path)
+        and router_winsec.directory_owned_by_user(path)
+    ):
+        router_winsec.secure(path)
 
 
 def check_directory(path: Path) -> None:
+    if _WINDOWS:
+        if not router_winsec.directory_is_private(path):
+            raise OSError(
+                "Router agent directory is not owned and protected by this user"
+            )
+        return
     info = path.lstat()
     if (
         not stat.S_ISDIR(info.st_mode)
@@ -26,6 +69,12 @@ def check_directory(path: Path) -> None:
 
 def read_private(path: Path) -> str:
     check_directory(path.parent)
+    if _WINDOWS:
+        with router_winsec.open_private(path) as fd:
+            contents = os.read(fd, 65537).decode("utf-8")
+        if len(contents) > 65536:
+            raise ValueError("Router agent private file is too large")
+        return contents
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, encoding="utf-8") as handle:
         info = os.fstat(handle.fileno())
@@ -43,9 +92,15 @@ def read_private(path: Path) -> str:
 
 def write_private(path: Path, content: str) -> None:
     """Publish complete 0600 contents; a failed write leaves the old file intact."""
+    if _WINDOWS:
+        make_directory(path.parent)
     check_directory(path.parent)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
+        if _WINDOWS:
+            # Before any content: owner this user, readable by no one else. A
+            # rename keeps it, so the published file has it too.
+            router_winsec.secure(Path(temporary))
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(content)
             handle.flush()
@@ -57,7 +112,27 @@ def write_private(path: Path, content: str) -> None:
 
 @contextlib.contextmanager
 def private_lock(path: Path):
-    # These files are used only by the Unix native agent.
+    if _WINDOWS:
+        import msvcrt  # noqa: PLC0415
+
+        make_directory(path.parent)
+        check_directory(path.parent)
+        with router_winsec.open_private(path, write=True, create=True) as fd:
+            # Byte 0 is the lock, empty file or not; LK_LOCK gives up after
+            # ten seconds, so wait the way flock does.
+            while True:
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                os.lseek(fd, 0, os.SEEK_SET)
+                with contextlib.suppress(OSError):
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        return
     import fcntl  # noqa: PLC0415
 
     check_directory(path.parent)
@@ -94,8 +169,10 @@ def register(directory: Path, health_key: str, upstream: str, api_key: str) -> s
     Domain separation keeps local bearer tokens distinct from health proofs.
     Old bindings remain usable by open sessions during refresh or key rotation.
     """
+    if _WINDOWS:
+        make_directory(directory.parent)
     check_directory(directory.parent)
-    directory.mkdir(mode=0o700, exist_ok=True)
+    make_directory(directory)
     check_directory(directory)
     message = json.dumps(["router-local-credential-v1", upstream, api_key]).encode()
     token = (

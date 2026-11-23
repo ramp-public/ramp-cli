@@ -4,8 +4,10 @@
 use std::sync::Mutex;
 
 /// Recently seen client pids, checked before a full scan (agents keep reconnecting from the same pid).
+#[cfg_attr(windows, allow(dead_code))]
 static RECENT: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 
+#[cfg_attr(windows, allow(dead_code))]
 fn remember(pid: i32) {
     let mut r = RECENT.lock().unwrap();
     r.retain(|&p| p != pid);
@@ -13,6 +15,7 @@ fn remember(pid: i32) {
     r.truncate(64);
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn recent() -> Vec<i32> {
     RECENT.lock().unwrap().clone()
 }
@@ -214,5 +217,57 @@ mod imp {
         let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
         let s = String::from_utf8_lossy(&path[..end]).into_owned();
         (!s.is_empty()).then_some(s)
+    }
+}
+
+/// Windows: the TCP table names the process that owns each connection directly, so no scan is
+/// needed. A client counts only if it runs as this user, at medium integrity or above, outside an
+/// AppContainer (see `win::trusted_client`).
+#[cfg(windows)]
+mod imp {
+    use crate::win;
+
+    pub fn find(helper_port: u16, peer_port: u16, me: i32) -> Option<(i32, String)> {
+        let pid = win::tcp_peer_pid(helper_port, peer_port)?;
+        (pid as i32 != me && win::trusted_client(pid)).then(|| (pid as i32, win::image_name(pid)))
+    }
+
+    pub fn same_user(helper_port: u16, peer_port: u16) -> bool {
+        // Like macOS, this process itself (an embedded client) also counts.
+        win::tcp_peer_pid(helper_port, peer_port).is_some_and(|pid| pid == std::process::id() || win::trusted_client(pid))
+    }
+
+    pub fn cwd(pid: i32) -> Option<String> {
+        win::process_cwd(pid as u32).map(|d| crate::paths::canon(&d).into_owned())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn socket_identity_requires_a_live_peer_of_this_user() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let helper = listener.local_addr().unwrap().port();
+            let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (_accepted, peer) = listener.accept().unwrap();
+            assert_eq!(win::tcp_peer_pid(helper, peer.port()), Some(std::process::id()));
+            assert!(same_user(helper, peer.port()));
+            assert!(win::trusted_client(std::process::id()));
+            // This process is never reported as its own client.
+            assert!(find(helper, peer.port(), std::process::id() as i32).is_none());
+            assert!(!same_user(helper, 0));
+            // Its working directory, in attribution's form.
+            let here = crate::paths::canon(&std::env::current_dir().unwrap().to_string_lossy()).into_owned();
+            assert_eq!(cwd(std::process::id() as i32).as_deref(), Some(here.trim_end_matches('/')));
+            drop(client);
+        }
+
+        #[test]
+        fn system_processes_are_not_trusted() {
+            // pid 4 is the System process: another user, and not openable.
+            assert!(!win::trusted_client(4));
+            assert!(!win::process_gone(std::process::id()));
+        }
     }
 }

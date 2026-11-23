@@ -1,4 +1,4 @@
-//! ramp-router-agent: the Ramp Router background agent, run by launchd or systemd.
+//! ramp-router-agent: the Ramp Router background agent, run by launchd, systemd or Task Scheduler.
 //!
 //!   ramp-router-agent [serve]
 //!       [--sync-ramp <ramp> --sync-env-file <file> --sync-manifest <file> --sync-opt-out <file>
@@ -6,6 +6,12 @@
 //!       [--port 47317 --settings <file> --log <file> [--shadow]]
 //!
 //! The --sync-* options keep Router setups fresh; --port also serves repository tagging.
+//! On Windows, --agent-log names the file for the agent's own output (Task Scheduler has no
+//! StandardErrorPath), --extra-ca-files carries RAMP_ROUTER_EXTRA_CA_FILES (a task has no
+//! environment), and the program never opens a window: it is built for the Windows subsystem.
+
+// A console program started by Task Scheduler opens a console window; this one has none.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use rrh::proxy::{self, Conn, Server};
 use rrh::sync::{self, Scheduler};
@@ -18,6 +24,7 @@ fn arg(args: &[String], name: &str) -> Option<String> {
 }
 
 /// A listening socket handed over by the service manager, so restarts never refuse connections.
+#[cfg(unix)]
 fn inherited_listener() -> Option<std::net::TcpListener> {
     use std::os::fd::FromRawFd;
     // systemd socket activation
@@ -45,7 +52,14 @@ fn inherited_listener() -> Option<std::net::TcpListener> {
     None
 }
 
+/// Task Scheduler hands over no socket.
+#[cfg(windows)]
+fn inherited_listener() -> Option<std::net::TcpListener> {
+    None
+}
+
 /// 127.0.0.1:port with SO_REUSEADDR and a 1024-connection backlog (std's default is 128).
+#[cfg(unix)]
 fn bind(port: u16) -> std::io::Result<std::net::TcpListener> {
     use std::os::fd::FromRawFd;
     unsafe {
@@ -70,6 +84,9 @@ fn bind(port: u16) -> std::io::Result<std::net::TcpListener> {
         Ok(listener)
     }
 }
+
+#[cfg(windows)]
+use rrh::win::bind;
 
 fn scheduler(args: &[String]) -> Option<Arc<Scheduler>> {
     let manifest = arg(args, "--sync-manifest")?;
@@ -115,6 +132,19 @@ async fn serve(args: Vec<String>) {
     let inherited = inherited_listener().filter(|l| l.local_addr().is_ok_and(|a| a.port() != 0));
     let mut inherited = inherited.map(Ok);
     let mut down = false;
+    // Windows: Task Scheduler's End returns before the previous agent has exited and released
+    // the port, so a restart's first binds can fail for a moment; keep trying briefly before
+    // treating the listener as down. (launchd and systemd hand over their own socket.)
+    #[cfg(windows)]
+    for _ in 0..100 {
+        match bind(port) {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => tokio::time::sleep(Duration::from_millis(100)).await,
+            result => {
+                inherited = Some(result);
+                break;
+            }
+        }
+    }
     let std_listener = loop {
         match inherited.take().unwrap_or_else(|| bind(port)) {
             Ok(l) => break l,
@@ -171,6 +201,19 @@ async fn serve(args: Vec<String>) {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(windows)]
+    {
+        if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h" | "--version" | "-V")) {
+            rrh::win::attach_parent_console();
+        } else if let Some(log) = arg(&args, "--agent-log") {
+            rrh::win::redirect_output(std::path::Path::new(&log));
+        }
+        // A task has no environment of its own, so the CA bundles launchd and systemd pass in
+        // RAMP_ROUTER_EXTRA_CA_FILES come as an argument. Set before any other thread starts.
+        if let Some(files) = arg(&args, "--extra-ca-files") {
+            std::env::set_var(rrh::tls::EXTRA_CA_ENV, files);
+        }
+    }
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("usage: ramp-router-agent [serve] [--sync-ramp <ramp> --sync-env-file <file> --sync-manifest <file> --sync-opt-out <file> [--sync-interval <seconds>] [--sync-log <file>]] [--port <port> [--settings <file>] [--log <file>] [--shadow]]\n       ramp-router-agent --version");
         return;
@@ -180,7 +223,7 @@ fn main() {
         return;
     }
     // --build identifies the binary in the service definition (so updates reload it); unused here.
-    const OPTIONS: [&str; 12] = ["--build", "--port", "--settings", "--log", "--reported-version", "--shadow", "--sync-ramp", "--sync-env-file", "--sync-manifest", "--sync-opt-out", "--sync-interval", "--sync-log"];
+    const OPTIONS: [&str; 14] = ["--agent-log", "--build", "--extra-ca-files", "--port", "--settings", "--log", "--reported-version", "--shadow", "--sync-ramp", "--sync-env-file", "--sync-manifest", "--sync-opt-out", "--sync-interval", "--sync-log"];
     if let Some(bad) = args.iter().find(|a| a.starts_with("--") && !OPTIONS.contains(&a.as_str())) {
         eprintln!("ramp-router-agent: unknown option {bad} (see --help)");
         std::process::exit(2);

@@ -15,11 +15,15 @@ from __future__ import annotations
 
 import json
 import os
-import selectors
+import queue
 import subprocess
+import threading
 import time
 from pathlib import Path
 
+# A server that has exited ends its output within this; one whose child keeps
+# stdout open is left to the daemon reader rather than waited on.
+_READER_EXIT_SECONDS = 2
 _TIMEOUT_SECONDS = 10
 
 
@@ -126,9 +130,10 @@ class _AppServer:
             )
         except OSError as exc:
             raise TrustUnavailable(str(exc)) from None
-        self._selector = selectors.DefaultSelector()
-        self._selector.register(self._process.stdout, selectors.EVENT_READ)
-        self._buffer = b""
+        # A thread rather than a selector: Windows can't select on a pipe.
+        self._lines: queue.Queue[bytes] = queue.Queue()
+        self._reader = threading.Thread(target=self._read_lines, daemon=True)
+        self._reader.start()
         try:
             self.request(
                 "initialize", {"clientInfo": {"name": "ramp-cli", "version": "1"}}
@@ -141,17 +146,30 @@ class _AppServer:
         return self
 
     def __exit__(self, *_exc: object) -> None:
-        self._selector.close()
         self._process.kill()
         self._process.wait()
+        # Close stdin before waiting on the reader. npm's Codex launcher runs
+        # the real server as a child sharing these pipes, so killing the
+        # launcher leaves that child holding stdout open until stdin ends.
+        self._close(self._process.stdin)
+        # Ends at the end of output, which the kill or stdin's end brings;
+        # joined before stdout closes under it.
+        self._reader.join(_READER_EXIT_SECONDS)
+        if not self._reader.is_alive():
+            # A reader still blocked on a child that keeps stdout open holds
+            # the pipe's lock, so closing would wait on it; the daemon thread
+            # and the pipe go when the child does.
+            self._close(self._process.stdout)
+
+    @staticmethod
+    def _close(pipe) -> None:
         # A request the server never read can leave stdin's buffer full;
         # closing retries that flush and would raise BrokenPipeError over
-        # the TrustUnavailable already being handled.
-        for pipe in (self._process.stdin, self._process.stdout):
-            try:
-                pipe.close()
-            except OSError:
-                pass
+        # the TrustUnavailable already being handled. The pipe still closes.
+        try:
+            pipe.close()
+        except OSError:
+            pass
 
     def request(self, method: str, params: dict) -> dict:
         self._next_id += 1
@@ -173,16 +191,21 @@ class _AppServer:
         except OSError:
             raise TrustUnavailable("Codex app-server exited") from None
 
+    def _read_lines(self) -> None:
+        # b"" marks the end of output: the server exited or was killed.
+        for line in iter(self._process.stdout.readline, b""):
+            self._lines.put(line)
+        self._lines.put(b"")
+
     def _read_message(self) -> dict:
-        while b"\n" not in self._buffer:
-            remaining = self._deadline - time.monotonic()
-            if remaining <= 0 or not self._selector.select(remaining):
-                raise TrustUnavailable("Codex app-server timed out")
-            chunk = os.read(self._process.stdout.fileno(), 65536)
-            if not chunk:
-                raise TrustUnavailable("Codex app-server exited")
-            self._buffer += chunk
-        line, self._buffer = self._buffer.split(b"\n", 1)
+        remaining = self._deadline - time.monotonic()
+        try:
+            line = self._lines.get(timeout=max(remaining, 0))
+        except queue.Empty:
+            raise TrustUnavailable("Codex app-server timed out") from None
+        if not line:
+            self._lines.put(b"")  # keep reporting the exit
+            raise TrustUnavailable("Codex app-server exited")
         try:
             message = json.loads(line)
         except ValueError:

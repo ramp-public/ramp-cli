@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -17,9 +17,15 @@ import ramp_cli.commands.router as router_module
 import ramp_cli.commands.router_settings as router_settings
 import ramp_cli.commands.router_sync as sync_module
 import ramp_cli.main as main_module
-from ramp_cli import __version__
+from ramp_cli import __version__, cost_script
 from ramp_cli.config.settings import config_dir
 from ramp_cli.main import cli
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+from .test_router import _WINDOWS_RAMP, _simulate_windows
 
 # Captured at import time, before the conftest fixture pins the resolver, so
 # the resolution logic itself stays testable.
@@ -168,6 +174,9 @@ def test_sync_is_due_only_after_the_cooldown():
     assert sync_module.sync_is_due()
 
 
+@pytest.mark.posix_only(
+    reason="session sync hooks are POSIX shell commands and are not registered on Windows"
+)
 @pytest.mark.parametrize("client", ["claude-code", "codex", "opencode"])
 def test_session_sync_hook_command_wraps_and_quotes_the_executable(monkeypatch, client):
     assert sync_module.session_sync_hook_command(client) == (
@@ -185,12 +194,128 @@ def test_session_sync_hook_command_wraps_and_quotes_the_executable(monkeypatch, 
 
 def test_session_sync_hook_command_is_skipped_when_it_cannot_run(monkeypatch):
     monkeypatch.setattr(sync_module, "ramp_executable", lambda: None)
+    # Real Windows resolves through cost_script instead.
+    monkeypatch.setattr(cost_script, "windows_executable", lambda: None)
     assert sync_module.session_sync_hook_command("codex") is None
 
-    # Restore the process-wide platform before pytest formats its report paths.
-    with monkeypatch.context() as windows:
-        windows.setattr(sync_module.os, "name", "nt")
-        assert sync_module.session_sync_hook_command("codex") is None
+    _simulate_windows(monkeypatch)
+    monkeypatch.setattr(cost_script, "windows_executable", lambda: None)
+    assert sync_module.session_sync_hook_command("codex") is None
+    # A path with a space and no 8.3 short form can't be one bare word. (Real
+    # Windows has PROGRA~1 for this one, so rule the short form out.)
+    monkeypatch.setattr(cost_script, "_short_path", lambda _path: None)
+    monkeypatch.setattr(
+        cost_script, "windows_executable", lambda: "C:/Program Files/ramp.exe"
+    )
+    assert sync_module.session_sync_hook_command("codex") is None
+
+
+def _windows_guard() -> Path:
+    return sync_module.job_lock_dir() / sync_module.WINDOWS_HOOK_GUARD
+
+
+@pytest.mark.parametrize(
+    "client,native", [("claude-code", False), ("codex", True)], ids=["claude", "codex"]
+)
+@pytest.mark.parametrize("event", [None, sync_module.SYNC_HOOK_STOP_EVENT])
+def test_windows_sync_hook_runs_ramp_through_the_guard(
+    monkeypatch, client, native, event
+):
+    _simulate_windows(monkeypatch)
+
+    command = sync_module.session_sync_hook_command(client, event)
+
+    # Bare words, as for the cost scripts: forward slashes for Claude Code's
+    # Git Bash or PowerShell, backslashes for Codex's cmd.exe or PowerShell.
+    def spelled(path: object) -> str:
+        text = str(path)
+        return text.replace("/", "\\") if native else text.replace("\\", "/")
+
+    suffix = f" --event {event}" if event else ""
+    assert command == (
+        f"{spelled(_windows_guard())} {spelled(_WINDOWS_RAMP)} "
+        f"router sync --hook --client {client}{suffix}"
+    )
+    # The guard is the POSIX command's `[ -x ]` and `|| true`.
+    guard = _windows_guard().read_bytes()
+    assert b'if exist "%~f1" call "%~f1" %2' in guard
+    assert guard.endswith(b"exit /b 0\r\n")
+    assert sync_module.command_runs_session_sync(command, event, client) is True
+    other = "codex" if client == "claude-code" else "claude-code"
+    assert sync_module.command_runs_session_sync(command, event, other) is False
+    other_event = None if event else sync_module.SYNC_HOOK_STOP_EVENT
+    assert sync_module.command_runs_session_sync(command, other_event) is False
+
+
+def test_windows_sync_hook_rewrites_a_changed_guard_and_skips_an_unwritable_one(
+    monkeypatch,
+):
+    _simulate_windows(monkeypatch)
+    sync_module.session_sync_hook_command("codex")
+    _windows_guard().write_text("@echo hello\r\n")
+
+    assert sync_module.session_sync_hook_command("codex") is not None
+    assert b"exit /b 0" in _windows_guard().read_bytes()
+
+    _windows_guard().unlink()
+    _windows_guard().mkdir()
+    assert sync_module.session_sync_hook_command("codex") is None
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        # Written by a ramp installed somewhere else, or by hand.
+        (
+            r"C:\old\router-sync-hook.cmd C:\old\ramp.exe router sync --hook "
+            "--client codex",
+            True,
+        ),
+        (
+            "C:/old/ROUTER-SYNC-HOOK.CMD C:/old/ramp-windows-amd64.exe "
+            "router sync --hook --client claude-code",
+            True,
+        ),
+        (r"C:\old\ramp.exe router sync --hook --client codex", True),
+        (
+            r"C:\old\other.cmd C:\old\ramp.exe router sync --hook --client codex",
+            False,
+        ),
+        (r"C:\old\router-sync-hook.cmd C:\old\notramp.exe router sync --hook", False),
+        (r"C:\old\router-sync-hook.cmd router sync --hook", False),
+    ],
+)
+def test_windows_sync_hook_forms_are_recognized(command, expected):
+    assert sync_module.command_runs_session_sync(command) is expected
+
+
+def test_windows_spawn_runs_detached_without_a_window(monkeypatch):
+    _simulate_windows(monkeypatch)
+    for name, value in (
+        ("CREATE_NEW_PROCESS_GROUP", 0x200),
+        ("CREATE_NO_WINDOW", 0x8000000),
+        ("CREATE_BREAKAWAY_FROM_JOB", 0x1000000),
+    ):
+        monkeypatch.setattr(sync_module.subprocess, name, value, raising=False)
+    calls = []
+
+    def popen(command, **kwargs):
+        calls.append((command, kwargs))
+        if len(calls) == 1:
+            raise PermissionError("the job forbids breakaway")
+
+    monkeypatch.setattr(sync_module.subprocess, "Popen", popen)
+
+    sync_module.spawn_detached_refresh()
+
+    assert [command for command, _ in calls] == [
+        [_WINDOWS_RAMP, "router", "sync", "--detached"]
+    ] * 2
+    assert [kwargs["creationflags"] for _, kwargs in calls] == [
+        0x200 | 0x8000000 | 0x1000000,
+        0x200 | 0x8000000,
+    ]
+    assert all("start_new_session" not in kwargs for _, kwargs in calls)
 
 
 @pytest.mark.parametrize(
@@ -212,6 +337,9 @@ def test_command_runs_session_sync_requires_an_invocation(command, expected):
     assert sync_module.command_runs_session_sync(command) is expected
 
 
+@pytest.mark.posix_only(
+    reason="session sync hooks are POSIX shell commands and are not registered on Windows"
+)
 def test_event_registrations_are_told_apart(monkeypatch):
     monkeypatch.setattr(sync_module, "ramp_executable", lambda: Path("/opt/ramp"))
     start = sync_module.session_sync_hook_command("codex")
@@ -234,6 +362,9 @@ def test_event_registrations_are_told_apart(monkeypatch):
     )
 
 
+@pytest.mark.posix_only(
+    reason="session sync hooks are POSIX shell commands and are not registered on Windows"
+)
 def test_client_registrations_are_told_apart(monkeypatch):
     monkeypatch.setattr(sync_module, "ramp_executable", lambda: Path("/opt/ramp"))
     claude = sync_module.session_sync_hook_command(
@@ -267,18 +398,21 @@ def test_ramp_executable_resolution(monkeypatch, tmp_path):
     assert _REAL_RAMP_EXECUTABLE() == fake
 
     # An npm-managed install's stable link beats a (possibly npx-cache) PATH hit.
+    # Absolute on this platform: Windows anchors a bare "/usr/bin" to a drive.
+    npx_ramp = str(tmp_path / "_npx" / "ramp")
+    path_ramp = str(tmp_path / "usr" / "bin" / "ramp")
     monkeypatch.setattr(sys, "argv", ["pytest"])
-    monkeypatch.setattr(sync_module.shutil, "which", lambda _name: "/tmp/_npx/ramp")
+    monkeypatch.setattr(sync_module.shutil, "which", lambda _name: npx_ramp)
     monkeypatch.setattr(sync_module, "npm_entrypoint", lambda: fake)
     assert _REAL_RAMP_EXECUTABLE() == fake
     monkeypatch.setattr(sync_module, "npm_entrypoint", lambda: None)
 
     # Otherwise PATH lookup, then None.
-    monkeypatch.setattr(sync_module.shutil, "which", lambda _name: "/usr/bin/ramp")
-    assert _REAL_RAMP_EXECUTABLE() == Path("/usr/bin/ramp")
+    monkeypatch.setattr(sync_module.shutil, "which", lambda _name: path_ramp)
+    assert _REAL_RAMP_EXECUTABLE() == Path(path_ramp)
 
     monkeypatch.setattr(sys, "argv", ["ramp"])
-    assert _REAL_RAMP_EXECUTABLE() == Path("/usr/bin/ramp")
+    assert _REAL_RAMP_EXECUTABLE() == Path(path_ramp)
 
     monkeypatch.setattr(sync_module.shutil, "which", lambda _name: "bin/ramp")
     assert _REAL_RAMP_EXECUTABLE() == fake
@@ -289,6 +423,9 @@ def test_ramp_executable_resolution(monkeypatch, tmp_path):
 
 def test_spawn_detached_refresh_runs_the_resolved_cli_detached(monkeypatch):
     calls = {}
+    # Real Windows resolves through cost_script; give it the same stand-in.
+    stand_in = sync_module.ramp_executable()
+    monkeypatch.setattr(cost_script, "windows_executable", lambda: str(stand_in))
 
     def popen(command, **kwargs):
         calls["command"] = command
@@ -299,12 +436,16 @@ def test_spawn_detached_refresh_runs_the_resolved_cli_detached(monkeypatch):
     sync_module.spawn_detached_refresh()
 
     assert calls["command"] == [
-        "/opt/ramp-cli/bin/ramp",
+        # conftest's stand-in entrypoint, in this platform's separators.
+        str(Path("/opt/ramp-cli/bin/ramp")),
         "router",
         "sync",
         "--detached",
     ]
-    assert calls["kwargs"]["start_new_session"] is True
+    if os.name == "nt":
+        assert calls["kwargs"]["creationflags"] & subprocess.CREATE_NO_WINDOW
+    else:
+        assert calls["kwargs"]["start_new_session"] is True
     assert (config_dir() / "router-sync.log").exists()
 
 
@@ -313,6 +454,7 @@ def test_spawn_detached_refresh_reenters_the_interpreter_without_an_entrypoint(
 ):
     calls = {}
     monkeypatch.setattr(sync_module, "ramp_executable", lambda: None)
+    monkeypatch.setattr(cost_script, "windows_executable", lambda: None)
     monkeypatch.setattr(
         sync_module.subprocess,
         "Popen",
@@ -326,6 +468,7 @@ def test_spawn_detached_refresh_reenters_the_interpreter_without_an_entrypoint(
     assert command[-3:] == ["router", "sync", "--detached"]
 
 
+@pytest.mark.posix_only(reason="the sync lock uses fcntl")
 def test_concurrent_session_starts_yield_exactly_one_syncer():
     _write_cooldown(age_seconds=sync_module.SYNC_COOLDOWN_SECONDS + 1)
     barrier = threading.Barrier(4)
@@ -346,6 +489,7 @@ def test_concurrent_session_starts_yield_exactly_one_syncer():
     assert winners == [True]
 
 
+@pytest.mark.posix_only(reason="holds the sync lock with fcntl")
 def test_claim_sync_slot_loses_while_another_process_holds_the_lock():
     _write_cooldown(age_seconds=sync_module.SYNC_COOLDOWN_SECONDS + 1)
     lock_path = sync_module.job_lock_dir() / "router-sync.lock"
@@ -464,6 +608,7 @@ def test_every_invocation_records_the_installed_version(monkeypatch):
     assert (config_dir() / "installed-version").read_text() == __version__
 
 
+@pytest.mark.posix_only(reason="holds the sync lock with fcntl")
 def test_a_lock_losing_invocation_still_emits_the_notice(monkeypatch):
     _write_cooldown(age_seconds=sync_module.SYNC_COOLDOWN_SECONDS + 1)
     _cache_update()
@@ -532,6 +677,7 @@ def test_an_unwritable_state_dir_fails_closed(monkeypatch, tmp_path):
     assert spawned == []
 
 
+@pytest.mark.posix_only(reason="the sync lock uses fcntl")
 def test_sync_lock_does_not_follow_xdg_config_home(monkeypatch, tmp_path):
     """The job's lock stays the same lock under another XDG_CONFIG_HOME."""
     with sync_module.sync_lock() as held:
@@ -557,3 +703,9 @@ def test_sync_lock_waits_for_a_holder_to_finish():
     with sync_module.sync_lock(wait=5) as acquired:
         assert acquired
     holder.join(5)
+
+
+def test_a_hand_written_hook_with_an_escaped_space_is_recognized():
+    # POSIX shells escape spaces with a backslash; that is not a Windows path.
+    command = "/Users/a/My\\ Tools/ramp router sync --hook --client codex"
+    assert sync_module.command_runs_session_sync(command, client="codex") is True

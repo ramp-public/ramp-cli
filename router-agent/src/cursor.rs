@@ -75,7 +75,9 @@ fn user_dir(home: &Path, env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Pa
     }
     #[cfg(target_os = "macos")]
     let base = home.join("Library/Application Support");
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    let base = var("APPDATA").unwrap_or_else(|| home.join("AppData/Roaming"));
+    #[cfg(all(unix, not(target_os = "macos")))]
     let base = var("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
     base.join("Cursor/User")
 }
@@ -101,7 +103,7 @@ fn workspaces(storage: &Path) -> HashMap<String, String> {
         .into_iter()
         .filter_map(|(slug, mut entries)| {
             if entries.iter().any(|(d, _)| *d != entries[0].0) {
-                entries.retain(|(d, entry)| Path::new(d).is_dir() || last_used(entry).is_some_and(|t| t.elapsed().unwrap_or_default() <= RECENT));
+                entries.retain(|(d, entry)| Path::new(&*crate::paths::native(&crate::paths::canon(d))).is_dir() || last_used(entry).is_some_and(|t| t.elapsed().unwrap_or_default() <= RECENT));
             }
             let first = entries.first()?.0.clone();
             entries.iter().all(|(d, _)| *d == first).then_some((slug, first))
@@ -276,8 +278,19 @@ fn record_upload(settings: &Path, status: &Value) {
     }
 }
 
+#[cfg(unix)]
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Cursor keeps `.cursor` in the profile folder; a scheduled task has no HOME.
+#[cfg(windows)]
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()).map(PathBuf::from)
+}
+
 pub async fn run(settings: PathBuf) {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
+    let Some(home) = home_dir() else { return };
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut http = HttpConnector::new();
     http.enforce_http(false);
@@ -330,7 +343,7 @@ pub async fn run(settings: PathBuf) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

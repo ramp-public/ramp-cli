@@ -10,6 +10,8 @@ import pytest
 
 from ramp_cli.commands import router_schedule as schedule
 
+pytestmark = pytest.mark.posix_only(reason="systemd user services")
+
 _REAL_RUN = schedule._run
 
 

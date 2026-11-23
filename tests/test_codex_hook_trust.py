@@ -7,6 +7,7 @@ import json
 import shutil
 import sys
 import textwrap
+import time
 import tomllib
 
 import pytest
@@ -16,7 +17,11 @@ from ramp_cli import codex_hook_trust
 from ramp_cli.commands import router as router_module
 from ramp_cli.main import cli
 
-from .test_router import _mock_models
+from .test_router import _mock_models, _simulate_windows
+
+_HOOKS_ARE_POSIX_ONLY = pytest.mark.posix_only(
+    reason="checks the POSIX hook commands; Windows writes its own, tested below"
+)
 
 # conftest replaces this for every test so none starts a real Codex.
 _real_trust = codex_hook_trust.trust_router_hooks
@@ -75,6 +80,7 @@ def _hook(config_path, event, command, *, index=0, status="untrusted", **extra):
     }
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_trusts_only_the_exact_commands_router_wrote(tmp_path):
     config_path = tmp_path / "config.toml"
     config_path.write_text("")
@@ -120,6 +126,7 @@ def test_trusts_only_the_exact_commands_router_wrote(tmp_path):
     }
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_nothing_is_written_when_router_hooks_are_already_trusted(tmp_path):
     config_path = tmp_path / "config.toml"
     hook = _hook(config_path, "stop", "ramp-cost", status="trusted")
@@ -130,6 +137,7 @@ def test_nothing_is_written_when_router_hooks_are_already_trusted(tmp_path):
     assert not log.exists()
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_a_retained_hook_keeps_recorded_trust_but_is_never_newly_trusted(tmp_path):
     config_path = tmp_path / "config.toml"
     kept = _hook(config_path, "stop", "ramp-cost", status="trusted")
@@ -152,6 +160,7 @@ def test_an_older_codex_leaves_trust_unavailable(tmp_path, fail):
         _real_trust(codex, config_path, {("stop", "ramp-cost")})
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_a_failed_initialize_reaps_the_app_server(tmp_path, monkeypatch):
     codex, _ = _fake_app_server(tmp_path, [], fail="initialize")
     started = []
@@ -169,6 +178,7 @@ def test_a_failed_initialize_reaps_the_app_server(tmp_path, monkeypatch):
     assert process.stdin.closed and process.stdout.closed
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_a_broken_stdin_pipe_does_not_mask_trust_unavailable(tmp_path, monkeypatch):
     # The server exits without reading: initialize's write fails, and its
     # bytes stay buffered, so closing stdin raises BrokenPipeError again.
@@ -203,6 +213,30 @@ def test_a_broken_stdin_pipe_does_not_mask_trust_unavailable(tmp_path, monkeypat
     assert closed
 
 
+@pytest.mark.posix_only(reason="the stand-in launcher is a shebang script")
+def test_a_launcher_whose_server_outlives_it_does_not_stall_cleanup(tmp_path):
+    # npm installs `codex` as a launcher that runs the real server as a child
+    # with the same pipes. Killing the launcher leaves that child holding
+    # stdout until stdin ends, so cleanup must close stdin before waiting.
+    server, _ = _fake_app_server(tmp_path, [])
+    launcher = tmp_path / "codex-launcher"
+    launcher.write_text(
+        textwrap.dedent(
+            f"""\
+            #!{sys.executable}
+            import subprocess, sys
+            sys.exit(subprocess.call([{sys.executable!r}, {str(server)!r}]))
+            """
+        )
+    )
+    launcher.chmod(0o755)
+
+    started = time.monotonic()
+    _real_trust(launcher, tmp_path / "config.toml", {("stop", "ramp-cost")})
+
+    assert time.monotonic() - started < codex_hook_trust._TIMEOUT_SECONDS / 2
+
+
 def test_a_missing_codex_leaves_trust_unavailable(tmp_path):
     with pytest.raises(codex_hook_trust.TrustUnavailable):
         _real_trust(tmp_path / "missing", tmp_path / "config.toml", {("stop", "x")})
@@ -210,6 +244,7 @@ def test_a_missing_codex_leaves_trust_unavailable(tmp_path):
         _real_trust(None, tmp_path / "config.toml", {("stop", "x")})
 
 
+@pytest.mark.real_harness_binaries
 @pytest.mark.skipif(shutil.which("codex") is None, reason="needs the Codex CLI")
 def test_the_installed_codex_records_trust_for_router_hooks_only(tmp_path):
     codex_home = tmp_path / "codex-home"
@@ -269,7 +304,11 @@ def _codex_like_trust(calls):
                         continue
                     trusted[key] = digest
                     if current != digest:
-                        added += f'\n[hooks.state."{key}"]\ntrusted_hash = "{digest}"\n'
+                        # json.dumps quotes Windows backslashes for TOML.
+                        added += (
+                            f"\n[hooks.state.{json.dumps(key)}]\n"
+                            f'trusted_hash = "{digest}"\n'
+                        )
         config_path.write_text(config_path.read_text() + added)
         return trusted
 
@@ -280,6 +319,7 @@ def _state(codex_home):
     return json.loads((codex_home / "ramp-router-state.json").read_text())
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_configure_trusts_router_hooks_and_unconfigure_removes_that_trust(
     tmp_path, monkeypatch
 ):
@@ -337,6 +377,47 @@ def test_configure_trusts_router_hooks_and_unconfigure_removes_that_trust(
     assert "SessionStart" not in restored["hooks"]
 
 
+def test_windows_hooks_are_trusted_and_that_trust_removed(tmp_path, monkeypatch):
+    _simulate_windows(monkeypatch)
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _mock_models(monkeypatch, [{"id": "a"}])
+    calls = []
+    monkeypatch.setattr(
+        router_module.codex_hook_trust, "trust_router_hooks", _codex_like_trust(calls)
+    )
+    args = ["--human", "router", "configure", "codex", "--api-key", "router-secret"]
+    configured = CliRunner().invoke(cli, args)
+    assert configured.exit_code == 0, configured.output
+
+    # The exact Windows commands configure wrote, and nothing else.
+    (commands,) = calls
+    sync = router_module.session_sync_hook_command
+    assert commands >= {
+        ("sessionStart", sync("codex")),
+        ("stop", sync("codex", router_module.SYNC_HOOK_STOP_EVENT)),
+    }
+    # Backslash paths, for cmd.exe and PowerShell.
+    assert all(
+        "\\" in command and "/" not in command.split()[0] for _, command in commands
+    )
+    config_path = codex_home / "config.toml"
+    assert len(_state(codex_home)[router_module.CODEX_HOOK_TRUST_STATE_KEY]) == 3
+    assert router_module._codex_hooks_awaiting_trust(config_path) == []
+
+    # Configuring again finds every hook already trusted.
+    assert CliRunner().invoke(cli, args).exit_code == 0
+    assert calls[1] == commands
+    assert tomllib.loads(config_path.read_text())["hooks"]["state"].keys() == (
+        _state(codex_home)[router_module.CODEX_HOOK_TRUST_STATE_KEY].keys()
+    )
+
+    unconfigured = CliRunner().invoke(cli, ["router", "unconfigure", "codex"])
+    assert unconfigured.exit_code == 0, unconfigured.output
+    assert "hooks" not in tomllib.loads(config_path.read_text())
+
+
+@_HOOKS_ARE_POSIX_ONLY
 def test_unconfigure_leaves_no_empty_hooks_state_table(tmp_path, monkeypatch):
     codex_home = tmp_path / "codex"
     codex_home.mkdir()
@@ -364,6 +445,7 @@ def test_unconfigure_leaves_no_empty_hooks_state_table(tmp_path, monkeypatch):
     }
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_reconfigure_replaces_trust_for_hooks_that_moved(tmp_path, monkeypatch):
     codex_home = tmp_path / "codex"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
@@ -389,6 +471,7 @@ def test_reconfigure_replaces_trust_for_hooks_that_moved(tmp_path, monkeypatch):
     assert {key: entry["trusted_hash"] for key, entry in state.items()} == second
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_configure_still_reports_untrusted_hooks_when_codex_cannot_be_asked(
     tmp_path, monkeypatch
 ):
@@ -424,6 +507,7 @@ def test_unconfigure_keeps_a_users_disabled_hook_setting(tmp_path, monkeypatch):
     assert restored["hooks"]["state"] == {"/elsewhere:stop:0:0": {"enabled": False}}
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_a_model_change_keeps_trust_for_router_hooks(tmp_path, monkeypatch):
     codex_home = tmp_path / "codex"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
@@ -460,6 +544,7 @@ def test_a_model_change_keeps_trust_for_router_hooks(tmp_path, monkeypatch):
     assert {key: entry["trusted_hash"] for key, entry in state.items()} == recorded
 
 
+@_HOOKS_ARE_POSIX_ONLY
 def test_a_skipped_cost_hook_download_keeps_its_trust(tmp_path, monkeypatch):
     codex_home = tmp_path / "codex"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
@@ -476,7 +561,7 @@ def test_a_skipped_cost_hook_download_keeps_its_trust(tmp_path, monkeypatch):
     # even when the command configure would write now has changed.
     monkeypatch.setattr(router_module, "_install_cost_script", lambda *a: False)
     monkeypatch.setattr(
-        router_module, "_codex_cost_hook_command", lambda *a: pytest.fail("rebuilt")
+        router_module, "_codex_cost_hook_command", lambda *a: "changed-cost-hook"
     )
     assert CliRunner().invoke(cli, args).exit_code == 0
     assert _state(codex_home)[router_module.CODEX_HOOK_TRUST_STATE_KEY] == recorded

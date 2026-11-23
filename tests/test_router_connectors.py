@@ -27,6 +27,19 @@ from ramp_cli.main import cli
 from ramp_cli.router_connectors import auth as credentials
 from ramp_cli.router_connectors import bridge, harnesses
 
+# Only an absolute command counts as the CLI's own entry, and a POSIX path has
+# no drive on Windows, so anchor it to the current one there.
+_RAMP = str(Path("/usr/local/bin/ramp").absolute())
+
+# Router's Claude Desktop profile is set up only on macOS.
+_DESKTOP_NEEDS_FCNTL = pytest.mark.posix_only(
+    reason="Claude Desktop setup needs macOS file locking (fcntl)"
+)
+_HARNESS_PARAMS = [
+    pytest.param(h, marks=_DESKTOP_NEEDS_FCNTL) if h == "desktop" else h
+    for h in harnesses.HARNESSES
+]
+
 
 def auth(**changes):
     return {
@@ -283,7 +296,7 @@ def test_legacy_grant_fails_without_browser_or_exchange(monkeypatch):
     assert error.value.code == 4
 
 
-@pytest.mark.parametrize("harness", harnesses.HARNESSES)
+@pytest.mark.parametrize("harness", _HARNESS_PARAMS)
 @pytest.mark.parametrize(
     "executable_name", ["ramp", "ramp-darwin-arm64", "ramp-windows-amd64.exe"]
 )
@@ -293,6 +306,8 @@ def test_registration_preserves_settings_rebinds_only_owned_entry_and_disable_is
     monkeypatch.setattr(claude_cowork, "claude_is_running", lambda: False)
     if harness == "pi":
         monkeypatch.setenv("HOME", str(tmp_path))
+        # Windows expands "~" from USERPROFILE.
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         monkeypatch.setenv("PI_CODING_AGENT_DIR", "~/custom-pi")
         path = tmp_path / "custom-pi" / "mcp.json"
     else:
@@ -348,7 +363,25 @@ def test_registration_preserves_settings_rebinds_only_owned_entry_and_disable_is
         assert path.read_text() == before
 
 
-@pytest.mark.parametrize("harness", ["pi", "desktop"])
+def test_disabling_the_desktop_connector_on_windows_says_macos_only(monkeypatch):
+    # Disable skips Cowork's preflight, so the Desktop lock answers instead.
+    monkeypatch.setattr(claude_cowork, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(claude_cowork, "fcntl", None)
+
+    result = CliRunner().invoke(
+        cli, ["router", "connectors", "disable", "--harness", "desktop"]
+    )
+
+    assert result.exit_code == 1
+    assert "Automatic Claude Desktop setup currently supports macOS only." in (
+        result.output
+    )
+    assert not harnesses.config_path("desktop").exists()
+
+
+@pytest.mark.parametrize(
+    "harness", ["pi", pytest.param("desktop", marks=_DESKTOP_NEEDS_FCNTL)]
+)
 def test_connector_cli_uses_default_app_directory_and_requires_closed_desktop(
     monkeypatch, tmp_path, harness
 ):
@@ -357,7 +390,7 @@ def test_connector_cli_uses_default_app_directory_and_requires_closed_desktop(
     monkeypatch.delenv("RAMP_CLAUDE_DESKTOP_APP_SUPPORT")
     monkeypatch.setattr(claude_cowork, "preflight", lambda: None)
     monkeypatch.setattr(claude_cowork, "claude_is_running", lambda: True)
-    monkeypatch.setattr(harnesses, "_executable", lambda: "/usr/local/bin/ramp")
+    monkeypatch.setattr(harnesses, "_executable", lambda: _RAMP)
     setup(monkeypatch, lambda request: issued())
     runner = CliRunner()
     path = (
@@ -383,7 +416,7 @@ def test_connector_cli_uses_default_app_directory_and_requires_closed_desktop(
     assert enabled.exit_code == 0, enabled.output
     entry = json.loads(path.read_text())["mcpServers"]["ramp-connectors"]
     assert entry == {
-        "command": "/usr/local/bin/ramp",
+        "command": _RAMP,
         "args": [
             "router",
             "connectors",
@@ -412,7 +445,7 @@ def test_codex_registration_preserves_concurrent_config_changes(
     path = tmp_path / "config.toml"
     path.write_text('model = "original"\n')
     monkeypatch.setattr(harnesses, "config_path", lambda _: path)
-    monkeypatch.setattr(harnesses, "_executable", lambda: "/usr/local/bin/ramp")
+    monkeypatch.setattr(harnesses, "_executable", lambda: _RAMP)
     if not enabled:
         harnesses.enable("codex", "a" * 32)
     original_lock = router.codex_config_lock
@@ -443,7 +476,7 @@ def test_jsonc_registration_preserves_unrelated_source_and_custom_path(
 ):
     path = tmp_path / "custom.jsonc"
     monkeypatch.setenv("OPENCODE_CONFIG", str(path))
-    monkeypatch.setattr(harnesses, "_executable", lambda: "/usr/local/bin/ramp")
+    monkeypatch.setattr(harnesses, "_executable", lambda: _RAMP)
     unrelated = '/* provider comment */\n  provider: {name: "custom"},'
     slack = '// keep slack\n    slack: {type: "remote", url: "https://slack.example/mcp"}, // trailing comment'
     path.write_text("{\n" + unrelated + "\n  mcp: {\n" + slack + "\n  },\n}\n")
@@ -463,7 +496,7 @@ def test_inline_codex_mcp_configuration_is_not_lossily_rewritten(monkeypatch, tm
     text = 'model = "custom"\nmcp_servers = {slack = {command = "slack"}}\n'
     path.write_text(text)
     monkeypatch.setattr(harnesses, "config_path", lambda _: path)
-    monkeypatch.setattr(harnesses, "_executable", lambda: "/usr/local/bin/ramp")
+    monkeypatch.setattr(harnesses, "_executable", lambda: _RAMP)
     with pytest.raises(RampCLIError, match="Cannot safely edit"):
         harnesses.enable("codex", "a" * 32)
     assert path.read_text() == text
@@ -819,3 +852,67 @@ def test_catalog_reports_connectors_off(monkeypatch):
         "available": False,
         "connectors": [],
     }
+
+
+def test_windows_registration_uses_the_native_executable_not_a_cmd_launcher(
+    monkeypatch, tmp_path
+):
+    native = tmp_path / "ramp-windows-amd64.exe"
+    native.write_text("")
+    native.chmod(0o755)
+    monkeypatch.setattr(harnesses.sys, "platform", "win32")
+    monkeypatch.setattr(
+        harnesses.shutil, "which", lambda name: str(tmp_path / "ramp.CMD")
+    )
+    monkeypatch.setattr(harnesses.sys, "argv", [str(native)])
+
+    assert harnesses._executable() == str(native)
+
+
+def test_windows_keeps_a_cmd_launcher_when_no_native_executable_is_known(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(harnesses.sys, "platform", "win32")
+    monkeypatch.setattr(
+        harnesses.shutil, "which", lambda name: str(tmp_path / "ramp.CMD")
+    )
+    monkeypatch.setattr(harnesses.sys, "argv", [str(tmp_path / "python.exe")])
+
+    assert harnesses._executable() == str(tmp_path / "ramp.CMD")
+
+
+@pytest.mark.parametrize("name", ["RAMP.EXE", "ramp.CMD", "Ramp-Windows-Amd64.exe"])
+def test_windows_owns_entries_whatever_the_executable_case(monkeypatch, tmp_path, name):
+    monkeypatch.setattr(harnesses.sys, "platform", "win32")
+    entry = {
+        "type": "stdio",
+        "command": str(tmp_path / name),
+        "args": ["router", "connectors", "bridge", "--binding", "a" * 32],
+    }
+
+    assert harnesses._owned("claude-code", entry) is not None
+
+
+def test_other_platforms_keep_exact_executable_names(monkeypatch):
+    monkeypatch.setattr(harnesses.sys, "platform", "darwin")
+    entry = {
+        "type": "stdio",
+        "command": "/install/ramp.cmd",
+        "args": ["router", "connectors", "bridge", "--binding", "a" * 32],
+    }
+
+    assert harnesses._owned("claude-code", entry) is None
+
+
+def test_windows_finds_the_exe_behind_a_console_script_argv(monkeypatch, tmp_path):
+    # pip and uv launchers report argv[0] as ...\Scripts\ramp, without ".exe".
+    native = tmp_path / "ramp.exe"
+    native.write_text("")
+    native.chmod(0o755)
+    monkeypatch.setattr(harnesses.sys, "platform", "win32")
+    monkeypatch.setattr(
+        harnesses.shutil, "which", lambda name: str(tmp_path / "ramp.CMD")
+    )
+    monkeypatch.setattr(harnesses.sys, "argv", [str(tmp_path / "ramp")])
+
+    assert harnesses._executable() == str(native)

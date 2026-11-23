@@ -579,3 +579,39 @@ def test_start_spinner_draws_nothing_without_a_terminal():
     stop()
 
     assert buf.getvalue() == ""
+
+
+def test_show_notice_never_breaks_an_indented_command(monkeypatch):
+    monkeypatch.setattr("ramp_cli.output.style._term_width", lambda: 80)
+    command = (
+        '  claude --settings "C:\\Users\\someone\\.claude\\'
+        'original.settings.json" --model default'
+    )
+    buf = io.StringIO()
+
+    show_notice("NOTICE", ["Run your previous setup at any time:", command], file=buf)
+
+    rows = buf.getvalue().splitlines()
+    assert any(command in row for row in rows)
+    # The frame grows with the command, so every row stays aligned.
+    assert len({len(row) for row in rows}) == 1
+
+
+def test_show_notice_lets_a_command_overflow_a_narrow_terminal(monkeypatch):
+    monkeypatch.setattr("ramp_cli.output.style._term_width", lambda: 80)
+    monkeypatch.setenv("NO_COLOR", "1")
+    command = '  claude --settings "C:/' + "x" * 90 + '.json" --model default'
+
+    class Terminal(io.StringIO):
+        def isatty(self):
+            return True
+
+    buf = Terminal()
+
+    show_notice("NOTICE", ["Run your previous setup at any time:", command], file=buf)
+
+    rows = buf.getvalue().splitlines()
+    framed = [row for row in rows if command not in row]
+    # The frame stays within the window; only the command's row runs past it.
+    assert {len(row) for row in framed} == {80}
+    assert f"\u2502 {command}" in rows

@@ -38,6 +38,7 @@ except ImportError:  # pragma: no cover - Cowork setup is macOS-only
     fcntl = None
 
 CLAUDE_BUNDLE_ID = "com.anthropic.claudefordesktop"
+_MACOS_ONLY = "Automatic Claude Desktop setup currently supports macOS only."
 CLAUDE_COWORK_URL = "claude://cowork/"
 GATEWAY_CLIENT_HEADER = "X-Gateway-Client"
 GATEWAY_CLIENT = "claude-cowork"
@@ -143,10 +144,10 @@ def _profile_path(profile_id: str) -> Path:
 @contextmanager
 def transaction_lock():
     """Serialize all Cowork configuration read-modify-write transactions."""
-    if fcntl is None:  # pragma: no cover - rejected by the macOS preflight
-        raise click.ClickException(
-            "Automatic Claude Desktop setup requires macOS file locking."
-        )
+    if fcntl is None:
+        # Windows. Paths that skip the preflight, such as disabling the
+        # Desktop connector, still get the same answer it gives.
+        raise click.ClickException(_MACOS_ONLY)
     lock_path = state_path().parent / ".ramp-router-cowork.lock"
     lock_file = None
     try:
@@ -455,9 +456,7 @@ def _cli_settings(profile: dict) -> dict:
 
 def _ensure_macos() -> None:
     if sys.platform != "darwin":
-        raise click.ClickException(
-            "Automatic Claude Desktop setup currently supports macOS only."
-        )
+        raise click.ClickException(_MACOS_ONLY)
 
 
 def _run_quiet(command: list[str], *, timeout: float = 15) -> int:

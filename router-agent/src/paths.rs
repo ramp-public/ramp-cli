@@ -1,5 +1,10 @@
 //! Path helpers (POSIX normalization, `~` expansion) and cached `stat` that never touches autofs.
+//!
+//! Attribution works on POSIX paths. On Windows, absolute paths enter it through `canon` as
+//! `/C:/dir/file` (so every "absolute path starts with /" rule holds) and leave it through `native`
+//! for file system calls. Elsewhere both are the identity.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -89,9 +94,55 @@ pub fn abspath(p: &str) -> String {
     if p.starts_with('/') {
         normpath(p)
     } else {
-        let cwd = std::env::current_dir().map(|c| c.to_string_lossy().into_owned()).unwrap_or_else(|_| "/".into());
+        let cwd = std::env::current_dir().map(|c| canon(&c.to_string_lossy()).into_owned()).unwrap_or_else(|_| "/".into());
         normpath(&join(&cwd, p))
     }
+}
+
+/// Identity: Unix paths are already in attribution's form.
+#[cfg(not(windows))]
+#[inline]
+pub fn canon(p: &str) -> Cow<'_, str> {
+    Cow::Borrowed(p)
+}
+
+/// A Windows absolute path in attribution's form, `/C:/dir/file`: `C:\dir`, `C:/dir`,
+/// `\\?\C:\dir`, a file-URL path `/c:/dir`, and Git Bash's `/c/dir`. Anything else (relative
+/// paths, UNC shares, which can hang on a dead server) is returned unchanged.
+#[cfg(windows)]
+pub fn canon(p: &str) -> Cow<'_, str> {
+    let rest = p.strip_prefix(r"\\?\").unwrap_or(p);
+    let b = rest.as_bytes();
+    let drive = |i: usize| b.get(i).is_some_and(u8::is_ascii_alphabetic);
+    let sep = |i: usize| matches!(b.get(i), Some(b'/' | b'\\'));
+    let (letter, tail) = if drive(0) && b.get(1) == Some(&b':') && (sep(2) || b.len() == 2) {
+        (b[0], &rest[2..])
+    } else if b.first() == Some(&b'/') && drive(1) && b.get(2) == Some(&b':') && (sep(3) || b.len() == 3) {
+        (b[1], &rest[3..])
+    } else if b.first() == Some(&b'/') && drive(1) && (b.get(2) == Some(&b'/') || b.len() == 2) {
+        (b[1], &rest[2..])
+    } else {
+        return Cow::Borrowed(p);
+    };
+    let tail = tail.replace('\\', "/");
+    Cow::Owned(format!("/{}:{}", letter.to_ascii_uppercase() as char, if tail.is_empty() { "/" } else { &tail }))
+}
+
+/// Identity: attribution's paths are the file system's.
+#[cfg(not(windows))]
+#[inline]
+pub fn native(p: &str) -> Cow<'_, str> {
+    Cow::Borrowed(p)
+}
+
+/// `/C:/dir` back to `C:/dir` (Windows accepts `/` separators) for file system calls.
+#[cfg(windows)]
+pub fn native(p: &str) -> Cow<'_, str> {
+    let b = p.as_bytes();
+    if b.first() == Some(&b'/') && b.get(1).is_some_and(u8::is_ascii_alphabetic) && b.get(2) == Some(&b':') {
+        return Cow::Owned(if b.len() == 3 { format!("{}/", &p[1..]) } else { p[1..].to_string() });
+    }
+    Cow::Borrowed(p)
 }
 
 pub fn expanduser(p: &str) -> String {
@@ -100,7 +151,7 @@ pub fn expanduser(p: &str) -> String {
     }
     let i = p.find('/').unwrap_or(p.len());
     let user = &p[1..i];
-    let home = if user.is_empty() { std::env::var("HOME").ok().or_else(|| home_of(None)) } else { home_of(Some(user)) };
+    let home = if user.is_empty() { home_var().or_else(|| home_of(None)) } else { home_of(Some(user)) };
     match home {
         Some(h) => {
             let h = h.trim_end_matches('/');
@@ -112,6 +163,16 @@ pub fn expanduser(p: &str) -> String {
     }
 }
 
+/// The profile folder for `~`; other users' (`~name`) are not looked up.
+#[cfg(windows)]
+fn home_of(user: Option<&str>) -> Option<String> {
+    if user.is_some() {
+        return None;
+    }
+    std::env::var("USERPROFILE").ok().filter(|h| !h.is_empty()).map(|h| canon(&h).into_owned())
+}
+
+#[cfg(unix)]
 fn home_of(user: Option<&str>) -> Option<String> {
     unsafe {
         let pw = match user {
@@ -126,6 +187,12 @@ fn home_of(user: Option<&str>) -> Option<String> {
         }
         Some(std::ffi::CStr::from_ptr((*pw).pw_dir).to_string_lossy().into_owned())
     }
+}
+
+/// `$HOME`. Windows sets no HOME for a scheduled task, and a HOME set by Git Bash or MSYS tools
+/// is not the profile folder Windows programs use, so `~` is always the profile there.
+fn home_var() -> Option<String> {
+    if cfg!(windows) { None } else { std::env::var("HOME").ok() }
 }
 
 pub fn isdir(p: &str) -> bool {
@@ -152,7 +219,7 @@ fn stat(p: &str) -> Option<bool> {
             return *v;
         }
     }
-    let v = std::fs::metadata(p).ok().and_then(|m| if m.is_dir() { Some(true) } else if m.is_file() { Some(false) } else { None });
+    let v = std::fs::metadata(&*native(p)).ok().and_then(|m| if m.is_dir() { Some(true) } else if m.is_file() { Some(false) } else { None });
     let mut c = STAT_CACHE.lock().unwrap();
     if c.len() > 100_000 {
         c.clear();
@@ -184,7 +251,13 @@ fn autofs_mount_points() -> Vec<String> {
     out
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Windows has no autofs.
+#[cfg(windows)]
+fn autofs_mount_points() -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn autofs_mount_points() -> Vec<String> {
     std::fs::read_to_string("/proc/mounts")
         .map(|t| {
@@ -217,5 +290,40 @@ mod tests {
         assert_eq!(join("/a/", "b"), "/a/b");
         assert_eq!(char_prefix("héllo", 2), "hé");
         assert_eq!(strip("\u{1c} x \u{a0}"), "x");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_paths_pass_through() {
+        for p in ["/a/b", "C:\\x", "/c/x", "rel"] {
+            assert!(matches!(canon(p), Cow::Borrowed(q) if q == p));
+            assert!(matches!(native(p), Cow::Borrowed(q) if q == p));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths() {
+        assert_eq!(canon(r"C:\Users\me\repo"), "/C:/Users/me/repo");
+        assert_eq!(canon("c:/Users/me/repo/"), "/C:/Users/me/repo/");
+        assert_eq!(canon(r"\\?\D:\work"), "/D:/work");
+        assert_eq!(canon("/c:/Users/me"), "/C:/Users/me");
+        assert_eq!(canon("/c/Users/me"), "/C:/Users/me");
+        assert_eq!(canon("C:"), "/C:/");
+        assert_eq!(canon(r"C:\"), "/C:/");
+        assert_eq!(canon("/c"), "/C:/");
+        // not absolute drive paths: unchanged
+        for p in ["C:rel", "src\\main.rs", r"\\server\share\x", "/usr/bin", "/cd/x", "rel/x"] {
+            assert_eq!(canon(p), p);
+        }
+        assert_eq!(native("/C:/Users/me"), "C:/Users/me");
+        assert_eq!(native("/C:"), "C:/");
+        assert_eq!(native("/usr"), "/usr");
+        assert_eq!(normpath(&canon(r"C:\a\..\b")), "/C:/b");
+        assert_eq!(dirname("/C:/a"), "/C:");
+        assert_eq!(dirname("/C:"), "/");
+        let home = std::env::var("USERPROFILE").unwrap();
+        assert_eq!(expanduser("~/x"), format!("{}/x", canon(&home).trim_end_matches('/')));
+        assert!(isdir(&canon(&home)));
     }
 }

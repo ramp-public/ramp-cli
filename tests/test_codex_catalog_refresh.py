@@ -12,6 +12,10 @@ import pytest
 
 from ramp_cli import codex_desktop
 
+pytestmark = pytest.mark.posix_only(
+    reason="the live refresh talks to Codex over a Unix socket"
+)
+
 
 @pytest.fixture
 def backend(tmp_path, monkeypatch):

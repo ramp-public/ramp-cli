@@ -15,6 +15,7 @@ import os
 import secrets
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable
@@ -30,6 +31,7 @@ from prompt_toolkit.output import DummyOutput
 
 from ramp_cli.auth import oauth
 from ramp_cli.auth.refresh import _refresh_lock
+from ramp_cli.commands import router_winsec
 from ramp_cli.config import settings
 from ramp_cli.errors import EXIT_AUTH_REQUIRED, ApiError, RampCLIError
 
@@ -227,6 +229,10 @@ def _atomic_write(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor, temporary = tempfile.mkstemp(dir=path.parent)
     try:
+        if sys.platform == "win32":
+            # mkstemp's 0600 means nothing on Windows: this user and SYSTEM
+            # only, set before any content (a rename keeps it).
+            router_winsec.secure(Path(temporary))
         with os.fdopen(descriptor, "w") as output:
             json.dump(data, output)
             output.flush()

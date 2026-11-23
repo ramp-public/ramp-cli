@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import stat
 import time
 import urllib.parse
+from contextlib import closing
 
 import pytest
 from click.testing import CliRunner
@@ -802,8 +804,12 @@ def test_cursor_setup_binds_its_key_for_transcript_uploads(
     stored = router_repo.config_dir() / "router-agent-credentials"
     record = json.loads((stored / f"{binding['credential']}.json").read_text())
     assert record == {"upstream": upstream, "api_key": "router-secret"}
-    mode = router_repo.cursor_binding_path().stat().st_mode
-    assert stat.S_IMODE(mode) == 0o600
+    # Private to this user: mode 0600, or on Windows an owner-only ACL, which
+    # read_private checks.
+    assert router_local_auth.read_private(router_repo.cursor_binding_path())
+    if os.name != "nt":
+        mode = router_repo.cursor_binding_path().stat().st_mode
+        assert stat.S_IMODE(mode) == 0o600
 
 
 def test_cursor_setup_replaces_the_previous_binding(monkeypatch):
@@ -1069,6 +1075,9 @@ def test_status_flags_an_unreadable_binding_as_broken(monkeypatch, contents):
     assert payload == {"state": "broken", "reason": "binding_unreadable"}
 
 
+@pytest.mark.posix_only(
+    reason="chmod doesn't change Windows ACLs; test_router_windows_agent covers shared ones"
+)
 def test_a_world_readable_binding_is_broken_as_the_agent_would_find_it(
     monkeypatch,
 ):
@@ -1316,7 +1325,9 @@ def test_a_team_that_blocks_personal_keys_is_detected(key):
 def test_personal_keys_count_as_allowed_unless_cursor_says_so(value):
     path = cursor.state_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as db:
+    # The connection's own context manager only commits; Windows can't delete
+    # a database that is still open.
+    with closing(sqlite3.connect(path)) as db, db:
         db.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB)")
         db.execute("INSERT INTO ItemTable VALUES ('adminSettings.cached', ?)", (value,))
     assert not cursor.personal_keys_blocked()

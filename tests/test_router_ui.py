@@ -495,7 +495,9 @@ def test_background_work_is_responsive_and_cannot_be_abandoned():
         async with app.run_test(size=(100, 35)) as pilot:
             await settle(app, pilot)
             page = app.screen
-            page.run("Writing", lambda: release.wait(3))
+            # Released below; the ceiling only stops a broken test hanging, so
+            # a slow runner can't let the work finish before the checks.
+            page.run("Writing", lambda: release.wait(30))
             await pilot.pause()
             try:
                 assert app.busy

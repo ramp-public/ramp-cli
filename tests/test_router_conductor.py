@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import os
-import stat
 import tomllib
 from pathlib import Path
 
@@ -24,6 +23,7 @@ from ramp_cli import __version__, claude_cowork
 from ramp_cli.commands import conductor
 from ramp_cli.commands.router import DEFAULT_ROUTER_BASE_URL as ROUTER_BASE_URL
 from ramp_cli.main import cli
+from tests.platform_support import assert_mode
 
 
 @pytest.fixture(autouse=True)
@@ -118,6 +118,9 @@ def _configure(runner=None):
     )
 
 
+@pytest.mark.posix_only(
+    reason="Conductor runs only on macOS and its wrappers are POSIX shell scripts"
+)
 def test_configure_conductor_writes_wrappers_and_settings(monkeypatch):
     _mock_models(monkeypatch)
     home = conductor.conductor_home()
@@ -149,7 +152,7 @@ def test_configure_conductor_writes_wrappers_and_settings(monkeypatch):
 
     key_path = artifacts / "ramp-router-key"
     assert key_path.read_text() == "router-secret"
-    assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
+    assert_mode(key_path, 0o600)
 
     claude_wrapper = (artifacts / "claude-code").read_text()
     assert os.access(artifacts / "claude-code", os.X_OK)
@@ -199,6 +202,9 @@ def test_configure_conductor_writes_wrappers_and_settings(monkeypatch):
     assert state["settings"]["claude_code_executable_path"] == {"present": False}
 
 
+@pytest.mark.posix_only(
+    reason="Conductor runs only on macOS and its wrappers are POSIX shell scripts"
+)
 def test_conductor_codex_uses_and_recovers_the_repository_agent(
     monkeypatch, isolated_config
 ):
@@ -501,15 +507,15 @@ def test_configure_conductor_preserves_the_settings_file_mode(monkeypatch):
     runner = CliRunner()
 
     assert _configure(runner).exit_code == 0
-    assert stat.S_IMODE(settings.stat().st_mode) == 0o600
+    assert_mode(settings, 0o600)
     removed = runner.invoke(cli, ["--human", "router", "unconfigure", "conductor"])
     assert removed.exit_code == 0, removed.output
-    assert stat.S_IMODE(settings.stat().st_mode) == 0o600
+    assert_mode(settings, 0o600)
 
     # A settings file this command creates gets the ordinary default mode.
     settings.unlink()
     assert _configure(runner).exit_code == 0
-    assert stat.S_IMODE(settings.stat().st_mode) == 0o644
+    assert_mode(settings, 0o644)
 
 
 def test_configure_conductor_preserves_escaped_multiline_delimiters(monkeypatch):
@@ -602,6 +608,9 @@ def test_configure_conductor_writes_through_a_symlinked_settings_file(
     }
 
 
+@pytest.mark.posix_only(
+    reason="session sync hooks are POSIX shell commands and are not registered on Windows"
+)
 def test_conductor_codex_home_registers_session_sync(monkeypatch):
     _mock_models(monkeypatch)
     home = conductor.conductor_home()
@@ -652,6 +661,9 @@ def test_unconfigure_keeps_a_dangling_user_symlink(monkeypatch, tmp_path):
     assert tomllib.loads(target.read_text()) == {}
 
 
+@pytest.mark.posix_only(
+    reason="session sync hooks are POSIX shell commands and are not registered on Windows"
+)
 def test_sync_hook_never_points_at_the_isolated_home_itself(monkeypatch):
     _mock_models(monkeypatch)
     home = conductor.conductor_home()
