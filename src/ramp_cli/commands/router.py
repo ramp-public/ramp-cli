@@ -106,7 +106,6 @@ from ramp_cli.output.formatter import (
 )
 from ramp_cli.output.style import show_notice, start_spinner
 from ramp_cli.router_connectors import harnesses as connector_harnesses
-from ramp_cli.router_connectors import ramp_mcp
 from ramp_cli.router_connectors import skill as connector_skill
 from ramp_cli.router_integrations import integration_package_path
 from ramp_cli.router_setup import (
@@ -1735,11 +1734,6 @@ def _cursor_model_options(command):
     help="Sign in, configure selected harnesses, and enable background refresh and repository tagging.",
 )
 @click.option(
-    "--mcp",
-    is_flag=True,
-    help="Also add the Ramp MCP server (https://mcp.ramp.com/mcp) to each configured app.",
-)
-@click.option(
     "--reuse-existing-key",
     is_flag=True,
     help=(
@@ -1807,7 +1801,6 @@ def router_configure(
     no_browser: bool,
     connectors: bool,
     enable_agent: bool,
-    mcp: bool,
     reuse_existing_key: bool,
     confirm_browser: bool,
     claude_models: str | None,
@@ -1894,7 +1887,6 @@ def router_configure(
         and not confirm_browser
         and not connectors
         and not enable_agent
-        and not mcp
         and not cursor_options.given()
         and not cursor_options.variants_given()
         and (not clients or (api_key is None and setup_file is None))
@@ -1933,7 +1925,6 @@ def router_configure(
         confirm_browser=confirm_browser,
         connectors=connectors,
         enable_agent=enable_agent,
-        mcp=mcp,
         cursor_options=cursor_options,
     )
     results = None
@@ -2147,7 +2138,6 @@ def _run_configure(
     confirm_browser: bool = False,
     connectors: bool = False,
     enable_agent: bool = False,
-    mcp: bool = False,
     cursor_options: _CursorOptions | None = None,
 ) -> list[dict] | None:
     cursor_options = cursor_options or _CursorOptions()
@@ -2169,7 +2159,6 @@ def _run_configure(
         and not reuse_existing_key
         and not connectors
         and not enable_agent
-        and not mcp
         and not cursor_options.given()
         and not cursor_options.variants_given()
         and (
@@ -2333,8 +2322,6 @@ def _run_configure(
         # preference configures, so the repeat-configure shortcut clears it
         # like a full configure would.
         _scrub_stale_fable_verdict()
-        if mcp:
-            ramp_mcp.configure("claude-code", router_base_url())
         if connector_skill.refresh():
             connector_skill.install("claude-code")
         # Like every other configure, so RAMP_NO_SESSION_SYNC=1 removes the
@@ -2721,7 +2708,6 @@ def _run_configure(
                         api_key,
                         base_url,
                         model_ids=tuple(model.id for model in models),
-                        mcp=mcp,
                         **(
                             {"connector_binding": connector_binding}
                             if connector_binding is not None
@@ -2806,8 +2792,6 @@ def _run_configure(
                     if cursor.personal_keys_blocked()
                     else {}
                 )
-                if mcp:
-                    ramp_mcp.configure(CURSOR_CLIENT, base_url)
                 reopen_result = _reopen_cursor(cursor_quit)
                 reopened = (
                     {"reopened": reopen_result} if reopen_result is not None else {}
@@ -2962,8 +2946,6 @@ def _run_configure(
                     failure_error = HarnessOutdatedError
                 continue
             switchyard_push.settle(written=True)
-            if mcp:
-                ramp_mcp.configure(item, base_url)
             if connector_skill_available and item in (
                 "claude-code",
                 "codex",

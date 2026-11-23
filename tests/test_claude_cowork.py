@@ -16,7 +16,7 @@ from click.testing import CliRunner
 from ramp_cli import __version__, claude_cowork
 from ramp_cli.commands import router, router_repo, router_schedule
 from ramp_cli.main import cli
-from ramp_cli.router_connectors import harnesses, ramp_mcp
+from ramp_cli.router_connectors import harnesses
 
 
 @pytest.fixture
@@ -1654,23 +1654,6 @@ def test_agent_routing_keeps_a_real_v1_in_the_gateway_path(tagging):
     router_repo._save_settings({"enabled": False})
     claude_cowork.refresh_agent_routing()
     assert claude_cowork.configured_gateway_base_url() == "https://api.router.com/v1"
-
-
-def test_routed_desktop_still_gets_ramp_mcp(tagging, monkeypatch):
-    monkeypatch.setattr(ramp_mcp.shutil, "which", lambda _name: "/usr/bin/npx")
-    claude_cowork.configure("router-secret", "https://api.router.com/v1", mcp=True)
-
-    assert router_repo.is_wrapped(claude_cowork.configured_gateway_base_url())
-    desktop = json.loads(claude_cowork._desktop_config_path().read_text())
-    assert desktop["mcpServers"]["ramp"] == ramp_mcp.desktop_entry()
-
-
-def test_desktop_without_npx_gets_no_mcp_servers_key(cowork_host, monkeypatch):
-    monkeypatch.setattr(ramp_mcp.shutil, "which", lambda _name: None)
-    claude_cowork.configure("router-secret", "https://api.router.com/v1", mcp=True)
-
-    desktop = json.loads(claude_cowork._desktop_config_path().read_text())
-    assert "mcpServers" not in desktop
 
 
 def test_a_key_sealed_by_desktop_keeps_refresh_and_routing_working(

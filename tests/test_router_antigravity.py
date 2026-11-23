@@ -1033,41 +1033,6 @@ def test_unconfigure_preserves_edited_gateway_even_with_custom_header(monkeypatc
     assert "models" not in after
 
 
-def test_configure_antigravity_injects_ramp_mcp_and_preserves_existing_servers(
-    monkeypatch,
-):
-    all_models = [_make_model("gpt-6.2-sol", display_name="GPT-6.2 Sol")]
-    _stub_models(monkeypatch, all_models, all_models)
-    mcp_path = antigravity.mcp_config_path()
-    mcp_path.parent.mkdir(parents=True, exist_ok=True)
-    mcp_path.write_text(
-        json.dumps(
-            {"mcpServers": {"custom": {"command": "/usr/local/bin/custom"}}},
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    res = CliRunner().invoke(
-        cli,
-        [
-            "--human",
-            "router",
-            "configure",
-            "antigravity",
-            "--api-key",
-            "sk-router-secret-12345678",
-            "--mcp",
-            "--no-input",
-        ],
-    )
-    assert res.exit_code == 0, res.output
-    mcp = json.loads(mcp_path.read_text(encoding="utf-8"))
-    assert mcp["mcpServers"]["custom"] == {"command": "/usr/local/bin/custom"}
-    assert mcp["mcpServers"]["ramp"] == {"url": "https://mcp.ramp.com/mcp"}
-
-
 @pytest.mark.parametrize(
     ("platform", "state", "expect_restarted", "expect_error"),
     [
@@ -1240,3 +1205,33 @@ def test_restart_skips_quit_when_ancestry_probe_fails(monkeypatch):
     assert _real_runs_inside([4242]) is None
     assert _real_restart_running(action="configured") is False
     assert [cmd[0] for cmd in calls] == ["ps", "pgrep", "ps"]
+
+
+def test_build_model_entries_clamps_shared_window_max_output_tokens():
+    entries = {
+        e["modelId"]: e
+        for e in antigravity.build_model_entries(
+            [
+                _make_model(
+                    "grok-4.7", context_window=500_000, max_output_tokens=500_000
+                ),
+                _make_model(
+                    "muse-wonder-1.0",
+                    context_window=1_048_576,
+                    max_output_tokens=1_048_576,
+                ),
+                _make_model(
+                    "custom/small", context_window=16_384, max_output_tokens=16_384
+                ),
+                _make_model(
+                    "deepseek-v4.1-flash",
+                    context_window=1_048_576,
+                    max_output_tokens=262_144,
+                ),
+            ]
+        )
+    }
+    assert entries["grok-4.7"]["maxOutputTokens"] == 125_000
+    assert entries["muse-wonder-1.0"]["maxOutputTokens"] == 128_000
+    assert entries["custom/small"]["maxOutputTokens"] == 4_096
+    assert entries["deepseek-v4.1-flash"]["maxOutputTokens"] == 262_144

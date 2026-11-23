@@ -371,7 +371,12 @@ def build_model_entries(selected_models: Sequence[Any]) -> list[dict[str, Any]]:
         if meta.context_window and meta.context_window > 0:
             entry["maxTokens"] = meta.context_window
         if meta.max_output_tokens and meta.max_output_tokens > 0:
-            entry["maxOutputTokens"] = meta.max_output_tokens
+            max_output = meta.max_output_tokens
+            if meta.context_window and max_output >= meta.context_window:
+                # Antigravity subtracts maxOutputTokens from maxTokens to compute
+                # the prompt budget; cap shared-window models so input headroom remains.
+                max_output = max(1, min(meta.context_window // 4, 128_000))
+            entry["maxOutputTokens"] = max_output
 
         modalities = set(meta.input_modalities or ())
         if not modalities or "image" in modalities:

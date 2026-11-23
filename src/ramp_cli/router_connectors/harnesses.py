@@ -133,9 +133,7 @@ def _owned(harness: str, entry: object) -> str | None:
     return args[4]
 
 
-def _read(
-    path: Path, harness: str, *, server: str = SERVER
-) -> tuple[str, dict, object]:
+def _read(path: Path, harness: str) -> tuple[str, dict, object]:
     try:
         text = path.read_text() if path.exists() else ""
         data = (
@@ -155,7 +153,7 @@ def _read(
         servers = data.get(key, {})
         if not isinstance(servers, dict):
             raise ValueError
-        return text, data, servers.get(server)
+        return text, data, servers.get(SERVER)
     except (ValueError, OSError) as exc:
         raise RampCLIError(
             "Could not safely read harness configuration; nothing was changed."
@@ -269,9 +267,7 @@ def _json_field(text: str, key: str, replacement: str | None) -> str:
     )
 
 
-def _render_json(
-    text: str, key: str, entry: dict | None, *, server: str = SERVER
-) -> str:
+def _render_json(text: str, key: str, entry: dict | None) -> str:
     original = text or "{}\n"
     try:
         members, _ = _json_members(original)
@@ -280,14 +276,14 @@ def _render_json(
             "{}",
         )
         updated_map = _json_field(
-            server_map, server, json.dumps(entry) if entry is not None else None
+            server_map, SERVER, json.dumps(entry) if entry is not None else None
         )
         candidate = _json_field(original, key, updated_map)
         expected = json5.loads(original, allow_duplicate_keys=False)
         if entry is None:
-            expected.setdefault(key, {}).pop(server, None)
+            expected.setdefault(key, {}).pop(SERVER, None)
         else:
-            expected.setdefault(key, {})[server] = entry
+            expected.setdefault(key, {})[SERVER] = entry
         if json5.loads(candidate, allow_duplicate_keys=False) != expected:
             raise ValueError("Configuration changed unexpectedly")
         return candidate
@@ -297,14 +293,11 @@ def _render_json(
         ) from exc
 
 
-def _render_codex(
-    text: str, data: dict, entry: dict | None, *, server: str = SERVER
-) -> str:
+def _render_codex(text: str, data: dict, entry: dict | None) -> str:
     # Append/remove one standalone table, retaining all unrelated text/comments.
     # Reject unusual nested/inline representations rather than risk a lossy edit.
-    escaped = re.escape(server)
     header = re.compile(
-        rf'^\s*\[mcp_servers\.(?:{escaped}|"{escaped}"|\'{escaped}\')\]\s*(?:#.*)?$'
+        r'^\s*\[mcp_servers\.(?:ramp-connectors|"ramp-connectors"|\'ramp-connectors\')\]\s*(?:#.*)?$'
     )
     lines = text.splitlines(keepends=True)
     starts = [i for i, line in enumerate(lines) if header.match(line.rstrip("\r\n"))]
@@ -324,14 +317,20 @@ def _render_codex(
     else:
         candidate = text
     if entry is not None:
-        body = "\n".join(f"{k} = {json.dumps(v)}" for k, v in entry.items())
-        candidate = f"{candidate.rstrip()}\n\n[mcp_servers.{server}]\n{body}\n"
+        candidate = (
+            candidate.rstrip()
+            + "\n\n[mcp_servers.ramp-connectors]\ncommand = "
+            + json.dumps(entry["command"])
+            + "\nargs = "
+            + json.dumps(entry["args"])
+            + "\n"
+        )
     expected = json.loads(json.dumps(data))
     servers = expected.setdefault("mcp_servers", {})
     if entry is None:
-        servers.pop(server, None)
+        servers.pop(SERVER, None)
     else:
-        servers[server] = entry
+        servers[SERVER] = entry
     try:
         parsed = tomllib.loads(candidate)
     except tomllib.TOMLDecodeError as exc:

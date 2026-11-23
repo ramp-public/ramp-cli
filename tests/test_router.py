@@ -1075,7 +1075,7 @@ def test_configure_cowork_consumes_the_setup_file_and_deletes_it_after_success(
             )
         ]
 
-    def configure(api_key, base_url, model_ids=(), mcp=False):
+    def configure(api_key, base_url, model_ids=()):
         captured["configure"] = (api_key, base_url)
         captured["configure_model_ids"] = model_ids
         return tmp_path / "Claude-3p" / "configLibrary" / "profile.json", ()
@@ -1703,7 +1703,7 @@ def test_configure_sets_up_cowork_alongside_a_coding_agent(tmp_path, monkeypatch
     monkeypatch.setattr(
         claude_cowork,
         "configure",
-        lambda api_key, base_url, model_ids=(), mcp=False: (
+        lambda api_key, base_url, model_ids=(): (
             captured.update(cowork=(api_key, base_url))
             or (tmp_path / "profile.json", ())
         ),
@@ -1785,7 +1785,7 @@ def test_a_setup_file_covers_every_selected_agent(tmp_path, monkeypatch):
     monkeypatch.setattr(
         claude_cowork,
         "configure",
-        lambda api_key, base_url, model_ids=(), mcp=False: (
+        lambda api_key, base_url, model_ids=(): (
             captured.update(cowork=(api_key, base_url))
             or (tmp_path / "profile.json", ())
         ),
@@ -5195,47 +5195,6 @@ def test_connector_skill_install_uses_home_when_override_is_empty(
     target = Path.home() / relative_target
     assert (target / connector_skill.NAME / "SKILL.md").is_file()
     assert managed_skill_names(target) == [connector_skill.NAME]
-
-
-@pytest.mark.parametrize("mcp", [False, True])
-def test_configure_adds_ramp_mcp_only_with_mcp_flag(tmp_path, monkeypatch, mcp):
-    claude_home = tmp_path / "claude"
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
-    _mock_models(monkeypatch)
-    args = [
-        "--human",
-        "router",
-        "configure",
-        "claude-code",
-        "--api-key",
-        "router-secret",
-    ]
-
-    result = CliRunner().invoke(cli, [*args, *(["--mcp"] if mcp else [])])
-
-    assert result.exit_code == 0, result.output
-    mcp_path = claude_home / ".claude.json"
-    config = json.loads(mcp_path.read_text()) if mcp_path.exists() else {}
-    assert ("ramp" in config.get("mcpServers", {})) is mcp
-
-
-def test_repeat_claude_code_configure_adds_ramp_mcp(tmp_path, monkeypatch):
-    claude_home = tmp_path / "claude"
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
-    _mock_models(monkeypatch)
-    args = ["--human", "router", "configure", "claude-code", "--mcp"]
-    configured = CliRunner().invoke(cli, [*args, "--api-key", "router-secret"])
-    assert configured.exit_code == 0, configured.output
-    # As a setup from a CLI without Ramp MCP leaves it.
-    mcp_path = claude_home / ".claude.json"
-    mcp_path.write_text("{}")
-
-    repeated = CliRunner().invoke(cli, ["--no-input", *args])
-
-    assert repeated.exit_code == 0, repeated.output
-    assert json.loads(mcp_path.read_text())["mcpServers"]["ramp"]["url"] == (
-        "https://mcp.ramp.com/mcp"
-    )
 
 
 def test_reconfigure_claude_only_updates_model_view(tmp_path, monkeypatch):
@@ -12029,7 +11988,7 @@ def test_configure_without_a_terminal_targets_every_integration(
         browser_calls.append((url, no_browser))
         return "router-secret"
 
-    def configure_cowork(api_key, base_url, *, model_ids, mcp=False):
+    def configure_cowork(api_key, base_url, *, model_ids):
         desktop_keys["cowork"] = api_key
         assert base_url == ROUTER_BASE_URL
         assert model_ids == ("gpt-5.4",)
