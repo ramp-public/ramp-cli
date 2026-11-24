@@ -127,7 +127,7 @@ async fn serve(args: Vec<String>) {
         }
     }
     let settings = arg(&args, "--settings").map(PathBuf::from);
-    let version = arg(&args, "--reported-version").or_else(|| std::env::var("RAMP_CLI_VERSION").ok()).unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+    let version = arg(&args, "--reported-version").or_else(|| std::env::var("RAMP_CLI_VERSION").ok()).unwrap_or_else(|| rrh::version::release().to_string());
     // launchd hands over an unbound socket when another program held the port at load.
     let inherited = inherited_listener().filter(|l| l.local_addr().is_ok_and(|a| a.port() != 0));
     let mut inherited = inherited.map(Ok);
@@ -219,7 +219,7 @@ fn main() {
         return;
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("ramp-router-agent {}", env!("CARGO_PKG_VERSION"));
+        println!("ramp-router-agent {}", rrh::version::release());
         return;
     }
     // --build identifies the binary in the service definition (so updates reload it); unused here.

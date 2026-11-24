@@ -9,6 +9,7 @@ pub mod process;
 pub mod proxy;
 pub mod sync;
 pub mod tls;
+pub mod version;
 #[cfg(windows)]
 pub mod win;
 #[cfg(any(windows, test))]

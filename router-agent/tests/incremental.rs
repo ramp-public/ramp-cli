@@ -244,7 +244,8 @@ fn native_turn_ids_win_and_untagged_requests_keep_turn_metadata() {
     let value: serde_json::Value = serde_json::from_slice(&spliced).unwrap();
     assert_eq!(value["metadata"], serde_json::json!({
         "turn_id": "entry-42",
-        "turn_id_source": "harness_header"
+        "turn_id_source": "harness_header",
+        "router_agent_version": rrh::version::release()
     }));
 }
 

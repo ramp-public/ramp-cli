@@ -2168,6 +2168,11 @@ pub fn plan(doc: &Doc, a: &Attribution) -> Option<Plan> {
         fields.push(("turn_id", turn_id));
         fields.push(("turn_id_source", a.turn_id_source.as_deref().unwrap_or("")));
     }
+    // Which agent wrote these fields, so a person whose tags look wrong can be checked for an old
+    // agent without asking them.
+    if !fields.is_empty() {
+        fields.push(("router_agent_version", crate::version::release()));
+    }
     crate::json::splice_fields(doc, &fields)
 }
 
